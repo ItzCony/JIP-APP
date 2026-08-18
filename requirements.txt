@@ -1,0 +1,17 @@
+nicegui
+bcrypt
+mysql-connector-python
+numpy
+pandas
+pillow
+playwright
+psutil
+PyMuPDF
+pyzipper
+qrcode
+opencv-python-headless
+openpyxl
+pyxlsb
+xlrd
+xlwt
+docxtpl
