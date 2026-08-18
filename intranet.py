@@ -859,7 +859,7 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
             with ui.column().classes('login-wrap items-center gap-0 mx-auto'):
                 ui.image('/static/logo.png').classes('login-logo mb-6')
                 ui.label('Vítejte v Moje JIPka').classes('login-title text-center')
-                ui.label('Přihlaste se firemním účtem').classes('login-sub text-center mt-1 mb-6')
+                ui.label('Přihlaste se firemním účtem, nebo os. číslem').classes('login-sub text-center mt-1 mb-6')
 
                 email_input = ui.input('E-mail nebo osobní číslo', value=_zapamatovany_email) \
                     .classes('w-full mb-3').props('outlined dark type=text autocomplete=username name=email id=login-email')
