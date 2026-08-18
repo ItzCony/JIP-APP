@@ -1120,19 +1120,16 @@ def vykresli_dochazku(user_id, user_name, vsechna_prava):
                 prijemci.add(mail)
 
         if not prijemci:
+            # ponytail: 1 dotaz na všechna relevantní práva místo N× ziskej_prava_uzivatele v cyklu
+            hledana_prava = ['vse', 'dochazka_admin']
+            hledana_prava += [f'hlavni_vedouci_{o.lower()}' for o in oddeleni_cil if o]
+            opravneni_ids = set(intranet_data.ziskej_uzivatele_s_pravem(*hledana_prava).keys())
+
             for mail, udata in vsichni_uzivatele_komplet.items():
                 if udata['id'] == cilovy_id: continue
                 if not udata.get('email_nova_zadost', True): continue
-
-                kompletni_prava_u = intranet_data.ziskej_prava_uzivatele(udata['id'])
-                kompletni_prava_u = [p.lower() for p in kompletni_prava_u]
-
-                if 'vse' in kompletni_prava_u or 'dochazka_admin' in kompletni_prava_u:
+                if udata['id'] in opravneni_ids:
                     prijemci.add(mail)
-                else:
-                    for o in oddeleni_cil:
-                        if f'hlavni_vedouci_{o.lower()}' in kompletni_prava_u:
-                            prijemci.add(mail)
         return prijemci
 
     _sub_refreshes = []
@@ -1780,7 +1777,8 @@ def vykresli_dochazku(user_id, user_name, vsechna_prava):
                 if muze_zadat_za_sebe:
                     @ui.refreshable
                     def vykresli_dovolenky():
-                        moje_z_d = intranet_data.ziskej_zadosti(user_id)
+                        # ponytail: filtr nad cachovaným "vše" místo per-user DB dotazu v event-loopu
+                        moje_z_d = [z for z in intranet_data.ziskej_zadosti(None) if z['user_iduser'] == user_id]
                         _aktualni_db = intranet_data.ziskej_vsechny_uzivatele()
                         _muj_ucet = next((u for u in _aktualni_db.values() if u['id'] == user_id), {})
                         current_year = datetime.date.today().year
@@ -2430,14 +2428,21 @@ def vykresli_dochazku(user_id, user_name, vsechna_prava):
                                     label='Osoba',
                                     with_input=True,
                                 ).classes('w-56 bg-white')
-                                ui.button('Filtrovat', icon='filter_alt', on_click=lambda: render_historie.refresh()).classes(
+                                def _filtruj_historie():
+                                    hist_page['p'] = 1
+                                    render_historie.refresh()
+                                ui.button('Filtrovat', icon='filter_alt', on_click=_filtruj_historie).classes(
                                     'bg-blue-600 hover:bg-blue-700 text-white font-bold h-[3.5rem] px-5 shadow-sm')
                                 def _zrusit_filtr_historie():
                                     hist_od.set_value('')
                                     hist_do.set_value('')
                                     hist_osoba.set_value('Všichni')
+                                    hist_page['p'] = 1
                                     render_historie.refresh()
                                 ui.button(icon='clear', on_click=_zrusit_filtr_historie).props('flat round').tooltip('Zrušit filtr').classes('self-center text-gray-500')
+
+                            HIST_NA_STRANU = 10
+                            hist_page = {'p': 1}
 
                             @ui.refreshable
                             def render_historie():
@@ -2459,9 +2464,13 @@ def vykresli_dochazku(user_id, user_name, vsechna_prava):
                                 if not filtered:
                                     ui.label('Žádné záznamy neodpovídají filtru.').classes('text-gray-500 italic p-4')
                                     return
-                                ui.label(f'Zobrazeno {min(len(filtered), 200)} z {len(filtered)} záznamů').classes('text-xs text-gray-400 mb-2 px-1')
-                                with ui.card().classes('w-full p-3 shadow-sm bg-white rounded-xl border border-blue-200 mb-8 overflow-y-auto').style('max-height: 800px'):
-                                    for z in filtered[:200]:
+                                pocet_stran = max(1, -(-len(filtered) // HIST_NA_STRANU))
+                                if hist_page['p'] > pocet_stran: hist_page['p'] = pocet_stran
+                                _od = (hist_page['p'] - 1) * HIST_NA_STRANU
+                                strana = filtered[_od:_od + HIST_NA_STRANU]
+                                ui.label(f'Zobrazeno {_od + 1}–{_od + len(strana)} z {len(filtered)} záznamů').classes('text-xs text-gray-400 mb-2 px-1')
+                                with ui.card().classes('w-full p-3 shadow-sm bg-white rounded-xl border border-blue-200 mb-2 justify-start').style('overflow: visible'):
+                                    for z in strana:
                                         je_presczas = z.get('_typ_zaznamu') == 'presczas'
                                         barva = 'text-green-600' if z['stav'] == 'Schváleno' else ('text-gray-500' if z['stav'] == 'Stornováno' else 'text-red-600')
                                         ikona = '⏰' if je_presczas and z['stav'] == 'Schváleno' else ('✅' if z['stav'] == 'Schváleno' else ('🛑' if z['stav'] == 'Stornováno' else '❌'))
@@ -2516,6 +2525,17 @@ def vykresli_dochazku(user_id, user_name, vsechna_prava):
                                                         ui.label(f"⏳ Žádost o storno: {z.get('storno_req_reason') or ''}").classes('text-xs text-orange-600 font-medium')
                                                 elif z.get('storno_at'):
                                                     ui.label(f"Stornováno: {formatuj_cas(z['storno_at'])}").classes('text-xs text-gray-500 font-medium')
+                                    # doplň prázdné sloty, ať má každá strana výšku 10 záznamů
+                                    for _ in range(HIST_NA_STRANU - len(strana)):
+                                        ui.element('div').classes('w-full mb-2 shrink-0').style('height: 74px')
+                                    if pocet_stran > 1:
+                                        def _zmen_stranu(e):
+                                            hist_page['p'] = int(e.value or 1)
+                                            render_historie.refresh()
+                                        with ui.row().classes('w-full justify-center items-center mt-auto pt-2 border-t border-gray-200'):
+                                            ui.pagination(1, pocet_stran, value=hist_page['p'], direction_links=True,
+                                                          on_change=_zmen_stranu).props('color=blue-6 max-pages=7 boundary-numbers')
+                                ui.element('div').classes('mb-8')
                             render_historie()
                     vykresli_historie_sekce()
                     _sub_refreshes.append(vykresli_historie_sekce.refresh)
