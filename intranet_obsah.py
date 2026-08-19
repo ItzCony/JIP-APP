@@ -165,7 +165,28 @@ def render_prava_kategorie(zakladni_prava, vybrana_prava_list, lazy=False):
         ui.label('Žádná dostupná práva k přiřazení.').classes('text-gray-400 italic text-sm')
         return vybrane_set
 
-    stav = {'kat': kat_nazvy[0], 'hledat': ''}
+    # Podskupiny uvnitř kategorie (např. Značky: Produkt / Provoz) – přepínač
+    # nad seznamem práv. Práva bez 'podskupina' se zobrazují vždy.
+    podskupiny: dict = {}
+    for kat, prava in kategorie.items():
+        vp = []
+        for v in prava.values():
+            p = v.get('podskupina')
+            if p and p not in vp:
+                vp.append(p)
+        if len(vp) > 1:
+            podskupiny[kat] = vp
+
+    stav = {'kat': kat_nazvy[0], 'hledat': '',
+            'pod': {k: v[0] for k, v in podskupiny.items()}}
+
+    def _prava_kat(kat):
+        """Práva kategorie po filtru aktivní podskupiny."""
+        pod = stav['pod'].get(kat)
+        if not pod:
+            return kategorie[kat]
+        return {k: v for k, v in kategorie[kat].items()
+                if v.get('podskupina') in (None, pod)}
 
     # Pre-deklarace pro nonlocal v _postav_ui (lazy build) — closury níže
     # (_aktualizuj_total, vyber_kat) tyto názvy čtou.
@@ -244,14 +265,14 @@ def render_prava_kategorie(zakladni_prava, vybrana_prava_list, lazy=False):
         row.on('click', toggle)
 
     def vybrat_vse_kat(kat):
-        for k in kategorie[kat]:
+        for k in _prava_kat(kat):
             vybrane_set.add(k)
         _aktualizuj_badge(kat)
         _aktualizuj_total()
         render_detail.refresh()
 
     def zrusit_kat(kat):
-        for k in kategorie[kat]:
+        for k in _prava_kat(kat):
             vybrane_set.discard(k)
         _aktualizuj_badge(kat)
         _aktualizuj_total()
@@ -302,8 +323,19 @@ def render_prava_kategorie(zakladni_prava, vybrana_prava_list, lazy=False):
                   .props('flat dense size=sm color=positive')
                 ui.button('Zrušit', icon='remove_done', on_click=lambda k=kat: zrusit_kat(k)) \
                   .props('flat dense size=sm color=grey')
+        if kat in podskupiny:
+            def _pod(p, k=kat):
+                stav['pod'][k] = p
+                render_detail.refresh()
+            with ui.row().classes('items-center gap-1 mb-2 px-1 flex-nowrap'):
+                for p in podskupiny[kat]:
+                    akt = stav['pod'].get(kat) == p
+                    ui.button(p, on_click=lambda _=None, p=p: _pod(p)) \
+                      .props('dense no-caps size=sm ' + ('unelevated' if akt else 'flat outline')) \
+                      .classes('rounded-lg px-3 ' + ('bg-blue-600 text-white' if akt
+                                                     else 'text-gray-600'))
         with ui.column().classes('w-full gap-2 max-h-[44vh] md:max-h-[54vh] overflow-y-auto pr-1'):
-            for k, v in kategorie[kat].items():
+            for k, v in _prava_kat(kat).items():
                 _radek_prava(kat, k, v)
 
     def on_search(e):
@@ -2735,12 +2767,18 @@ def vykresli_spravu_uzivatelu(user_email, user_name):
     if not _nast.get('kviz_zapnuty', True):       _skryte_kategorie.add('Modul Kvíz')
     if not _nast.get('finance_zapnuty', True):    _skryte_kategorie.add('Modul Aprovia')
     if not _nast.get('veletrh_zapnuty', True):    _skryte_kategorie.add('Modul Veletrh')
-    if not _nast.get('znacky_zapnuty', True):     _skryte_kategorie.add('Modul Značky JIP')
-    if not _nast.get('znacky_provoz_zapnuty', True): _skryte_kategorie.add('Modul Značky Provoz')
     if not _nast.get('planogram_zapnuty', True):  _skryte_kategorie.add('Modul Plánogram tabáku')
     if not _nast.get('ochutnavky_zapnuty', True): _skryte_kategorie.add('Modul Ochutnávky MO a CC')
-    if _skryte_kategorie:
-        zakladni_prava = {k: v for k, v in zakladni_prava.items() if v.get('kategorie') not in _skryte_kategorie}
+    # Značky mají jednu kategorii se dvěma podskupinami → skrývá se podskupina.
+    _skryte_podskupiny = set()
+    if not _nast.get('znacky_zapnuty', True):        _skryte_podskupiny.add(('Modul Značky', 'Produkt'))
+    if not _nast.get('znacky_provoz_zapnuty', True): _skryte_podskupiny.add(('Modul Značky', 'Provoz'))
+    if _skryte_kategorie or _skryte_podskupiny:
+        zakladni_prava = {
+            k: v for k, v in zakladni_prava.items()
+            if v.get('kategorie') not in _skryte_kategorie
+            and (v.get('kategorie'), v.get('podskupina')) not in _skryte_podskupiny
+        }
 
     spolecnosti_db = intranet_data.ziskej_vsechny_spolecnosti()
     spolecnosti_options = {s['id']: s['nazev'] for s in spolecnosti_db}

@@ -9,13 +9,12 @@ ZAKLADNI_PRAVA = {
     'admin_logy': {'kategorie': 'Administrace portálu', 'nazev': 'Audit Log', 'popis': 'Vidí historii aktivity a kliknutí všech uživatelů.', 'ikona': 'history'},
     'admin_server': {'kategorie': 'Administrace portálu', 'nazev': 'Monitor serveru', 'popis': 'Vidí vytížení hardwaru serveru.', 'ikona': 'memory'},
 
-    'dlazdice_dochazka_zaklad': {'kategorie': 'Docházka: Obecné', 'nazev': 'Přístup do Docházky', 'popis': 'Uživatel vidí dlaždici Docházka a může modul otevřít.', 'ikona': 'event'},
-    'dochazka_zadosti': {'kategorie': 'Docházka: Osobní', 'nazev': 'Zadávat žádosti o volno', 'popis': 'Umožňuje uživateli vytvořit si vlastní žádost v kalendáři.', 'ikona': 'edit_calendar'},
-    'dochazka_email': {'kategorie': 'Docházka: Osobní', 'nazev': 'Vypnout maily o schválení', 'popis': 'Může si v profilu vypnout e-mailová upozornění.', 'ikona': 'mark_email_read'},
-
-    'dochazka_mazani': {'kategorie': 'Docházka: Zvýšená práva', 'nazev': 'Smazat jakoukoliv žádost', 'popis': 'Může nevratně odstranit libovolnou žádost v celém systému!', 'ikona': 'delete_forever'},
-    'dochazka_schvalovat_sebe': {'kategorie': 'Docházka: Zvýšená práva', 'nazev': 'Schválit sám sebe', 'popis': 'Je-li schvalovatel, může si potvrdit vlastní volno bez asistence nadřízeného.', 'ikona': 'how_to_reg'},
-    'dochazka_admin': {'kategorie': 'Docházka: Zvýšená práva', 'nazev': 'Super-Schvalovatel', 'popis': 'Může schválit volno KOMUKOLIV v celé firmě, i napříč odděleními.', 'ikona': 'verified'},
+    'dlazdice_dochazka_zaklad': {'kategorie': 'Docházka', 'nazev': 'Přístup do Docházky', 'popis': 'Uživatel vidí dlaždici Docházka a může modul otevřít.', 'ikona': 'event'},
+    'dochazka_zadosti': {'kategorie': 'Docházka', 'nazev': 'Zadávat žádosti o volno', 'popis': 'Umožňuje uživateli vytvořit si vlastní žádost v kalendáři.', 'ikona': 'edit_calendar'},
+    'dochazka_email': {'kategorie': 'Docházka', 'nazev': 'Vypnout maily o schválení', 'popis': 'Může si v profilu vypnout e-mailová upozornění.', 'ikona': 'mark_email_read'},
+    'dochazka_mazani': {'kategorie': 'Docházka', 'nazev': 'Smazat jakoukoliv žádost', 'popis': 'Může nevratně odstranit libovolnou žádost v celém systému!', 'ikona': 'delete_forever'},
+    'dochazka_schvalovat_sebe': {'kategorie': 'Docházka', 'nazev': 'Schválit sám sebe', 'popis': 'Je-li schvalovatel, může si potvrdit vlastní volno bez asistence nadřízeného.', 'ikona': 'how_to_reg'},
+    'dochazka_admin': {'kategorie': 'Docházka', 'nazev': 'Super-Schvalovatel', 'popis': 'Může schválit volno KOMUKOLIV v celé firmě, i napříč odděleními.', 'ikona': 'verified'},
 
     'slozky_vse': {'kategorie': 'Složky a Evidence', 'nazev': 'Vidí všechny složky oddělení', 'popis': 'Má přístup do záznamů všech oddělení.', 'ikona': 'folder_shared'},
     'kalendar_vse': {'kategorie': 'Složky a Evidence', 'nazev': 'Vidí všechny v kalendáři', 'popis': 'V globálním kalendáři vidí všechny lidi z celé firmy.', 'ikona': 'calendar_month'},
@@ -42,11 +41,11 @@ ZAKLADNI_PRAVA = {
     'ucetni_pristup': {'kategorie': 'Účetní pohledy', 'nazev': 'Exporty (Účtárna)', 'popis': 'Speciální přístupy k detailním exportům pro mzdy.', 'ikona': 'account_balance'},
     'import_dovolene': {'kategorie': 'Účetní pohledy', 'nazev': 'Import dovolené', 'popis': 'Může nahrávat Excel s reálnými zůstatky dovolené, které se párují na osobní číslo zaměstnance.', 'ikona': 'upload_file'},
 
-    'znacky_uzivatel': {'kategorie': 'Modul Značky JIP', 'nazev': 'Uživatel hlasování', 'popis': 'Může hlasovat, psát poznámky a zobrazovat případy, ke kterým byl přizván.', 'ikona': 'how_to_vote'},
-    'znacky_spravce': {'kategorie': 'Modul Značky JIP', 'nazev': 'Správce hlasování', 'popis': 'Zadává případy, vybírá hlasující a dědí práva uživatele.', 'ikona': 'manage_accounts'},
+    'znacky_uzivatel': {'kategorie': 'Modul Značky', 'podskupina': 'Produkt', 'nazev': 'Uživatel hlasování', 'popis': 'Může hlasovat, psát poznámky a zobrazovat případy, ke kterým byl přizván.', 'ikona': 'how_to_vote'},
+    'znacky_spravce': {'kategorie': 'Modul Značky', 'podskupina': 'Produkt', 'nazev': 'Správce hlasování', 'popis': 'Zadává případy, vybírá hlasující a dědí práva uživatele.', 'ikona': 'manage_accounts'},
 
-    'znacky_provoz_uzivatel': {'kategorie': 'Modul Značky Provoz', 'nazev': 'Uživatel hlasování', 'popis': 'Může hlasovat, psát poznámky a zobrazovat vše v modulu Značky Provoz.', 'ikona': 'how_to_vote'},
-    'znacky_provoz_spravce':  {'kategorie': 'Modul Značky Provoz', 'nazev': 'Správce hlasování', 'popis': 'Zadává případy ke schválení a dědí práva uživatele v modulu Značky Provoz.', 'ikona': 'manage_accounts'},
+    'znacky_provoz_uzivatel': {'kategorie': 'Modul Značky', 'podskupina': 'Provoz', 'nazev': 'Uživatel hlasování', 'popis': 'Může hlasovat, psát poznámky a zobrazovat vše v modulu Značky Provoz.', 'ikona': 'how_to_vote'},
+    'znacky_provoz_spravce':  {'kategorie': 'Modul Značky', 'podskupina': 'Provoz', 'nazev': 'Správce hlasování', 'popis': 'Zadává případy ke schválení a dědí práva uživatele v modulu Značky Provoz.', 'ikona': 'manage_accounts'},
 
     'prodej_akt_ctenar':       {'kategorie': 'Modul Prodejní aktivity', 'nazev': 'Čtenář', 'popis': 'Může otevřít modul a číst všechny záznamy prodejních aktivit. Nemůže nic editovat.', 'ikona': 'visibility'},
     'prodej_akt_zadavatel':    {'kategorie': 'Modul Prodejní aktivity', 'nazev': 'Zadavatel', 'popis': 'Zakládá nové aktivity a zapisuje pole nákupčího: dodavatel, termíny, kompenzace, kódy zboží…', 'ikona': 'edit_note'},
