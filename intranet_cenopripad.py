@@ -439,6 +439,12 @@ def _vidi_op(p):
     return _je_spravce(p) or "cenopripad_spravce_nakup" in p
 
 
+def _vidi_costprice(p):
+    """Smí vidět sloupce CostPrice (Výběrová řízení) u ind. cen.
+    Plný správce modulu (vč. varianty bez e-mailů) nebo Office obchod."""
+    return _je_spravce(p) or "cenopripad_office_obchod" in p
+
+
 def _je_office(p):
     return any(x in p for x in ("cenopripad_office_nakup", "cenopripad_office_obchod"))
 
@@ -2553,9 +2559,9 @@ def _dialog_detail(pripad, user_id, user_name, prava):
             else:
                 cols.append({"name": "marze", "label": "Marže", "field": "marze", "align": "left"})
             cols.append({"name": "duvod", "label": "Detail", "field": "duvod", "align": "left"})
-        # CostPrice (Výběrová řízení) — zcela vpravo, JEN Admin / Office Obchod, jen ind. ceny.
-        vidi_costprice = (typ == "porovnani" and
-                          ("vse" in prava or "cenopripad_office_obchod" in prava))
+        # CostPrice (Výběrová řízení) — zcela vpravo, JEN správce modulu / Office obchod,
+        # jen ind. ceny.
+        vidi_costprice = (typ == "porovnani" and _vidi_costprice(prava))
         cp_map = {}
         if vidi_costprice:
             cp_map = _costprice_dle_kodu([r.get("kod") for r in radky])
