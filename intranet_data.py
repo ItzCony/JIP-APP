@@ -1194,6 +1194,97 @@ def ziskej_uzivatele_s_pravem(*prava, pouze_jmena=False):
         if cursor: cursor.close()
         if conn: conn.close()
 
+def ziskej_matici_prav() -> dict:
+    """Kompletní podklad pro matici práv — 6 bulk dotazů, žádné N+1.
+
+    Vrací {'uzivatele': [{id, jmeno, email, aktivni, oddeleni:[], role:[]}],
+    'primo': {uid: set(prava)}, 'role_prava': {role: set}, 'odd_prava': {oddeleni: set}}.
+    Skrytý admin (SKRYTY_ADMIN_ID) ani servisní admin@admin.cz se do matice
+    nikdy nedostanou — stejná výluka jako v ziskej_uzivatele_s_pravem.
+    """
+    prazdno = {'uzivatele': [], 'primo': {}, 'role_prava': {}, 'odd_prava': {}}
+    inicializace_db()
+    conn = get_db_connection()
+    if not conn:
+        return prazdno
+    cursor = None
+    try:
+        cursor = conn.cursor(buffered=True)
+        cursor.execute(f"""
+            SELECT u.iduser, CONCAT(u.name, ' ', u.surname), u.email, u.is_active
+            FROM user u
+            WHERE u.iduser <> {SKRYTY_ADMIN_ID} AND u.email <> 'admin@admin.cz'
+            ORDER BY u.surname, u.name
+        """)
+        uzivatele = [
+            {'id': r[0], 'jmeno': (r[1] or '').strip(), 'email': r[2] or '',
+             'aktivni': bool(r[3]), 'oddeleni': [], 'role': []}
+            for r in cursor.fetchall()
+        ]
+        idx = {u['id']: u for u in uzivatele}
+
+        cursor.execute("""
+            SELECT dtu.user_iduser, d.name
+            FROM department_To_user dtu
+            JOIN department d ON d.iddepartment = dtu.department_iddepartment
+        """)
+        for uid, nazev in cursor.fetchall():
+            if uid in idx and nazev:
+                idx[uid]['oddeleni'].append(nazev)
+
+        cursor.execute("""
+            SELECT utj.user_iduser, jp.name
+            FROM user_To_jobPosition utj
+            JOIN jobPosition jp ON jp.idjobPosition = utj.jobPosition_idjobPosition
+        """)
+        for uid, nazev in cursor.fetchall():
+            if uid in idx and nazev:
+                idx[uid]['role'].append(nazev)
+
+        primo = {}
+        cursor.execute("""
+            SELECT utp.user_iduser, p.name
+            FROM user_To_privileges utp
+            JOIN privileges p ON p.idprivileges = utp.privileges_idprivileges
+        """)
+        for uid, pravo in cursor.fetchall():
+            if uid in idx and pravo:
+                primo.setdefault(uid, set()).add(pravo)
+
+        role_prava = {}
+        cursor.execute("""
+            SELECT jp.name, p.name
+            FROM jobPosition_To_privileges jtp
+            JOIN jobPosition jp ON jp.idjobPosition = jtp.jobPosition_idjobPosition
+            JOIN privileges p ON p.idprivileges = jtp.privileges_idprivileges
+        """)
+        for role, pravo in cursor.fetchall():
+            if role and pravo:
+                role_prava.setdefault(role, set()).add(pravo)
+
+        odd_prava = {}
+        cursor.execute("""
+            SELECT d.name, p.name
+            FROM department_To_privileges dtp
+            JOIN department d ON d.iddepartment = dtp.department_iddepartment
+            JOIN privileges p ON p.idprivileges = dtp.privileges_idprivileges
+        """)
+        for odd, pravo in cursor.fetchall():
+            if odd and pravo:
+                odd_prava.setdefault(odd, set()).add(pravo)
+
+        for u in uzivatele:
+            u['oddeleni'].sort()
+            u['role'].sort()
+        return {'uzivatele': uzivatele, 'primo': primo,
+                'role_prava': role_prava, 'odd_prava': odd_prava}
+    except Exception as e:
+        print(f"Chyba ziskej_matici_prav: {e}")
+        return prazdno
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
+
 def ziskej_uzivatele_pravo_detail(pravo):
     """Detailní přehled pro JEDNO právo: kdo jej má a JAKÝM kanálem.
 

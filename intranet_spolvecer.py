@@ -709,7 +709,7 @@ def _rozesli_pobocku_sync(klic, prijemci, zprava_extra=''):
     hl = _nacti_hlavicku(klic)
     stav_popis = _STAVY.get(hl.get('stav', 'rozpracovano'), _STAVY['rozpracovano'])[0]
     soucet = _soucet(klic)
-    server_url = 'http://analytikasys.jip-napoje.cz/spolvecer'
+    server_url = 'https://analytikasys.jip-napoje.cz/spolvecer'
     predmet = f'Společenský večer {ROK} – {kod} {nazev}'
     extra = (zprava_extra or '').strip()
     sent = fail = 0

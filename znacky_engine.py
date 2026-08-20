@@ -69,7 +69,7 @@ class ZnackyEngine:
         self.set_emaily = f'{prefix}_emaily_zapnuty'
 
         # Pevná adresa portálu
-        self._portal_base = 'http://analytikasys.jip-napoje.cz'
+        self._portal_base = 'https://analytikasys.jip-napoje.cz'
 
         # Runtime
         self._db_init  = False
