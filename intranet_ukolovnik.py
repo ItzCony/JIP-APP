@@ -8,6 +8,8 @@ import datetime
 import os
 import uuid
 import calendar
+import tempfile
+import time
 from collections import OrderedDict
 
 UKOL_PRILOHY_DIR = 'ukol_prilohy'
@@ -2040,6 +2042,244 @@ def _nacti_dalsi_terminy_opak(opak_ids) -> dict:
     return vysledek
 
 
+# =========================================================
+# SEKCE: EXPORT ÚKOLŮ DO XLSX
+# =========================================================
+_EXPORT_COLS = [
+    ('nazev', 'Název'), ('stav', 'Stav'), ('priorita', 'Priorita'),
+    ('typ_ukolu', 'Typ'), ('oddeleni', 'Oddělení'),
+    ('prirazen_jmeno', 'Přiděleno'), ('zadal_jmeno', 'Zadal'),
+    ('termin', 'Termín'), ('vytvoreno', 'Vytvořeno'),
+    ('dokonceno_datum', 'Dokončeno'), ('odhad_hodin', 'Odhad (h)'),
+    ('projekt_nazev', 'Projekt'), ('porada_nazev', 'Porada'), ('popis', 'Popis'),
+]
+
+# Whitelist — hodnota jde do SQL bez uvozovek, nesmí přijít z klienta jinak než přes klíč.
+_EXPORT_DATUM_SLOUPCE = {
+    'termin':    'termin',
+    'vytvoreno': 'DATE(vytvoreno)',
+    'dokonceno': 'DATE(dokonceno_datum)',
+}
+
+_EXPORT_TMP_DIR = os.path.join(tempfile.gettempdir(), 'jip_ukolovnik')
+
+
+def _parse_mesic(hodnota: str) -> datetime.date:
+    """'2026-03' → date(2026, 3, 1). Vyhodí ValueError na nesmysl."""
+    rok, mesic = (int(x) for x in str(hodnota).split('-')[:2])
+    return datetime.date(rok, mesic, 1)
+
+
+def _konec_mesice(d: datetime.date) -> datetime.date:
+    return datetime.date(d.year, d.month, calendar.monthrange(d.year, d.month)[1])
+
+
+def _export_scope_ids(user_id: int, vsechna_prava):
+    """Koho smí uživatel exportovat. None = bez omezení (správce)."""
+    if 'vse' in vsechna_prava or 'ukolovnik_admin' in vsechna_prava:
+        return None
+    lide = _ziskej_uzivatele_oddeleni(vsechna_prava)          # hlavní vedoucí oddělení
+    if not lide and 'ukolovnik_ukoly_oddeleni_vse' in vsechna_prava:
+        lide = _ziskej_uziv_sveho_oddeleni(user_id)
+    if not lide:
+        lide = _ziskej_podrizene(user_id)                     # liniový vedoucí
+    ids = {u['id'] for u in lide}
+    ids.add(user_id)                                          # sebe vždy
+    return sorted(ids)
+
+
+def _export_ukoly_data(od, do, stavy=None, osoba_id=None, oddeleni=None,
+                       dle='termin', scope_ids=None) -> list:
+    """Úkoly pro export. od/do = datetime.date (včetně). scope_ids=None → bez omezení."""
+    kde = [f"{_EXPORT_DATUM_SLOUPCE.get(dle, 'termin')} BETWEEN %s AND %s"]
+    par = [od, do]
+    if stavy:
+        kde.append(f"stav IN ({','.join(['%s'] * len(stavy))})")
+        par += list(stavy)
+    if osoba_id:
+        oid = int(osoba_id)
+        if scope_ids is not None and oid not in scope_ids:
+            return []                                          # mimo oprávnění → nic
+        kde.append("prirazen_id = %s")
+        par.append(oid)
+    elif scope_ids is not None:
+        ph = ','.join(['%s'] * len(scope_ids))
+        kde.append(f"(prirazen_id IN ({ph}) OR zadal_id IN ({ph}))")
+        par += list(scope_ids) + list(scope_ids)
+
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return []
+    try:
+        cur = conn.cursor(dictionary=True)
+        cur.execute(
+            f"SELECT {', '.join(c for c, _ in _EXPORT_COLS)} FROM ukolovnik_ukoly "
+            f"WHERE {' AND '.join(kde)} ORDER BY termin, vytvoreno", par)
+        radky = cur.fetchall()
+    finally:
+        cur.close(); conn.close()
+
+    if oddeleni:
+        # sloupec je CSV s mezerami („Obchod, IT") → porovnání v Pythonu, ne FIND_IN_SET
+        radky = [r for r in radky
+                 if oddeleni in _oddeleni_chips(r.get('oddeleni'), max_chips=99)]
+    return radky
+
+
+def _export_popis_parametru(od, do, stavy=None, osoba_jmeno=None, oddeleni=None,
+                            dle='termin', pocet=None, kdo=None) -> list:
+    """Dvojice (popisek, hodnota) do hlavičky sešitu — co přesně je v exportu."""
+    dle_lbl = {'termin': 'termín úkolu', 'vytvoreno': 'datum vytvoření',
+               'dokonceno': 'datum dokončení'}.get(dle, dle)
+    radky = [
+        ('Období', f'{MESICE_CZ[od.month]} {od.year} – {MESICE_CZ[do.month]} {do.year}'
+                   f'  ({od:%d.%m.%Y} – {do:%d.%m.%Y}, dle: {dle_lbl})'),
+        ('Stav úkolů', ', '.join(stavy) if stavy else 'všechny'),
+        ('Oddělení', oddeleni or 'všechna'),
+        ('Osoba (přiděleno)', osoba_jmeno or 'všichni'),
+        ('Počet úkolů', pocet),
+        ('Exportoval', f'{kdo or "?"} — {datetime.datetime.now():%d.%m.%Y %H:%M}'),
+    ]
+    return radky
+
+
+def _export_ukoly_xlsx(radky: list, cesta: str, parametry: list = None) -> str:
+    from openpyxl import Workbook
+    from openpyxl.styles import Font
+    wb = Workbook()
+    ws = wb.active
+    ws.title = 'Úkoly'
+
+    # Hlavička s parametry exportu; tabulka začíná až pod ní (offset drží auto_filter/freeze).
+    tucne = Font(bold=True)
+    if parametry:
+        nadpis = ws.cell(1, 1, 'Export úkolů z Úkolovníku')
+        nadpis.font = Font(bold=True, size=13)
+        for i, (lbl, hodnota) in enumerate(parametry, start=2):
+            ws.cell(i, 1, f'{lbl}:').font = tucne
+            ws.cell(i, 2, hodnota if hodnota is not None else '')
+        prvni_radek = len(parametry) + 3          # +1 nadpis, +1 prázdný, +1 hlavička
+    else:
+        prvni_radek = 1
+
+    for i, (_, lbl) in enumerate(_EXPORT_COLS, 1):
+        ws.cell(prvni_radek, i, lbl).font = tucne
+    ws.freeze_panes = f'A{prvni_radek + 1}'
+    for r in radky:
+        ws.append([r.get(k) for k, _ in _EXPORT_COLS])
+
+    posledni = prvni_radek + len(radky)
+    for i, (k, lbl) in enumerate(_EXPORT_COLS, 1):
+        pismeno = ws.cell(prvni_radek, i).column_letter
+        ws.column_dimensions[pismeno].width = 60 if k == 'popis' else max(12, min(32, len(lbl) + 8))
+        if k in ('termin', 'vytvoreno', 'dokonceno_datum'):
+            for radek in range(prvni_radek + 1, posledni + 1):
+                ws.cell(radek, i).number_format = 'DD.MM.YYYY'
+    ws.auto_filter.ref = f'A{prvni_radek}:{ws.cell(prvni_radek, len(_EXPORT_COLS)).column_letter}{posledni}'
+    wb.save(cesta)
+    return cesta
+
+
+def _export_tmp_cesta(jmeno: str) -> str:
+    """Cesta v temp adresáři; při každém exportu smaže staré soubory (obsahují firemní data)."""
+    os.makedirs(_EXPORT_TMP_DIR, exist_ok=True)
+    ted = time.time()
+    for f in os.listdir(_EXPORT_TMP_DIR):
+        stara = os.path.join(_EXPORT_TMP_DIR, f)
+        try:
+            if os.path.isfile(stara) and ted - os.path.getmtime(stara) > 1800:
+                os.remove(stara)
+        except OSError:
+            pass
+    return os.path.join(_EXPORT_TMP_DIR, f'{int(ted * 1000)}_{jmeno}')
+
+
+def _dialog_export_ukoly(user_id, user_name, vsechna_prava, predvolby=None):
+    """Dialog: období měsíců + stav + oddělení/osoba → .xlsx ke stažení."""
+    predvolby = predvolby or {}
+    is_admin = 'vse' in vsechna_prava or 'ukolovnik_admin' in vsechna_prava
+    dnes = datetime.date.today()
+    ted_mesic = f'{dnes:%Y-%m}'
+
+    osoba_opts = {'': 'Vše'}
+    for uid, jm in _ziskej_viditelne_uzivatele(user_id, vsechna_prava).items():
+        osoba_opts[str(uid)] = jm
+    odd_opts = {'': 'Vše', **_ziskej_oddeleni_options()} if is_admin else {}
+
+    with ui.dialog() as dlg, ui.card().classes('w-[540px] max-w-full p-5 gap-3'):
+        ui.label('Export úkolů do Excelu').classes('text-lg font-bold text-gray-800')
+
+        with ui.row().classes('w-full gap-2 no-wrap'):
+            od_in = ui.input('Od měsíce', value=ted_mesic).props('type=month dense outlined').classes('flex-1')
+            do_in = ui.input('Do měsíce', value=ted_mesic).props('type=month dense outlined').classes('flex-1')
+        dle_in = ui.select({'termin': 'Termín úkolu', 'vytvoreno': 'Datum vytvoření',
+                            'dokonceno': 'Datum dokončení'},
+                           value='termin', label='Období počítat dle').classes('w-full').props('dense outlined')
+
+        _stav_pred = [predvolby['stav']] if predvolby.get('stav') in STAVY_UKOL else []
+        stav_in = ui.select(list(STAVY_UKOL.keys()), multiple=True, value=_stav_pred,
+                            label='Stav (prázdné = všechny)').classes('w-full').props('dense outlined use-chips')
+
+        odd_in = None
+        if odd_opts:
+            odd_in = ui.select(odd_opts, value=predvolby.get('odd') or '',
+                               label='Oddělení').classes('w-full').props('dense outlined')
+        _osoba_pred = predvolby.get('osoba') or ''
+        osoba_in = ui.select(osoba_opts, value=_osoba_pred if _osoba_pred in osoba_opts else '',
+                             label='Osoba (přiděleno)').classes('w-full').props('dense outlined')
+
+        stav_lbl = ui.label('').classes('text-xs text-gray-500')
+
+        async def _spust():
+            try:
+                od = _parse_mesic(od_in.value)
+                do = _konec_mesice(_parse_mesic(do_in.value))
+            except (ValueError, AttributeError, TypeError):
+                ui.notify('Vyber platné období (měsíc od / do).', type='warning'); return
+            if do < od:
+                ui.notify('Konec období je před začátkem.', type='warning'); return
+
+            stav_lbl.text = 'Připravuji export…'
+            scope = await asyncio.to_thread(_export_scope_ids, user_id, vsechna_prava)
+            radky = await asyncio.to_thread(
+                _export_ukoly_data, od, do, list(stav_in.value or []),
+                osoba_in.value or None, (odd_in.value if odd_in else None) or None,
+                dle_in.value, scope)
+            if not radky:
+                stav_lbl.text = ''
+                ui.notify('Žádné úkoly neodpovídají zvolenému filtru.', type='info'); return
+
+            parametry = _export_popis_parametru(
+                od, do, list(stav_in.value or []),
+                osoba_opts.get(str(osoba_in.value or '')) if osoba_in.value else None,
+                (odd_in.value if odd_in else None) or None,
+                dle_in.value, len(radky), user_name)
+
+            jmeno = f'ukoly_{od:%Y-%m}_{do:%Y-%m}.xlsx'
+            cesta = await asyncio.to_thread(_export_tmp_cesta, jmeno)
+            await asyncio.to_thread(_export_ukoly_xlsx, radky, cesta, parametry)
+            # Přes HTTP, ne WebSocket — ui.download.content padá nad ~1 MB na engine.io limitu.
+            ui.download.file(cesta, jmeno)
+            intranet_logger.log_activity(
+                user_name, 'Úkolovník',
+                f'Export úkolů {od:%Y-%m}–{do:%Y-%m} ({len(radky)} řádků)')
+            stav_lbl.text = ''
+            dlg.close()
+
+            async def _uklid():
+                await asyncio.sleep(300)
+                try:
+                    os.remove(cesta)
+                except OSError:
+                    pass
+            background_tasks.create(_uklid())
+
+        with ui.row().classes('w-full justify-end gap-2 mt-1'):
+            ui.button('Zrušit', on_click=dlg.close).props('flat color=grey')
+            ui.button('Stáhnout XLSX', icon='download', on_click=_spust).props('color=green-7 unelevated')
+    dlg.open()
+
+
 @ui.refreshable
 async def _vykresli_ukoly(user_id, user_name, vsechna_prava, dialog_anchor=None, ukoly_stav=None):
     is_admin = 'vse' in vsechna_prava or 'ukolovnik_admin' in vsechna_prava
@@ -2157,6 +2397,13 @@ async def _vykresli_ukoly(user_id, user_name, vsechna_prava, dialog_anchor=None,
                                   label='').classes('w-48').props('dense outlined')
         else:
             filtr_odd = None
+
+        ui.button('Export', icon='download', on_click=lambda: _dialog_export_ukoly(
+            user_id, user_name, vsechna_prava,
+            {'stav': filtr_stav.value,
+             'osoba': filtr_osoba.value if filtr_osoba else '',
+             'odd': filtr_odd.value if filtr_odd else ''})
+        ).props('flat dense color=green-7').classes('text-xs')
 
         ui.element('div').classes('flex-1')
 
@@ -4985,6 +5232,9 @@ async def _vykresli_statistika(user_id, user_name, vsechna_prava, stat_stav: dic
             if je_vedouci:
                 _stat_seg([('moje', 'Moje'), ('osoba', 'Osoba'), ('oddeleni', 'Oddělení')], pohled,
                           lambda k: _uprav(pohled=k, drill_uid=None))
+                ui.button('Export XLSX', icon='download',
+                          on_click=lambda: _dialog_export_ukoly(user_id, user_name, vsechna_prava)
+                          ).props('outline dense color=green-7').classes('text-xs')
 
     # Selector osoby
     if je_vedouci and pohled == 'osoba' and podrizeni:

@@ -22,6 +22,7 @@ import asyncio
 import csv
 import io
 import pyzipper
+import tempfile
 
 # České řazení: č/ř/š/ž jsou samostatná písmena, 'ch' po 'h'; á/é/í… řadí k základnímu písmenu.
 # ponytail: vlastní klíč místo locale.strxfrm — locale 'cs' nemusí být na serveru dostupná
@@ -2748,8 +2749,176 @@ def vykresli_dochazku(user_id, user_name, vsechna_prava):
 # ==========================================
 # --- SPRÁVA UŽIVATELŮ A ODDĚLENÍ ---
 # ==========================================
+# ── Export matice práv (jen superadmin, šifrovaný ZIP) ─────────────
+# Matice = kdo má které právo a kterým kanálem. Písmena v buňce:
+# P = přímo, R = přes pracovní pozici (roli), O = přes oddělení.
+_MATICE_TMP_DIR = os.path.join(tempfile.gettempdir(), 'jip_prava')
+_MATICE_MAX_BUNEK = 400_000
+
+def _matice_tmp_cesta(jmeno: str) -> str:
+    """Cesta v temp adresáři; při každém exportu smaže staré soubory."""
+    os.makedirs(_MATICE_TMP_DIR, exist_ok=True)
+    ted = time.time()
+    for f in os.listdir(_MATICE_TMP_DIR):
+        stara = os.path.join(_MATICE_TMP_DIR, f)
+        try:
+            if os.path.isfile(stara) and ted - os.path.getmtime(stara) > 1800:
+                os.remove(stara)
+        except OSError:
+            pass
+    return os.path.join(_MATICE_TMP_DIR, f'{int(ted * 1000)}_{jmeno}')
+
+def _matice_zip_sync(matice: dict, katalog: dict, kategorie: list,
+                     odd_filtr: list, jen_aktivni: bool, zdedene: bool,
+                     plochy: bool, kdo: str) -> tuple:
+    """Sestaví šifrovaný ZIP s maticí práv. Běží ve vlákně mimo event loop."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment
+    tucne = Font(bold=True)
+    svisle = Alignment(textRotation=90, vertical='bottom', horizontal='center')
+
+    klice = [
+        k for k, v in sorted(
+            katalog.items(),
+            key=lambda x: (x[1].get('kategorie', ''), x[1].get('podskupina', '') or '',
+                           x[1].get('nazev', ''))
+        )
+        if not kategorie or v.get('kategorie') in kategorie
+    ]
+    uzivatele = [
+        u for u in matice['uzivatele']
+        if (u['aktivni'] or not jen_aktivni)
+        and (not odd_filtr or set(u['oddeleni']) & set(odd_filtr))
+    ]
+    if not klice or not uzivatele:
+        raise ValueError('Zvolenému filtru neodpovídá žádné právo ani uživatel.')
+    if len(uzivatele) * len(klice) > _MATICE_MAX_BUNEK:
+        raise ValueError('Matice je příliš velká — zužte kategorie práv nebo oddělení.')
+
+    primo = matice['primo']
+    role_prava = matice['role_prava']
+    odd_prava = matice['odd_prava']
+
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    def _list(nazev: str, header: list, radky: list, sirky: dict = None,
+              svisla_od: int = None):
+        ws = wb.create_sheet(title=nazev[:31])
+        ws.append(header)
+        for i, bunka in enumerate(ws[1], 1):
+            bunka.font = tucne
+            if svisla_od and i >= svisla_od:
+                bunka.alignment = svisle
+        for r in radky:
+            ws.append(r)
+        if svisla_od:
+            ws.row_dimensions[1].height = 150
+            ws.freeze_panes = ws.cell(2, svisla_od).coordinate
+        for i in range(1, len(header) + 1):
+            pismeno = ws.cell(1, i).column_letter
+            if svisla_od and i >= svisla_od:
+                ws.column_dimensions[pismeno].width = 4
+            else:
+                ws.column_dimensions[pismeno].width = (sirky or {}).get(i, 22)
+        return ws
+
+    # --- List 1: Parametry (co přesně je v souboru) ---------------------
+    _list('Parametry', ['Položka', 'Hodnota'], [
+        ('Export', 'Matice práv'),
+        ('Vytvořeno', datetime.datetime.now().strftime('%d.%m.%Y %H:%M')),
+        ('Exportoval', kdo),
+        ('Kategorie práv', ', '.join(kategorie) if kategorie else 'Všechny'),
+        ('Oddělení', ', '.join(odd_filtr) if odd_filtr else 'Všechna'),
+        ('Uživatelé', 'Jen aktivní' if jen_aktivni else 'Aktivní i neaktivní'),
+        ('Zděděná práva (R/O)', 'Zahrnuta' if zdedene else 'Nezahrnuta (jen přímá)'),
+        ('Počet uživatelů', len(uzivatele)),
+        ('Počet práv', len(klice)),
+        ('Legenda', 'P = přímo · R = přes pracovní pozici · O = přes oddělení'),
+        ('Poznámka', 'Hlavní (skrytý) administrátor a servisní účet nejsou '
+                     'v exportu. Práva kategorie „Administrace portálu“ se '
+                     'nepřidělují přes UI, proto v matici nejsou.'),
+    ], sirky={1: 26, 2: 90})
+
+    # --- List 2: Uživatelé × práva -------------------------------------
+    hlavicka = ['Jméno', 'E-mail', 'Aktivní', 'Oddělení', 'Role', 'Poznámka']
+    radky = []
+    pouzita_prava = set()
+    plochy_radky = []
+    for u in uzivatele:
+        p = primo.get(u['id'], set())
+        r = set().union(*[role_prava.get(x, set()) for x in u['role']]) if u['role'] else set()
+        o = set().union(*[odd_prava.get(x, set()) for x in u['oddeleni']]) if u['oddeleni'] else set()
+        pouzita_prava |= p | r | o
+        vse = 'vse' in (p | r | o)
+        radek = [u['jmeno'], u['email'], 'Ano' if u['aktivni'] else 'Ne',
+                 ', '.join(u['oddeleni']), ', '.join(u['role']),
+                 'VŠE (superadmin)' if vse else '']
+        for k in klice:
+            kanaly = 'P' if k in p else ''
+            if zdedene:
+                kanaly += 'R' if k in r else ''
+                kanaly += 'O' if k in o else ''
+            radek.append(kanaly)
+            if plochy and kanaly:
+                plochy_radky.append([
+                    u['jmeno'], u['email'], katalog[k].get('nazev', k), k,
+                    katalog[k].get('kategorie', ''), kanaly,
+                ])
+        radky.append(radek)
+    _list('Uživatelé × práva',
+          hlavicka + [katalog[k].get('nazev', k) for k in klice], radky,
+          sirky={1: 26, 2: 30, 3: 9, 4: 24, 5: 24, 6: 18},
+          svisla_od=len(hlavicka) + 1)
+
+    # --- List 3+4: zdroj dědičnosti ------------------------------------
+    _list('Role × práva', ['Role'] + [katalog[k].get('nazev', k) for k in klice],
+          [[role] + ['X' if k in prava else '' for k in klice]
+           for role, prava in sorted(role_prava.items())],
+          sirky={1: 30}, svisla_od=2)
+    _list('Oddělení × práva', ['Oddělení'] + [katalog[k].get('nazev', k) for k in klice],
+          [[odd] + ['X' if k in prava else '' for k in klice]
+           for odd, prava in sorted(odd_prava.items())],
+          sirky={1: 30}, svisla_od=2)
+
+    # --- List 5: katalog (vysvětlivka ke zkráceným hlavičkám) ----------
+    _list('Katalog práv', ['Klíč', 'Kategorie', 'Podskupina', 'Název', 'Popis'],
+          [[k, katalog[k].get('kategorie', ''), katalog[k].get('podskupina', '') or '',
+            katalog[k].get('nazev', ''), katalog[k].get('popis', '')] for k in klice],
+          sirky={1: 30, 2: 26, 3: 20, 4: 34, 5: 80})
+
+    # --- List 6: plochý seznam (volitelně, pro filtrování/kontingenci) --
+    if plochy:
+        _list('Plochý seznam',
+              ['Jméno', 'E-mail', 'Právo', 'Klíč', 'Kategorie', 'Kanál'],
+              plochy_radky, sirky={1: 26, 2: 30, 3: 34, 4: 30, 5: 26, 6: 10})
+
+    # --- List 7: práva v DB, která katalog nezná (jen když existují) ----
+    neznama = sorted(pouzita_prava - set(katalog) - {'vse'} - set(intranet_prava.ADMIN_ONLY_PRAVA))
+    if neznama:
+        _list('Neznámá práva', ['Klíč práva v DB'], [[k] for k in neznama], sirky={1: 40})
+
+    ted = datetime.datetime.now().strftime('%d_%m_%H_%M')
+    xlsx_nazev = f'matice_prav_{ted}.xlsx'
+    zip_nazev = f'matice_prav_{ted}.zip'
+    buf = io.BytesIO()
+    wb.save(buf)
+    cesta = _matice_tmp_cesta(zip_nazev)
+    with pyzipper.AESZipFile(
+        cesta, 'w',
+        compression=pyzipper.ZIP_DEFLATED,
+        encryption=pyzipper.WZ_AES,
+    ) as zf:
+        # Heslo jen z env (intranet_data.export_zip_heslo) — stejný mechanismus
+        # jako u exportu uživatelů, lze rotovat bez zásahu do kódu.
+        zf.setpassword(intranet_data.export_zip_heslo())
+        zf.writestr(xlsx_nazev, buf.getvalue())
+    return cesta, zip_nazev, len(uzivatele), len(klice)
+
 @ui.refreshable
-def vykresli_spravu_uzivatelu(user_email, user_name):
+def vykresli_spravu_uzivatelu(user_email, user_name, vsechna_prava=None):
+    # Matici práv smí stáhnout jen superadmin — je to mapa, kudy do aplikace.
+    _je_superadmin = "vse" in (vsechna_prava or [])
     with ui.row().classes('w-full items-center gap-4 mb-8'):
         ui.icon('manage_accounts', size='2.4rem').classes('text-indigo-600 bg-indigo-50 p-3 rounded-2xl shadow-sm')
         with ui.column().classes('gap-0'):
@@ -4392,6 +4561,60 @@ def vykresli_spravu_uzivatelu(user_email, user_name):
 
             dlg_km.open()
 
+        # ── Dialog: Export matice práv (viz _matice_zip_sync nahoře) ──────
+        async def _dialog_export_matice():
+            if not _je_superadmin:
+                ui.notify('Matici práv smí stáhnout jen administrátor.', type='negative')
+                return
+            katalog = intranet_prava.ziskej_kompletni_seznam_prav(oddeleni, typy_v)
+            kategorie_opts = sorted({v.get('kategorie', '') for v in katalog.values() if v.get('kategorie')})
+            odd_opts = sorted(oddeleni.keys())
+            with ui.dialog() as dlg, ui.card().classes('w-[560px] max-w-full p-5 gap-3'):
+                ui.label('Export matice práv').classes('text-lg font-bold text-gray-800')
+                ui.label('Kdo má které právo a odkud plyne. Výstup je šifrovaný ZIP '
+                         '(heslo drží IT).').classes('text-xs text-gray-500')
+                kat_in = ui.select(kategorie_opts, multiple=True,
+                                   label='Kategorie práv (prázdné = všechny)') \
+                           .classes('w-full').props('dense outlined use-chips')
+                odd_in = ui.select(odd_opts, multiple=True,
+                                   label='Oddělení (prázdné = všechna)') \
+                           .classes('w-full').props('dense outlined use-chips')
+                akt_in = ui.checkbox('Jen aktivní uživatelé', value=True)
+                ded_in = ui.checkbox('Zahrnout zděděná práva (role, oddělení)', value=True)
+                plochy_in = ui.checkbox('Přidat plochý seznam (pro kontingenční tabulku)', value=False)
+                stav_lbl = ui.label('').classes('text-xs text-gray-500')
+
+                async def _spust():
+                    stav_lbl.text = 'Připravuji export…'
+                    try:
+                        matice = await asyncio.to_thread(intranet_data.ziskej_matici_prav)
+                        cesta, jmeno, poc_u, poc_p = await asyncio.to_thread(
+                            _matice_zip_sync, matice, katalog, list(kat_in.value or []),
+                            list(odd_in.value or []), akt_in.value, ded_in.value,
+                            plochy_in.value, user_name,
+                        )
+                    except ValueError as e:
+                        stav_lbl.text = ''
+                        ui.notify(str(e), type='warning')
+                        return
+                    except RuntimeError as e:
+                        stav_lbl.text = ''
+                        ui.notify(str(e), type='negative')
+                        return
+                    # Přes HTTP, ne WebSocket — ui.download.content padá nad ~1 MB.
+                    ui.download.file(cesta, jmeno)
+                    intranet_logger.log_activity(
+                        user_name, 'Export práv',
+                        f'Export matice práv ({poc_u} uživatelů × {poc_p} práv)')
+                    stav_lbl.text = ''
+                    dlg.close()
+
+                with ui.row().classes('w-full justify-end gap-2 mt-1'):
+                    ui.button('Zrušit', on_click=dlg.close).props('flat color=grey')
+                    ui.button('Stáhnout ZIP', icon='lock', on_click=_spust) \
+                      .props('color=indigo-7 unelevated')
+            dlg.open()
+
         # ── Řádek: filtr + tlačítka ───────────────────────────────────────
         with ui.row().classes('w-full items-center gap-3 mb-6'):
             filtr_input = ui.input('Hledat uživatele...').classes('flex-1 max-w-md').props('outlined dense clearable debounce=400').props('prepend-icon=search')
@@ -4402,6 +4625,9 @@ def vykresli_spravu_uzivatelu(user_email, user_name):
               .props('unelevated no-caps').classes('bg-indigo-600 hover:bg-indigo-700 text-white font-semibold rounded-lg shadow-sm')
             ui.button('Export CSV', icon='download', on_click=_dialog_export_csv) \
               .props('outline no-caps').classes('text-slate-700 font-semibold rounded-lg')
+            if _je_superadmin:
+                ui.button('Matice práv', icon='grid_on', on_click=_dialog_export_matice) \
+                  .props('outline no-caps').classes('text-slate-700 font-semibold rounded-lg')
 
         # Bez hledání se vykreslí jen prvních _LIMIT_UZIV uživatelů — jinak by se
         # při vstupu do sekce stavěly stovky expansion komponent najednou (pomalé
