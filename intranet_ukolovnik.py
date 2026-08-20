@@ -2194,9 +2194,8 @@ def _export_tmp_cesta(jmeno: str) -> str:
     return os.path.join(_EXPORT_TMP_DIR, f'{int(ted * 1000)}_{jmeno}')
 
 
-def _dialog_export_ukoly(user_id, user_name, vsechna_prava, predvolby=None):
+def _dialog_export_ukoly(user_id, user_name, vsechna_prava):
     """Dialog: období měsíců + stav + oddělení/osoba → .xlsx ke stažení."""
-    predvolby = predvolby or {}
     is_admin = 'vse' in vsechna_prava or 'ukolovnik_admin' in vsechna_prava
     dnes = datetime.date.today()
     ted_mesic = f'{dnes:%Y-%m}'
@@ -2216,16 +2215,14 @@ def _dialog_export_ukoly(user_id, user_name, vsechna_prava, predvolby=None):
                             'dokonceno': 'Datum dokončení'},
                            value='termin', label='Období počítat dle').classes('w-full').props('dense outlined')
 
-        _stav_pred = [predvolby['stav']] if predvolby.get('stav') in STAVY_UKOL else []
-        stav_in = ui.select(list(STAVY_UKOL.keys()), multiple=True, value=_stav_pred,
+        stav_in = ui.select(list(STAVY_UKOL.keys()), multiple=True, value=[],
                             label='Stav (prázdné = všechny)').classes('w-full').props('dense outlined use-chips')
 
         odd_in = None
         if odd_opts:
-            odd_in = ui.select(odd_opts, value=predvolby.get('odd') or '',
+            odd_in = ui.select(odd_opts, value='',
                                label='Oddělení').classes('w-full').props('dense outlined')
-        _osoba_pred = predvolby.get('osoba') or ''
-        osoba_in = ui.select(osoba_opts, value=_osoba_pred if _osoba_pred in osoba_opts else '',
+        osoba_in = ui.select(osoba_opts, value='',
                              label='Osoba (přiděleno)').classes('w-full').props('dense outlined')
 
         stav_lbl = ui.label('').classes('text-xs text-gray-500')
@@ -2397,13 +2394,6 @@ async def _vykresli_ukoly(user_id, user_name, vsechna_prava, dialog_anchor=None,
                                   label='').classes('w-48').props('dense outlined')
         else:
             filtr_odd = None
-
-        ui.button('Export', icon='download', on_click=lambda: _dialog_export_ukoly(
-            user_id, user_name, vsechna_prava,
-            {'stav': filtr_stav.value,
-             'osoba': filtr_osoba.value if filtr_osoba else '',
-             'odd': filtr_odd.value if filtr_odd else ''})
-        ).props('flat dense color=green-7').classes('text-xs')
 
         ui.element('div').classes('flex-1')
 
