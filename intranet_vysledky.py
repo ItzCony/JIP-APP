@@ -4985,6 +4985,7 @@ def vykresli_vysledky(user_id: int, user_name: str, vsechna_prava: list):
                 with ui.row().classes('items-center gap-3 mb-4'):
                     ui.button(icon='arrow_back', on_click=_zpet).props('flat round').tooltip('Zpět na výběr pobočky')
                     ui.label('Přehled poboček').classes('text-2xl font-bold text-gray-800')
+                    _exp_tlacitko_zr(pristupne_pobocky, user_name)
                 _vykresli_prehled(user_id, user_name, pristupne_pobocky, on_open=_otevri, je_ao=je_ao)
         else:
             with ui.column().classes('w-full gap-0'):
@@ -5029,6 +5030,9 @@ def _vykresli_detail_pobocky(pobocka: str, user_id: int, user_name: str, je_ao: 
             ui.label('Tato pobočka nemá sekci Podrobné náklady.') \
                 .classes('text-gray-400 italic py-6')
             return
+
+    with ui.row().classes('w-full justify-end mb-2'):
+        _exp_tlacitko_pobocka(pobocka, povolene, user_name)
 
     if 'podrobne' in povolene:
         inicializuj_osnovu(pobocka, aktualni_rok)
@@ -6544,3 +6548,410 @@ def _vykresli_obraty(pobocka: str, je_ao: bool, user_name: str):
 @ui.refreshable
 def _vykresli_zisk(pobocka: str, je_ao: bool, user_name: str):
     _oz_render_novy(pobocka, je_ao, user_name, 'zisk')
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  EXPORT DO XLSX – kompletní data pobočky + přehledový soubor ZR
+# ═══════════════════════════════════════════════════════════════════════════════
+# Formáty čísel bereme z `intranet_sankce._XLSX_FMT`, ať se exporty napříč
+# aplikací chovají stejně. Vlastní zapisovač je tu proto, že `_xlsx_bytes`
+# umí jen jeden list s jednou tabulkou – tady je potřeba sešit o mnoha listech
+# a u obratů/zisků bloková osnova vedle sebe (měsíce / dcery / sítě).
+#
+# Listy „Obraty_prodeje" a „Zisk_Marže" se zapisují v rozložení, které umí
+# přečíst `_oz_parsuj_sheets` (titulek sekce ve sloupci C/I/N, roky pod ním ve
+# sloupcích D/E, měsíce a „Celkový součet" pod tím) → export jde znovu
+# naimportovat. Bloky proto nesmí mít jinou vnitřní osnovu.
+
+_EXP_OZ_ROZTEC = 18          # svislá rozteč bloků obratů/zisků (blok = 16 řádků)
+# Barvy/písma dle vzorového sešitu „…_porovnání_obratů_….xlsx" od uživatelů:
+# modrá hlavička, žlutý titulek, data Arial 10, součty tučně červeně.
+_EXP_HLAVICKA_BG = '3399FF'  # modrý pruh hlavičky
+_EXP_TITUL_BG = 'FFCC00'     # žlutý titulek listu
+_EXP_TITUL_BG_SVETLY = 'FFFFCC'  # světle žlutý titulek na listech obratů/zisků
+_EXP_SOUCET_BARVA = 'FF0000'  # červené součtové řádky
+
+# Listy obratů/zisků kopírují barvy kontingenčních tabulek ze vzorového sešitu:
+# hlavičky i „Celkový součet" tmavě šedé s bílým písmem, data v barvě skupiny.
+_EXP_OZ_HLAVICKA_BG = '404040'
+_EXP_OZ_BARVY = {                       # (titulek skupiny, výplň dat, světlá výplň marží)
+    'mesice': ('76933C', 'EBF1DE', 'C4D79B'),
+    'dcery': ('31859B', 'DAEEF3', 'B7DEE8'),
+    'site': ('E26B0A', 'FDE9D9', 'FCD5B4'),
+}
+_EXP_OZ_BANNER = {'obraty': 'FFFFCC', 'zisk': 'DCE6F1'}
+
+
+def _exp_slug(s: str) -> str:
+    """Název souboru bez diakritiky a bez znaků, které rozbíjí Content-Disposition."""
+    return re.sub(r'[^A-Za-z0-9]+', '_', _bez_diakritiky(s)).strip('_') or 'export'
+
+
+def _exp_wb():
+    from openpyxl import Workbook
+    wb = Workbook()
+    wb.remove(wb.active)          # výchozí prázdný list nechceme
+    return wb
+
+
+def _exp_list(wb, nazev: str, pouzite: set):
+    """Nový list s názvem ošetřeným dle pravidel Excelu (max 31 znaků, bez
+    []:*?/\\, unikátní v sešitu)."""
+    zaklad = re.sub(r'[\[\]:*?/\\]', '-', str(nazev)).strip()[:31] or 'List'
+    jmeno, i = zaklad, 2
+    while jmeno.lower() in pouzite:
+        pripona = f'_{i}'
+        jmeno = zaklad[:31 - len(pripona)] + pripona
+        i += 1
+    pouzite.add(jmeno.lower())
+    return wb.create_sheet(title=jmeno)
+
+
+def _exp_tabulka(ws, cols: list[tuple], rows: list[dict], soucet: dict | None = None,
+                 r0: int = 1):
+    """Zapíše tabulku: cols = [(nadpis, pole, typ, šířka)], typ dle `_XLSX_FMT`.
+    Součtový řádek (a řádky s `_je_celkem`/`_soucet`) jsou tučně."""
+    from intranet_sankce import _XLSX_FMT
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+    tucne = Font(name='Calibri', size=11, bold=True, color=_EXP_SOUCET_BARVA)
+    bezne = Font(name='Arial', size=10)
+    hlavicka = Font(name='Calibri', size=11, bold=True)
+    for i, (nadpis, _f, _t, sirka) in enumerate(cols, start=1):
+        c = ws.cell(r0, i, nadpis)
+        c.font = hlavicka
+        c.fill = PatternFill('solid', fgColor=_EXP_HLAVICKA_BG)
+        c.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+        ws.column_dimensions[get_column_letter(i)].width = sirka
+    ws.row_dimensions[r0].height = 30
+    r = r0
+    for row in list(rows) + ([soucet] if soucet else []):
+        r += 1
+        je_soucet = bool(row.get('_je_celkem') or row.get('_soucet')) or row is soucet
+        for i, (_n, pole, typ, _w) in enumerate(cols, start=1):
+            v = row.get(pole)
+            if typ == 'text':
+                v = '' if v is None else str(v)
+            elif v in (None, ''):
+                v = None
+            else:
+                try:
+                    v = float(v)
+                except (TypeError, ValueError):
+                    v = None
+            c = ws.cell(r, i, v)
+            c.number_format = _XLSX_FMT[typ]
+            c.font = tucne if je_soucet else bezne
+    ws.freeze_panes = ws.cell(r0 + 1, 1).coordinate
+    if r > r0:
+        ws.auto_filter.ref = f'A{r0}:{get_column_letter(len(cols))}{r}'
+    return r
+
+
+# ── Sloupce jednotlivých tabulek ─────────────────────────────────────────────
+
+def _exp_cols_souhrn(prefix: list[tuple] | None = None,
+                     pocitane: bool = True) -> list[tuple]:
+    """Tabulka nákladů = stejné sloupce (i pořadí a počítané) jako grid.
+    `pocitane=False` pro surové DB řádky, kde „Podíl mzdy v %"/„%" nejsou."""
+    cols = list(prefix) if prefix else []
+    for db, popis, _idx, sirka in _SOUHRN_COLS:
+        cols.append((popis, db, 'money', max(12, round(sirka / 7))))
+        if not pocitane:
+            continue
+        if db == 'mzdy':
+            cols.append(('Podíl mzdy v %', '_podil_mzdy', 'pct', 15))
+        elif db == 'total':
+            cols.append(('%', '_procento', 'pct', 10))
+    return cols
+
+
+def _exp_cols_naklady() -> list[tuple]:
+    return ([('Účetní předpis', 'ucetni_predpis', 'text', 14),
+             ('Název předpisu', 'nazev_predpisu', 'text', 42)]
+            + [(nazev, db, 'money', 15) for db, nazev in zip(MESICE_DB, MESICE_NAZVY)]
+            + [('Celkem', 'celkem', 'money', 17)])
+
+
+def _exp_cols_porovnani(rok: int, minuly: int) -> list[tuple]:
+    cols = [('Účetní předpis', 'ucetni_predpis', 'text', 14),
+            ('Název předpisu', 'nazev_predpisu', 'text', 42)]
+    for db, nazev in zip(MESICE_DB, MESICE_NAZVY):
+        cols += [(f'{nazev} {rok}', f'akt_{db}', 'money', 15),
+                 (f'{nazev} {minuly}', f'min_{db}', 'money', 15),
+                 (f'{nazev} rozdíl', f'diff_{db}', 'money', 15)]
+    cols += [(f'Celkem {rok}', 'akt_celkem', 'money', 17),
+             (f'Celkem {minuly}', 'min_celkem', 'money', 17),
+             ('Celkem rozdíl', 'diff_celkem', 'money', 17)]
+    return cols
+
+
+# ── Obraty / Zisk (bloková osnova kompatibilní s importem) ───────────────────
+
+def _exp_oz_blok(ws, r0: int, sloupce: tuple, titul_skupiny: str, titul_sekce: str,
+                 rok_old: int, rok_new: int, v_old: dict, v_new: dict, pct: bool = False,
+                 skup: str = 'mesice'):
+    """Jeden blok (karta v UI): titulek, „Rok", měsíce 1–12, Celkový součet
+    a dopočítané „Porovnání" (nový rok ÷ starý rok).
+
+    Barvy 1:1 dle vzorových kontingenčních tabulek: nadpis v barvě skupiny,
+    dvouřádková hlavička a součet tmavě šedé s bílým písmem, data ve světlé
+    barvě skupiny. Bloky marží (`pct`) mají místo šedé střední odstín skupiny
+    a data bez výplně."""
+    from openpyxl.styles import Font, PatternFill
+    cm, c1, c2 = sloupce
+    c3 = c2 + 1
+    fmt = '0.00%' if pct else '#,##0.00'
+    barva_titulku, vypln_dat, vypln_svetla = _EXP_OZ_BARVY[skup]
+    nadpis = Font(name='Arial', size=11, bold=True, color=barva_titulku)
+    hlavicka_f = Font(name='Arial', size=10, bold=True,
+                      color='000000' if pct else 'FFFFFF')
+    bezne = Font(name='Arial', size=10)
+    hlavicka = PatternFill('solid', fgColor=vypln_svetla if pct else _EXP_OZ_HLAVICKA_BG)
+    data_fill = None if pct else PatternFill('solid', fgColor=vypln_dat)
+    for c in (cm, c1, c2, c3):
+        ws.cell(r0 + 1, c).fill = hlavicka
+        ws.cell(r0 + 2, c).fill = hlavicka
+    ws.cell(r0, cm, titul_skupiny).font = nadpis
+    ws.cell(r0 + 1, cm, titul_sekce).font = hlavicka_f
+    ws.cell(r0 + 1, c1, 'Rok').font = hlavicka_f
+    for c, v in ((cm, 'Měsíc - číslo'), (c1, rok_old), (c2, rok_new), (c3, 'Porovnání')):
+        ws.cell(r0 + 2, c, v).font = hlavicka_f
+    for i, mesic in enumerate(list(range(1, 13)) + [0]):
+        r = r0 + 3 + i
+        je_celkem = mesic == 0
+        pismo = hlavicka_f if je_celkem else bezne
+        vypln = hlavicka if je_celkem else data_fill
+        ws.cell(r, cm, 'Celkový součet' if je_celkem else mesic).font = pismo
+        for c, vals in ((c1, v_old), (c2, v_new)):
+            v = vals.get(mesic)
+            cell = ws.cell(r, c, None if v is None else float(v))
+            cell.number_format = fmt
+            cell.font = pismo
+        a, b = v_old.get(mesic), v_new.get(mesic)
+        pom = ws.cell(r, c3, (b / a) if (a and b is not None) else None)
+        pom.number_format = '0.00%'
+        pom.font = pismo
+        if vypln is not None:
+            for c in (cm, c1, c2, c3):
+                ws.cell(r, c).fill = vypln
+
+
+def _exp_list_oz(wb, pouzite: set, pobocka: str, list_klic: str):
+    """List „Obraty_prodeje" / „Zisk_Marže" – stejné karty jako v UI."""
+    from openpyxl.styles import Font, PatternFill
+    from openpyxl.utils import get_column_letter
+    txt = _OZ_TEXTY[list_klic]
+    data = nacti_oz_data(pobocka, list_klic)
+    obraty = nacti_oz_data(pobocka, 'obraty') if list_klic == 'zisk' else data
+    rok_old, rok_new = _oz_zjisti_roky(data, obraty)
+    ws = _exp_list(wb, 'Obraty_prodeje' if list_klic == 'obraty' else 'Zisk_Marže', pouzite)
+    nazev = _POBOCKY_EXCEL_REVERSE.get(pobocka, pobocka)
+    titul = ws.cell(1, 1, f'{txt["titulek"]} {nazev} – {rok_new} × {rok_old}')
+    titul.font = Font(name='Arial', size=16, bold=True)
+    titul.fill = PatternFill('solid', fgColor=_EXP_OZ_BANNER[list_klic])
+    for c in range(3, 18):
+        ws.column_dimensions[get_column_letter(c)].width = 17
+
+    r = 3
+    for sekce_key, sekce_nazev in txt['sekce']:
+        for skup in _OZ_SKUP_PORADI:
+            sek = data.get(skup, {}).get(sekce_key, {})
+            _exp_oz_blok(ws, r, _OZ_COLMAP[skup], txt['skupiny'][skup][0], sekce_nazev,
+                         rok_old, rok_new, sek.get(rok_old, {}), sek.get(rok_new, {}),
+                         skup=skup)
+        r += _EXP_OZ_ROZTEC
+
+    if list_klic == 'obraty':
+        # Staropramen + Operace (data z „Tabulka nákladů_DATA.xlsx")
+        for skup, sekce_key, sloupec, titul in _OZN_KARTY:
+            sek = data.get(skup, {}).get(sekce_key, {})
+            _exp_oz_blok(ws, r, _OZ_COLMAP[skup if sekce_key == 'ops' else 'mesice'],
+                         titul, sloupec, rok_old, rok_new,
+                         sek.get(rok_old, {}), sek.get(rok_new, {}),
+                         skup=skup if sekce_key == 'ops' else 'mesice')
+            if sekce_key != 'ops':
+                r += _EXP_OZ_ROZTEC
+        r += _EXP_OZ_ROZTEC
+
+    zs = data.get('zalozni_sklad', {})
+    for sekce_key, sekce_nazev in (txt['sekce'] if zs else []):
+        sek = zs.get(sekce_key, {})
+        if not sek:
+            continue
+        _exp_oz_blok(ws, r, _OZ_COLMAP['mesice'],
+                     'Meziroční porovnání prodejů na Záložní sklad', sekce_nazev,
+                     rok_old, rok_new, sek.get(rok_old, {}), sek.get(rok_new, {}))
+        r += _EXP_OZ_ROZTEC
+
+    if list_klic == 'zisk':
+        # Marže se v UI nedrží v DB, dopočítává se Zisk ÷ Obrat – stejně i tady.
+        marze_nazev, marze_pod = txt['marze']
+
+        def _marze(skup, rok):
+            zk = data.get(skup, {}).get('kc', {}).get(rok, {})
+            ob = obraty.get(skup, {}).get('kc', {}).get(rok, {})
+            return {m: ((zk.get(m) / ob[m]) if (ob.get(m) and zk.get(m) is not None) else None)
+                    for m in list(range(1, 13)) + [0]}
+
+        for skup in _OZ_SKUP_PORADI:
+            _exp_oz_blok(ws, r, _OZ_COLMAP[skup], marze_nazev,
+                         f'Marže v % – {marze_pod[skup]}', rok_old, rok_new,
+                         _marze(skup, rok_old), _marze(skup, rok_new), pct=True, skup=skup)
+        r += _EXP_OZ_ROZTEC
+    return ws
+
+
+# ── Sešit pobočky ────────────────────────────────────────────────────────────
+
+def _export_pobocka_xlsx(pobocka: str, sekce: list[str]) -> bytes:
+    """Kompletní data pobočky do XLSX. `sekce` = záložky, které uživatel v detailu
+    reálně vidí (`povolene`) – export nikdy neobsahuje víc, než co je na obrazovce."""
+    import io
+    rok = datetime.datetime.now().year
+    minuly = rok - 1
+    nazev = _POBOCKY_EXCEL_REVERSE.get(pobocka, pobocka)
+    wb = _exp_wb()
+    pouzite: set = set()
+
+    if 'obraty' in sekce:
+        _exp_list_oz(wb, pouzite, pobocka, 'obraty')
+    if 'zisk' in sekce:
+        _exp_list_oz(wb, pouzite, pobocka, 'zisk')
+    if 'naklady' in sekce:
+        ws = _exp_list(wb, 'Tabulka nákladů', pouzite)
+        _exp_tabulka(ws, _exp_cols_souhrn([('Rok', '_rok_disp', 'text', 14),
+                                           ('Měsíc', '_mesic_disp', 'text', 9)]),
+                     _priprav_souhrn_pro_grid(nacti_souhrn(pobocka)))
+    if 'podrobne' in sekce:
+        # Pořadí listů jako ve vzorovém souboru: aktuální rok, porovnání, minulý rok.
+        # V názvu listu je krátký (interní) název pobočky – „010 - Pardubice 2026"
+        # by přeteklo přes 31 znaků, které Excel na název listu dovolí.
+        def _podrobne(r: int):
+            for _popis, klic in [(nazev, pobocka)] + _VNORENE_POBOCKY.get(pobocka, []):
+                rows = nacti_naklady(klic, r)
+                ws2 = _exp_list(wb, f'Náklady podrobně {klic} {r}', pouzite)
+                _exp_tabulka(ws2, _exp_cols_naklady(), rows, _soucet_naklady(rows))
+
+        _podrobne(rok)
+        rows = nacti_porovnani(pobocka, rok)
+        ws = _exp_list(wb, f'Porovnání nákladů {rok}x{minuly}', pouzite)
+        _exp_tabulka(ws, _exp_cols_porovnani(rok, minuly), rows, _soucet_porovnani(rows))
+        _podrobne(minuly)
+
+    if not wb.sheetnames:
+        return b''
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+# ── Sešit ZR (přehled poboček) ───────────────────────────────────────────────
+
+_EXP_KG_POPIS = dict(_PREHLED_METRIKY, **{
+    'operace': 'Operace', 'operace_dcery': 'Operace dcery', 'operace_site': 'Operace sítě',
+})
+
+
+def _exp_cols_zr_data() -> list[tuple]:
+    cols = _exp_cols_souhrn([('Pobočka', '_pobocka_nazev', 'text', 24),
+                             ('Rok', 'rok', 'int', 8),
+                             ('Číslo pobočky', '_cislo', 'text', 13),
+                             ('Měsíc', 'mesic', 'int', 8)], pocitane=False)
+    return cols + [(_EXP_KG_POPIS.get(db, db), db, 'num', 17) for db, _idx in _KG_COLS]
+
+
+def _exp_cols_zr_souhrn(roky: list[int], mesic: bool) -> list[tuple]:
+    cols = [('Pobočka', '_pobocka', 'text', 26)]
+    if mesic:
+        cols.append(('Měsíc', '_mesic', 'text', 9))
+    for db, popis in _PREHLED_METRIKY:
+        for rok in roky:
+            cols.append((f'{popis} {rok}', f'{db}_{rok}', 'num', 18))
+    return cols
+
+
+def _export_zr_xlsx(pobocky: list[str], roky: list[int]) -> bytes:
+    """Soubor ZR: plochý list DATA + počítané souhrny + list „Výsledek …" na
+    každou pobočku. Jen pobočky, které uživatel vidí v Přehledu poboček."""
+    import io
+    wb = _exp_wb()
+    pouzite: set = set()
+
+    # DATA – všechny pobočky × roky × měsíce, všechny sloupce tabulky nákladů
+    data_rows: list[dict] = []
+    souhrny: list[tuple] = []
+    for pob in pobocky:
+        nazev = _POBOCKY_EXCEL_REVERSE.get(pob, pob)
+        cislo = (re.match(r'\s*(\d+)', nazev) or [None, ''])[1]
+        raw = [r for r in nacti_souhrn(pob) if int(r['rok']) in roky]
+        for r in raw:
+            r['_pobocka_nazev'] = nazev
+            r['_cislo'] = cislo
+        data_rows += raw
+        souhrny.append((pob, _priprav_souhrn_pro_grid(raw)))
+    _exp_tabulka(_exp_list(wb, 'DATA', pouzite), _exp_cols_zr_data(), data_rows)
+
+    # SOUHRN listy – statické hodnoty (ne kontingenční tabulky) ze stejných
+    # funkcí, jaké plní záložky Souhrn / Mezisoučty v Přehledu poboček.
+    rows, total = nacti_prehled_souhrn(roky, pobocky)
+    _exp_tabulka(_exp_list(wb, 'SOUHRN_TOTAL', pouzite),
+                 _exp_cols_zr_souhrn(roky, mesic=False), rows, total or None)
+    rows, total = nacti_prehled_mezisoucty(roky, pobocky)
+    _exp_tabulka(_exp_list(wb, 'SOUHRN_mezisoučty', pouzite),
+                 _exp_cols_zr_souhrn(roky, mesic=True), rows, total or None)
+
+    cols_vysledek = _exp_cols_souhrn([('Rok', '_rok_disp', 'text', 14),
+                                      ('Měsíc', '_mesic_disp', 'text', 9)])
+    for nazev, rows in souhrny:
+        _exp_tabulka(_exp_list(wb, f'Výsledek {nazev}', pouzite), cols_vysledek, rows)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+# ── Tlačítka ─────────────────────────────────────────────────────────────────
+
+async def _exp_stahni(builder, args: tuple, soubor: str, user_name: str, zprava: str):
+    """Sestaví sešit mimo event loop (openpyxl je blokující) a pošle ho přes HTTP
+    – ui.download.content by u velkých sešitů narazil na limit WebSocketu."""
+    import asyncio
+    from intranet_sankce import _stahni_pres_http
+    ui.notify('Připravuji export…', type='ongoing')
+    try:
+        data = await asyncio.to_thread(builder, *args)
+    except Exception as exc:
+        print(f'[vysledky] export error: {exc}')
+        ui.notify(f'Export se nezdařil: {exc}', type='negative')
+        return
+    if not data:
+        ui.notify('Není co exportovat.', type='warning')
+        return
+    _stahni_pres_http(data, soubor)
+    intranet_logger.log_activity(user_name, 'Výsledky poboček', zprava)
+
+
+def _exp_tlacitko_pobocka(pobocka: str, sekce: list[str], user_name: str):
+    nazev = _POBOCKY_EXCEL_REVERSE.get(pobocka, pobocka)
+    dnes = datetime.date.today().strftime('%Y-%m-%d')
+    ui.button('Export do XLSX', icon='download',
+              on_click=lambda: _exp_stahni(
+                  _export_pobocka_xlsx, (pobocka, sekce),
+                  f'{_exp_slug(nazev)}_vysledky_{dnes}.xlsx', user_name,
+                  f'Export dat pobočky {nazev} do XLSX')) \
+        .props('color=green outline no-caps') \
+        .tooltip('Stáhne všechna zobrazená data pobočky do sešitu XLSX')
+
+
+def _exp_tlacitko_zr(pobocky: list[str], user_name: str):
+    rok = datetime.datetime.now().year
+    roky = [rok - 1, rok]
+    dnes = datetime.date.today().strftime('%d_%m_%Y')
+    ui.button('Stáhnout ZR', icon='download',
+              on_click=lambda: _exp_stahni(
+                  _export_zr_xlsx, (list(pobocky), roky),
+                  f'Vysledky_pobocek_{dnes}.xlsx', user_name,
+                  f'Export souboru ZR ({rok - 1}+{rok}, {len(pobocky)} poboček)')) \
+        .props('color=green outline no-caps') \
+        .tooltip(f'Sešit ZR za roky {rok - 1} a {rok} – DATA, souhrny a listy poboček')

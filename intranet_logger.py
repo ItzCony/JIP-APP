@@ -171,7 +171,7 @@ POVOLENE_UROVNE = {
     "Podání žádosti", "Schválení žádosti", "Zamítnutí žádosti", "Stornování žádosti",
     "Přesčas",
     "Export docházky", "Export účetní", "Export faktur", "IKOS Export",
-    "Export práv", "Úkolovník",
+    "Export práv", "Úkolovník", "Výsledky poboček",
     "Záloha DB", "Obnova DB",
     "Přepnutí modulu",
     "Autom. záloha faktur",
