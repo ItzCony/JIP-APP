@@ -976,6 +976,40 @@ def email_z_osobniho_cisla(ident):
         if cursor: cursor.close()
         if conn: conn.close()
 
+def najdi_uzivatele_dle_emailu(email):
+    """Pro OIDC: heslo už ověřil IdP, hledáme jen účet v intranetu.
+    Vrací (user_id, "Jméno Příjmení", chyba) — stejný tvar jako overit_prihlaseni.
+
+    Bez auto-provisioningu: neznámý e-mail = odmítnutí. Účty zakládá admin,
+    protože z nich visí práva, útvary a schvalovací role."""
+    email = (email or '').strip().lower()
+    if not email:
+        return None, None, "Chybný e-mail."
+
+    if not nacti_mysql().get("enabled"):
+        return None, None, "Systém není napojen na databázi."
+
+    conn = get_db_connection()
+    if not conn:
+        return None, None, "Chyba databáze (Zkontrolujte nastavení MySQL)"
+
+    cursor = None
+    try:
+        cursor = conn.cursor(dictionary=True, buffered=True)
+        cursor.execute("SELECT iduser, name, surname, is_active FROM user WHERE email = %s", (email,))
+        u = cursor.fetchone()
+        if not u:
+            return None, None, "Účet v intranetu neexistuje."
+        if not u['is_active']:
+            return None, None, "Účet byl deaktivován administrátorem!"
+        return u['iduser'], f"{u['name']} {u['surname']}", "OK"
+    except Exception as e:
+        return None, None, str(e)
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
+
+
 def overit_prihlaseni(email, heslo):
     # K-6: Rate limiting platí pro VŠECHNY (včetně DB adminů). Vyňat je jen
     # nouzový admin z env (break-glass), aby ho útočník nemohl zamknout.

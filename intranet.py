@@ -8,7 +8,6 @@ import intranet_veletrh
 import intranet_logger
 import intranet_monitor
 import intranet_helpdesk
-import uuid
 import intranet_kviz
 import intranet_nastaveni
 import intranet_finance
@@ -36,6 +35,7 @@ import contextvars
 import re
 import intranet_emaily
 import intranet_session
+import intranet_oidc
 import intranet_2fa
 
 
@@ -904,9 +904,7 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
                         except Exception:
                             pass
 
-                        token = str(uuid.uuid4())
-                        app.storage.user.update({'user_id': id_u, 'user_email': email, 'user_name': jmeno_u, 'login_token': token, 'intranet_tab': 'prehled'})
-                        intranet_session.zaznamenej_prihlaseni_token(email, token)
+                        intranet_session.zahaj_relaci(id_u, email, jmeno_u)
 
                         with ui.dialog().props('maximized persistent transition-show="fade" transition-hide="fade"') as loading_dlg:
                             with ui.column().classes('login-loading w-full h-full items-center justify-center m-0 p-0'):
@@ -922,12 +920,7 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
                         # JS detekce Brave (timeout až 2 s) nesmí zdržet přihlášení.
                         _je_brave = await intranet_logger.zjisti_brave()
                         _ip, _zarizeni = intranet_logger.ziskej_klienta_info(client, je_brave=_je_brave)
-                        # Uložíme do relace, aby je znalo i (synchronní) odhlášení
-                        app.storage.user['login_ip'] = _ip
-                        app.storage.user['login_device'] = _zarizeni
-                        intranet_monitor.zaznamenej_prihlaseni(email, jmeno_u, ip=_ip, device=_zarizeni)
-
-                        intranet_logger.log_activity(jmeno_u, "Přihlášení", f"Úspěšné přihlášení (E-mail: {email})", ip=_ip, device=_zarizeni)
+                        intranet_session.zaznamenej_klienta(email, jmeno_u, _ip, _zarizeni)
 
                     if id_u:
                         # 2FA: relace vznikne až po ověření kódu z autentifikační aplikace
@@ -1159,6 +1152,15 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
                             .props('flat dense no-caps').classes('login-link')
 
                     ui.button('Přihlásit se', on_click=zkusit_prihlaseni).props('no-caps unelevated').classes('login-btn w-full')
+
+                    # Firemní účet (OIDC) — jen když je vyplněná celá konfigurace v env
+                    if intranet_oidc.je_zapnuto():
+                        ui.button('Přihlásit se firemním účtem',
+                                  on_click=lambda: ui.navigate.to('/auth/login')) \
+                            .props('no-caps outline').classes('login-btn w-full mt-3')
+                        _oidc_chyba = app.storage.user.pop('oidc_chyba', '')
+                        if _oidc_chyba:
+                            ui.timer(0.1, lambda z=_oidc_chyba: ui.notify(z, type='warning', position='top', timeout=8000), once=True)
 
                     with ui.row().classes('w-full justify-center items-center mt-7 gap-0'):
                         ui.label('JIP východočeská, a.s.').classes('login-foot')
