@@ -27,6 +27,9 @@ import asyncio
 import collections
 import glob
 import json
+import uuid
+
+from nicegui import app
 
 import intranet_data
 import intranet_monitor
@@ -73,6 +76,33 @@ def zaznamenej_prihlaseni_token(email: str, token: str) -> None:
         # Nové přihlášení ruší případné admin-vynucené odhlášení, jinak by se
         # uživatel odhlásil hned po opětovném přihlášení.
         FORCE_LOGOUT_EMAILS.discard(email.lower())
+
+
+def zahaj_relaci(id_u, email: str, jmeno: str) -> str:
+    """Vznik přihlášené relace — jediné místo pro formulář i OIDC callback.
+    Rychlá část: zápis do ``app.storage.user`` + evidence tokenu. Musí proběhnout
+    dřív, než se kamkoli naviguje, jinak stráž na stránce vyhodí zpět na login."""
+    token = str(uuid.uuid4())
+    app.storage.user.update({
+        'user_id': id_u,
+        'user_email': email,
+        'user_name': jmeno,
+        'login_token': token,
+        'intranet_tab': 'prehled',
+    })
+    zaznamenej_prihlaseni_token(email, token)
+    return token
+
+
+def zaznamenej_klienta(email: str, jmeno: str, ip: str, device: str) -> None:
+    """Pomalá část: monitor + audit log. Odděleno od ``zahaj_relaci``, protože
+    ve formuláři se IP/zařízení zjišťuje až po detekci Brave (až 2 s) — to nesmí
+    zdržet samotné přihlášení."""
+    # Uložíme do relace, aby je znalo i (synchronní) odhlášení
+    app.storage.user['login_ip'] = ip
+    app.storage.user['login_device'] = device
+    intranet_monitor.zaznamenej_prihlaseni(email, jmeno, ip=ip, device=device)
+    intranet_logger.log_activity(jmeno, "Přihlášení", f"Úspěšné přihlášení (E-mail: {email})", ip=ip, device=device)
 
 
 def vynut_odhlaseni(email: str) -> None:

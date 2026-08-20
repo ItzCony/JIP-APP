@@ -21,6 +21,7 @@ import intranet_finance
 import intranet_kviz
 import odstavka
 import intranet
+import intranet_oidc  # registruje /auth/login a /auth/callback (no-op bez env)
 import intranet_exporty
 import intranet_jobs
 import znackyjip
