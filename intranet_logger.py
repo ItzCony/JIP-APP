@@ -180,6 +180,7 @@ POVOLENE_UROVNE = {
     "Společenský večer",
     "Vizitky",
     "Lupa",
+    "Schůzky",
 }
 
 # Strukturovaná metadata (IP / zařízení) připojujeme na konec řádku do ⟦…⟧.

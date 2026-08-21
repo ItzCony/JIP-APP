@@ -562,6 +562,11 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
         nastaveni.get('lupa_zapnuty', True)
         and intranet_lupa.ma_pristup(user_id, vsechna_prava)
     )
+    ma_pristup_schuzky = (
+        'vse' in vsechna_prava or
+        any(p in vsechna_prava for p in (
+            'schuzky_zadatel', 'schuzky_vedouci', 'schuzky_spravce'))
+    ) and nastaveni.get('schuzky_zapnuty', True)
     is_admin = "vse" in vsechna_prava
 
     nazev_kviz       = "Zkouškový Kvíz"
@@ -755,6 +760,14 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
                 ui.label('🪪').classes('text-7xl mb-6')
                 ui.label('Vizitky a podpisy').classes('text-2xl font-bold text-gray-800 mb-4 text-center')
                 ui.button('Otevřít', on_click=jit_do_vizitek).classes('bg-sky-600 hover:bg-sky-700 text-white font-bold py-3 px-8 rounded-lg shadow-md')
+
+        if ma_pristup_schuzky:
+            def jit_do_schuzek():
+                app.storage.user['intranet_tab'] = 'schuzky'
+            with ui.card().classes('w-80 h-72 items-center justify-center shadow-xl hover:scale-105 transition-transform duration-300 cursor-pointer bg-white rounded-2xl border border-indigo-200').on('click', jit_do_schuzek):
+                ui.label('🗓️').classes('text-7xl mb-6')
+                ui.label('Schůzky s vedoucím').classes('text-2xl font-bold text-gray-800 mb-4 text-center')
+                ui.button('Otevřít', on_click=jit_do_schuzek).classes('bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 px-8 rounded-lg shadow-md')
 
         if ma_pristup_cenopripad:
             def jit_do_cenopripad():
