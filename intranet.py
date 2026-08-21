@@ -58,7 +58,7 @@ def _odhlas_vycisti_relaci():
 
 # Statické soubory — whitelist konkrétních povolených souborů.
 # ZÁMĚRNĚ nepoužíváme add_static_files('.'), aby nebyly dostupné
-# konfigurační soubory s hesly (mysql_intranet.json, nastaveni_intranetu.json atd.)
+# konfigurační soubory s hesly (nastaveni_intranetu.json atd.)
 import os as _os
 _STATIC_WHITELIST = [
     'auto.svg', 'auto.png',
@@ -1505,7 +1505,7 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
                 if tab_finance:     _RENDER_FNS['finance']       = lambda: intranet_finance.vykresli_finance(user_id, user_name, vsechna_prava)
                 if tab_vystup:      _RENDER_FNS['vystup']        = lambda: intranet_kviz.vykresli_vystup_kviz(user_name, vsechna_prava)
                 if tab_uzivatele:   _RENDER_FNS['uzivatele']     = lambda: intranet_obsah.vykresli_spravu_uzivatelu(user_email, user_name, vsechna_prava)
-                if tab_mysql:       _RENDER_FNS['mysql']         = lambda: intranet_nastaveni.vykresli_mysql(user_name)
+                if tab_mysql:       _RENDER_FNS['mysql']         = lambda: intranet_nastaveni.vykresli_nastaveni_portalu(user_name)
                 if tab_veletrh:     _RENDER_FNS['veletrh']       = lambda: intranet_veletrh.vykresli_veletrh(user_id, user_name, vsechna_prava)
                 if tab_znacky:      _RENDER_FNS['znacky']        = lambda: znackyjip.vykresli_znacky(user_id, user_name, vsechna_prava)
                 if tab_znacky_provoz: _RENDER_FNS['znacky_provoz'] = lambda: znacky_provoz.vykresli(user_id, user_name, vsechna_prava)
