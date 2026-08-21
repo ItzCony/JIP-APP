@@ -1,13 +1,12 @@
 from nicegui import ui, app
 import intranet_data
 import intranet_logger
-import os
 import asyncio
 import datetime
 import re
 
 
-def vykresli_mysql(user_name):
+def vykresli_nastaveni_portalu(user_name):
     with ui.column().classes('w-full px-4 md:px-8 xl:px-12 py-6 bg-gray-50/30 min-h-screen gap-6'):
 
         # --- HLAVIČKA ---
@@ -22,7 +21,6 @@ def vykresli_mysql(user_name):
             tab_moduly      = ui.tab('Moduly',      icon='view_module')
             tab_narozeniny  = ui.tab('Narozeniny',  icon='cake')
             tab_email       = ui.tab('E-mail',      icon='email')
-            tab_db          = ui.tab('Databáze',    icon='storage')
 
         with ui.tab_panels(tabs, value=tab_moduly).classes('w-full'):
 
@@ -277,146 +275,3 @@ def vykresli_mysql(user_name):
                         with ui.row().classes('w-full justify-end gap-4 border-t border-gray-100 pt-6'):
                             ui.button('Otestovat spojení', icon='send', on_click=otestovat_spojeni).classes('bg-teal-600 hover:bg-teal-700 text-white font-bold px-8 h-12 shadow-sm rounded-xl')
                             ui.button('Uložit nastavení', icon='save', on_click=ulozit_email).classes('bg-gray-800 hover:bg-black text-white font-bold px-8 h-12 shadow-sm rounded-xl')
-
-            # =========================================================
-            # ZÁLOŽKA 6: DATABÁZE
-            # =========================================================
-            with ui.tab_panel(tab_db):
-                with ui.column().classes('w-full gap-8'):
-
-                    # --- MySQL konfigurace ---
-                    with ui.card().classes('w-full p-6 xl:p-8 shadow-sm bg-white rounded-2xl border-l-[10px] border-blue-600 hover:shadow-md transition-shadow'):
-                        with ui.row().classes('w-full justify-between items-center mb-6'):
-                            with ui.column().classes('gap-1'):
-                                ui.label('Hlavní MySQL Databáze').classes('text-2xl font-bold text-gray-800')
-                                ui.label('Spojení na databázový server s produkčními daty.').classes('text-sm text-gray-500')
-
-                            mysql_cfg = intranet_data.nacti_mysql()
-                            sw_enabled = ui.switch('POVOLIT PŘIPOJENÍ', value=mysql_cfg.get('enabled', False)).classes('font-black text-blue-700 bg-blue-50 px-4 py-2 rounded-xl border border-blue-100')
-
-                        with ui.grid(columns=1).classes('w-full gap-6 md:grid-cols-2 lg:grid-cols-5 mb-6 bg-gray-50/50 p-6 rounded-xl border border-gray-100'):
-                            inp_host = ui.input('Host', value=mysql_cfg.get('host', 'localhost')).classes('w-full bg-white lg:col-span-2').props('outlined')
-                            inp_port = ui.input('Port', value=mysql_cfg.get('port', '3306')).classes('w-full bg-white').props('outlined')
-                            inp_db   = ui.input('Název DB', value=mysql_cfg.get('db', '')).classes('w-full bg-white lg:col-span-2').props('outlined')
-                            inp_user = ui.input('Uživatel', value=mysql_cfg.get('user', '')).classes('w-full bg-white lg:col-span-2').props('outlined')
-                            inp_pass = ui.input('Heslo', password=True, value=mysql_cfg.get('pass', '')).classes('w-full bg-white lg:col-span-3').props('outlined')
-
-                        def zkusit_mysql():
-                            import mysql.connector
-                            # Název DB jde do dotazu jako identifikátor (nelze %s),
-                            # proto ho striktně validujeme proti SQL injection.
-                            if not intranet_data.je_validni_db_identifikator(inp_db.value):
-                                ui.notify("Neplatný název databáze (povoleno jen A–Z, a–z, 0–9, _ a $, max 64 znaků).", type='negative')
-                                return
-                            try:
-                                conn = mysql.connector.connect(host=inp_host.value, port=inp_port.value, user=inp_user.value, password=inp_pass.value, connect_timeout=5)
-                                conn.cursor().execute(f"CREATE DATABASE IF NOT EXISTS `{inp_db.value}` CHARACTER SET utf8mb4")
-                                conn.close()
-                                ui.notify(f"Připojení k MySQL '{inp_db.value}' úspěšné!", type='positive')
-                            except Exception as e: ui.notify(f"Chyba: {e}", type='negative')
-
-                        def ulozit_m():
-                            mysql_cfg['enabled'] = sw_enabled.value; mysql_cfg['host'] = inp_host.value; mysql_cfg['port'] = inp_port.value
-                            mysql_cfg['db'] = inp_db.value; mysql_cfg['user'] = inp_user.value; mysql_cfg['pass'] = inp_pass.value
-                            intranet_data.uloz_mysql(mysql_cfg)
-                            intranet_logger.log_activity(user_name, "Systém", "Uložena konfigurace DB")
-                            ui.notify('Konfigurace uložena.', type='positive')
-
-                        with ui.row().classes('w-full justify-end gap-4'):
-                            ui.button('Otestovat DB spojení', icon='cable', on_click=zkusit_mysql).classes('bg-blue-600 hover:bg-blue-700 text-white font-bold h-12 px-8 shadow-sm rounded-xl')
-                            ui.button('Uložit konfiguraci DB', icon='save', on_click=ulozit_m).classes('bg-gray-800 hover:bg-black text-white font-bold h-12 px-8 shadow-sm rounded-xl')
-                            ui.button('Export databáze', icon='download', on_click=lambda: otevrit_export()).classes('bg-indigo-600 hover:bg-indigo-700 text-white font-bold h-12 px-8 shadow-sm rounded-xl')
-
-                    # Logika exportu DB (tlačítko je v bloku „Hlavní MySQL Databáze")
-                    with ui.element('div').classes('hidden'):
-                        async def otevrit_export():
-                            def _nacti_tabulky():
-                                conn = intranet_data.get_db_connection()
-                                if not conn: return []
-                                cur = conn.cursor()
-                                try:
-                                    cur.execute("SHOW TABLES")
-                                    return [r[0] for r in cur.fetchall()]
-                                finally:
-                                    cur.close(); conn.close()
-
-                            tabulky = await asyncio.to_thread(_nacti_tabulky)
-                            checkboxy: dict = {}
-                            radky: dict = {}
-
-                            with ui.dialog() as dlg, ui.card().classes('w-full max-w-lg p-6'):
-                                ui.label('Export databáze').classes('text-2xl font-bold text-gray-800 mb-5')
-
-                                with ui.column().classes('w-full gap-2'):
-                                    ui.label('Čitelný export vybraných tabulek do Excelu. Jedna tabulka = jeden list.').classes('text-sm text-gray-500 mb-1')
-
-                                    def filtrovat(e):
-                                        q = (e.value or '').strip().lower()
-                                        for t, r in radky.items():
-                                            r.set_visibility(not q or q in t.lower())
-
-                                    ui.input(placeholder='Hledat tabulku…', on_change=filtrovat) \
-                                        .classes('w-full').props('outlined dense clearable')
-
-                                    with ui.row().classes('gap-1 items-center'):
-                                        ui.button('Vybrat vše',
-                                                  on_click=lambda: [cb.set_value(True) for cb in checkboxy.values()]) \
-                                            .props('flat dense').classes('text-xs text-gray-500')
-                                        ui.label('·').classes('text-gray-300')
-                                        ui.button('Zrušit výběr',
-                                                  on_click=lambda: [cb.set_value(False) for cb in checkboxy.values()]) \
-                                            .props('flat dense').classes('text-xs text-gray-500')
-
-                                    with ui.scroll_area().style('height:320px') \
-                                            .classes('w-full border border-gray-200 rounded-xl'):
-                                        for t in tabulky:
-                                            with ui.row().classes(
-                                                    'items-center px-3 py-0.5 hover:bg-gray-50 w-full') as r:
-                                                checkboxy[t] = ui.checkbox(t, value=True) \
-                                                    .classes('font-mono text-sm w-full')
-                                            radky[t] = r
-
-                                # ── Exportovat ─────────────────────────────────────────
-                                async def spustit():
-                                    dlg.close()
-                                    zvolene = [t for t, cb in checkboxy.items() if cb.value]
-                                    if not zvolene:
-                                        ui.notify('Vyberte alespoň jednu tabulku.', type='warning')
-                                        return
-                                    ui.notify('Generuji Excel, strpení…', type='info', icon='hourglass_empty')
-                                    def _xlsx():
-                                        import pandas as pd, time as _t
-                                        conn = intranet_data.get_db_connection()
-                                        if not conn: raise RuntimeError("Nelze se připojit k databázi")
-                                        try:
-                                            os.makedirs("Exporty_DB", exist_ok=True)
-                                            nazev = 'Export' if len(zvolene) < len(tabulky) else 'Zaloha'
-                                            cesta = os.path.join("Exporty_DB", f"{nazev}_{_t.strftime('%Y%m%d_%H%M')}.xlsx")
-                                            with pd.ExcelWriter(cesta, engine='openpyxl') as w:
-                                                for t in zvolene:
-                                                    cr = conn.cursor(dictionary=True)
-                                                    cr.execute(f"SELECT * FROM `{t}`")
-                                                    rows = cr.fetchall()
-                                                    df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=[d[0] for d in cr.description])
-                                                    if not df.empty:
-                                                        for col in df.select_dtypes(include=['datetime64[ns]', 'datetime64']).columns:
-                                                            df[col] = df[col].dt.tz_localize(None)
-                                                    df.to_excel(w, sheet_name=t[:31], index=False)
-                                                    cr.close()
-                                            return cesta
-                                        finally:
-                                            conn.close()
-                                    try:
-                                        c = await asyncio.to_thread(_xlsx)
-                                        ui.download(c); ui.notify('Staženo', type='positive')
-                                        intranet_logger.log_activity(user_name, "Záloha DB", f"Stažen Excel export ({len(zvolene)} tabulek: {', '.join(zvolene)})")
-                                    except Exception as e:
-                                        ui.notify(f'Chyba: {e}', type='negative')
-
-                                with ui.row().classes('w-full justify-end gap-3 mt-6'):
-                                    ui.button('Zrušit', on_click=dlg.close).props('flat').classes('text-gray-500')
-                                    ui.button('Exportovat', icon='download', on_click=spustit) \
-                                        .classes('bg-indigo-600 hover:bg-indigo-700 text-white font-bold px-6 h-10 rounded-xl')
-
-                            dlg.open()
-

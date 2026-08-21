@@ -132,7 +132,6 @@ def export_zip_heslo() -> bytes:
     return heslo.encode('utf-8')
 
 
-SOUBOR_MYSQL_INTRANET = 'mysql_intranet.json'
 SOUBOR_NASTAVENI_INTRANETU = 'nastaveni_intranetu.json'
 
 # ==========================================
@@ -467,30 +466,34 @@ def uloz_nastaveni_intranetu(data):
         print(f"Chyba uložení nastavení na disk: {e}")
 
 def nacti_mysql():
+    """Přístup k DB výhradně z proměnných prostředí JIPKA_DB_* — na disku nic není.
+
+    Config je read-only (žádné UI ho nepřepisuje), takže ho stačí přečíst jednou.
+    Změna údajů = úprava EnvironmentFile na serveru + restart služby.
+
+    enabled se neukládá, odvozuje se: prázdný user/db nebo nesmyslný název DB
+    znamená "neexistuje připojení" — aplikace pak jede v nouzovém režimu
+    (break-glass admin z EMERGENCY_ADMIN_*) místo padání na půl cesty.
+    """
     global CACHE_MYSQL
     if CACHE_MYSQL is not None:
         return CACHE_MYSQL
 
-    if not os.path.exists(SOUBOR_MYSQL_INTRANET):
-        CACHE_MYSQL = {"host": "localhost", "port": "3306", "user": "root", "pass": "", "db": "firemni_portal", "enabled": False}
-        return CACHE_MYSQL
-    try:
-        with open(SOUBOR_MYSQL_INTRANET, 'r', encoding='utf-8') as f:
-            CACHE_MYSQL = json.load(f)
-            return CACHE_MYSQL
-    except Exception:
-        CACHE_MYSQL = {"host": "localhost", "port": "3306", "user": "root", "pass": "", "db": "firemni_portal", "enabled": False}
-        return CACHE_MYSQL
+    cfg = {
+        "host": os.environ.get('JIPKA_DB_HOST', 'localhost'),
+        "port": os.environ.get('JIPKA_DB_PORT', '3306'),
+        "user": os.environ.get('JIPKA_DB_USER', '').strip(),
+        "pass": os.environ.get('JIPKA_DB_PASS', ''),
+        "db":   os.environ.get('JIPKA_DB_NAME', '').strip(),
+    }
+    # Název DB jde do CREATE DATABASE jako identifikátor (nelze %s), a od zrušení
+    # konfigurace v UI ho nikdo jiný nevaliduje — kontrola musí být tady.
+    cfg["enabled"] = bool(cfg["user"] and je_validni_db_identifikator(cfg["db"]))
+    if cfg["user"] and not cfg["enabled"]:
+        print("[db] JIPKA_DB_NAME chybí nebo je neplatný název databáze — připojení vypnuto.")
 
-def uloz_mysql(data):
-    global CACHE_MYSQL, DB_POOL
-    CACHE_MYSQL = data
-    try:
-        # tajne=True — obsahuje heslo k DB → práva 0600.
-        zapis_json_atomicky(SOUBOR_MYSQL_INTRANET, data, tajne=True, indent=4)
-        DB_POOL = None # Reset poolu po změně nastavení
-    except Exception as e:
-        print(f"Chyba uložení MySQL nastavení na disk: {e}")
+    CACHE_MYSQL = cfg
+    return CACHE_MYSQL
 
 # ========================================================
 # CONNECTION POOLING (ZRYCHLENÍ DATABÁZE)
