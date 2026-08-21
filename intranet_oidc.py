@@ -184,7 +184,7 @@ async def oidc_login():
         intranet_logger.log_activity('Systém', 'OIDC', f'Discovery selhalo: {e}')
         return _zpet_s_chybou('Přihlášení přes firemní účet je dočasně nedostupné.')
 
-    dotaz = urllib.parse.urlencode({
+    parametry = {
         'client_id': CLIENT_ID,
         'response_type': 'code',
         'redirect_uri': REDIRECT_URI,
@@ -194,7 +194,20 @@ async def oidc_login():
         'nonce': nonce,
         'code_challenge': challenge,
         'code_challenge_method': 'S256',
-    })
+    }
+
+    # login_hint → IdP rovnou nabídne konkrétní účet místo obrazovky „Vyberte účet".
+    # Zdroj: `oidc_hint` (uložený po předchozím přihlášení přes firemní účet), jinak
+    # e-mail ze „Zapamatovat si mě". Jen nápověda, uživatel může účet v Entra přepnout.
+    try:
+        hint = str(app.storage.user.get('oidc_hint')
+                   or app.storage.user.get('login_email') or '').strip()
+        if '@' in hint:
+            parametry['login_hint'] = hint
+    except Exception:
+        pass
+
+    dotaz = urllib.parse.urlencode(parametry)
     return RedirectResponse(disc['authorization_endpoint'] + '?' + dotaz)
 
 
@@ -244,4 +257,10 @@ async def oidc_callback(request: Request):
     # Bez auto-provisioningu: účet musí v intranetu existovat (práva, útvary).
     intranet_session.zahaj_relaci(id_u, email, jmeno)
     intranet_session.zaznamenej_klienta(email, jmeno, ip, device)
+    # Zapamatovat účet pro `login_hint` při dalším přihlášení → uživatel už neuvidí
+    # u Microsoftu výběr účtu. Ukládá se JEN e-mail, nikdy token ani heslo.
+    try:
+        app.storage.user['oidc_hint'] = email
+    except Exception:
+        pass
     return RedirectResponse('/')

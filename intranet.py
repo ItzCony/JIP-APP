@@ -46,11 +46,14 @@ def _odhlas_vycisti_relaci():
     vypnutí 2FA nebo "Odhlásit ze všech zařízení"."""
     _duvera = app.storage.user.get('totp_duvera_token')
     _email = app.storage.user.get('login_email')  # "Zapamatovat si mě" (jen e-mail, nikdy heslo)
+    _oidc = app.storage.user.get('oidc_hint')     # účet pro login_hint (jen e-mail)
     app.storage.user.clear()
     if _duvera:
         app.storage.user['totp_duvera_token'] = _duvera
     if _email:
         app.storage.user['login_email'] = _email
+    if _oidc:
+        app.storage.user['oidc_hint'] = _oidc
 
 
 # Statické soubory — whitelist konkrétních povolených souborů.
@@ -870,20 +873,44 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
                 ui.label('Vítejte v Moje JIPka').classes('login-title text-center')
                 ui.label('Přihlaste se firemním účtem, nebo os. číslem').classes('login-sub text-center mt-1 mb-6')
 
-                email_input = ui.input('E-mail nebo osobní číslo', value=_zapamatovany_email) \
-                    .classes('w-full mb-3').props('outlined dark type=text autocomplete=username name=email id=login-email')
-                with email_input.add_slot('prepend'):
-                    ui.icon('mail_outline')
+                # Firemní účet (OIDC) je primární cesta: tlačítko nahoře, heslový formulář
+                # schovaný za odkazem. Bez env konfigurace (`je_zapnuto()` False) se nic
+                # nevykreslí a stránka vypadá přesně jako dřív.
+                _oidc_on = intranet_oidc.je_zapnuto()
 
-                heslo_input = ui.input('Heslo', password=True, password_toggle_button=True) \
-                    .classes('w-full mb-1').props('outlined dark autocomplete=current-password name=password id=login-password')
-                with heslo_input.add_slot('prepend'):
-                    ui.icon('lock_outline')
+                def _ukaz_heslo():
+                    heslo_box.set_visibility(True)
+                    heslo_odkaz.set_visibility(False)
 
-                # Řádek „zapamatovat + zapomenuté heslo" a hlavní tlačítko se vykreslí až
-                # níže (po definici obslužných funkcí) do tohoto kontejneru, aby pořadí
-                # na obrazovce odpovídalo návrhu.
-                akce_box = ui.column().classes('w-full gap-0')
+                if _oidc_on:
+                    ui.button('Přihlásit se firemním účtem (MS365)', icon='business',
+                              on_click=lambda: ui.navigate.to('/auth/login')) \
+                        .props('no-caps unelevated').classes('login-btn w-full')
+                    heslo_odkaz = ui.button('Přihlásit se heslem', on_click=_ukaz_heslo) \
+                        .props('flat dense no-caps').classes('login-link mt-3 mb-2')
+                    _oidc_chyba = app.storage.user.pop('oidc_chyba', '')
+                    if _oidc_chyba:
+                        ui.timer(0.1, lambda z=_oidc_chyba: ui.notify(z, type='warning', position='top', timeout=8000), once=True)
+
+                heslo_box = ui.column().classes('w-full gap-0')
+                with heslo_box:
+                    email_input = ui.input('E-mail nebo osobní číslo', value=_zapamatovany_email) \
+                        .classes('w-full mb-3').props('outlined dark type=text autocomplete=username name=email id=login-email')
+                    with email_input.add_slot('prepend'):
+                        ui.icon('mail_outline')
+
+                    heslo_input = ui.input('Heslo', password=True, password_toggle_button=True) \
+                        .classes('w-full mb-1').props('outlined dark autocomplete=current-password name=password id=login-password')
+                    with heslo_input.add_slot('prepend'):
+                        ui.icon('lock_outline')
+
+                    # Řádek „zapamatovat + zapomenuté heslo" a hlavní tlačítko se vykreslí až
+                    # níže (po definici obslužných funkcí) do tohoto kontejneru, aby pořadí
+                    # na obrazovce odpovídalo návrhu.
+                    akce_box = ui.column().classes('w-full gap-0')
+
+                if _oidc_on:
+                    heslo_box.set_visibility(False)
 
                 async def zkusit_prihlaseni():
                     email = email_input.value.strip().lower()
@@ -1162,17 +1189,10 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
 
                     ui.button('Přihlásit se', on_click=zkusit_prihlaseni).props('no-caps unelevated').classes('login-btn w-full')
 
-                    # Firemní účet (OIDC) — jen když je vyplněná celá konfigurace v env
-                    if intranet_oidc.je_zapnuto():
-                        ui.button('Přihlásit se firemním účtem',
-                                  on_click=lambda: ui.navigate.to('/auth/login')) \
-                            .props('no-caps outline').classes('login-btn w-full mt-3')
-                        _oidc_chyba = app.storage.user.pop('oidc_chyba', '')
-                        if _oidc_chyba:
-                            ui.timer(0.1, lambda z=_oidc_chyba: ui.notify(z, type='warning', position='top', timeout=8000), once=True)
-
-                    with ui.row().classes('w-full justify-center items-center mt-7 gap-0'):
-                        ui.label('JIP východočeská, a.s.').classes('login-foot')
+                # Patička je mimo `heslo_box` i `akce_box` — musí zůstat vidět i tehdy,
+                # když je heslový formulář schovaný.
+                with ui.row().classes('w-full justify-center items-center mt-7 gap-0'):
+                    ui.label('JIP východočeská, a.s.').classes('login-foot')
 
     else:
         # Brána: nový účet / heslo nastavené adminem → nic jiného se nevykreslí, dokud si heslo nezmění
