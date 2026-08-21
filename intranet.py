@@ -28,7 +28,6 @@ import intranet_asm
 import intranet_vizitky
 import intranet_spolvecer
 import intranet_lupa
-import intranet_schuzky
 
 import time
 import asyncio
@@ -655,7 +654,6 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
         'cenopripad':    'cenopripad_zapnuty',
         'asm':           'asm_zapnuty',
         'lupa':          'lupa_zapnuty',
-        'schuzky':       'schuzky_zapnuty',
 
     }
 
@@ -796,13 +794,6 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
     if nastaveni.get('vizitky_zapnuty', True):
         dostupne_taby.append('vizitky')
 
-    _ma_schuzky = (
-        ma_vse or
-        any(p in vsechna_prava for p in
-            ('schuzky_zadatel', 'schuzky_vedouci', 'schuzky_spravce'))
-    )
-    if _ma_schuzky and nastaveni.get('schuzky_zapnuty', True):
-        dostupne_taby.append('schuzky')
 
     _ma_cenopripad = (
         ma_vse or
@@ -826,7 +817,15 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
             'asm_zadatel', 'asm_office', 'asm_spravce',
             'asm_spravce_bez_emailu', 'asm_vkladatel'))
     )
-    if _ma_asm and nastaveni.get('asm_zapnuty', True):
+    # Schůzky s vedoucími jsou dlaždice uvnitř Formulářů ASM — kdo má právo jen
+    # na ně, musí záložku vidět taky (uvnitř pak uvidí jen tu jednu dlaždici).
+    _ma_schuzky = (
+        ma_vse or
+        any(p in vsechna_prava for p in
+            ('schuzky_zadatel', 'schuzky_vedouci', 'schuzky_spravce'))
+    )
+    if ((_ma_asm and nastaveni.get('asm_zapnuty', True))
+            or (_ma_schuzky and nastaveni.get('schuzky_zapnuty', True))):
         dostupne_taby.append('asm')
 
     # Lupa: přístup se z práv odvodit nedá — rozhoduje spárování ASM s příjmením
@@ -1435,8 +1434,6 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
                         tab_asm = ui.tab('asm', label='📝  Formuláře ASM').classes('justify-start text-lg text-gray-800')
                     if 'lupa' in dostupne_taby:
                         tab_lupa = ui.tab('lupa', label='🔍  Lupou na obchod').classes('justify-start text-lg text-gray-800')
-                    if 'schuzky' in dostupne_taby:
-                        tab_schuzky = ui.tab('schuzky', label='🗓️  Schůzky s vedoucím').classes('justify-start text-lg text-gray-800')
 
                     if ma_vse or "uzivatele" in vsechna_prava:
                         tab_uzivatele = ui.tab('uzivatele', label='👥  Správa uživatelů').classes('justify-start text-lg text-gray-800')
@@ -1513,7 +1510,6 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
                 if 'cenopripad' in dostupne_taby: _RENDER_FNS['cenopripad'] = lambda: intranet_cenopripad.vykresli_cenopripad(user_id, user_name, vsechna_prava)
                 if 'asm'        in dostupne_taby: _RENDER_FNS['asm']        = lambda: intranet_asm.vykresli_asm(user_id, user_name, vsechna_prava)
                 if 'lupa'       in dostupne_taby: _RENDER_FNS['lupa']       = lambda: intranet_lupa.vykresli_lupa(user_id, user_name, vsechna_prava)
-                if 'schuzky'    in dostupne_taby: _RENDER_FNS['schuzky']    = lambda: intranet_schuzky.vykresli_schuzky(user_id, user_name, user_email, vsechna_prava)
 
                 if tab_logy:        _RENDER_FNS['logy']          = lambda: intranet_logger.vykresli_logy(user_name, vsechna_prava)
                 if tab_server:      _RENDER_FNS['server']        = lambda: intranet_monitor.vykresli_monitor(vsechna_prava)
@@ -1665,10 +1661,6 @@ async def route_cenopripad(client: Client):
 @ui.page('/lupa')
 async def route_lupa(client: Client):
     await vykresli_kompletni_intranet(client, 'lupa')
-
-@ui.page('/schuzky')
-async def route_schuzky(client: Client):
-    await vykresli_kompletni_intranet(client, 'schuzky')
 
 @ui.page('/asm')
 async def route_asm(client: Client, pripad: str = ''):
