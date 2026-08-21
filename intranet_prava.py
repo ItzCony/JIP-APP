@@ -155,11 +155,11 @@ ZAKLADNI_PRAVA = {
     'lupa_vkladatel': {'kategorie': 'Modul Lupou na obchod', 'nazev': 'Vkladatel dat', 'popis': 'Smí nahrávat soubory GIST prodejů (dávkově). Nevidí data ASM, ke kterým nemá přístup jinou cestou.', 'ikona': 'upload'},
     'lupa_admin':     {'kategorie': 'Modul Lupou na obchod', 'nazev': 'Správce',       'popis': 'Plná práva k modulu: všechna ASM, import, komentáře, audit výjezdů.', 'ikona': 'local_police'},
 
-    # Rezervace ind. schůzky s vedoucím — kdo má právo `schuzky_vedouci`, ten se
-    # automaticky objeví jako volitelný vedoucí v kalendáři (nikde se nehardcoduje).
-    'schuzky_zadatel': {'kategorie': 'Modul Schůzky s vedoucím', 'nazev': 'Žadatel o schůzku', 'popis': 'ASM. Zakládá žádosti o individuální schůzku, vidí jen své žádosti a jejich stav. V kalendáři vidí obsazenost anonymně (šedé bloky).', 'ikona': 'event_available'},
-    'schuzky_vedouci': {'kategorie': 'Modul Schůzky s vedoucím', 'nazev': 'Vedoucí schůzky',  'popis': 'Vidí všechny žádosti na svoji osobu a potvrzuje/zamítá je. V kalendáři vidí jména pouze u svých schůzek.', 'ikona': 'how_to_reg'},
-    'schuzky_spravce': {'kategorie': 'Modul Schůzky s vedoucím', 'nazev': 'Správce schůzek',  'popis': 'Vidí a může vše. Jako jediný vypisuje a uzavírá termíny pro hlášení individuálních schůzek.', 'ikona': 'local_police'},
+    # Rezervace ind. schůzky s vedoucími — schůzka je vždy společná, kdo má právo
+    # `schuzky_vedouci`, tomu žádost přijde a odklikne si účast (nic se nehardcoduje).
+    'schuzky_zadatel': {'kategorie': 'Modul Formuláře ASM', 'nazev': 'Žadatel o schůzku', 'popis': 'ASM. Zakládá žádosti o schůzku (jedna žádost pro všechny vedoucí), vidí jen své žádosti a jejich stav. V kalendáři vidí obsazenost anonymně (šedé bloky).', 'ikona': 'event_available'},
+    'schuzky_vedouci': {'kategorie': 'Modul Formuláře ASM', 'nazev': 'Vedoucí schůzky',  'popis': 'Dostane každou žádost o schůzku a odklikne, zda se účastní. První ANO schůzku potvrdí, NE od všech ji zamítne. V kalendáři vidí jména žadatelů. Vypisuje a uzavírá termíny.', 'ikona': 'how_to_reg'},
+    'schuzky_spravce': {'kategorie': 'Modul Formuláře ASM', 'nazev': 'Správce schůzek',  'popis': 'Vidí a může vše, včetně vypisování a uzavírání termínů pro hlášení individuálních schůzek.', 'ikona': 'local_police'},
 
 }
 
