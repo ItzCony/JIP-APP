@@ -550,7 +550,7 @@ def _odesli_kulatiny_upozorneni(dnes, nastaveni):
     prijemci = [p for p in _rozdel_emaily(
         nastaveni.get('narozeniny_kulatiny_emaily')
         or nastaveni.get('narozeniny_kulatiny_email')
-        or nastaveni.get('smtp_user', '')) if '@' in p]
+        or intranet_data.nacti_smtp().get('smtp_user', '')) if '@' in p]
     if not prijemci:
         return
     cil = dnes + datetime.timedelta(days=KULATINY_PREDSTIH_DNI)
@@ -922,7 +922,7 @@ def _tab_podpisy():
 
     def _otevri_nahled():
         nastaveni = intranet_data.nacti_nastaveni_intranetu()
-        smtp_user   = nastaveni.get('smtp_user', 'intranet@firma.cz')
+        smtp_user   = intranet_data.nacti_smtp().get('smtp_user') or 'intranet@firma.cz'
         predmet_tpl = nastaveni.get('narozeniny_email_predmet', 'Všechno nejlepší k narozeninám! 🎂')
         text_tpl = nastaveni.get(
             'narozeniny_email_text',
@@ -1098,7 +1098,7 @@ def _dialog_kulatiny_email(osoba: dict, vek: int):
     vychozi_emaily = _rozdel_emaily(
         nastaveni.get('narozeniny_kulatiny_emaily')
         or nastaveni.get('narozeniny_kulatiny_email')
-        or nastaveni.get('smtp_user', '')
+        or intranet_data.nacti_smtp().get('smtp_user', '')
     )
     jmeno_cele     = osoba.get('jmeno_cele', f"{osoba.get('jmeno','')} {osoba.get('prijmeni','')}".strip())
     datum_str      = _datum_cz(osoba.get('datum_narozeni', ''))

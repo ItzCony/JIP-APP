@@ -676,9 +676,9 @@ def _emaily_realizatoru() -> list:
 
 
 def _app_url() -> str:
-    """Plný odkaz na modul Vizitky (z nastavení 'app_url'); '' pokud není nastaven."""
+    """Plný odkaz na modul Vizitky (z env JIPKA_APP_URL); '' pokud není nastaven."""
     try:
-        u = (intranet_data.nacti_nastaveni_intranetu().get('app_url', '') or '').strip().rstrip('/')
+        u = intranet_data.APP_URL
         return f'{u}/vizitky' if u else ''
     except Exception:
         return ''

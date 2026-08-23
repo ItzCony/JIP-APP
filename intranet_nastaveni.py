@@ -20,7 +20,6 @@ def vykresli_nastaveni_portalu(user_name):
         with ui.tabs().classes('w-full') as tabs:
             tab_moduly      = ui.tab('Moduly',      icon='view_module')
             tab_narozeniny  = ui.tab('Narozeniny',  icon='cake')
-            tab_email       = ui.tab('E-mail',      icon='email')
 
         with ui.tab_panels(tabs, value=tab_moduly).classes('w-full'):
 
@@ -217,61 +216,3 @@ def vykresli_nastaveni_portalu(user_name):
 
                         with ui.row().classes('w-full justify-end border-t border-gray-100 pt-5 mt-2'):
                             ui.button('Uložit', icon='save', on_click=uloz_kulatiny_email).classes('bg-gray-800 hover:bg-black text-white font-bold px-8 h-12 shadow-sm rounded-xl')
-
-            # =========================================================
-            # ZÁLOŽKA 5: E-MAIL
-            # =========================================================
-            with ui.tab_panel(tab_email):
-                with ui.column().classes('w-full gap-8'):
-
-                    with ui.card().classes('w-full p-6 xl:p-8 shadow-sm bg-white rounded-2xl border-l-[10px] border-teal-500 hover:shadow-md transition-shadow'):
-                        nastaveni_mail = intranet_data.nacti_nastaveni_intranetu()
-
-                        with ui.row().classes('w-full justify-between items-center mb-6'):
-                            with ui.column().classes('gap-1'):
-                                ui.label('SMTP a IMAP Server (Notifikace)').classes('text-2xl font-bold text-gray-800')
-                                ui.label('Konfigurace poštovního klienta pro automatické rozesílání schválených dovolených a faktur.').classes('text-sm text-gray-500')
-
-                            def toggle_emaily(e):
-                                n = intranet_data.nacti_nastaveni_intranetu(); n['emaily_zapnuty'] = e.value; intranet_data.uloz_nastaveni_intranetu(n)
-                                intranet_logger.log_activity(user_name, "Systém", f"E-maily globálně {'ZAPNUTY' if e.value else 'VYPNUTY'}")
-                                ui.notify('Stav e-mailů uložen.', type='info')
-                            ui.switch('POVOLIT ODESÍLÁNÍ', value=nastaveni_mail.get('emaily_zapnuty', True), on_change=toggle_emaily).classes('font-black text-teal-700 bg-teal-50 px-4 py-2 rounded-xl border border-teal-100')
-
-                        with ui.grid(columns=1).classes('w-full gap-6 md:grid-cols-2 lg:grid-cols-4 mb-6'):
-                            smtp_server = ui.input('SMTP Server', value=nastaveni_mail.get('smtp_server', '')).classes('w-full bg-white').props('outlined')
-                            smtp_port   = ui.number('SMTP Port', value=nastaveni_mail.get('smtp_port', 465)).classes('w-full bg-white').props('outlined')
-                            smtp_user   = ui.input('Přihlašovací e-mail', value=nastaveni_mail.get('smtp_user', '')).classes('w-full bg-white').props('outlined')
-                            smtp_pass   = ui.input('Heslo', password=True, value=nastaveni_mail.get('smtp_password', '')).classes('w-full bg-white').props('outlined')
-
-                        with ui.row().classes('w-full items-center gap-4 mb-2'):
-                            app_url_input = ui.input(
-                                'URL aplikace (proklik v e-mailech)',
-                                value=nastaveni_mail.get('app_url', ''),
-                                placeholder='https://intranet.mojejipka.cz',
-                            ).classes('flex-1 bg-white').props('outlined')
-                            ui.label('Vyplňte adresu, na kterou budou odkazovat e-maily o absencích.').classes('text-xs text-gray-400')
-
-                        def ulozit_email():
-                            n = intranet_data.nacti_nastaveni_intranetu()
-                            n['smtp_server'] = smtp_server.value; n['smtp_port'] = smtp_port.value; n['smtp_user'] = smtp_user.value; n['smtp_password'] = smtp_pass.value
-                            n['app_url'] = app_url_input.value.strip()
-                            intranet_data.uloz_nastaveni_intranetu(n)
-                            intranet_logger.log_activity(user_name, "Systém", "Uloženo nové SMTP nastavení")
-                            ui.notify('SMTP uloženo.', type='positive')
-
-                        async def otestovat_spojeni():
-                            if not smtp_user.value or not smtp_pass.value or not smtp_server.value: return ui.notify('Vyplňte všechny údaje!', type='warning')
-                            ulozit_email()
-                            ui.notify('Testuji odesílání... Zkontrolujte Server Terminál pro detaily.', type='info', icon='hourglass_empty')
-                            def _send_test():
-                                import intranet_emaily
-                                return intranet_emaily.odesli_upozorneni_email(smtp_user.value, "✅ ÚSPĚCH: Test spojení z Intranetu", "Nastavení funguje.")
-                            try:
-                                if await asyncio.to_thread(_send_test): ui.notify('✅ E-mail úspěšně odeslán!', type='positive')
-                                else: ui.notify('❌ Chyba při odesílání. Koukněte do logů.', type='negative')
-                            except Exception as e: ui.notify(f'Chyba: {e}', type='negative')
-
-                        with ui.row().classes('w-full justify-end gap-4 border-t border-gray-100 pt-6'):
-                            ui.button('Otestovat spojení', icon='send', on_click=otestovat_spojeni).classes('bg-teal-600 hover:bg-teal-700 text-white font-bold px-8 h-12 shadow-sm rounded-xl')
-                            ui.button('Uložit nastavení', icon='save', on_click=ulozit_email).classes('bg-gray-800 hover:bg-black text-white font-bold px-8 h-12 shadow-sm rounded-xl')

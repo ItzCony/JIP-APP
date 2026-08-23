@@ -38,32 +38,61 @@ def _text_na_html(text: str) -> str:
         '</body></html>'
     )
 
+def _smtp_duvod(smtp) -> str:
+    """Proč se neodesílá — aby se ticho v logu dalo odlišit od chybějící konfigurace."""
+    return "JIPKA_SMTP_ENABLED=0" if smtp["vypnuto_operatorem"] else "chybí JIPKA_SMTP_HOST/USER/PASS"
+
+
+def _spoj_smtp(smtp):
+    """Otevře a přihlásí SMTP spojení. Volající ho zavírá."""
+    if smtp["smtp_port"] == 465:
+        server = smtplib.SMTP_SSL(smtp["smtp_server"], smtp["smtp_port"], timeout=15)
+    else:
+        server = smtplib.SMTP(smtp["smtp_server"], smtp["smtp_port"], timeout=15)
+        server.ehlo()
+        server.starttls()
+        server.ehlo()
+    server.login(smtp["smtp_user"], smtp["smtp_password"])
+    return server
+
+
+def otestuj_spojeni():
+    """Odešle kontrolní e-mail sám sobě (na smtp_user). Vrací (ok, hláška).
+
+    V UI na to není tlačítko — kontrola SMTP se spouští ručně na serveru:
+        sudo -u www-data python3 -c "import intranet_emaily as e; print(e.otestuj_spojeni())"
+    (ve WorkingDirectory aplikace, aby se načetl stejný env z EnvironmentFile).
+
+    Blokující (síť) — z UI by se muselo volat přes asyncio.to_thread.
+    Jede úplně stejnou cestou jako ostrý provoz včetně IMAP kopie do Odeslané."""
+    smtp = intranet_data.nacti_smtp()
+    if not smtp["enabled"]:
+        return False, f"Odesílání e-mailů je vypnuto ({_smtp_duvod(smtp)})."
+    prijemce = smtp["smtp_user"]
+    ok = odesli_upozorneni_email(
+        prijemce,
+        "Test spojení z intranetu",
+        "Kontrolní e-mail z Nastavení portálu. Odesílání e-mailů funguje.",
+    )
+    if not ok:
+        return False, "Odeslání selhalo — důvod je v logu služby (journalctl -u intranet)."
+    return True, f"Kontrolní e-mail odeslán na {prijemce} ({smtp['smtp_server']}:{smtp['smtp_port']})."
+
+
 def odesli_upozorneni_email(prijemce, predmet, text):
     sys_log(f"=== START ODESÍLÁNÍ E-MAILU PRO: {prijemce} ===")
     try:
-        sys_log("[KROK 1] Načítání nastavení intranetu...")
-        nastaveni = intranet_data.nacti_nastaveni_intranetu()
+        sys_log("[KROK 1] Čtení SMTP konfigurace z prostředí...")
+        smtp = intranet_data.nacti_smtp()
 
-        if not nastaveni.get("emaily_zapnuty", True):
-            sys_log(" -> INFO: E-maily jsou globálně vypnuty v nastavení. Přerušuji.")
+        if not smtp["enabled"]:
+            sys_log(f" -> INFO: Odesílání e-mailů je vypnuto ({_smtp_duvod(smtp)}). Přerušuji.")
             return False
 
-        sys_log("[KROK 2] Čtení SMTP/IMAP konfigurace...")
-        smtp_server = nastaveni.get("smtp_server")
-        smtp_port_raw = nastaveni.get("smtp_port")
-
-        try:
-            smtp_port = int(smtp_port_raw) if smtp_port_raw else 465
-        except ValueError:
-            smtp_port = 465
-
-        smtp_user = nastaveni.get("smtp_user")
-        smtp_password = nastaveni.get("smtp_password")
-
-        if not smtp_server or not smtp_user or not smtp_password:
-            msg = " -> CHYBA: Nejsou vyplněny přihlašovací údaje (Server, Uživatel nebo Heslo chybí)!"
-            sys_log(msg)
-            return False
+        smtp_server = smtp["smtp_server"]
+        smtp_port = smtp["smtp_port"]
+        smtp_user = smtp["smtp_user"]
+        smtp_password = smtp["smtp_password"]
 
         sys_log("[KROK 3] Sestavování e-mailové zprávy...")
         msg = MIMEMultipart('related')
@@ -75,17 +104,8 @@ def odesli_upozorneni_email(prijemce, predmet, text):
         alt.attach(MIMEText(text, 'plain', 'utf-8'))
         alt.attach(MIMEText(_text_na_html(text), 'html', 'utf-8'))
 
-        sys_log(f"[KROK 4] Připojování k SMTP serveru {smtp_server}:{smtp_port} (Timeout 15s)...")
-        if smtp_port == 465:
-            server = smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=15)
-        else:
-            server = smtplib.SMTP(smtp_server, smtp_port, timeout=15)
-            server.ehlo()
-            server.starttls()
-            server.ehlo()
-
-        sys_log("[KROK 5] Přihlašování k SMTP (ověřování uživatele a hesla)...")
-        server.login(smtp_user, smtp_password)
+        sys_log(f"[KROK 4] Připojování a přihlašování k SMTP {smtp_server}:{smtp_port} (Timeout 15s)...")
+        server = _spoj_smtp(smtp)
 
         sys_log("[KROK 6] Odesílání zprávy přes SMTP...")
         server.sendmail(smtp_user, prijemce, msg.as_string())
@@ -105,7 +125,7 @@ def odesli_upozorneni_email(prijemce, predmet, text):
     # ------------------ IMAP ČÁST (Uložení do Odeslané pošty) ------------------
     sys_log("[KROK 8] Připojování k IMAP pro uložení do Odeslané pošty...")
     try:
-        imap_server = nastaveni.get("imap_server")
+        imap_server = smtp.get("imap_server")
         if not imap_server:
             imap_server = smtp_server.replace('smtp', 'imap')
             sys_log(f" -> IMAP server nebyl zadán, zkouším automaticky odvodit: {imap_server}")
@@ -148,20 +168,12 @@ def odesli_email_s_prilohou(prijemce, predmet, text, cesta_souboru):
     """Odešle e-mail s textovým tělem a přiloženým souborem."""
     sys_log(f"=== IKOS EMAIL S PŘÍLOHOU PRO: {prijemce} ===")
     try:
-        nastaveni = intranet_data.nacti_nastaveni_intranetu()
-        if not nastaveni.get("emaily_zapnuty", True):
-            sys_log(" -> INFO: E-maily jsou globálně vypnuty.")
+        smtp = intranet_data.nacti_smtp()
+        if not smtp["enabled"]:
+            sys_log(f" -> INFO: Odesílání e-mailů je vypnuto ({_smtp_duvod(smtp)}).")
             return False
 
-        smtp_server   = nastaveni.get("smtp_server")
-        smtp_port_raw = nastaveni.get("smtp_port")
-        smtp_port     = int(smtp_port_raw) if smtp_port_raw else 465
-        smtp_user     = nastaveni.get("smtp_user")
-        smtp_password = nastaveni.get("smtp_password")
-
-        if not smtp_server or not smtp_user or not smtp_password:
-            sys_log(" -> CHYBA: Chybí SMTP přihlašovací údaje.")
-            return False
+        smtp_user = smtp["smtp_user"]
 
         msg = MIMEMultipart()
         msg['From']    = smtp_user
@@ -182,13 +194,7 @@ def odesli_email_s_prilohou(prijemce, predmet, text, cesta_souboru):
         part.add_header('Content-Disposition', 'attachment', filename=nazev_souboru)
         msg.attach(part)
 
-        if smtp_port == 465:
-            server = smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=15)
-        else:
-            server = smtplib.SMTP(smtp_server, smtp_port, timeout=15)
-            server.ehlo(); server.starttls(); server.ehlo()
-
-        server.login(smtp_user, smtp_password)
+        server = _spoj_smtp(smtp)
         server.sendmail(smtp_user, prijemce, msg.as_string())
         server.quit()
 
@@ -208,23 +214,15 @@ def odesli_html_email(prijemce, predmet, html_obsah, inline_soubory=None):
     """
     sys_log(f"=== START ODESÍLÁNÍ HTML E-MAILU PRO: {prijemce} ===")
     try:
-        nastaveni = intranet_data.nacti_nastaveni_intranetu()
-        if not nastaveni.get("emaily_zapnuty", True):
-            sys_log(" -> INFO: E-maily jsou globálně vypnuty. Přerušuji.")
+        smtp = intranet_data.nacti_smtp()
+        if not smtp["enabled"]:
+            sys_log(f" -> INFO: Odesílání e-mailů je vypnuto ({_smtp_duvod(smtp)}). Přerušuji.")
             return False
 
-        smtp_server   = nastaveni.get("smtp_server")
-        smtp_port_raw = nastaveni.get("smtp_port")
-        try:
-            smtp_port = int(smtp_port_raw) if smtp_port_raw else 465
-        except ValueError:
-            smtp_port = 465
-        smtp_user     = nastaveni.get("smtp_user")
-        smtp_password = nastaveni.get("smtp_password")
-
-        if not smtp_server or not smtp_user or not smtp_password:
-            sys_log(" -> CHYBA: Chybí SMTP přihlašovací údaje.")
-            return False
+        smtp_server   = smtp["smtp_server"]
+        smtp_port     = smtp["smtp_port"]
+        smtp_user     = smtp["smtp_user"]
+        smtp_password = smtp["smtp_password"]
 
         msg = MIMEMultipart('related')
         msg['From']    = smtp_user
@@ -249,13 +247,7 @@ def odesli_html_email(prijemce, predmet, html_obsah, inline_soubory=None):
                     sys_log(f" -> VAROVÁNÍ: Nelze načíst obrázek {cesta}: {e}")
 
         sys_log(f"[KROK 4] Připojování k SMTP {smtp_server}:{smtp_port}...")
-        if smtp_port == 465:
-            server = smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=15)
-        else:
-            server = smtplib.SMTP(smtp_server, smtp_port, timeout=15)
-            server.ehlo(); server.starttls(); server.ehlo()
-
-        server.login(smtp_user, smtp_password)
+        server = _spoj_smtp(smtp)
         server.sendmail(smtp_user, prijemce, msg.as_string())
         server.quit()
         sys_log(f" -> ÚSPĚCH: HTML e-mail odeslán na {prijemce}.")
@@ -269,7 +261,7 @@ def odesli_html_email(prijemce, predmet, html_obsah, inline_soubory=None):
         return False
 
     try:
-        imap_server = nastaveni.get("imap_server") or smtp_server.replace('smtp', 'imap')
+        imap_server = smtp.get("imap_server") or smtp_server.replace('smtp', 'imap')
         mail = imaplib.IMAP4_SSL(imap_server, 993)
         mail.login(smtp_user, smtp_password)
         for slozka in ['"Sent Items"', 'Sent', 'Odeslané', 'Odeslana_posta', 'INBOX.Sent']:

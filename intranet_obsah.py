@@ -1231,7 +1231,7 @@ def vykresli_dochazku(user_id, user_name, vsechna_prava):
                                     break
                             if zadatel_email and zadatel_data.get('email_vyrizeni_zadosti', True):
                                 predmet = f"STORNO: Vaše schválená žádost o {z_data['typ']} byla stornována"
-                                _app_url = intranet_data.nacti_nastaveni_intranetu().get('app_url', '').strip()
+                                _app_url = intranet_data.APP_URL
                                 _proklik = f"\n➡ Přejít do aplikace: {_app_url}\n\n" if _app_url else "\n\n"
                                 text = f"Dobrý den {zadatel_data['jmeno']},\n\nVaše dříve schválená žádost o {z_data['typ']} (v termínu {formatuj_datum(z_data['from'])} až {formatuj_datum(z_data['to'])}) byla STORNOVÁNA vaším nadřízeným.\n\n"
                                 text += f"Důvod storna: {duvod}{_proklik}S pozdravem,\nMoje JIPka"
@@ -1278,7 +1278,7 @@ def vykresli_dochazku(user_id, user_name, vsechna_prava):
                 try:
                     oddeleni_cil = [o.strip() for o in (z_data.get('oddeleni') or '').split(',')]
                     predmet = f"ŽÁDOST O STORNO: {user_name}"
-                    _app_url = intranet_data.nacti_nastaveni_intranetu().get('app_url', '').strip()
+                    _app_url = intranet_data.APP_URL
                     _proklik = f"\n\n➡ Přejít do aplikace: {_app_url}" if _app_url else ""
                     text = (f"Dobrý den,\n\n{user_name} žádá o stornování schválené absence "
                             f"\"{z_data['typ']}\" (v termínu {formatuj_datum(z_data['from'])} – {formatuj_datum(z_data['to'])}).\n\n"
@@ -1341,7 +1341,7 @@ def vykresli_dochazku(user_id, user_name, vsechna_prava):
                                f'{"schválena — absence je stornována" if schvalit else "zamítnuta — absence zůstává schválená"}.')
                     if zadatel_email and zadatel_data.get('email_vyrizeni_zadosti', True):
                         predmet = f"STORNO {'SCHVÁLENO' if schvalit else 'ZAMÍTNUTO'}: {z_data['typ']}"
-                        _app_url = intranet_data.nacti_nastaveni_intranetu().get('app_url', '').strip()
+                        _app_url = intranet_data.APP_URL
                         _proklik = f"\n\n➡ Přejít do aplikace: {_app_url}" if _app_url else ""
                         text = f"Dobrý den {zadatel_data['jmeno']},\n\n{_zprava}{_proklik}\n\nS pozdravem,\nMoje JIPka"
                         asyncio.create_task(asyncio.to_thread(intranet_emaily.odesli_upozorneni_email, zadatel_email, predmet, text))
@@ -1454,7 +1454,7 @@ def vykresli_dochazku(user_id, user_name, vsechna_prava):
                                     break
                             if zadatel_email and zadatel_data.get('email_vyrizeni_zadosti', True):
                                 predmet = f"ÚPRAVA: Vaše schválená absence ({z_data['typ']}) byla upravena"
-                                _app_url = intranet_data.nacti_nastaveni_intranetu().get('app_url', '').strip()
+                                _app_url = intranet_data.APP_URL
                                 _proklik = f"\n➡ Přejít do aplikace: {_app_url}\n\n" if _app_url else "\n\n"
                                 text = (f"Dobrý den {zadatel_data['jmeno']},\n\n"
                                         f"Vaše schválená absence ({z_data['typ']}) byla upravena vaším nadřízeným.\n\n"
@@ -2103,7 +2103,7 @@ def vykresli_dochazku(user_id, user_name, vsechna_prava):
                                                 if prijemci_k_odeslani:
                                                     typ_nazev = typy_volna.get(typ_select.value, 'volno')
                                                     predmet = f"Nový záznam: {cil_data['jmeno_cele']}"
-                                                    _app_url = intranet_data.nacti_nastaveni_intranetu().get('app_url', '').strip()
+                                                    _app_url = intranet_data.APP_URL
                                                     _proklik = f"\n\n➡ Přejít do aplikace: {_app_url}" if _app_url else ""
                                                     text = f"Dobrý den,\n\n{cil_data['jmeno_cele']} přidal záznam: {typ_nazev} v termínu od {date_od.value} do {date_do.value}{_cas_str_z} ({_dur_str_z}).\n\nProsím, přihlaste se do Moje JIPka k náhledu na záznam.{_proklik}\n\nToto je automatická zpráva z portálu Moje JIPka"
                                                     for p_email in prijemci_k_odeslani:
@@ -2293,7 +2293,7 @@ def vykresli_dochazku(user_id, user_name, vsechna_prava):
                                         break
                                 if zadatel_email and zadatel_data.get('email_vyrizeni_zadosti', True):
                                     predmet = "Na Váš záznam byla učiněna reakce"
-                                    _app_url = intranet_data.nacti_nastaveni_intranetu().get('app_url', '').strip()
+                                    _app_url = intranet_data.APP_URL
                                     _proklik = f"\n\n➡ Přejít do aplikace: {_app_url}" if _app_url else ""
                                     text = f"Dobrý den {zadatel_data['jmeno']},\n\nNa Váš záznam \"{z_data['typ']}\" (v termínu {formatuj_datum(z_data['from'])} až {formatuj_datum(z_data['to'])}) byla učiněna reakce.{_proklik}\n\nToto je automatická zpráva z portálu Moje JIPka"
                                     asyncio.create_task(asyncio.to_thread(intranet_emaily.odesli_upozorneni_email, zadatel_email, predmet, text))
@@ -2336,7 +2336,7 @@ def vykresli_dochazku(user_id, user_name, vsechna_prava):
                                                 break
                                         if zadatel_email and zadatel_data.get('email_vyrizeni_zadosti', True):
                                             predmet = "Na Váš záznam byla učiněna reakce"
-                                            _app_url = intranet_data.nacti_nastaveni_intranetu().get('app_url', '').strip()
+                                            _app_url = intranet_data.APP_URL
                                             _proklik = f"\n\n➡ Přejít do aplikace: {_app_url}" if _app_url else ""
                                             text = f"Dobrý den {zadatel_data['jmeno']},\n\nNa Váš záznam \"{z_data['typ']}\" (v termínu {formatuj_datum(z_data['from'])} až {formatuj_datum(z_data['to'])}) byla učiněna reakce."
                                             if duvod_val.strip():

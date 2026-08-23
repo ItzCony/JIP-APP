@@ -2045,7 +2045,7 @@ def _emaily_spravce(oddeleni):
 
 def _app_url():
     try:
-        u = (intranet_data.nacti_nastaveni_intranetu().get("app_url", "") or "").strip().rstrip("/")
+        u = intranet_data.APP_URL
         return f"{u}/cenopripad" if u else ""
     except Exception:
         return ""
