@@ -1196,7 +1196,7 @@ def _emaily_spravce():
 
 def _app_url():
     try:
-        u = (intranet_data.nacti_nastaveni_intranetu().get("app_url", "") or "").strip().rstrip("/")
+        u = intranet_data.APP_URL
         return f"{u}/asm" if u else ""
     except Exception:
         return ""
@@ -1208,7 +1208,7 @@ def _pripad_url(pripad_id):
     if not pripad_id:
         return _app_url()
     try:
-        u = (intranet_data.nacti_nastaveni_intranetu().get("app_url", "") or "").strip().rstrip("/")
+        u = intranet_data.APP_URL
         return f"{u}/asm?pripad={int(pripad_id)}" if u else ""
     except Exception:
         return ""
@@ -1244,7 +1244,7 @@ def _smtp_domena():
     """Firemní e-mailová doména = část za '@' v odesílací adrese (smtp_user).
     Bez konfigurace vrací "" → e-maily OZ se nedopočítají."""
     try:
-        su = (intranet_data.nacti_nastaveni_intranetu().get("smtp_user") or "").strip()
+        su = (intranet_data.nacti_smtp().get("smtp_user") or "").strip()
     except Exception:
         su = ""
     return su.split("@", 1)[1].lower() if "@" in su else ""

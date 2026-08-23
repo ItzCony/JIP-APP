@@ -646,7 +646,7 @@ def _prepni_termin(termin_id, aktivni):
 # =========================================================
 def _app_url() -> str:
     try:
-        u = (intranet_data.nacti_nastaveni_intranetu().get('app_url', '') or '').strip().rstrip('/')
+        u = intranet_data.APP_URL
         return f'{u}/asm' if u else ''   # modul bydlí v rozcestníku Formulářů ASM
     except Exception:
         return ''

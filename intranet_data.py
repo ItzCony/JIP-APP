@@ -134,11 +134,17 @@ def export_zip_heslo() -> bytes:
 
 SOUBOR_NASTAVENI_INTRANETU = 'nastaveni_intranetu.json'
 
+# Veřejná URL portálu pro odkazy v e-mailech. Není tajemství, ale patří ke
+# konfiguraci prostředí (test/ostrý), ne do editovatelného nastavení portálu.
+APP_URL = os.environ.get('JIPKA_APP_URL', '').strip().rstrip('/')
+
 # ==========================================
 # GLOBÁLNÍ PAMĚŤOVÁ CACHE (RAM)
 # ==========================================
 CACHE_NASTAVENI = None
+_CACHE_NASTAVENI_MTIME = 0.0
 CACHE_MYSQL = None
+CACHE_SMTP = None
 DB_POOL = None
 DB_ZAKLAD_INICIALIZOVAN = False
 
@@ -399,10 +405,24 @@ def vycistit_stare_cache_prava(max_vek_sekund=7200):
         del _CACHE_PRAVA[uid]
 
 def nacti_nastaveni_intranetu():
-    global CACHE_NASTAVENI
-    if CACHE_NASTAVENI is not None:
+    """Nastavení portálu z JSONu, cachované v RAM podle mtime souboru.
+
+    Cache se zahodí, jakmile se soubor na disku změní — tedy i při ruční editaci
+    na serveru nebo zápisu z jiného workeru, ne jen po zápisu z tohohle procesu.
+    Cena je jeden stat() na čtení. Strop: mtime má na některých FS granularitu
+    1 s, takže dvě změny ve stejné sekundě se můžou slít; u zápisů z UI to jistí
+    uloz_nastaveni_intranetu(), které cache nastaví rovnou.
+    """
+    global CACHE_NASTAVENI, _CACHE_NASTAVENI_MTIME
+    try:
+        mtime = os.path.getmtime(SOUBOR_NASTAVENI_INTRANETU)
+    except OSError:
+        mtime = 0.0
+
+    if CACHE_NASTAVENI is not None and mtime == _CACHE_NASTAVENI_MTIME:
         return CACHE_NASTAVENI
 
+    _CACHE_NASTAVENI_MTIME = mtime
     if not os.path.exists(SOUBOR_NASTAVENI_INTRANETU):
         CACHE_NASTAVENI = {"dlazdice_1": "Zkouškový Kvíz", "dlazdice_2": "Dokumenty", "dlazdice_3": "Docházka a Volno"}
         return CACHE_NASTAVENI
@@ -457,11 +477,14 @@ def zapis_json_atomicky(cesta: str, data, *, tajne: bool = False, **json_kwargs)
 
 
 def uloz_nastaveni_intranetu(data):
-    global CACHE_NASTAVENI
+    global CACHE_NASTAVENI, _CACHE_NASTAVENI_MTIME
     CACHE_NASTAVENI = data
     try:
-        # tajne=True — obsahuje mj. SMTP heslo → práva 0600.
+        # Hesla už tu nejsou (SMTP jde z env), ale soubor leží v docrootu →
+        # 0600 zůstává jako pojistka proti servírování přes HTTP.
         zapis_json_atomicky(SOUBOR_NASTAVENI_INTRANETU, data, tajne=True, indent=4)
+        # Vlastní zápis nesmí zneplatnit právě naplněnou cache.
+        _CACHE_NASTAVENI_MTIME = os.path.getmtime(SOUBOR_NASTAVENI_INTRANETU)
     except Exception as e:
         print(f"Chyba uložení nastavení na disk: {e}")
 
@@ -494,6 +517,47 @@ def nacti_mysql():
 
     CACHE_MYSQL = cfg
     return CACHE_MYSQL
+
+
+def nacti_smtp():
+    """Přístup k SMTP výhradně z proměnných prostředí JIPKA_SMTP_* — na disku nic není.
+
+    Config je read-only (žádné UI ho nepřepisuje), takže ho stačí přečíst jednou.
+    Změna údajů = úprava EnvironmentFile na serveru + restart služby.
+
+    enabled se neukládá, odvozuje se z kompletnosti údajů. JIPKA_SMTP_ENABLED=0
+    je vypínač pro odstávku, kdy údaje mají zůstat nastavené.
+    Klíče se jmenují stejně jako dřív v JSONu, aby volající kód zůstal beze změny.
+    """
+    global CACHE_SMTP
+    if CACHE_SMTP is not None:
+        return CACHE_SMTP
+
+    # float() kvůli starým hodnotám z ui.number, které se ukládaly jako 465.0.
+    try:
+        port = int(float(os.environ.get('JIPKA_SMTP_PORT', '') or 465))
+    except (ValueError, TypeError):
+        print("[smtp] JIPKA_SMTP_PORT není číslo — používám 465.")
+        port = 465
+
+    cfg = {
+        "smtp_server":   os.environ.get('JIPKA_SMTP_HOST', '').strip(),
+        "smtp_port":     port,
+        "smtp_user":     os.environ.get('JIPKA_SMTP_USER', '').strip(),
+        "smtp_password": os.environ.get('JIPKA_SMTP_PASS', ''),
+        # Prázdný = odvodí se ze smtp_server (viz intranet_emaily).
+        "imap_server":   os.environ.get('JIPKA_SMTP_IMAP_HOST', '').strip(),
+    }
+    cfg["udaje_kompletni"] = bool(cfg["smtp_server"] and cfg["smtp_user"] and cfg["smtp_password"])
+    cfg["vypnuto_operatorem"] = os.environ.get('JIPKA_SMTP_ENABLED', '1').strip().lower() in ('0', 'false', 'no')
+    cfg["enabled"] = cfg["udaje_kompletni"] and not cfg["vypnuto_operatorem"]
+
+    if not cfg["enabled"]:
+        duvod = "vypnuto přes JIPKA_SMTP_ENABLED" if cfg["vypnuto_operatorem"] else "chybí JIPKA_SMTP_HOST/USER/PASS"
+        print(f"[smtp] Odesílání e-mailů je vypnuto — {duvod}.")
+
+    CACHE_SMTP = cfg
+    return CACHE_SMTP
 
 # ========================================================
 # CONNECTION POOLING (ZRYCHLENÍ DATABÁZE)
