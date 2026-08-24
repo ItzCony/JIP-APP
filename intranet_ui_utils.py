@@ -34,7 +34,7 @@ import inspect
 import time
 from typing import Any, Callable, Optional
 
-from nicegui import context
+from nicegui import context, app, ui
 
 # Po jak dlouhé nepřetržité nepřítomnosti WebSocket spojení timer vzdáme.
 # Krátké výpadky (reconnect, uspaný notebook) tick pouze přeskočí.
@@ -187,3 +187,54 @@ def bezpecny_timer(
         interval, callback,
         once=once, active=active, immediate=immediate, popis=popis,
     )
+
+
+# ───────────────────────────── Refreshable na klienta ─────────────────────────
+# @ui.refreshable použitý jako dekorátor NA ÚROVNI MODULU vyrobí JEDEN objekt
+# už při importu a ten je sdílený všemi připojenými klienty: jeho .targets drží
+# sloty všech relací a NiceGUI je při .refresh() nefiltruje podle klienta
+# (jediný filtr `target.instance` slouží pro @ui.refreshable_method ve třídách
+# a u modulové funkce je vždy None). Jedno kliknutí tedy překreslí i cizí
+# prohlížeče — a protože se cizí slot renderuje v request contextvaru
+# klikajícího klienta, přečte si app.storage.user CIZÍ data.
+#
+# Tenhle wrapper drží jeden refreshable objekt na klienta v app.storage.client,
+# která zaniká spolu s klientem (žádný leak). Volací místa se nemění: objekt je
+# volatelný a .refresh je vázaná metoda, takže ho lze i dál předávat jako
+# callback — klienta si zjistí až ve chvíli volání.
+
+
+class _RefreshableNaKlienta:
+    """Per-klientská náhrada @ui.refreshable pro funkce na úrovni modulu."""
+
+    __slots__ = ('_func', '_klic')
+
+    def __init__(self, func: Callable) -> None:
+        self._func = func
+        self._klic = f'_rf::{func.__module__}.{func.__qualname__}'
+
+    def _rf(self):
+        """Refreshable objekt patřící PRÁVĚ TOMUTO klientovi (líně vyrobený)."""
+        rf = app.storage.client.get(self._klic)
+        if rf is None:
+            rf = ui.refreshable(self._func)
+            app.storage.client[self._klic] = rf
+        return rf
+
+    def __call__(self, *args: Any, **kwargs: Any):
+        return self._rf()(*args, **kwargs)
+
+    def refresh(self, *args: Any, **kwargs: Any):
+        return self._rf().refresh(*args, **kwargs)
+
+    def __repr__(self) -> str:
+        return f'<refreshable_na_klienta {self._klic}>'
+
+
+def refreshable_na_klienta(func: Callable) -> _RefreshableNaKlienta:
+    """Náhrada @ui.refreshable pro funkce definované na úrovni modulu.
+
+    Bez ní si dva současně přihlášení uživatelé přepisují navzájem pohled,
+    protože .refresh() jednoho překreslí sloty všech ostatních.
+    """
+    return _RefreshableNaKlienta(func)
