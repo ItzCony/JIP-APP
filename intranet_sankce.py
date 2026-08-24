@@ -26,6 +26,7 @@ from nicegui import ui, app
 import intranet_data
 import intranet_logger
 import intranet_notifikace
+from intranet_ui_utils import refreshable_na_klienta
 import datetime
 import hashlib
 import io
@@ -2867,7 +2868,7 @@ def _col_defs_zamitnute(muze_psat_pozn: bool) -> list:
     return cols
 
 
-@ui.refreshable
+@refreshable_na_klienta
 async def _vykresli_zamitnute(user_id, user_name, vsechna_prava):
     ma_vse = 'vse' in vsechna_prava
     je_analytik = ma_vse or 'sankce_analytik' in vsechna_prava
@@ -3202,7 +3203,7 @@ def _col_defs_souhrn(je_ucetni: bool) -> list:
     ]
 
 
-@ui.refreshable
+@refreshable_na_klienta
 async def _vykresli_vystaveni(user_id, user_name, vsechna_prava):
     ma_vse = 'vse' in vsechna_prava
     je_analytik = ma_vse or 'sankce_analytik' in vsechna_prava
@@ -4067,7 +4068,7 @@ def _dlazdice(emoji, nadpis, barva_border, barva_btn, on_click):
             f'{barva_btn} text-white font-bold py-3 px-8 rounded-lg shadow-md')
 
 
-@ui.refreshable
+@refreshable_na_klienta
 async def vykresli_sankce(user_id, user_name, vsechna_prava):
     # DB dotazy běží ve vlákně — nedrží event loop celého serveru
     await asyncio.to_thread(inicializace_sankce_db)
