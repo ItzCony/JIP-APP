@@ -4,6 +4,7 @@ import intranet_data, intranet_logger
 import intranet_static
 import intranet_emaily
 import intranet_jobs
+from intranet_ui_utils import refreshable_na_klienta
 try: import fitz; HAS_FITZ = True
 except ImportError: HAS_FITZ = False
 
@@ -1019,7 +1020,7 @@ def ukaz_historii_produktu(hledany_produkt):
 # ==========================================
 # 💼 HLAVNÍ SUPER-MODUL NÁKUP A FAKTURACE
 # ==========================================
-@ui.refreshable
+@refreshable_na_klienta
 def vykresli_finance(user_id, user_name, vsechna_prava):
     inicializace_financi_db()
 
@@ -2024,11 +2025,11 @@ def vykresli_finance(user_id, user_name, vsechna_prava):
                                 ui.label('Kč bez DPH celkem (Z aktuálně zobrazených faktur)').classes('text-xs font-bold uppercase tracking-wider opacity-80')
 
                         with ui.row().classes('w-full bg-white p-4 rounded-xl shadow-sm border border-gray-100 mb-6 items-center gap-4 flex-wrap'):
-                            ui.select({'Všichni': 'Všichni žadatelé', **{z: z for z in sorted(set(f.get('zadavatel', '') for f in vsechny_f if f.get('zadavatel')))}}, value=state.get('filter_zadavatel', 'Všichni')).bind_value(state, 'filter_zadavatel').classes('w-48 bg-gray-50').props('dense outlined')
-                            ui.select({'Všechny': 'Všechny stavy', 'Čeká': 'Čeká na schválení', 'Schváleno': 'Schválené', 'Zamítnuto': 'Zamítnuté', 'Po splatnosti': 'Po splatnosti'}, value=state.get('filter_stav', 'Všechny')).bind_value(state, 'filter_stav').classes('w-48 bg-gray-50').props('dense outlined')
+                            ui.select({'Všichni': 'Všichni žadatelé', **{z: z for z in sorted(set(f.get('zadavatel', '') for f in vsechny_f if f.get('zadavatel')))}}, value=state.get('filter_zadavatel', 'Všichni')).on_value_change(lambda e: state.update(filter_zadavatel=e.value)).classes('w-48 bg-gray-50').props('dense outlined')
+                            ui.select({'Všechny': 'Všechny stavy', 'Čeká': 'Čeká na schválení', 'Schváleno': 'Schválené', 'Zamítnuto': 'Zamítnuté', 'Po splatnosti': 'Po splatnosti'}, value=state.get('filter_stav', 'Všechny')).on_value_change(lambda e: state.update(filter_stav=e.value)).classes('w-48 bg-gray-50').props('dense outlined')
 
-                            ui.input('Datum od', value=state.get('filter_od', '')).bind_value(state, 'filter_od').classes('w-32 bg-gray-50').props('type=date dense outlined clearable')
-                            ui.input('Datum do', value=state.get('filter_do', '')).bind_value(state, 'filter_do').classes('w-32 bg-gray-50').props('type=date dense outlined clearable')
+                            ui.input('Datum od', value=state.get('filter_od', '')).on_value_change(lambda e: state.update(filter_od=e.value)).classes('w-32 bg-gray-50').props('type=date dense outlined clearable')
+                            ui.input('Datum do', value=state.get('filter_do', '')).on_value_change(lambda e: state.update(filter_do=e.value)).classes('w-32 bg-gray-50').props('type=date dense outlined clearable')
 
                             ui.button('Filtrovat', on_click=obsah_panelu.refresh).classes('bg-blue-600 text-white font-bold ml-auto')
                             ui.button(icon='close', color='red', on_click=lambda: (state.update({'filter_zadavatel': 'Všichni', 'filter_stav': 'Všechny', 'filter_od': '', 'filter_do': ''}), obsah_panelu.refresh())).props('flat round')

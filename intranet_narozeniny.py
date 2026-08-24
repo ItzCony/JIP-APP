@@ -15,6 +15,7 @@ import json
 import os
 import unicodedata
 from urllib.parse import quote as _url_quote
+from intranet_ui_utils import refreshable_na_klienta
 
 EMAIL_DOMENA = 'jip-napoje.cz'
 
@@ -587,7 +588,7 @@ def _odesli_kulatiny_upozorneni(dnes, nastaveni):
 # UI — hlavní sekce
 # ==========================================
 
-@ui.refreshable
+@refreshable_na_klienta
 def vykresli_narozeniny(user_id, user_name, vsechna_prava):
     nastaveni = intranet_data.nacti_nastaveni_intranetu()
     nazev     = nastaveni.get('dlazdice_7', 'Narozeniny')
@@ -617,7 +618,7 @@ def vykresli_narozeniny(user_id, user_name, vsechna_prava):
 # TAB: Přehled narozenin
 # ------------------------------------------
 
-@ui.refreshable
+@refreshable_na_klienta
 def _tab_prehled():
     seznam = nacti_data()
 
@@ -733,7 +734,7 @@ def _tab_prehled():
 # TAB: Správa databáze
 # ------------------------------------------
 
-@ui.refreshable
+@refreshable_na_klienta
 def _tab_databaze():
     seznam = nacti_data()
 
@@ -877,7 +878,7 @@ def _tab_databaze():
 # TAB: Podpisy v e-mailu
 # ------------------------------------------
 
-@ui.refreshable
+@refreshable_na_klienta
 def _tab_podpisy():
     podpisy = _ziskej_podpisy()
 

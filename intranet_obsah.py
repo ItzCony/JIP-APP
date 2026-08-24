@@ -23,6 +23,7 @@ import csv
 import io
 import pyzipper
 import tempfile
+from intranet_ui_utils import refreshable_na_klienta, prepni_tab
 
 # České řazení: č/ř/š/ž jsou samostatná písmena, 'ch' po 'h'; á/é/í… řadí k základnímu písmenu.
 # ponytail: vlastní klíč místo locale.strxfrm — locale 'cs' nemusí být na serveru dostupná
@@ -476,7 +477,7 @@ def vykresli_prirazena_prava(prava_keys, zakladni_prava, varianta='osobni'):
                             chip.tooltip(popis)
 
 
-@ui.refreshable
+@refreshable_na_klienta
 def vykresli_prehled(user_id, user_name, vsechna_prava):
     nastaveni = intranet_data.nacti_nastaveni_intranetu()
 
@@ -601,7 +602,7 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
         if ma_pristup_dochazka_zaklad_dlazdice:
             def jit_do_dochazky():
                 app.storage.user['aktivni_slozka_dochazka'] = None
-                app.storage.user['intranet_tab'] = 'dochazka'
+                prepni_tab('dochazka')
             with ui.card().classes('w-80 h-72 items-center justify-center shadow-md hover:scale-105 transition-transform duration-300 cursor-pointer bg-white rounded-2xl border border-orange-100').on('click', jit_do_dochazky):
                 ui.label('📅').classes('text-7xl mb-6')
                 ui.label(nazev_dochazka).classes('text-2xl font-bold text-gray-800 mb-4 text-center')
@@ -609,7 +610,7 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
 
         if ma_pristup_veletrh:
             def jit_do_veletrhu():
-                app.storage.user['intranet_tab'] = 'veletrh'
+                prepni_tab('veletrh')
             with ui.card().classes('w-80 h-72 items-center justify-center shadow-xl hover:scale-105 transition-transform duration-300 cursor-pointer bg-white rounded-2xl border border-purple-200').on('click', jit_do_veletrhu):
                 ui.label('🎪').classes('text-7xl mb-6')
                 ui.label(nazev_veletrh).classes('text-2xl font-bold text-gray-800 mb-4 text-center')
@@ -617,7 +618,7 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
 
         if ma_pristup_finance:
             def jit_do_financi():
-                app.storage.user['intranet_tab'] = 'finance'
+                prepni_tab('finance')
             with ui.card().classes('w-80 h-72 items-center justify-center shadow-xl hover:scale-105 transition-transform duration-300 cursor-pointer bg-white rounded-2xl border border-blue-200').on('click', jit_do_financi):
                 ui.label('💼').classes('text-7xl mb-6')
                 ui.label(nazev_finance).classes('text-2xl font-bold text-gray-800 mb-4 text-center')
@@ -625,7 +626,7 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
 
         if ma_pristup_znacky:
             def jit_do_znacek():
-                app.storage.user['intranet_tab'] = 'znacky'
+                prepni_tab('znacky')
             with ui.card().classes('w-80 h-72 items-center justify-center shadow-xl hover:scale-105 transition-transform duration-300 cursor-pointer bg-white rounded-2xl border border-purple-300').on('click', jit_do_znacek):
                 ui.label('🏷️').classes('text-7xl mb-6')
                 ui.label('Privátní značky JIP').classes('text-2xl font-bold text-gray-800 mb-4 text-center')
@@ -633,7 +634,7 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
 
         if ma_pristup_znacky_provoz:
             def jit_do_znacek_provoz():
-                app.storage.user['intranet_tab'] = 'znacky_provoz'
+                prepni_tab('znacky_provoz')
             with ui.card().classes('w-80 h-72 items-center justify-center shadow-xl hover:scale-105 transition-transform duration-300 cursor-pointer bg-white rounded-2xl border border-blue-300').on('click', jit_do_znacek_provoz):
                 ui.label('🏭').classes('text-7xl mb-6')
                 ui.label('Hlas Provozu').classes('text-2xl font-bold text-gray-800 mb-4 text-center')
@@ -641,7 +642,7 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
 
         if ma_pristup_prod_akt:
             def jit_do_prod_akt():
-                app.storage.user['intranet_tab'] = 'prod_akt'
+                prepni_tab('prod_akt')
             with ui.card().classes('w-80 h-72 items-center justify-center shadow-xl hover:scale-105 transition-transform duration-300 cursor-pointer bg-white rounded-2xl border border-emerald-300').on('click', jit_do_prod_akt):
                 ui.label('📋').classes('text-7xl mb-6')
                 ui.label('Prodejní aktivity').classes('text-2xl font-bold text-gray-800 mb-4 text-center')
@@ -650,7 +651,7 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
         if ma_pristup_narozeniny:
             narozeniny_dnes = intranet_narozeniny.ziskej_pocet_narozenin_dnes(vsechna_prava)
             def jit_do_narozenin():
-                app.storage.user['intranet_tab'] = 'narozeniny'
+                prepni_tab('narozeniny')
             with ui.card().classes('w-80 h-72 items-center justify-center shadow-xl hover:scale-105 transition-transform duration-300 cursor-pointer bg-white rounded-2xl border border-pink-200 relative').on('click', jit_do_narozenin):
                 if narozeniny_dnes > 0:
                     ui.badge(str(narozeniny_dnes), color='red').classes('absolute top-3 right-3 text-lg font-black px-2')
@@ -660,7 +661,7 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
 
         if _ma_smeny:
             def jit_do_smen():
-                app.storage.user['intranet_tab'] = 'smeny'
+                prepni_tab('smeny')
             with ui.card().classes('w-80 h-72 items-center justify-center shadow-xl hover:scale-105 transition-transform duration-300 cursor-pointer bg-white rounded-2xl border border-teal-200').on('click', jit_do_smen):
                 ui.label('⌨️').classes('text-7xl mb-6')
                 ui.label('Plánování směn').classes('text-2xl font-bold text-gray-800 mb-4 text-center')
@@ -668,7 +669,7 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
 
         if ma_pristup_komunikace:
             def jit_do_komunikace():
-                app.storage.user['intranet_tab'] = 'komunikace'
+                prepni_tab('komunikace')
             with ui.card().classes('w-80 h-72 items-center justify-center shadow-xl hover:scale-105 transition-transform duration-300 cursor-pointer bg-white rounded-2xl border border-cyan-200').on('click', jit_do_komunikace):
                 ui.label('💬').classes('text-7xl mb-6')
                 ui.label(nazev_komunikace).classes('text-2xl font-bold text-gray-800 mb-4 text-center')
@@ -676,7 +677,7 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
 
         if ma_pristup_planogram:
             def jit_do_planogramu():
-                app.storage.user['intranet_tab'] = 'planogram'
+                prepni_tab('planogram')
             with ui.card().classes('w-80 h-72 items-center justify-center shadow-xl hover:scale-105 transition-transform duration-300 cursor-pointer bg-white rounded-2xl border border-amber-200').on('click', jit_do_planogramu):
                 ui.label('🚬').classes('text-7xl mb-6')
                 ui.label('Plánogram tabákových výrobků').classes('text-xl font-bold text-gray-800 mb-4 text-center')
@@ -691,7 +692,7 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
                 print(f"[Nástěnka] Počet ochutnávek: {e}")
 
             def jit_do_ochutnavek():
-                app.storage.user['intranet_tab'] = 'ochutnavky'
+                prepni_tab('ochutnavky')
             with ui.card().classes('w-80 h-72 items-center justify-center shadow-xl hover:scale-105 transition-transform duration-300 cursor-pointer bg-white rounded-2xl border border-green-200').on('click', jit_do_ochutnavek):
                 ui.label('🍽️').classes('text-7xl mb-4')
                 ui.label('Ochutnávky MO a CC').classes('text-xl font-bold text-gray-800 mb-2 text-center')
@@ -722,7 +723,7 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
                 _pocet_ukolu = 0
 
             def jit_do_ukolovniku():
-                app.storage.user['intranet_tab'] = 'ukolovnik'
+                prepni_tab('ukolovnik')
             with ui.card().classes('w-80 h-72 items-center justify-center shadow-xl hover:scale-105 transition-transform duration-300 cursor-pointer bg-white rounded-2xl border border-indigo-200 relative').on('click', jit_do_ukolovniku):
                 if _pocet_ukolu > 0:
                     ui.badge(str(_pocet_ukolu), color='red').classes('absolute top-3 right-3 text-lg font-black px-2')
@@ -732,7 +733,7 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
 
         if ma_pristup_vysledky:
             def jit_do_vysledku():
-                app.storage.user['intranet_tab'] = 'vysledky'
+                prepni_tab('vysledky')
             with ui.card().classes('w-80 h-72 items-center justify-center shadow-xl hover:scale-105 transition-transform duration-300 cursor-pointer bg-white rounded-2xl border border-rose-200').on('click', jit_do_vysledku):
                 ui.label('📊').classes('text-7xl mb-6')
                 ui.label('Výsledky poboček').classes('text-2xl font-bold text-gray-800 mb-4 text-center')
@@ -741,7 +742,7 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
         if ma_pristup_sankce:
             def jit_do_sankci():
                 app.storage.user['sankce_pohled'] = None  # po vstupu vždy přehled dvou dlaždic
-                app.storage.user['intranet_tab'] = 'sankce'
+                prepni_tab('sankce')
             with ui.card().classes('w-80 h-72 items-center justify-center shadow-xl hover:scale-105 transition-transform duration-300 cursor-pointer bg-white rounded-2xl border border-red-200').on('click', jit_do_sankci):
                 ui.label('⚖️').classes('text-7xl mb-6')
                 ui.label('Sankce').classes('text-2xl font-bold text-gray-800 mb-4 text-center')
@@ -750,7 +751,7 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
         if ma_pristup_spolvecer:
             def jit_do_spolvecer():
                 app.storage.user[f'spolvecer_sel_{user_id}'] = None  # po vstupu vždy přehled dlaždic poboček
-                app.storage.user['intranet_tab'] = 'spolvecer'
+                prepni_tab('spolvecer')
             with ui.card().classes('w-80 h-72 items-center justify-center shadow-xl hover:scale-105 transition-transform duration-300 cursor-pointer bg-white rounded-2xl border border-fuchsia-200').on('click', jit_do_spolvecer):
                 ui.label('🎉').classes('text-7xl mb-6')
                 ui.label('Spol. večer 2026').classes('text-2xl font-bold text-gray-800 mb-4 text-center')
@@ -758,7 +759,7 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
 
         if ma_pristup_vizitky:
             def jit_do_vizitek():
-                app.storage.user['intranet_tab'] = 'vizitky'
+                prepni_tab('vizitky')
             with ui.card().classes('w-80 h-72 items-center justify-center shadow-xl hover:scale-105 transition-transform duration-300 cursor-pointer bg-white rounded-2xl border border-sky-200').on('click', jit_do_vizitek):
                 ui.label('🪪').classes('text-7xl mb-6')
                 ui.label('Vizitky a podpisy').classes('text-2xl font-bold text-gray-800 mb-4 text-center')
@@ -767,7 +768,7 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
         if ma_pristup_cenopripad:
             def jit_do_cenopripad():
                 app.storage.user['cenopripad_pohled'] = None  # po vstupu vždy rozcestník dlaždic
-                app.storage.user['intranet_tab'] = 'cenopripad'
+                prepni_tab('cenopripad')
             with ui.card().classes('w-80 h-72 items-center justify-center shadow-xl hover:scale-105 transition-transform duration-300 cursor-pointer bg-white rounded-2xl border border-emerald-200').on('click', jit_do_cenopripad):
                 ui.label('🏷️').classes('text-7xl mb-6')
                 ui.label('Cenopřípad').classes('text-2xl font-bold text-gray-800 mb-4 text-center')
@@ -776,7 +777,7 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
         if ma_pristup_asm:
             def jit_do_asm():
                 app.storage.user['asm_pohled'] = None  # po vstupu vždy rozcestník dlaždic
-                app.storage.user['intranet_tab'] = 'asm'
+                prepni_tab('asm')
             with ui.card().classes('w-80 h-72 items-center justify-center shadow-xl hover:scale-105 transition-transform duration-300 cursor-pointer bg-white rounded-2xl border border-emerald-200').on('click', jit_do_asm):
                 ui.label('📝').classes('text-7xl mb-6')
                 ui.label('Formuláře ASM').classes('text-2xl font-bold text-gray-800 mb-4 text-center')
@@ -785,7 +786,7 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
         if ma_pristup_lupa:
             def jit_do_lupa():
                 app.storage.user[f'lupa_pohled_{user_id}'] = None  # vždy rozcestník ASM
-                app.storage.user['intranet_tab'] = 'lupa'
+                prepni_tab('lupa')
             with ui.card().classes('w-80 h-72 items-center justify-center shadow-xl hover:scale-105 transition-transform duration-300 cursor-pointer bg-white rounded-2xl border border-indigo-200').on('click', jit_do_lupa):
                 ui.label('🔍').classes('text-7xl mb-6')
                 ui.label('Lupou na obchod').classes('text-2xl font-bold text-gray-800 mb-4 text-center')
@@ -797,12 +798,12 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
     # ==========================================
     with ui.page_sticky(position='bottom-right', x_offset=20, y_offset=20):
         def jit_na_helpdesk():
-            app.storage.user['intranet_tab'] = 'helpdesk'
+            prepni_tab('helpdesk')
 
         ui.button('Podpora', icon='support_agent', on_click=jit_na_helpdesk) \
             .classes('bg-blue-600 hover:bg-blue-700 text-white font-bold rounded-full shadow-[0_10px_25px_rgba(37,99,235,0.4)] px-5 h-12 text-sm transition-transform hover:scale-105')
 
-@ui.refreshable
+@refreshable_na_klienta
 def vykresli_osobni_nastaveni(user_id, user_email, user_name):
     ui.label('Osobní nastavení účtu').classes('text-4xl font-extrabold text-gray-800 mb-8')
 
@@ -1104,7 +1105,7 @@ def _tl_karta(d, stav, storno_req=False, extra=''):
             'border-left:5px solid ' + ('#ea580c' if storno_req else _TL_BARVY.get(stav, '#9ca3af')))
 
 
-@ui.refreshable
+@refreshable_na_klienta
 def vykresli_dochazku(user_id, user_name, vsechna_prava):
     _nast_doc = intranet_data.nacti_nastaveni_intranetu()
     presczasy_zapnuty = _nast_doc.get('presczasy_zapnuty', True)
@@ -1641,8 +1642,9 @@ def vykresli_dochazku(user_id, user_name, vsechna_prava):
                                 ui.label(t).classes('text-xs font-bold')
                     if zobraz_odd_filtr:
                         with ui.row().classes('items-center ml-auto'):
-                            cal_filter = ui.select(filter_options, value=app.storage.user.get('cal_odd_filter'), label='Filtrovat kalendář').bind_value(app.storage.user, 'cal_odd_filter').classes('w-64 bg-white').props('dense outlined rounded')
-                            cal_filter.on_value_change(vykresli_mesic.refresh)
+                            cal_filter = ui.select(filter_options, value=app.storage.user.get('cal_odd_filter'), label='Filtrovat kalendář').classes('w-64 bg-white').props('dense outlined rounded')
+                            cal_filter.on_value_change(lambda e: (app.storage.user.update(cal_odd_filter=e.value),
+                                                                  vykresli_mesic.refresh()))
 
             pocet_dni = calendar.monthrange(y, m)[1]
             statni_svatky = ziskej_statni_svatky(y, m)
@@ -1800,11 +1802,13 @@ def vykresli_dochazku(user_id, user_name, vsechna_prava):
     if app.storage.user.get('dochazka_vnitrni_tab') not in dostupne_vnitrni:
         app.storage.user['dochazka_vnitrni_tab'] = dostupne_vnitrni[0] if dostupne_vnitrni else None
 
-    with ui.tabs().props('no-caps align=left dense active-color=red-6 indicator-color=red-6').bind_value(app.storage.user, 'dochazka_vnitrni_tab').classes('w-full justify-start border-b-2 border-gray-200 mb-4 text-gray-600') as main_tabs:
+    with ui.tabs(value=app.storage.user['dochazka_vnitrni_tab']).props('no-caps align=left dense active-color=red-6 indicator-color=red-6').classes('w-full justify-start border-b-2 border-gray-200 mb-4 text-gray-600') as main_tabs:
         if ma_pristup_zadosti or povoleny_schvalovat_oddeleni or jsem_neci_manazer or jsem_majitel: ui.tab('moje', label='Moje docházka').classes('text-sm font-semibold')
         if povoleny_sprava_oddeleni: ui.tab('sprava', label='Záznamy oddělení').classes('text-sm font-semibold')
 
-    with ui.tab_panels(main_tabs, value=app.storage.user['dochazka_vnitrni_tab']).bind_value(app.storage.user, 'dochazka_vnitrni_tab').classes('w-full bg-transparent p-0'):
+    main_tabs.on_value_change(lambda e: app.storage.user.update(dochazka_vnitrni_tab=e.value))
+
+    with ui.tab_panels(main_tabs, value=app.storage.user['dochazka_vnitrni_tab']).classes('w-full bg-transparent p-0'):
 
         # ==========================================================
         # TAB 1: MOJE DOCHÁZKA (Žádosti + Schvalování)
@@ -2923,7 +2927,7 @@ def _matice_zip_sync(matice: dict, katalog: dict, kategorie: list,
         zf.writestr(xlsx_nazev, buf.getvalue())
     return cesta, zip_nazev, len(uzivatele), len(klice)
 
-@ui.refreshable
+@refreshable_na_klienta
 def vykresli_spravu_uzivatelu(user_email, user_name, vsechna_prava=None):
     # Matici práv smí stáhnout jen superadmin — je to mapa, kudy do aplikace.
     _je_superadmin = "vse" in (vsechna_prava or [])

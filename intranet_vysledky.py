@@ -4,6 +4,7 @@ import intranet_logger
 import datetime
 import re
 import unicodedata
+from intranet_ui_utils import refreshable_na_klienta
 
 
 def _bez_diakritiky(s: str) -> str:
@@ -4320,7 +4321,7 @@ def _vykresli_ostatni_provozy(user_id: int, user_name: str, je_ao: bool, je_ucet
                 )
 
 
-@ui.refreshable
+@refreshable_na_klienta
 def vykresli_vysledky(user_id: int, user_name: str, vsechna_prava: list):
     inicializace_vysledky_db()
 
@@ -5069,7 +5070,7 @@ def _vykresli_detail_pobocky(pobocka: str, user_id: int, user_name: str, je_ao: 
                     _tab_defs[key][1]()
 
 
-@ui.refreshable
+@refreshable_na_klienta
 def _vykresli_pobocka_komentare(pobocka: str, user_id: int, user_name: str, je_ao: bool):
     """Sekce „Komentáře" v detailu pobočky – jednoduchý chat pro všechny, kdo
     mají k pobočce přístup. U každé zprávy se eviduje, kdo ji napsal a kdy.
@@ -5150,7 +5151,7 @@ def _vykresli_pobocka_komentare(pobocka: str, user_id: int, user_name: str, je_a
                 .props('round unelevated color=primary').tooltip('Odeslat (Ctrl+Enter)')
 
 
-@ui.refreshable
+@refreshable_na_klienta
 def _vykresli_souhrn_nakladu(pobocka: str, je_ao: bool, user_name: str, user_id: int = 0):
     # ── Data grid ────────────────────────────────────────────────────────────
     raw = nacti_souhrn(pobocka)
@@ -5784,7 +5785,7 @@ def _tabulka_aktualni(pobocka: str, rok: int, user_id: int, user_name: str, je_u
             ui.label('Pouze pro čtení.').classes('text-xs text-gray-400 italic')
 
 
-@ui.refreshable
+@refreshable_na_klienta
 def _tabulka_porovnani(pobocka: str, aktualni_rok: int, je_ucetni: bool = False):
     rows       = nacti_porovnani(pobocka, aktualni_rok)
     minuly_rok = aktualni_rok - 1
@@ -6540,12 +6541,12 @@ def _oz_render_novy(pobocka: str, je_ao: bool, user_name: str, list_klic: str):
                           f'Marže v % – {marze_pod[skup]}', [], False, je_marze=True, popis_h=28)
 
 
-@ui.refreshable
+@refreshable_na_klienta
 def _vykresli_obraty(pobocka: str, je_ao: bool, user_name: str):
     _oz_render_novy(pobocka, je_ao, user_name, 'obraty')
 
 
-@ui.refreshable
+@refreshable_na_klienta
 def _vykresli_zisk(pobocka: str, je_ao: bool, user_name: str):
     _oz_render_novy(pobocka, je_ao, user_name, 'zisk')
 

@@ -11,6 +11,7 @@ import openpyxl
 from docxtpl import DocxTemplate
 import intranet_data
 import intranet_jobs
+from intranet_ui_utils import refreshable_na_klienta
 
 
 def build_zakaznici_veletrh_xlsx(zakaznici: list) -> str:
@@ -749,7 +750,7 @@ ui.add_head_html('''
 ''', shared=True)
 
 
-@ui.refreshable
+@refreshable_na_klienta
 def vykresli_veletrh(user_id, user_name, vsechna_prava):
     # --- Per-user UI state init ---
     if user_id not in _UI_STATE:

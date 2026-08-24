@@ -14,6 +14,7 @@ from datetime import date, datetime, timedelta
 import intranet_data
 import intranet_notifikace
 from nicegui import ui
+from intranet_ui_utils import refreshable_na_klienta
 
 # ─────────────────────────────────────────────────────────────────────────────
 # KONSTANTY
@@ -1230,7 +1231,7 @@ def _pole_datum(label, sirka='w-44', min_datum=None):
     return inp
 
 
-@ui.refreshable
+@refreshable_na_klienta
 def vykresli_ochutnavky(user_id, user_name, vsechna_prava):
     _init_db()
     os.makedirs(PRILOHY_DIR, exist_ok=True)

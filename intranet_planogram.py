@@ -13,6 +13,7 @@ from datetime import datetime
 import intranet_data
 import intranet_notifikace
 from nicegui import ui
+from intranet_ui_utils import refreshable_na_klienta
 
 # ─────────────────────────────────────────────────────────────────────────────
 # KONSTANTY
@@ -1710,7 +1711,7 @@ h1{{font-size:16px;font-weight:900;color:#1e3a5f;margin-bottom:3px}}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-@ui.refreshable
+@refreshable_na_klienta
 def vykresli_planogram(user_id, user_name, vsechna_prava):
     _init_db()
     os.makedirs(FOTO_DIR, exist_ok=True)

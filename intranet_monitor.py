@@ -86,10 +86,6 @@ _posledni: dict = {
     'procesy': 0, 'app_cpu': 0.0, 'app_ram': 0.0, 'app_thr': 0,
 }
 
-# Pomalé/těžší struktury (aktualizují se řidčeji)
-_top_procesy: list = []
-_disk_oddily: list = []
-
 # Statické informace o serveru (zjištěné jednou při importu)
 _BOOT = psutil.boot_time()
 try:
@@ -126,63 +122,6 @@ _prev = {
     'disk': psutil.disk_io_counters(),
     't':    time.time(),
 }
-_proc_cache: dict = {}   # pid → psutil.Process (kvůli cpu_percent mezi voláními)
-
-
-def _sber_top_procesy(limit: int = 8) -> list:
-    """Vrátí TOP procesy podle CPU. Běží v threadu (volá se 1×/3 s)."""
-    global _proc_cache
-    nove: dict = {}
-    vystup = []
-    for p in psutil.process_iter(['pid', 'name', 'memory_percent']):
-        try:
-            pid = p.info['pid']
-            if pid == 0:        # System Idle Process (Win) / scheduler — nezajímavé
-                continue
-            proc = _proc_cache.get(pid) or p
-            nove[pid] = proc
-            cpu = proc.cpu_percent(None) / pocet_jader     # podíl na celém CPU
-            vystup.append({
-                'pid':  pid,
-                'name': (p.info.get('name') or '?')[:30],
-                'cpu':  cpu,
-                'mem':  p.info.get('memory_percent') or 0.0,
-            })
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
-        except Exception:
-            continue
-    _proc_cache = nove
-    vystup.sort(key=lambda x: x['cpu'], reverse=True)
-    return vystup[:limit]
-
-
-def _sber_oddily() -> list:
-    """Využití jednotlivých diskových oddílů. Běží v threadu (1×/3 s)."""
-    out = []
-    try:
-        oddily = psutil.disk_partitions(all=False)
-    except Exception:
-        oddily = []
-    videno = set()
-    for part in oddily:
-        mp = part.mountpoint
-        if mp in videno or 'cdrom' in (part.opts or '') or not part.fstype:
-            continue
-        videno.add(mp)
-        try:
-            u = psutil.disk_usage(mp)
-            out.append({
-                'mount':   mp,
-                'fs':      part.fstype,
-                'pct':     u.percent,
-                'pouzito': u.used,
-                'celkem':  u.total,
-                'volno':   u.free,
-            })
-        except Exception:
-            continue
-    return out
 
 
 def aktualizuj_data_pozadi():
@@ -266,16 +205,9 @@ async def bg_monitor():
             _PROC_APP.cpu_percent(None)
         except Exception:
             pass
-    tik = 0
     while True:
         try:
             aktualizuj_data_pozadi()
-            tik += 1
-            if tik % 3 == 0:
-                # Těžší sběr mimo event-loop, ať neblokuje ostatní klienty
-                global _top_procesy, _disk_oddily
-                _top_procesy = await asyncio.to_thread(_sber_top_procesy)
-                _disk_oddily = await asyncio.to_thread(_sber_oddily)
         except Exception:
             pass
         await asyncio.sleep(1)
@@ -357,33 +289,16 @@ def vykresli_monitor(vsechna_prava):
             detail = ui.label('').classes('text-xs text-gray-400 truncate')
         return {'val': val, 'fill': fill, 'detail': detail}
 
-    def _kpi_val(titulek, ikona, ikona_barva):
-        with ui.card().classes(_CARD + ' gap-2'):
-            with ui.row().classes('w-full items-center gap-2 flex-nowrap'):
-                ui.icon(ikona, size='sm').classes(ikona_barva + ' shrink-0')
-                ui.label(titulek).classes('text-xs font-bold uppercase tracking-wider text-gray-400 truncate')
-            val = ui.label('—').classes('text-2xl font-black text-gray-800')
-            detail = ui.label('').classes('text-xs text-gray-400 truncate')
-        return {'val': val, 'detail': detail}
-
     def _set_pct(ref, pct, detail):
         ref['val'].set_text(f'{pct:.1f} %')
         ref['fill'].style(f'width:{min(pct, 100):.1f}%;background:{_barva_pct(pct)}')
         ref['detail'].set_text(detail)
 
     # ── Řada 1: procentuální ukazatele ────────────────────────────────────────
-    with ui.element('div').classes('w-full grid gap-4 grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 mb-4'):
+    with ui.element('div').classes('w-full grid gap-4 grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 mb-4'):
         kpi_cpu  = _kpi_pct('Procesor (CPU)',     'memory',       'text-green-500')
         kpi_ram  = _kpi_pct('Operační paměť',     'developer_board', 'text-blue-500')
         kpi_swap = _kpi_pct('Odkládací (Swap)',   'swap_horiz',   'text-indigo-500')
-        kpi_disk = _kpi_pct('Disk ( / )',         'storage',      'text-purple-500')
-
-    # ── Řada 2: hodnotové ukazatele ───────────────────────────────────────────
-    with ui.element('div').classes('w-full grid gap-4 grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 mb-6'):
-        kpi_net   = _kpi_val('Síť (provoz)',     'swap_vert',     'text-teal-500')
-        kpi_dio   = _kpi_val('Disk I/O',         'sync_alt',      'text-cyan-500')
-        kpi_jobs  = _kpi_val('Těžké úlohy',      'bolt',          'text-amber-500')
-        kpi_users = _kpi_val('Přihlášení',       'group',         'text-rose-500')
 
     # ── Systémový informační panel ────────────────────────────────────────────
     def _info_item(popisek, hodnota, ikona):
@@ -426,8 +341,8 @@ def vykresli_monitor(vsechna_prava):
         'series': cpu_series,
     }).classes('w-full h-72 bg-white p-4 shadow-sm rounded-2xl border border-gray-100 mb-6')
 
-    # ── Grafy: RAM/Swap a Síť ─────────────────────────────────────────────────
-    with ui.element('div').classes('w-full grid gap-6 grid-cols-1 xl:grid-cols-2 mb-6'):
+    # ── Graf: Paměť (RAM & Swap) ─────────────────────────────────────────────────
+    with ui.element('div').classes('w-full grid gap-6 grid-cols-1 mb-6'):
         with ui.column().classes('gap-2'):
             ui.label('Paměť (RAM & Swap)').classes('text-lg font-bold text-gray-700')
             graf_mem = ui.echart({
@@ -444,117 +359,7 @@ def vykresli_monitor(vsechna_prava):
                 ],
             }).classes('w-full h-72 bg-white p-4 shadow-sm rounded-2xl border border-gray-100')
 
-        with ui.column().classes('gap-2'):
-            ui.label('Síťový provoz').classes('text-lg font-bold text-gray-700')
-            graf_net = ui.echart({
-                'tooltip': {'trigger': 'axis'},
-                'legend': {'data': ['Download', 'Upload'], 'bottom': 0},
-                'grid': {'left': '3%', 'right': '4%', 'bottom': '14%', 'top': '8%', 'containLabel': True},
-                'xAxis': {'type': 'category', 'boundaryGap': False, 'data': list(casova_osa)},
-                'yAxis': {'type': 'value', 'axisLabel': {'formatter': '{value} KB/s'}},
-                'series': [
-                    {'name': 'Download', 'type': 'line', 'data': list(net_down_historie), 'smooth': True,
-                     'showSymbol': False, 'itemStyle': {'color': '#10b981'}, 'areaStyle': {'opacity': 0.2}},
-                    {'name': 'Upload', 'type': 'line', 'data': list(net_up_historie), 'smooth': True,
-                     'showSymbol': False, 'itemStyle': {'color': '#f59e0b'}, 'areaStyle': {'opacity': 0.15}},
-                ],
-            }).classes('w-full h-72 bg-white p-4 shadow-sm rounded-2xl border border-gray-100')
-
-    # ── Graf: Disk I/O + TOP procesy ──────────────────────────────────────────
-    with ui.element('div').classes('w-full grid gap-6 grid-cols-1 xl:grid-cols-2 mb-6'):
-        with ui.column().classes('gap-2'):
-            ui.label('Diskové operace (I/O)').classes('text-lg font-bold text-gray-700')
-            graf_dio = ui.echart({
-                'tooltip': {'trigger': 'axis'},
-                'legend': {'data': ['Čtení', 'Zápis'], 'bottom': 0},
-                'grid': {'left': '3%', 'right': '4%', 'bottom': '14%', 'top': '8%', 'containLabel': True},
-                'xAxis': {'type': 'category', 'boundaryGap': False, 'data': list(casova_osa)},
-                'yAxis': {'type': 'value', 'axisLabel': {'formatter': '{value} KB/s'}},
-                'series': [
-                    {'name': 'Čtení', 'type': 'line', 'data': list(disk_read_historie), 'smooth': True,
-                     'showSymbol': False, 'itemStyle': {'color': '#06b6d4'}, 'areaStyle': {'opacity': 0.2}},
-                    {'name': 'Zápis', 'type': 'line', 'data': list(disk_write_historie), 'smooth': True,
-                     'showSymbol': False, 'itemStyle': {'color': '#ef4444'}, 'areaStyle': {'opacity': 0.15}},
-                ],
-            }).classes('w-full h-72 bg-white p-4 shadow-sm rounded-2xl border border-gray-100')
-
-        with ui.column().classes('gap-2'):
-            ui.label('Nejnáročnější procesy (CPU)').classes('text-lg font-bold text-gray-700')
-            with ui.card().classes(_CARD + ' w-full h-72 overflow-y-auto'):
-                _proc_sloupce = [
-                    {'name': 'pid',  'label': 'PID',     'field': 'pid',  'align': 'left'},
-                    {'name': 'name', 'label': 'Proces',  'field': 'name', 'align': 'left'},
-                    {'name': 'cpu',  'label': 'CPU %',   'field': 'cpu',  'align': 'right', 'sortable': True},
-                    {'name': 'mem',  'label': 'RAM %',   'field': 'mem',  'align': 'right', 'sortable': True},
-                ]
-
-                @ui.refreshable
-                def _tab_procesy():
-                    if not _top_procesy:
-                        ui.label('Sbírám data o procesech…').classes('text-sm text-gray-400 italic')
-                        return
-                    rows = [{'pid': p['pid'], 'name': p['name'],
-                             'cpu': f"{p['cpu']:.1f}", 'mem': f"{p['mem']:.1f}"} for p in _top_procesy]
-                    ui.table(columns=_proc_sloupce, rows=rows, row_key='pid') \
-                        .props('flat dense').classes('w-full')
-                _tab_procesy()
-
-    # ── Diskové oddíly + přihlášení uživatelé ─────────────────────────────────
-    with ui.element('div').classes('w-full grid gap-6 grid-cols-1 xl:grid-cols-2 mb-6'):
-        with ui.column().classes('gap-2'):
-            ui.label('Využití diskových oddílů').classes('text-lg font-bold text-gray-700')
-            with ui.card().classes(_CARD + ' w-full gap-4'):
-                @ui.refreshable
-                def _tab_oddily():
-                    if not _disk_oddily:
-                        ui.label('Načítám oddíly…').classes('text-sm text-gray-400 italic')
-                        return
-                    for o in _disk_oddily:
-                        with ui.column().classes('w-full gap-1'):
-                            with ui.row().classes('w-full justify-between items-center flex-nowrap'):
-                                ui.label(f"{o['mount']}  ·  {o['fs']}").classes('text-sm font-bold text-gray-700 truncate')
-                                ui.label(f"{_lidska_velikost(o['pouzito'])} / {_lidska_velikost(o['celkem'])}  ·  {o['pct']:.0f} %") \
-                                    .classes('text-xs text-gray-500 shrink-0')
-                            track = ui.element('div').classes('w-full rounded-full bg-gray-100').style('height:8px;overflow:hidden')
-                            with track:
-                                ui.element('div').classes('rounded-full') \
-                                    .style(f"height:8px;width:{min(o['pct'], 100)}%;background:{_barva_pct(o['pct'])}")
-                _tab_oddily()
-
-        with ui.column().classes('gap-2'):
-            with ui.row().classes('w-full items-center justify-between'):
-                ui.label('Přihlášení uživatelé').classes('text-lg font-bold text-gray-700')
-                lbl_users_pocet = ui.label('0').classes('text-sm font-bold text-rose-600 bg-rose-50 rounded-full px-3 py-0.5')
-            with ui.card().classes(_CARD + ' w-full max-h-72 overflow-y-auto gap-1'):
-                @ui.refreshable
-                def _tab_uzivatele():
-                    akt = ziskej_aktivni()
-                    if not akt:
-                        ui.label('Nikdo není přihlášen.').classes('text-sm text-gray-400 italic')
-                        return
-                    for u in akt:
-                        with ui.row().classes('w-full items-center gap-3 p-2 rounded-lg hover:bg-gray-50 flex-nowrap'):
-                            ui.icon('account_circle', size='sm').classes('text-blue-400 shrink-0')
-                            with ui.column().classes('gap-0 min-w-0 flex-1'):
-                                ui.label(u['jmeno']).classes('text-sm font-bold text-gray-700 truncate')
-                                _pod = u['email'] + (f"  ·  {u['ip']}" if u['ip'] else '')
-                                ui.label(_pod).classes('text-xs text-gray-400 truncate')
-                            with ui.column().classes('gap-0 items-end shrink-0'):
-                                ui.label(u['trvani']).classes('text-sm font-bold text-gray-700')
-                                ui.label(f"od {u['od']}").classes('text-xs text-gray-400')
-                _tab_uzivatele()
-
-    # ── Detail fronty těžkých úloh ────────────────────────────────────────────
-    with ui.card().classes(_CARD + ' w-full mb-2'):
-        with ui.row().classes('w-full items-center gap-3'):
-            ui.icon('bolt', size='sm').classes('text-amber-500')
-            ui.label('Fronta těžkých úloh (exporty / tisk / parsování uploadů)') \
-                .classes('text-lg font-bold text-gray-700')
-        jobs_detail = ui.label('').classes('text-sm text-gray-500 mt-1')
-
     # ── Aktualizace UI (čte jen cache, žádné psutil volání) ───────────────────
-    _ui_tik = {'n': 0}
-
     def update_ui():
         p = _posledni
         _set_pct(kpi_cpu, p['cpu'],
@@ -563,28 +368,6 @@ def vykresli_monitor(vsechna_prava):
                  f"{p['ram_pouzito']:.1f} / {p['ram_celkem']:.1f} GB  ·  volno {p['ram_volno']:.1f} GB")
         _set_pct(kpi_swap, p['swap_pct'],
                  (f"{p['swap_pouzito']:.1f} / {p['swap_celkem']:.1f} GB" if p['swap_celkem'] > 0 else 'bez swapu'))
-        _set_pct(kpi_disk, p['disk_pct'],
-                 f"volno {p['disk_volno']:.1f} / {p['disk_celkem']:.1f} GB")
-
-        kpi_net['val'].set_text(f"↓ {_lidsky_tok(p['net_down'])}")
-        kpi_net['detail'].set_text(
-            f"↑ {_lidsky_tok(p['net_up'])}  ·  celkem ↓{_lidska_velikost(p['net_down_celkem'])}")
-        kpi_dio['val'].set_text(f"R {_lidsky_tok(p['disk_read'])}")
-        kpi_dio['detail'].set_text(f"W {_lidsky_tok(p['disk_write'])}")
-
-        ji = intranet_jobs.info()
-        kpi_jobs['val'].set_text(f"{ji['bezici_ulohy']} / {ji['max_workers']}")
-        kpi_jobs['detail'].set_text(
-            ('proces-pool ✓' if ji['pool_aktivni'] else 'jen vlákna') + f"  ·  {ji['jader']} jader")
-        jobs_detail.set_text(
-            f"Běžící: {ji['bezici_ulohy']} / {ji['max_workers']}  ·  "
-            f"{'proces-pool aktivní' if ji['pool_aktivni'] else 'pouze vlákna'}  ·  "
-            f"{ji['jader']} jader  ·  fallbacků na vlákno: {ji['fallbacku_na_vlakno']}")
-
-        _pocet_u = len(_AKTIVNI_UZIVATELE)
-        kpi_users['val'].set_text(str(_pocet_u))
-        kpi_users['detail'].set_text('aktivních relací')
-        lbl_users_pocet.set_text(str(_pocet_u))
 
         lbl_freq.set_text(f"{p['freq']:.0f} MHz" if p['freq'] else '—')
         lbl_uptime.set_text(_uptime_text())
@@ -604,23 +387,6 @@ def vykresli_monitor(vsechna_prava):
         graf_mem.options['series'][0]['data'] = list(ram_historie)
         graf_mem.options['series'][1]['data'] = list(swap_historie)
         graf_mem.update()
-
-        graf_net.options['xAxis']['data'] = osa
-        graf_net.options['series'][0]['data'] = list(net_down_historie)
-        graf_net.options['series'][1]['data'] = list(net_up_historie)
-        graf_net.update()
-
-        graf_dio.options['xAxis']['data'] = osa
-        graf_dio.options['series'][0]['data'] = list(disk_read_historie)
-        graf_dio.options['series'][1]['data'] = list(disk_write_historie)
-        graf_dio.update()
-
-        # Tabulky (procesy, oddíly, uživatelé) stačí přepsat 1×/3 s
-        _ui_tik['n'] += 1
-        if _ui_tik['n'] % 3 == 0:
-            _tab_procesy.refresh()
-            _tab_oddily.refresh()
-            _tab_uzivatele.refresh()
 
     update_ui()
     ui.timer(1.0, update_ui)
