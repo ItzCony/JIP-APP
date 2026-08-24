@@ -33,6 +33,7 @@ import intranet_logger
 import intranet_emaily
 import datetime
 import asyncio
+from intranet_ui_utils import refreshable_na_klienta
 
 
 # =========================================================
@@ -730,7 +731,7 @@ def _mail_rozhodnuto(r, datum, potvrzeno: bool, kdo='', duvod=''):
 # =========================================================
 # HLAVNÍ VYKRESLOVACÍ FUNKCE
 # =========================================================
-@ui.refreshable
+@refreshable_na_klienta
 def vykresli_schuzky(user_id, user_name, user_email, vsechna_prava, s_hlavickou=True):
     inicializace_schuzky_db()
     je_admin = 'vse' in vsechna_prava

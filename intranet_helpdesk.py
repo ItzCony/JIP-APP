@@ -2,6 +2,7 @@ from nicegui import ui
 import intranet_data
 import intranet_logger
 import datetime
+from intranet_ui_utils import refreshable_na_klienta
 
 # =========================================================
 # INICIALIZACE DATABÁZE PRO HELPDESK
@@ -50,7 +51,7 @@ def inicializace_helpdesk_db():
 # =========================================================
 # HLAVNÍ VYKRESLOVACÍ FUNKCE
 # =========================================================
-@ui.refreshable
+@refreshable_na_klienta
 def vykresli_helpdesk(user_id, user_name, vsechna_prava):
     inicializace_helpdesk_db()
 

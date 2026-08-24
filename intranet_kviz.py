@@ -10,6 +10,7 @@ from openpyxl.styles import PatternFill
 import intranet_data
 import intranet_logger
 import intranet_session
+from intranet_ui_utils import refreshable_na_klienta
 
 aktivni_studenti = {}
 dokoncene_testy = []
@@ -250,7 +251,7 @@ def index_page(client: Client):
                         with ui.tab_panels(
                             tabs,
                             value=state.get('admin_aktivni_tab', tab_monitor)
-                        ).classes('w-full bg-transparent p-0').bind_value(state, 'admin_aktivni_tab'):
+                        ).classes('w-full bg-transparent p-0').on_value_change(lambda e: state.update(admin_aktivni_tab=e.value)):
 
                             with ui.tab_panel(tab_monitor):
                                 with ui.card().classes('w-full p-6 shadow-xl rounded-2xl border border-gray-100 bg-white/95 backdrop-blur-sm mb-6'):
@@ -335,8 +336,9 @@ def index_page(client: Client):
 
                                     ui.label(f'Celkový počet otázek v testu ({edit_typ.upper()}):').classes(f'text-lg font-medium {barva_skupiny}')
                                     with ui.row().classes('w-full items-center mb-8'):
-                                        ui.slider(min=1, max=500, step=1).classes('w-2/3').bind_value(c, 'pocet_otazek')
-                                        ui.number(min=1, max=500, step=1, format='%d').classes('w-24 ml-4 bg-white').bind_value(c, 'pocet_otazek')
+                                        _sl = ui.slider(value=c.get('pocet_otazek', 1), min=1, max=500, step=1).classes('w-2/3')
+                                        ui.number(min=1, max=500, step=1, format='%d').classes('w-24 ml-4 bg-white').bind_value(_sl, 'value')
+                                        _sl.on_value_change(lambda e: c.update(pocet_otazek=e.value))
 
                                     ui.separator().classes('mb-6')
                                     ui.label('Rozdělení otázek do okruhů').classes(f'text-xl font-bold {barva_skupiny} mb-1')
@@ -367,25 +369,35 @@ def index_page(client: Client):
                                         zapnut = c.get(zapnut_key, idx == 1)
                                         with ui.card().classes('w-full p-4 mb-3 border border-gray-200 rounded-xl ' + ('bg-white' if zapnut else 'bg-gray-100 opacity-70')):
                                             with ui.row().classes('w-full items-center gap-4 mb-2'):
-                                                tog = ui.switch(f'Okruh {idx}', value=zapnut).bind_value(c, zapnut_key).classes('font-bold text-gray-700')
-                                                tog.on('update:model-value', lambda _: aktualizuj_soucet_label())
-                                                ui.input(placeholder=f'Název okruhu {idx}').classes('flex-1 bg-white').bind_value(c, nazev_key).bind_enabled_from(c, zapnut_key)
+                                                tog = ui.switch(f'Okruh {idx}', value=zapnut).classes('font-bold text-gray-700')
+                                                _inp = ui.input(placeholder=f'Název okruhu {idx}', value=c.get(nazev_key, '')).classes('flex-1 bg-white')
+                                                _inp.set_enabled(zapnut)
+                                                _inp.on_value_change(lambda e, k=nazev_key: c.update({k: e.value}))
                                                 ui.badge(soubor_stav, color='green' if max_ok > 0 else 'red').classes('shrink-0')
                                             with ui.row().classes('w-full items-center gap-3'):
                                                 ui.label('Počet losovaných otázek:').classes('text-sm text-gray-600 w-48 shrink-0')
-                                                ui.number(min=0, max=max(max_ok, 500), step=1, format='%d').classes('w-24 bg-white').bind_value(c, pocet_key).bind_enabled_from(c, zapnut_key).on('update:model-value', lambda _: aktualizuj_soucet_label())
+                                                _num = ui.number(min=0, max=max(max_ok, 500), step=1, format='%d', value=c.get(pocet_key, 0)) \
+                                                    .classes('w-24 bg-white').on('update:model-value', lambda _: aktualizuj_soucet_label())
+                                                _num.set_enabled(zapnut)
+                                                _num.on_value_change(lambda e, k=pocet_key: c.update({k: e.value}))
+                                                tog.on_value_change(lambda e, i=_inp, n=_num, k=zapnut_key: (c.update({k: e.value}),
+                                                                                                            i.set_enabled(e.value),
+                                                                                                            n.set_enabled(e.value),
+                                                                                                            aktualizuj_soucet_label()))
 
                                     aktualizuj_soucet_label()
                                     ui.separator().classes('my-6')
 
                                     ui.label(f'Časový limit testu — {edit_typ.upper()} (min):').classes(f'text-lg font-medium {barva_skupiny}')
                                     with ui.row().classes('w-full items-center mb-6'):
-                                        ui.slider(min=1, max=120, step=1).classes('w-2/3 text-blue-500').bind_value(c, 'casovy_limit_minuty')
-                                        ui.number(min=1, max=120, step=1, format='%d').classes('w-24 ml-4 bg-white').bind_value(c, 'casovy_limit_minuty')
+                                        _sl = ui.slider(value=c.get('casovy_limit_minuty', 1), min=1, max=120, step=1).classes('w-2/3 text-blue-500')
+                                        ui.number(min=1, max=120, step=1, format='%d').classes('w-24 ml-4 bg-white').bind_value(_sl, 'value')
+                                        _sl.on_value_change(lambda e: c.update(casovy_limit_minuty=e.value))
                                     ui.label(f'Minimální úspěšnost — {edit_typ.upper()} (%):').classes(f'text-lg font-medium {barva_skupiny}')
                                     with ui.row().classes('w-full items-center mb-6'):
-                                        ui.slider(min=0, max=100, step=1).classes('w-2/3 text-green-500').bind_value(c, 'min_procento_uspesnosti')
-                                        ui.number(min=0, max=100, step=1, format='%d').classes('w-24 ml-4 bg-white').bind_value(c, 'min_procento_uspesnosti')
+                                        _sl = ui.slider(value=c.get('min_procento_uspesnosti', 0), min=0, max=100, step=1).classes('w-2/3 text-green-500')
+                                        ui.number(min=0, max=100, step=1, format='%d').classes('w-24 ml-4 bg-white').bind_value(_sl, 'value')
+                                        _sl.on_value_change(lambda e: c.update(min_procento_uspesnosti=e.value))
                                     ui.button(
                                         f'💾 Uložit nastavení {edit_typ.upper()}',
                                         on_click=lambda t=edit_typ: uloz_nastaveni(t)
@@ -529,7 +541,7 @@ def index_page(client: Client):
                     aktualni_q = state['otazky'][state['aktualni_index']]
                     ui.label(aktualni_q['OTÁZKA']).classes('text-4xl font-extrabold mb-10 text-center text-gray-800 w-full skryt-pri-tisku')
                     moznosti = {'A': f"A)  {aktualni_q['A']}", 'B': f"B)  {aktualni_q['B']}", 'C': f"C)  {aktualni_q['C']}", 'D': f"D)  {aktualni_q['D']}"}
-                    radio = ui.radio(moznosti).classes('text-2xl mb-12 space-y-6 w-full ml-12 text-gray-800 font-medium skryt-pri-tisku').bind_value(state, 'vybrana_odpoved')
+                    radio = ui.radio(moznosti, value=state['vybrana_odpoved']).classes('text-2xl mb-12 space-y-6 w-full ml-12 text-gray-800 font-medium skryt-pri-tisku').on_value_change(lambda e: state.update(vybrana_odpoved=e.value))
 
                     def dalsi_otazka():
                         if not state['vybrana_odpoved']: return ui.notify('Vyberte odpověď!', type='warning', position='top')
@@ -675,7 +687,7 @@ def index_page(client: Client):
     hlavni_rozhrani()
 
 
-@ui.refreshable
+@refreshable_na_klienta
 def vykresli_vystup_kviz(user_name, vsechna_prava):
     if "vse" not in vsechna_prava and "vystup_vse" not in vsechna_prava and "vystup_osobni" not in vsechna_prava:
         ui.label('Přístup odepřen').classes('text-red-500 text-xl')

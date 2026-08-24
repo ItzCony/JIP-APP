@@ -214,18 +214,43 @@ class _RefreshableNaKlienta:
         self._klic = f'_rf::{func.__module__}.{func.__qualname__}'
 
     def _rf(self):
-        """Refreshable objekt patřící PRÁVĚ TOMUTO klientovi (líně vyrobený)."""
-        rf = app.storage.client.get(self._klic)
+        """Refreshable objekt patřící PRÁVĚ TOMUTO klientovi (líně vyrobený).
+
+        Mimo klientský kontext (background task, startup) vrací None — tam není
+        co překreslovat a pád by jen shodil úlohu.
+        """
+        try:
+            uloziste = app.storage.client
+        except Exception:
+            return None
+        rf = uloziste.get(self._klic)
         if rf is None:
             rf = ui.refreshable(self._func)
-            app.storage.client[self._klic] = rf
+            uloziste[self._klic] = rf
         return rf
 
     def __call__(self, *args: Any, **kwargs: Any):
-        return self._rf()(*args, **kwargs)
+        rf = self._rf()
+        if rf is None:      # vykreslení bez klienta nedává smysl — ať je to vidět
+            raise RuntimeError(f'{self._klic}: volání mimo klientský kontext')
+        return rf(*args, **kwargs)
 
     def refresh(self, *args: Any, **kwargs: Any):
-        return self._rf().refresh(*args, **kwargs)
+        rf = self._rf()
+        if rf is None:
+            return None
+        return rf.refresh(*args, **kwargs)
+
+    def __getattr__(self, jmeno: str) -> Any:
+        """Zbytek API `ui.refreshable` (targets, prune, func, ...) z klientova objektu.
+
+        Volající kód (např. ruční per-klient refresh bez clear()) tak funguje
+        beze změny. Mimo klientský kontext není z čeho brát → AttributeError.
+        """
+        rf = self._rf()
+        if rf is None:
+            raise AttributeError(f'{self._klic}: {jmeno} mimo klientský kontext')
+        return getattr(rf, jmeno)
 
     def __repr__(self) -> str:
         return f'<refreshable_na_klienta {self._klic}>'
@@ -238,3 +263,29 @@ def refreshable_na_klienta(func: Callable) -> _RefreshableNaKlienta:
     protože .refresh() jednoho překreslí sloty všech ostatních.
     """
     return _RefreshableNaKlienta(func)
+
+
+# ------------------------- Přepínání hlavních tabů -------------------------
+# Dřív: `ui.tabs().bind_value(app.storage.user, 'intranet_tab')`. Zdrojem je
+# dict (app.storage.user), který není bindable property → NiceGUI ho musel
+# pollovat každých 100 ms v `binding._refresh_step` ("binding propagation for
+# N active links took ... s"). Tady se místo pollingu zapisuje hodnota rovnou:
+# storage + set_value na elementu, obojí v kontextu kliknutí.
+
+def zaregistruj_prepinac_tabu(fn: Callable[[Any], None]) -> None:
+    """Uloží per-klient funkci, která umí přepnout hlavní tab intranetu."""
+    try:
+        app.storage.client['_prepinac_tabu'] = fn
+    except Exception:
+        pass  # mimo klientský kontext (startup, background task)
+
+
+def prepni_tab(nazev: str) -> None:
+    """Přepne hlavní tab intranetu — zápis do storage + přímé nastavení elementu."""
+    app.storage.user['intranet_tab'] = nazev
+    try:
+        fn = app.storage.client.get('_prepinac_tabu')
+    except Exception:
+        fn = None
+    if fn is not None:
+        fn(nazev)

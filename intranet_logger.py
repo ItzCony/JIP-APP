@@ -11,6 +11,7 @@ from collections import deque
 import sys
 import traceback
 import intranet_monitor
+from intranet_ui_utils import refreshable_na_klienta
 
 LOG_FILE = "activity.log"
 EXPORT_DIR = "Exporty_Logy"
@@ -361,7 +362,7 @@ _FILTR_SKUPINY = {
 # --- UŽIVATELSKÉ ROZHRANÍ (UI) ---
 # ==========================================
 
-@ui.refreshable
+@refreshable_na_klienta
 def vykresli_logy(user_name, vsechna_prava):
     if 'vse' not in vsechna_prava and 'admin_logy' not in vsechna_prava:
         ui.label('Přístup odepřen. Tuto sekci mohou vidět pouze administrátoři.').classes('text-2xl font-bold text-red-600')

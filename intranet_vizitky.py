@@ -27,6 +27,7 @@ import shutil
 import asyncio
 import base64
 import unicodedata
+from intranet_ui_utils import refreshable_na_klienta
 
 try:
     import vizitky_seed
@@ -1968,7 +1969,7 @@ def _dialog_detail(z, user_id, user_name, je_realizator, prekresli):
 # =========================================================
 # HLAVNÍ VYKRESLOVACÍ FUNKCE
 # =========================================================
-@ui.refreshable
+@refreshable_na_klienta
 def vykresli_vizitky(user_id, user_name, user_email, vsechna_prava):
     inicializace_vizitky_db()
 

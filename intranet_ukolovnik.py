@@ -4,6 +4,7 @@ import intranet_data
 import intranet_static
 import intranet_logger
 import intranet_notifikace
+import intranet_emaily
 import datetime
 import os
 import uuid
@@ -11,13 +12,17 @@ import calendar
 import tempfile
 import time
 from collections import OrderedDict
+from intranet_ui_utils import refreshable_na_klienta
 
 UKOL_PRILOHY_DIR = 'ukol_prilohy'
 PROJEKT_PRILOHY_DIR = 'projekt_prilohy'
+PORADA_PRILOHY_DIR = 'porada_prilohy'
 os.makedirs(UKOL_PRILOHY_DIR, exist_ok=True)
 os.makedirs(PROJEKT_PRILOHY_DIR, exist_ok=True)
+os.makedirs(PORADA_PRILOHY_DIR, exist_ok=True)
 intranet_static.chranene_soubory('/ukol_prilohy', UKOL_PRILOHY_DIR)
 intranet_static.chranene_soubory('/projekt_prilohy', PROJEKT_PRILOHY_DIR)
+intranet_static.chranene_soubory('/porada_prilohy', PORADA_PRILOHY_DIR)
 
 # =========================================================
 # KONSTANTY
@@ -94,6 +99,16 @@ def inicializace_ukolovnik_db():
                 id INT AUTO_INCREMENT PRIMARY KEY,
                 porada_id INT NOT NULL, user_id INT, jmeno_autora VARCHAR(255),
                 text TEXT, vytvoreno DATETIME DEFAULT CURRENT_TIMESTAMP
+            ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        """)
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS ukolovnik_porada_prilohy (
+                id VARCHAR(64) PRIMARY KEY,
+                porada_id INT NOT NULL, user_id INT, jmeno_autora VARCHAR(255),
+                soubor_nazev VARCHAR(255), soubor_cesta VARCHAR(512),
+                vytvoreno DATETIME DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_porada (porada_id)
             ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
         """)
 
@@ -622,6 +637,279 @@ def _ikona_souboru(nazev):
     return 'attach_file', 'text-gray-500'
 
 
+# =========================================================
+# PORADY: PŘÍSTUP, E-MAILY, VÝBĚR ÚČASTNÍKŮ
+# =========================================================
+PRAVA_PRISTUP_PORADY = ('vse', 'ukolovnik_admin', 'ukolovnik_porady')
+
+
+def _cas_hhmm(hodnota) -> str:
+    """Sloupec TIME chodí z MySQL jako timedelta ('9:00:00') — vrátí 'HH:MM'."""
+    if not hodnota:
+        return ''
+    if isinstance(hodnota, datetime.timedelta):
+        minuty = int(hodnota.total_seconds()) // 60
+        return f'{minuty // 60:02d}:{minuty % 60:02d}'
+    return str(hodnota)[:5]
+
+
+def _normalizuj_cas(inp):
+    """Převede '5' → '05:00', '9:5' → '09:05', '930' → '09:30' apod."""
+    v = (inp.value or '').strip()
+    if not v:
+        return
+    if ':' in v:
+        casti = v.split(':', 1)
+        h = casti[0].strip().zfill(2)
+        m = casti[1].strip().zfill(2)
+    else:
+        # Číslo bez dvojtečky: 1–2 číslice = hodiny, 3–4 = HHMM
+        if len(v) <= 2:
+            h, m = v.zfill(2), '00'
+        else:
+            h, m = v[:-2].zfill(2), v[-2:]
+    try:
+        if 0 <= int(h) <= 23 and 0 <= int(m) <= 59:
+            inp.value = f'{h}:{m}'
+    except ValueError:
+        pass
+
+
+def _uzivatele_s_pristupem_do_porad() -> set:
+    """user_id všech, kdo mají právo na sekci Porady — z uživatele, pozice i oddělení.
+
+    Jeden dotaz za celý výběr. `ziskej_prava_uzivatele()` by znamenala dotaz na
+    každého člověka v našeptávači zvlášť; sloupec `prava` z
+    `ziskej_vsechny_uzivatele()` zase obsahuje jen práva přidělená přímo
+    uživateli, takže by hlásil chybějící přístup i lidem, kteří ho mají z
+    pracovní pozice nebo oddělení.
+    """
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return set()
+    otazniky = ','.join(['%s'] * len(PRAVA_PRISTUP_PORADY))
+    dotaz = f"""
+        SELECT utp.user_iduser AS uid
+        FROM user_To_privileges utp
+        JOIN privileges p ON utp.privileges_idprivileges = p.idprivileges
+        WHERE LOWER(p.name) IN ({otazniky})
+        UNION
+        SELECT utj.user_iduser
+        FROM user_To_jobPosition utj
+        JOIN jobPosition_To_privileges jtp ON utj.jobPosition_idjobPosition = jtp.jobPosition_idjobPosition
+        JOIN privileges p ON jtp.privileges_idprivileges = p.idprivileges
+        WHERE LOWER(p.name) IN ({otazniky})
+        UNION
+        SELECT dtu.user_iduser
+        FROM department_To_user dtu
+        JOIN department_To_privileges dtp ON dtu.department_iddepartment = dtp.department_iddepartment
+        JOIN privileges p ON dtp.privileges_idprivileges = p.idprivileges
+        WHERE LOWER(p.name) IN ({otazniky})
+    """
+    cur = None
+    try:
+        cur = conn.cursor()
+        cur.execute(dotaz, PRAVA_PRISTUP_PORADY * 3)
+        return {r[0] for r in cur.fetchall() if r[0]}
+    except Exception as e:
+        print(f'[_uzivatele_s_pristupem_do_porad] {e}')
+        return set()
+    finally:
+        try:
+            if cur: cur.close()
+            conn.close()
+        except Exception:
+            pass
+
+
+def _porada_datum_txt(porada) -> str:
+    d = porada.get('datum')
+    if not d:
+        return ''
+    return f'{d.day}. {d.month}. {d.year}'
+
+
+def _porada_cas_txt(porada) -> str:
+    od = _cas_hhmm(porada.get('cas_od'))
+    do = _cas_hhmm(porada.get('cas_do'))
+    return f'{od}–{do}' if od and do else od
+
+
+def _porada_mail(porada, typ, kdo, ucastnici_jmena='', zmeny=None):
+    """Vrátí (předmět, tělo bez oslovení) e-mailu o poradě.
+
+    typ:   'pozvanka' (nová porada) | 'dodatecne' | 'zmena' | 'odebrani'
+    zmeny: [(popisek, stará hodnota, nová hodnota)] — jen pro typ 'zmena'
+    """
+    nazev = porada.get('nazev') or ''
+    datum = _porada_datum_txt(porada)
+    cas = _porada_cas_txt(porada)
+    kdy = ', '.join(x for x in (datum, cas) if x)
+    proklik = f'\n➡ Přejít do aplikace: {intranet_data.APP_URL}\n' if intranet_data.APP_URL else ''
+    podpis = '\nS pozdravem,\nMoje JIPka'
+
+    if typ == 'odebrani':
+        predmet = f'Zrušení účasti: {nazev}' + (f' – {datum}' if datum else '')
+        telo = (f'{kdo} Vás odebral/a ze seznamu účastníků porady\n'
+                f'„{nazev}"' + (f' ({kdy})' if kdy else '') + '.\n\n'
+                'Vaše účast se už neočekává, termín si můžete uvolnit.\n' + podpis)
+        return predmet, telo
+
+    if typ == 'zmena':
+        predmet = f'ZMĚNA: {nazev}' + (f' – nově {datum}' if datum else '')
+        radky = '\n'.join(f'{popisek + ":":<8}{(stara or "—")}   →   {(nova or "—")}'
+                          for popisek, stara, nova in (zmeny or []))
+        telo = (f'{kdo} změnil/a údaje porady, na kterou jste přizván/a.\n\n'
+                f'Porada: {nazev}\n\n'
+                f'{radky}\n\n'
+                'Ostatní údaje zůstávají beze změny.\n' + proklik + podpis)
+        return predmet, telo
+
+    uvod = (f'{kdo} Vás dodatečně přizval/a na poradu, která už je v intranetu založená.'
+            if typ == 'dodatecne' else f'{kdo} Vás přizval/a na poradu.')
+    predmet = f'Pozvánka na poradu: {nazev}' + (f' – {datum}' if datum else '')
+    if typ == 'dodatecne':
+        predmet += ' (dodatečné přizvání)'
+    polozky = [('Porada', nazev),
+               ('Termín', kdy),
+               ('Místo', porada.get('misto')),
+               ('Moderátor', porada.get('moderator_jmeno')),
+               ('Zapisovatel', porada.get('zapisovatel_jmeno')),
+               ('Účastníci', ucastnici_jmena)]
+    prehled = '\n'.join(f'{popisek + ":":<13}{hodnota}' for popisek, hodnota in polozky if hodnota)
+    program = f"\nProgram:\n{porada['popis']}\n" if porada.get('popis') else ''
+    return predmet, f'{uvod}\n\n{prehled}\n{program}\n{proklik}{podpis}'
+
+
+def _na_pozadi(fn, *args):
+    """Spustí blokující volání mimo UI vlákno — SMTP má 15s timeout na adresáta."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        try:
+            fn(*args)
+        except Exception as e:
+            print(f'[_na_pozadi] {e}')
+        return
+    background_tasks.create(asyncio.to_thread(fn, *args))
+
+
+def _posli_maily_porada(porada, prijemci_ids, typ, kdo, ucastnici_jmena='', zmeny=None) -> int:
+    """Rozešle e-mail o poradě na pozadí. Vrátí počet adresátů, kterým odchází."""
+    hledane = {int(u) for u in prijemci_ids if u}
+    if not hledane:
+        return 0
+    predmet, telo = _porada_mail(porada, typ, kdo, ucastnici_jmena, zmeny)
+    adresati = [(mail, u.get('jmeno') or '')
+                for mail, u in intranet_data.ziskej_vsechny_uzivatele().items()
+                if u.get('id') in hledane and mail]
+    for mail, jmeno in adresati:
+        oslov = f'Dobrý den {jmeno},' if jmeno else 'Dobrý den,'
+        _na_pozadi(intranet_emaily.odesli_upozorneni_email, mail, predmet, f'{oslov}\n\n{telo}')
+    return len(adresati)
+
+
+def _hlaska_o_mailech(zaklad: str) -> str:
+    """Vypnuté SMTP nesmí projít jako tiché „uloženo" — uživatel to musí vidět."""
+    try:
+        if intranet_data.nacti_smtp().get('enabled'):
+            return f'{zaklad} E-maily odeslány.'
+    except Exception:
+        pass
+    return f'{zaklad} E-maily se neodeslaly — SMTP je vypnuté.'
+
+
+def _vyber_ucastniku(vybrani: dict, ucast_opts: dict, povoleni_ids=None):
+    """Chipy + našeptávač účastníků porady; mutuje `vybrani` {id: jméno}.
+
+    Bez práva na sekci Porady účastníka nepřidá. Našeptávač jméno nabídne
+    schválně — schované jméno vypadá jako chyba hledání, odmítnutí s důvodem ne.
+    """
+    if povoleni_ids is None:
+        povoleni_ids = _uzivatele_s_pristupem_do_porad()
+    jmeno_na_id = {jm: uid for uid, jm in ucast_opts.items()}
+    vsechna_jmena = sorted(ucast_opts.values())
+
+    chipy = ui.row().classes('w-full gap-2 flex-wrap min-h-8 p-2 border border-gray-200 rounded-lg bg-gray-50 mb-2')
+
+    def prekresli():
+        chipy.clear()
+        with chipy:
+            if not vybrani:
+                ui.label('Zatím nikdo — najděte účastníka níže.').classes('text-xs text-gray-400 italic')
+            for uid, jm in sorted(vybrani.items(), key=lambda x: x[1]):
+                with ui.row().classes('items-center gap-0.5 bg-blue-100 text-blue-800 px-2 py-0.5 rounded-full'):
+                    ui.label(jm).classes('text-xs font-semibold')
+                    ui.button(icon='close',
+                              on_click=lambda u=uid: [vybrani.pop(u, None), prekresli()]) \
+                        .props('flat round dense size=xs').classes('text-blue-400 ml-0.5')
+
+    prekresli()
+
+    with ui.row().classes('w-full gap-2 items-center mb-3'):
+        # `autocomplete` z NiceGUI doplňuje jen prefix a jen Tabem — „nov" tak
+        # nikdy nenajde „Petr Novák". Proto vlastní nabídka: hledá v celém jméně
+        # a jde do ní kliknout.
+        inp_ucastnik = ui.input(
+            placeholder='Napište část jména (např. nov)…',
+            autocomplete=vsechna_jmena,
+        ).classes('flex-1 bg-white').props('outlined dense clearable debounce=150')
+
+        with inp_ucastnik:
+            nabidka = ui.menu().props('no-parent-event no-focus fit') \
+                .classes('max-h-60 overflow-auto')
+
+        def pridat_ucastnika(jmeno=None):
+            jm = (jmeno if jmeno is not None else (inp_ucastnik.value or '')).strip()
+            uid = jmeno_na_id.get(jm)
+            if not uid and jm:
+                # Rozepsané jméno bez kliknutí: ber ho, jen když je shoda jediná
+                shody = [j for j in vsechna_jmena if jm.lower() in j.lower()]
+                if len(shody) == 1:
+                    jm = shody[0]
+                    uid = jmeno_na_id[jm]
+            if not uid:
+                if jm:
+                    ui.notify('Uživatel nenalezen — vyberte ze nabídky.', type='warning')
+                return
+            if uid in vybrani:
+                ui.notify(f'{jm} je již přidán/a.', type='info')
+                inp_ucastnik.value = ''
+                nabidka.close()
+                return
+            if uid not in povoleni_ids:
+                ui.notify(f'{jm} nemá přístup do sekce Porady a zápisy — nelze přizvat. '
+                          'Přístup přiděluje správce práv.', type='negative', timeout=8000)
+                return
+            vybrani[uid] = jm
+            inp_ucastnik.value = ''
+            nabidka.close()
+            prekresli()
+
+        def nabidni(text):
+            dotaz = (text or '').strip().lower()
+            nabidka.clear()
+            if len(dotaz) < 2:
+                nabidka.close()
+                return
+            nalezeni = [jm for jm in vsechna_jmena
+                        if dotaz in jm.lower() and jmeno_na_id[jm] not in vybrani][:15]
+            with nabidka:
+                if not nalezeni:
+                    ui.item('Nikdo nenalezen').props('dense').classes('text-gray-400 text-sm')
+                for jm in nalezeni:
+                    ma_pristup = jmeno_na_id[jm] in povoleni_ids
+                    popis = jm if ma_pristup else f'{jm}  🔒 bez přístupu do porad'
+                    ui.menu_item(popis, on_click=lambda j=jm: pridat_ucastnika(j)) \
+                        .props('dense').classes('text-sm' if ma_pristup else 'text-sm text-gray-400')
+            nabidka.open()
+
+        inp_ucastnik.on_value_change(lambda e: nabidni(e.value))
+        inp_ucastnik.on('keydown.enter', lambda: pridat_ucastnika())
+        ui.button(icon='person_add', on_click=lambda: pridat_ucastnika()) \
+            .props('flat round').classes('text-blue-600').tooltip('Přidat účastníka (Enter)')
+
+
 def _ziskej_ucastniky_porady(porada_id):
     conn = intranet_data.get_db_connection()
     if not conn:
@@ -810,6 +1098,8 @@ def _smazat_poradu_db(porada_id):
         return False
     try:
         cur = conn.cursor()
+        cur.execute("SELECT soubor_cesta FROM ukolovnik_porada_prilohy WHERE porada_id=%s", (porada_id,))
+        prilohy_cesty = [r[0] for r in cur.fetchall()]
         cur.execute("SELECT id FROM ukolovnik_ukoly WHERE porada_id=%s", (porada_id,))
         ukol_ids = [r[0] for r in cur.fetchall()]
         cur.close(); conn.close()
@@ -820,11 +1110,18 @@ def _smazat_poradu_db(porada_id):
             return False
         cur2 = conn2.cursor()
         cur2.execute("DELETE FROM ukolovnik_porada_poznamky WHERE porada_id=%s", (porada_id,))
+        cur2.execute("DELETE FROM ukolovnik_porada_prilohy WHERE porada_id=%s", (porada_id,))
         cur2.execute("DELETE FROM ukolovnik_porada_ucastnici WHERE porada_id=%s", (porada_id,))
         cur2.execute("DELETE FROM ukolovnik_sledovaci WHERE typ='porada' AND ref_id=%s", (porada_id,))
         cur2.execute("DELETE FROM ukolovnik_log WHERE typ='porada' AND ref_id=%s", (porada_id,))
         cur2.execute("DELETE FROM ukolovnik_porady WHERE id=%s", (porada_id,))
         conn2.commit()
+        for cesta in prilohy_cesty:      # soubory až po commitu — jinak zmizí i při selhání DELETE
+            try:
+                if cesta and os.path.isfile(cesta):
+                    os.remove(cesta)
+            except Exception:
+                pass
         _bump_data_verze('porada', porada_id)  # živě promítnout smazání ostatním klientům
         return True
     except Exception as e:
@@ -1269,7 +1566,8 @@ def _dialog_detail_ukolu(ukol_id, user_id, user_name, vsechna_prava=None, on_ref
                     nacti_poznamky()
 
                     with ui.row().classes('w-full items-end gap-2'):
-                        nova_poz = ui.textarea('Nová poznámka...').classes('flex-1 bg-gray-50').props('outlined autogrow').bind_value(_navrhy, 'poznamka')
+                        nova_poz = ui.textarea('Nová poznámka...', value=_navrhy.get('poznamka', '')).classes('flex-1 bg-gray-50').props('outlined autogrow')\
+                            .on_value_change(lambda e: _navrhy.update(poznamka=e.value))
 
                         def pridat_poznamku():
                             txt = nova_poz.value.strip() if nova_poz.value else ''
@@ -1411,8 +1709,10 @@ def _dialog_detail_ukolu(ukol_id, user_id, user_name, vsechna_prava=None, on_ref
 
                     # Přidat krok plánu
                     with ui.row().classes('w-full gap-1 items-end'):
-                        novy_plan_text = ui.input('Nový krok…').classes('flex-1 text-xs').props('outlined dense').bind_value(_navrhy, 'plan_text')
-                        novy_plan_termin = ui.input('Termín').classes('w-20 text-xs').props('outlined dense placeholder="DD.MM."').bind_value(_navrhy, 'plan_termin')
+                        novy_plan_text = ui.input('Nový krok…', value=_navrhy.get('plan_text', '')).classes('flex-1 text-xs').props('outlined dense')\
+                            .on_value_change(lambda e: _navrhy.update(plan_text=e.value))
+                        novy_plan_termin = ui.input('Termín', value=_navrhy.get('plan_termin', '')).classes('w-20 text-xs').props('outlined dense placeholder="DD.MM."')\
+                            .on_value_change(lambda e: _navrhy.update(plan_termin=e.value))
 
                         def pridat_plan():
                             txt = novy_plan_text.value.strip() if novy_plan_text.value else ''
@@ -2277,7 +2577,7 @@ def _dialog_export_ukoly(user_id, user_name, vsechna_prava):
     dlg.open()
 
 
-@ui.refreshable
+@refreshable_na_klienta
 async def _vykresli_ukoly(user_id, user_name, vsechna_prava, dialog_anchor=None, ukoly_stav=None):
     is_admin = 'vse' in vsechna_prava or 'ukolovnik_admin' in vsechna_prava
     # Stav pohledu (stránka, řazení, sbalené dny, pohled) drží rodič → přežije refresh
@@ -3177,7 +3477,7 @@ def _nacti_udalosti_kalendar(user_id, typ, od, do, vsechna_prava=None):
     return udalosti
 
 
-@ui.refreshable
+@refreshable_na_klienta
 async def _vykresli_kalendar(user_id, user_name, vsechna_prava, mesic_stav: dict):
     """mesic_stav = {'rok': int, 'mesic': int, 'typ': 'plan'|'real', 'nahled': 'mesic'|'tyden'|'den', 'den': int}"""
     dnes = datetime.date.today()
@@ -3604,13 +3904,175 @@ def _dialog_detail_porady(porada_id, user_id, user_name, vsechna_prava, on_refre
                 return
             is_admin = vsechna_prava and ('vse' in vsechna_prava or 'ukolovnik_admin' in vsechna_prava)
             muze_editovat = is_admin or porada.get('vytvoril_id') == user_id or porada.get('moderator_id') == user_id
+            vidi_vsechny_p = is_admin or (vsechna_prava and 'ukolovnik_porady_vsichni' in vsechna_prava)
+            zamceno = porada.get('stav') == 'Dokončená'   # dokončená porada = jen ke čtení
+
+            def _zamek_brani() -> bool:
+                """Serverová pojistka — `disable` v prohlížeči nikoho nezastaví."""
+                if zamceno:
+                    ui.notify('Porada je dokončená — úpravy nejsou možné.', type='warning')
+                return zamceno
+
+            def _zamkni(prvek):
+                """Dokončená porada: ikona zůstane vidět, ale zešedne a nejde kliknout."""
+                if zamceno:
+                    prvek.props('disable').classes('!text-gray-300')
+                return prvek
+
+            def _opts_uzivatelu() -> dict:
+                return _ziskej_uzivatele_options() if vidi_vsechny_p \
+                    else _ziskej_viditelne_uzivatele(user_id, vsechna_prava or [])
+
+            def _odebrat_ucastnika(uc):
+                if _zamek_brani(): return
+                def _provest():
+                    c = intranet_data.get_db_connection()
+                    cu = c.cursor()
+                    cu.execute("DELETE FROM ukolovnik_porada_ucastnici WHERE porada_id=%s AND user_id=%s",
+                               (porada_id, uc['user_id']))
+                    c.commit(); cu.close(); c.close()
+                    _log('porada', porada_id, user_id, user_name, f"Odebral/a účastníka: {uc['jmeno']}")
+                    try:
+                        intranet_notifikace.pridej(uc['user_id'],
+                                                   f"📅 {user_name} tě odebral/a z porady '{porada['nazev'][:50]}'.", 'info')
+                    except Exception:
+                        pass
+                    _posli_maily_porada(porada, [uc['user_id']], 'odebrani', user_name)
+                    intranet_logger.log_activity(user_name, "Úkolovník", f"Odebrán účastník porady #{porada_id}")
+                    ui.notify(_hlaska_o_mailech(f"{uc['jmeno']} odebrán/a z porady."), type='positive', position='top')
+                    _bump_data_verze('porada', porada_id)
+                    _telo.refresh(); on_refresh()
+                _potvrdit_smazat(f"Odebrat {uc['jmeno']} z porady?\nDostane e-mail o zrušení účasti.", _provest)
+
+            def _dialog_prizvat():
+                if _zamek_brani(): return
+                stavajici = {u['user_id'] for u in _ziskej_ucastniky_porady(porada_id)}
+                opts = {uid: jm for uid, jm in _opts_uzivatelu().items() if uid not in stavajici}
+                novi: dict = {}
+                with _dialog_kotva(), ui.dialog() as d2, ui.card().classes('w-full max-w-xl p-6 rounded-xl'):
+                    ui.label('Přizvat na poradu').classes('text-xl font-bold text-blue-800 mb-1')
+                    ui.label('Pozvaní dostanou e-mail i upozornění v intranetu.').classes('text-xs text-gray-500 mb-3')
+                    _vyber_ucastniku(novi, opts)
+
+                    def _uloz_pozvane():
+                        if not novi:
+                            ui.notify('Nikdo nevybrán.', type='warning'); return
+                        c = intranet_data.get_db_connection()
+                        cu = c.cursor()
+                        for uid, jm in novi.items():
+                            cu.execute("INSERT IGNORE INTO ukolovnik_porada_ucastnici (porada_id, user_id, jmeno) VALUES (%s,%s,%s)",
+                                       (porada_id, uid, jm))
+                        c.commit(); cu.close(); c.close()
+                        jmena_vsech = ', '.join(sorted(u['jmeno'] for u in _ziskej_ucastniky_porady(porada_id)))
+                        for uid in novi:
+                            try:
+                                intranet_notifikace.pridej(uid, f"📅 {user_name} tě přizval/a na poradu: "
+                                                                f"'{porada['nazev'][:50]}' ({_porada_datum_txt(porada)})", 'info')
+                            except Exception:
+                                pass
+                        _posli_maily_porada(porada, list(novi), 'dodatecne', user_name, jmena_vsech)
+                        _log('porada', porada_id, user_id, user_name, 'Přizval/a: ' + ', '.join(novi.values()))
+                        intranet_logger.log_activity(user_name, "Úkolovník", f"Přizváni účastníci porady #{porada_id}")
+                        ui.notify(_hlaska_o_mailech(f'Přizváno: {len(novi)}.'), type='positive', position='top')
+                        _bump_data_verze('porada', porada_id)
+                        d2.close(); _telo.refresh(); on_refresh()
+
+                    with ui.row().classes('w-full justify-between mt-4'):
+                        ui.button('Zrušit', on_click=d2.close).classes('bg-gray-400 text-white font-bold px-6')
+                        ui.button('Přizvat a odeslat pozvánky', icon='mail', on_click=_uloz_pozvane) \
+                            .classes('bg-blue-600 text-white font-bold px-6 shadow-md')
+                d2.open()
+
+            def _dialog_upravit():
+                if _zamek_brani(): return
+                opts = dict(_opts_uzivatelu())
+                for uid_, jm_ in ((porada.get('moderator_id'), porada.get('moderator_jmeno')),
+                                  (porada.get('zapisovatel_id'), porada.get('zapisovatel_jmeno'))):
+                    if uid_ and jm_ and uid_ not in opts:
+                        opts[uid_] = jm_
+                sel_opts = {v: v for v in opts.values()}
+                with _dialog_kotva(), ui.dialog() as d2, ui.card().classes('w-full max-w-3xl p-6 rounded-xl'):
+                    ui.label('Upravit poradu').classes('text-2xl font-bold text-blue-800 mb-1')
+                    ui.label('Změnu termínu nebo místa pošleme účastníkům e-mailem.').classes('text-xs text-gray-500 mb-3')
+                    i_nazev = ui.input('Název / téma porady', value=porada['nazev']).classes('w-full mb-3 bg-white').props('outlined')
+                    i_popis = ui.textarea('Program a popis tématu', value=porada.get('popis') or '').classes('w-full mb-3 bg-white').props('outlined rows=3')
+                    with ui.row().classes('w-full gap-3 mb-3 flex-wrap'):
+                        i_datum = ui.input('Datum (DD.MM.RRRR)',
+                                           value=porada['datum'].strftime('%d.%m.%Y') if porada.get('datum') else '') \
+                            .classes('flex-1 bg-white').props('outlined')
+                        i_od = ui.input('Čas od (HH:MM)', value=_cas_hhmm(porada.get('cas_od'))).classes('flex-1 bg-white').props('outlined')
+                        i_do = ui.input('Čas do (HH:MM)', value=_cas_hhmm(porada.get('cas_do'))).classes('flex-1 bg-white').props('outlined')
+                        i_od.on('blur', lambda: _normalizuj_cas(i_od))
+                        i_do.on('blur', lambda: _normalizuj_cas(i_do))
+                    with ui.row().classes('w-full gap-3 mb-3 flex-wrap'):
+                        i_misto = ui.input('Místo konání', value=porada.get('misto') or '').classes('flex-1 bg-white').props('outlined')
+                        i_mod = ui.select(sel_opts, label='Moderátor', value=porada.get('moderator_jmeno')).classes('flex-1 bg-white').props('outlined')
+                        i_zap = ui.select(sel_opts, label='Zapisovatel', value=porada.get('zapisovatel_jmeno')).classes('flex-1 bg-white').props('outlined')
+
+                    def _uloz_upravu():
+                        if not (i_nazev.value or '').strip():
+                            ui.notify('Vyplňte název!', type='warning'); return
+                        try:
+                            nove_datum = datetime.datetime.strptime((i_datum.value or '').strip(), '%d.%m.%Y').date()
+                        except Exception:
+                            ui.notify('Neplatný formát data!', type='warning'); return
+                        nove = {
+                            'nazev': i_nazev.value.strip(),
+                            'popis': (i_popis.value or '').strip(),
+                            'datum': nove_datum,
+                            'cas_od': (i_od.value or '').strip() or None,
+                            'cas_do': (i_do.value or '').strip() or None,
+                            'misto': (i_misto.value or '').strip(),
+                            'moderator_jmeno': i_mod.value,
+                            'zapisovatel_jmeno': i_zap.value,
+                        }
+                        nove['moderator_id'] = next((u for u, j in opts.items() if j == i_mod.value), None)
+                        nove['zapisovatel_id'] = next((u for u, j in opts.items() if j == i_zap.value), None)
+
+                        zmeny = []
+                        stary_termin = ', '.join(x for x in (_porada_datum_txt(porada), _porada_cas_txt(porada)) if x)
+                        novy_termin = ', '.join(x for x in (_porada_datum_txt(nove), _porada_cas_txt(nove)) if x)
+                        if stary_termin != novy_termin:
+                            zmeny.append(('Termín', stary_termin, novy_termin))
+                        if (porada.get('misto') or '') != nove['misto']:
+                            zmeny.append(('Místo', porada.get('misto') or '', nove['misto']))
+
+                        c = intranet_data.get_db_connection()
+                        cu = c.cursor()
+                        cu.execute("""UPDATE ukolovnik_porady SET nazev=%s, popis=%s, datum=%s, cas_od=%s, cas_do=%s,
+                                      misto=%s, moderator_id=%s, moderator_jmeno=%s, zapisovatel_id=%s, zapisovatel_jmeno=%s
+                                      WHERE id=%s""",
+                                   (nove['nazev'], nove['popis'], nove['datum'], nove['cas_od'], nove['cas_do'],
+                                    nove['misto'], nove['moderator_id'], nove['moderator_jmeno'],
+                                    nove['zapisovatel_id'], nove['zapisovatel_jmeno'], porada_id))
+                        c.commit(); cu.close(); c.close()
+                        intranet_logger.log_activity(user_name, "Úkolovník", f"Upravena porada #{porada_id}")
+                        _log('porada', porada_id, user_id, user_name,
+                             'Upravil/a poradu' + (f" ({', '.join(z[0] for z in zmeny)})" if zmeny else ''))
+                        if zmeny:
+                            prijemci = [u['user_id'] for u in _ziskej_ucastniky_porady(porada_id) if u['user_id'] != user_id]
+                            _notifikuj_ucastniky_porady(porada_id, user_id,
+                                                        f"📅 Změna u porady '{nove['nazev'][:40]}': "
+                                                        + ', '.join(z[0].lower() for z in zmeny))
+                            _posli_maily_porada({**porada, **nove}, prijemci, 'zmena', user_name, zmeny=zmeny)
+                            ui.notify(_hlaska_o_mailech('Porada upravena.'), type='positive', position='top')
+                        else:
+                            ui.notify('Porada upravena.', type='positive', position='top')
+                        _bump_data_verze('porada', porada_id)
+                        d2.close(); _telo.refresh(); on_refresh()
+
+                    with ui.row().classes('w-full justify-between mt-4'):
+                        ui.button('Zrušit', on_click=d2.close).classes('bg-gray-400 text-white font-bold px-6')
+                        ui.button('Uložit změny', icon='save', on_click=_uloz_upravu) \
+                            .classes('bg-blue-600 text-white font-bold px-6 shadow-md')
+                d2.open()
 
             with ui.row().classes('w-full items-center justify-between px-6 py-4 bg-white border-b border-gray-200 shrink-0 shadow-sm'):
                 with ui.column().classes('gap-0'):
                     ui.label(porada['nazev']).classes('text-2xl font-black text-gray-800')
                     datum_str = porada['datum'].strftime('%d.%m.%Y') if porada.get('datum') else ''
-                    cas_od = str(porada['cas_od'])[:5] if porada.get('cas_od') else ''
-                    cas_do = str(porada['cas_do'])[:5] if porada.get('cas_do') else ''
+                    cas_od = _cas_hhmm(porada.get('cas_od'))
+                    cas_do = _cas_hhmm(porada.get('cas_do'))
                     meta = datum_str + (f'  •  {cas_od}–{cas_do}' if cas_od else '') + (f'  •  {porada["misto"]}' if porada.get('misto') else '')
                     ui.label(meta).classes('text-sm text-gray-500')
 
@@ -3619,6 +4081,7 @@ def _dialog_detail_porady(porada_id, user_id, user_name, vsechna_prava, on_refre
                     ui.label(porada['stav']).classes(f'px-3 py-1 rounded-full text-xs font-bold border uppercase tracking-wider {b_stav}')
                     if muze_editovat:
                         def _smazat_poradu_click():
+                            if _zamek_brani(): return
                             def _provest():
                                 ok = _smazat_poradu_db(porada_id)
                                 if ok:
@@ -3629,7 +4092,11 @@ def _dialog_detail_porady(porada_id, user_id, user_name, vsechna_prava, on_refre
                                 else:
                                     ui.notify('Chyba při mazání.', type='negative', position='top')
                             _potvrdit_smazat(f'Opravdu smazat poradu „{porada["nazev"]}"?\nBudou smazány i všechny zápisy a úkoly z porady.', _provest)
-                        ui.button(icon='delete_forever', on_click=_smazat_poradu_click).props('flat round dense').classes('text-red-400 hover:text-red-600').tooltip('Smazat poradu')
+                        _zamkni(ui.button(icon='edit', on_click=_dialog_upravit).props('flat round dense')
+                                .classes('text-blue-500 hover:text-blue-700').tooltip('Upravit poradu'))
+                        _zamkni(ui.button(icon='delete_forever', on_click=_smazat_poradu_click)
+                                .props('flat round dense').classes('text-red-400 hover:text-red-600')
+                                .tooltip('Smazat poradu'))
                     ui.button(icon='close', on_click=dlg.close).props('flat round dense').classes('text-gray-400 hover:text-red-500')
 
             with ui.row().classes('w-full flex-1 overflow-hidden gap-0'):
@@ -3645,7 +4112,20 @@ def _dialog_detail_porady(porada_id, user_id, user_name, vsechna_prava, on_refre
                             ui.label('Zapisovatel:').classes('text-gray-500 font-bold')
                             ui.label(porada.get('zapisovatel_jmeno') or '—').classes('text-gray-800')
                             ui.label('Účastníci:').classes('text-gray-500 font-bold')
-                            ui.label(ucastnici_jmena).classes('text-gray-800')
+                            with ui.row().classes('items-center gap-1 flex-wrap'):
+                                if not ucastnici:
+                                    ui.label('—').classes('text-gray-800')
+                                for u in ucastnici:
+                                    with ui.row().classes('items-center gap-0.5 bg-blue-50 text-blue-800 px-2 py-0.5 rounded-full'):
+                                        ui.label(u['jmeno']).classes('text-xs font-semibold')
+                                        if muze_editovat:
+                                            _zamkni(ui.button(icon='close', on_click=lambda uc=u: _odebrat_ucastnika(uc))
+                                                    .props('flat round dense size=xs').classes('text-blue-400')
+                                                    .tooltip('Odebrat z porady'))
+                                if muze_editovat:
+                                    _zamkni(ui.button(icon='person_add', on_click=_dialog_prizvat)
+                                            .props('flat round dense size=sm').classes('text-blue-600')
+                                            .tooltip('Přizvat další účastníky'))
                             ui.label('Vytvořil:').classes('text-gray-500 font-bold')
                             ui.label(f"{porada.get('vytvoril_jmeno','—')} ({porada['vytvoreno'].strftime('%d.%m.%Y %H:%M')})").classes('text-gray-800')
 
@@ -3654,10 +4134,14 @@ def _dialog_detail_porady(porada_id, user_id, user_name, vsechna_prava, on_refre
                             ui.label('Program / popis:').classes('text-xs font-bold text-gray-500 uppercase')
                             ui.label(porada['popis']).classes('text-gray-700 whitespace-pre-wrap text-sm mt-1')
 
-                        if muze_editovat:
+                        # Dokončenou poradu rozmrazí jen administrátor
+                        if muze_editovat and (is_admin or not zamceno):
                             with ui.row().classes('mt-3 gap-2 flex-wrap'):
                                 for s in ['Plánovaná', 'Probíhá', 'Dokončená', 'Zrušená']:
                                     def _zmen_stav(st=s):
+                                        if zamceno and not is_admin:
+                                            ui.notify('Stav dokončené porady mění jen administrátor.', type='warning')
+                                            return
                                         c = intranet_data.get_db_connection()
                                         cu = c.cursor()
                                         cu.execute("UPDATE ukolovnik_porady SET stav=%s WHERE id=%s", (st, porada_id))
@@ -3668,6 +4152,90 @@ def _dialog_detail_porady(porada_id, user_id, user_name, vsechna_prava, on_refre
                                         ui.notify(f'Stav: {st}', type='positive')
                                         dlg.close(); on_refresh()
                                     ui.button(s, on_click=_zmen_stav).props('size=sm outline').classes('font-bold')
+
+                    ui.label('Přílohy porady').classes('text-lg font-extrabold text-gray-700 mt-2')
+                    prilohy_box = ui.column().classes('w-full gap-2')
+
+                    def nacti_prilohy_p():
+                        prilohy_box.clear()
+                        c = intranet_data.get_db_connection()
+                        prilohy = []
+                        if c:
+                            try:
+                                cu = c.cursor(dictionary=True)
+                                cu.execute("SELECT * FROM ukolovnik_porada_prilohy WHERE porada_id=%s ORDER BY vytvoreno ASC", (porada_id,))
+                                prilohy = cu.fetchall()
+                            finally:
+                                cu.close(); c.close()
+                        with prilohy_box:
+                            if not prilohy:
+                                ui.label('Žádné přílohy.').classes('text-gray-400 italic text-xs')
+                            for pr in prilohy:
+                                ikona, ik_cls = _ikona_souboru(pr['soubor_nazev'])
+                                with ui.row().classes('w-full items-center gap-2 p-2 bg-gray-50 border border-gray-200 rounded-lg'):
+                                    ui.icon(ikona, size='sm').classes(ik_cls)
+                                    ui.link(pr['soubor_nazev'], f"/porada_prilohy/{os.path.basename(pr['soubor_cesta'])}") \
+                                        .classes('text-sm text-blue-600 hover:underline flex-1 truncate').props('target=_blank')
+                                    ui.label(pr.get('jmeno_autora', '')).classes('text-xs text-gray-400')
+                                    ui.label(pr['vytvoreno'].strftime('%d.%m.%Y')).classes('text-xs text-gray-400')
+                                    if muze_editovat or pr.get('user_id') == user_id:
+                                        _zamkni(ui.button(icon='delete', on_click=lambda p=pr: _smazat_prilohu_p(p))
+                                                .props('flat round dense size=sm').classes('text-gray-400 hover:text-red-500')
+                                                .tooltip('Smazat přílohu'))
+
+                    def _smazat_prilohu_p(pr):
+                        if _zamek_brani(): return
+                        def _provest():
+                            c = intranet_data.get_db_connection()
+                            cu = c.cursor()
+                            cu.execute("DELETE FROM ukolovnik_porada_prilohy WHERE id=%s", (pr['id'],))
+                            c.commit(); cu.close(); c.close()
+                            try:
+                                if pr.get('soubor_cesta') and os.path.isfile(pr['soubor_cesta']):
+                                    os.remove(pr['soubor_cesta'])
+                            except Exception:
+                                pass
+                            _log('porada', porada_id, user_id, user_name, f"Smazal/a přílohu: {pr['soubor_nazev']}")
+                            ui.notify('Příloha smazána.', type='positive')
+                            nacti_prilohy_p()
+                        _potvrdit_smazat(f"Opravdu smazat přílohu „{pr['soubor_nazev']}\"?", _provest)
+
+                    nacti_prilohy_p()
+
+                    async def zpracuj_upload_p(e: ui_events.UploadEventArguments):
+                        if _zamek_brani(): return
+                        try:
+                            soubor_id = str(uuid.uuid4())
+                            nazev_s = e.file.name
+                            ext = os.path.splitext(nazev_s)[1]
+                            cesta = os.path.join(PORADA_PRILOHY_DIR, f'{soubor_id}{ext}')
+                            os.makedirs(PORADA_PRILOHY_DIR, exist_ok=True)
+                            obsah = await e.file.read()
+                            with open(cesta, 'wb') as f:
+                                f.write(obsah)
+                            c = intranet_data.get_db_connection()
+                            cu = c.cursor()
+                            cu.execute("INSERT INTO ukolovnik_porada_prilohy (id, porada_id, user_id, jmeno_autora, soubor_nazev, soubor_cesta) VALUES (%s,%s,%s,%s,%s,%s)",
+                                       (soubor_id, porada_id, user_id, user_name, nazev_s, cesta))
+                            c.commit(); cu.close(); c.close()
+                            intranet_logger.log_activity(user_name, "Úkolovník", f"Příloha k poradě #{porada_id}: {nazev_s}")
+                            _log('porada', porada_id, user_id, user_name, f'Nahrál/a přílohu: {nazev_s}')
+                            _notifikuj_ucastniky_porady(porada_id, user_id,
+                                                        f"📎 {user_name} přidal/a přílohu '{nazev_s}' k poradě '{porada['nazev'][:40]}'.")
+                            ui.notify(f'Nahráno: {nazev_s}', type='positive')
+                            nacti_prilohy_p()
+                        except Exception as ex:
+                            ui.notify(f'Chyba nahrávání: {ex}', type='negative')
+
+                    if zamceno:
+                        ui.label('Nahrávání příloh je uzamčeno — porada je dokončená.') \
+                            .classes('text-xs text-gray-400 italic mt-1')
+                    else:
+                        ui.upload(label='Nahrát přílohu (PDF, Excel, Word, obrázek…)',
+                                  on_upload=zpracuj_upload_p, auto_upload=True, multiple=True,
+                                  max_file_size=25 * 1024 * 1024,
+                                  on_rejected=lambda _=None: ui.notify('Soubor je větší než 25 MB nebo má nepodporovaný typ.', type='warning')) \
+                            .props('accept=".pdf,.xlsx,.xls,.csv,.jpg,.jpeg,.png,.gif,.doc,.docx" flat color=blue-grey').classes('w-full mt-1')
 
                     ui.label('Zápis z porady').classes('text-lg font-extrabold text-gray-700 mt-2')
                     poznamky_box = ui.column().classes('w-full gap-3')
@@ -3698,9 +4266,16 @@ def _dialog_detail_porady(porada_id, user_id, user_name, vsechna_prava, on_refre
                     nacti_poz()
 
                     with ui.row().classes('w-full items-end gap-2 mt-2'):
-                        nova_p = ui.textarea('Přidat poznámku / zápis...').classes('flex-1 bg-gray-50').props('outlined autogrow').bind_value(_navrhy, 'zapis')
+                        nova_p = ui.textarea('Přidat poznámku / zápis...' if not zamceno
+                                             else 'Porada je dokončená — zápis nejde doplňovat.',
+                                             value='' if zamceno else _navrhy.get('zapis', '')) \
+                            .classes('flex-1 bg-gray-50').props('outlined autogrow') \
+                            .on_value_change(lambda e: _navrhy.update(zapis=e.value))
+                        if zamceno:
+                            nova_p.props('disable')
 
                         def pridat_poz():
+                            if _zamek_brani(): return
                             txt = nova_p.value.strip() if nova_p.value else ''
                             if not txt: return
                             c = intranet_data.get_db_connection()
@@ -3714,19 +4289,20 @@ def _dialog_detail_porady(porada_id, user_id, user_name, vsechna_prava, on_refre
                             nova_p.value = ''
                             nacti_poz()
 
-                        ui.button(icon='send', on_click=pridat_poz).classes('bg-blue-600 text-white h-14 w-14 rounded-xl shadow-md')
+                        _zamkni(ui.button(icon='send', on_click=pridat_poz)
+                                .classes('bg-blue-600 text-white h-14 w-14 rounded-xl shadow-md'))
 
                 # Pravý panel: úkoly porady
                 with ui.column().classes('w-96 shrink-0 overflow-y-auto p-5 gap-4 bg-gray-50'):
                     with ui.row().classes('w-full justify-between items-center'):
                         ui.label('Úkoly z porady').classes('text-lg font-extrabold text-gray-700')
                         if muze_editovat:
-                            ui.button(icon='add', on_click=lambda: _dialog_novy_ukol(
+                            _zamkni(ui.button(icon='add', on_click=lambda: _dialog_novy_ukol(
                                 user_id, user_name, vsechna_prava,
                                 porada_id=porada_id, porada_nazev=porada['nazev'],
                                 porada_datum=porada['datum'],
                                 on_refresh=nacti_ukoly_p
-                            )).props('round dense').classes('bg-green-600 text-white shadow')
+                            )).props('round dense').classes('bg-green-600 text-white shadow'))
 
                     ukoly_box = ui.column().classes('w-full gap-2')
 
@@ -3807,30 +4383,8 @@ def _dialog_nova_porada(user_id, user_name, on_refresh, vsechna_prava=None):
             cas_od = ui.input('Čas od (HH:MM)').classes('flex-1 bg-white').props('outlined')
             cas_do = ui.input('Čas do (HH:MM)').classes('flex-1 bg-white').props('outlined')
 
-            def normalizuj_cas(inp):
-                """Převede '5' → '05:00', '9:5' → '09:05', '930' → '09:30' apod."""
-                v = (inp.value or '').strip()
-                if not v:
-                    return
-                # Oddělovač dvojtečkou
-                if ':' in v:
-                    casti = v.split(':', 1)
-                    h = casti[0].strip().zfill(2)
-                    m = casti[1].strip().zfill(2)
-                else:
-                    # Číslo bez dvojtečky: 1–2 číslice = hodiny, 3–4 = HHMM
-                    if len(v) <= 2:
-                        h, m = v.zfill(2), '00'
-                    else:
-                        h, m = v[:-2].zfill(2), v[-2:]
-                try:
-                    if 0 <= int(h) <= 23 and 0 <= int(m) <= 59:
-                        inp.value = f'{h}:{m}'
-                except ValueError:
-                    pass
-
-            cas_od.on('blur', lambda: normalizuj_cas(cas_od))
-            cas_do.on('blur', lambda: normalizuj_cas(cas_do))
+            cas_od.on('blur', lambda: _normalizuj_cas(cas_od))
+            cas_do.on('blur', lambda: _normalizuj_cas(cas_do))
 
         _default_mod_zap = user_name if user_name in mod_zap_select else next(iter(mod_zap_select), None)
 
@@ -3842,47 +4396,7 @@ def _dialog_nova_porada(user_id, user_name, on_refresh, vsechna_prava=None):
         ui.label('Účastníci porady').classes('text-sm font-bold text-gray-600 mb-1')
 
         ucastnici_vyber: dict = {user_id: user_name}
-        jmeno_na_id = {jm: uid for uid, jm in ucast_opts.items()}
-        vsechna_jmena = sorted(ucast_opts.values())
-
-        chipy = ui.row().classes('w-full gap-2 flex-wrap min-h-8 p-2 border border-gray-200 rounded-lg bg-gray-50 mb-2')
-
-        def prekresli_ucastniky():
-            chipy.clear()
-            with chipy:
-                for uid, jm in sorted(ucastnici_vyber.items(), key=lambda x: x[1]):
-                    with ui.row().classes('items-center gap-0.5 bg-blue-100 text-blue-800 px-2 py-0.5 rounded-full'):
-                        ui.label(jm).classes('text-xs font-semibold')
-                        ui.button(icon='close',
-                                  on_click=lambda u=uid: [ucastnici_vyber.pop(u, None), prekresli_ucastniky()]) \
-                            .props('flat round dense size=xs').classes('text-blue-400 ml-0.5')
-
-        prekresli_ucastniky()
-
-        with ui.row().classes('w-full gap-2 items-center mb-3'):
-            inp_ucastnik = ui.input(
-                placeholder='Hledat a přidat účastníka…',
-                autocomplete=vsechna_jmena,
-            ).classes('flex-1 bg-white').props('outlined dense clearable')
-
-            def pridat_ucastnika():
-                jm = (inp_ucastnik.value or '').strip()
-                uid = jmeno_na_id.get(jm)
-                if not uid:
-                    if jm:
-                        ui.notify('Uživatel nenalezen — vyberte ze seznamu.', type='warning')
-                    return
-                if uid in ucastnici_vyber:
-                    ui.notify(f'{jm} je již přidán/a.', type='info')
-                    inp_ucastnik.value = ''
-                    return
-                ucastnici_vyber[uid] = jm
-                inp_ucastnik.value = ''
-                prekresli_ucastniky()
-
-            inp_ucastnik.on('keydown.enter', pridat_ucastnika)
-            ui.button(icon='person_add', on_click=pridat_ucastnika) \
-                .props('flat round').classes('text-blue-600').tooltip('Přidat účastníka (Enter)')
+        _vyber_ucastniku(ucastnici_vyber, ucast_opts)
 
         def ulozit():
             if not nazev.value or not nazev.value.strip():
@@ -3928,7 +4442,19 @@ def _dialog_nova_porada(user_id, user_name, on_refresh, vsechna_prava=None):
                     intranet_notifikace.pridej(uid, f"📅 {user_name} tě pozval/a na poradu: '{nazev.value[:50]}' ({datum_date.strftime('%d.%m.%Y')})", 'info')
                 except Exception:
                     pass
-            ui.notify('Porada vytvořena.', type='positive', position='top')
+            if vybrany_ucastnici:
+                porada_mail = {
+                    'nazev': nazev.value.strip(), 'popis': popis.value.strip() if popis.value else '',
+                    'datum': datum_date,
+                    'cas_od': cas_od.value.strip() or None, 'cas_do': cas_do.value.strip() or None,
+                    'misto': misto.value.strip() if misto.value else '',
+                    'moderator_jmeno': mod_jmeno, 'zapisovatel_jmeno': zap_jmeno,
+                }
+                _posli_maily_porada(porada_mail, vybrany_ucastnici, 'pozvanka', user_name,
+                                    ', '.join(sorted(ucastnici_vyber.values())))
+                ui.notify(_hlaska_o_mailech('Porada vytvořena.'), type='positive', position='top')
+            else:
+                ui.notify('Porada vytvořena.', type='positive', position='top')
             dlg.close(); on_refresh()
 
         with ui.row().classes('w-full justify-between mt-4'):
@@ -3976,7 +4502,7 @@ def _nacti_porady_seznam(user_id, is_admin, je_vedouci, odd_user_ids, ma_oddelen
     return porady
 
 
-@ui.refreshable
+@refreshable_na_klienta
 async def _vykresli_porady(user_id, user_name, vsechna_prava):
     is_admin = 'vse' in vsechna_prava or 'ukolovnik_admin' in vsechna_prava
 
@@ -4025,8 +4551,8 @@ async def _vykresli_porady(user_id, user_name, vsechna_prava):
                 if filtr and p['stav'] != filtr: continue
                 b_stav = BARVY_STAVU_PORADA.get(p['stav'], 'bg-gray-100 text-gray-800 border-gray-300')
                 datum_str = p['datum'].strftime('%d.%m.%Y') if p.get('datum') else '—'
-                cas_od = str(p['cas_od'])[:5] if p.get('cas_od') else ''
-                cas_do = str(p['cas_do'])[:5] if p.get('cas_do') else ''
+                cas_od = _cas_hhmm(p.get('cas_od'))
+                cas_do = _cas_hhmm(p.get('cas_do'))
                 cas_str = f'{cas_od}–{cas_do}' if cas_od else ''
 
                 c2 = intranet_data.get_db_connection()
@@ -4412,7 +4938,7 @@ def _nacti_kapacita_statistiky(zobrazeni, uid_list, dnes, stat_od, stat_do) -> l
     return statistiky
 
 
-@ui.refreshable
+@refreshable_na_klienta
 async def _vykresli_kapacita(user_id, user_name, vsechna_prava, kap_stav: dict):
     """
     kap_stav = {
@@ -5169,7 +5695,7 @@ def _vykresli_stat_karty(st: dict, jmeno: str, zobraz_projekty: bool = True, zob
                         ui.label(d_str.strftime('%d.%m.') if hasattr(d_str, 'strftime') else str(d_str)[:5]).classes('text-xs text-gray-400 shrink-0')
 
 
-@ui.refreshable
+@refreshable_na_klienta
 async def _vykresli_statistika(user_id, user_name, vsechna_prava, stat_stav: dict):
     """
     stat_stav = {'pohled': 'moje'|'osoba'|'oddeleni', 'vybrany_uid': int|None,
@@ -5845,7 +6371,8 @@ def _dialog_detail_projektu(projekt_id, user_id, user_name, vsechna_prava, on_re
 
                     # Vstup do chatu
                     with ui.row().classes('w-full items-end gap-2 mt-2 sticky bottom-0 bg-white pt-2'):
-                        nova_zprava = ui.textarea('Napište zprávu...').classes('flex-1 bg-gray-50').props('outlined autogrow').bind_value(_navrhy, 'zprava')
+                        nova_zprava = ui.textarea('Napište zprávu...', value=_navrhy.get('zprava', '')).classes('flex-1 bg-gray-50').props('outlined autogrow')\
+                            .on_value_change(lambda e: _navrhy.update(zprava=e.value))
 
                         def odeslat_chat():
                             txt = nova_zprava.value.strip() if nova_zprava.value else ''
@@ -6121,7 +6648,7 @@ def _nacti_projekty_seznam(user_id, is_admin, je_vedouci, odd_user_ids, ma_oddel
     return projekty
 
 
-@ui.refreshable
+@refreshable_na_klienta
 async def _vykresli_projekty(user_id, user_name, vsechna_prava):
     is_admin = 'vse' in vsechna_prava or 'ukolovnik_admin' in vsechna_prava
 
@@ -6326,12 +6853,14 @@ async def vykresli_ukolovnik(user_id, user_name, vsechna_prava):
         ulozena_sekce = prvni
     app.storage.user['ukolovnik_sekce'] = ulozena_sekce
 
-    with ui.tabs().classes('w-full mb-6').bind_value(app.storage.user, 'ukolovnik_sekce') as tabs_uk:
+    with ui.tabs(value=ulozena_sekce).classes('w-full mb-6') as tabs_uk:
         for key, label, icon in _TAB_DEF:
             if key in viditelne:
                 ui.tab(key, label=label, icon=icon)
 
-    with ui.tab_panels(tabs_uk, value=ulozena_sekce).bind_value(app.storage.user, 'ukolovnik_sekce').classes('w-full bg-transparent p-0'):
+    tabs_uk.on_value_change(lambda e: app.storage.user.update(ukolovnik_sekce=e.value))
+
+    with ui.tab_panels(tabs_uk, value=ulozena_sekce).classes('w-full bg-transparent p-0'):
         if 'porady' in viditelne:
             with ui.tab_panel('porady'):
                 await _vykresli_porady(user_id, user_name, vsechna_prava)

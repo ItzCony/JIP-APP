@@ -60,6 +60,7 @@ def _odhlas_vycisti_relaci():
 # ZÁMĚRNĚ nepoužíváme add_static_files('.'), aby nebyly dostupné
 # konfigurační soubory s hesly (nastaveni_intranetu.json atd.)
 import os as _os
+from intranet_ui_utils import prepni_tab, zaregistruj_prepinac_tabu
 _STATIC_WHITELIST = [
     'auto.svg', 'auto.png',
     'prizemi.svg', 'druhe_patro.svg', 'suteren.svg',
@@ -1380,7 +1381,7 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
                 ui.timer(30, _notif_badge.refresh)
                 # ─────────────────────────────────────────────────────────
 
-                ui.button(icon='settings', on_click=lambda: app.storage.user.update({'intranet_tab': 'nastaveni'})) \
+                ui.button(icon='settings', on_click=lambda: prepni_tab('nastaveni')) \
                     .props('flat round color=white dense') \
                     .tooltip('Osobní nastavení')
 
@@ -1397,7 +1398,7 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
 
         try:
             with ui.left_drawer(elevated=True, value=True).classes('bg-gray-50 border-r border-gray-200 overflow-x-hidden') as drawer:
-                with ui.tabs().bind_value(app.storage.user, 'intranet_tab').props('vertical active-color="primary" indicator-color="primary"').classes('w-full text-left gap-2 pt-4 px-4') as tabs:
+                with ui.tabs(value=app.storage.user.get('intranet_tab', 'prehled')).props('vertical active-color="primary" indicator-color="primary"').classes('w-full text-left gap-2 pt-4 px-4') as tabs:
                     ui.tab('prehled', label='📊  Přehled').classes('justify-start text-lg text-gray-800')
                     ui.tab('helpdesk', label='🎧  Helpdesk').classes('hidden')
 
@@ -1556,7 +1557,7 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
                                 await v
                         background_tasks.create(_dokresli())
 
-                with ui.tab_panels(tabs, value=_aktivni_start).bind_value(app.storage.user, 'intranet_tab').classes('w-full bg-transparent p-0'):
+                with ui.tab_panels(tabs, value=_aktivni_start).classes('w-full bg-transparent p-0'):
                     # Přehled — vždy okamžitě
                     with ui.tab_panel('prehled'):
                         intranet_obsah.vykresli_prehled(user_id, user_name, vsechna_prava)
@@ -1587,7 +1588,13 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
 
                 # Lazy render bez pollingu: tab se dokreslí při změně hodnoty tabů.
                 # Zachytí kliknutí na tab i programové přepnutí přes binding.
-                tabs.on_value_change(lambda e: _vykresli_tab_v_kontextu(e.value))
+                def _zmena_tabu(e) -> None:
+                    if e.value:
+                        app.storage.user['intranet_tab'] = e.value
+                    _vykresli_tab_v_kontextu(e.value)
+
+                tabs.on_value_change(_zmena_tabu)
+                zaregistruj_prepinac_tabu(tabs.set_value)
 
             # Automatické odhlášení po nečinnosti: výchozí 10 minut natvrdo.
             # Individuální nastavení může čas změnit, ale nikdy nevypnout (0/None → 10 min).
