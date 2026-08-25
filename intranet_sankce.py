@@ -114,12 +114,16 @@ _MAPA_VYSTAVENI = {
     'dod.pozdemj':     'dod_pozde_mj',
     'obj.-cena':       'obj_cena',
     'hodn.sankce':     'hodn_sankce',
+    'nakupci(pob.)':   'nakupci_pob',
 }
 
 # Textové vs. číselné sloupce (pro správné uložení a formátování)
 _CISLA_ZAMITNUTE = {'objednano_mj', 'dodano_mj', 'odmitnuto_mj', 'obj_cena',
                     'hodn_sankce', 'odmitnuto_kc_celkem'}
 _CISLA_VYSTAVENI = {'objednano_mj', 'dodano_mj', 'dod_pozde_mj', 'obj_cena', 'hodn_sankce'}
+
+# Sloupce, které v importovaném souboru chybět SMĚJÍ (import je nepovažuje za chybu).
+_VOLITELNE = {'nakupci_pob'}
 
 # Sloupce do připnutého součtového řádku „Celkem" — vše číselné KROMĚ obj_cena.
 # (Obj.-cena je cena za 1 MJ; její sečtení napříč řádky nic nevypovídá.)
@@ -525,6 +529,15 @@ _XLSX_FMT = {
     'date':  'dd.mm.yyyy',
 }
 _XLSX_CISLA = ('money', 'num', 'int', 'pct')
+
+
+def _xlsx_format(typ, val) -> str:
+    """Formát buňky. U „num" (#,##0.###) Excel vykreslí desetinný oddělovač i u
+    celého čísla („2,"), proto celá čísla dostanou formát bez desetin.
+    """
+    if typ == 'num' and isinstance(val, (int, float)) and float(val).is_integer():
+        return _XLSX_FMT['int']
+    return _XLSX_FMT.get(typ, 'General')
 _DATUM_VZORY = ('%d.%m.%Y', '%Y-%m-%d', '%d.%m.%y', '%d/%m/%Y',
                 '%d.%m.%Y %H:%M', '%Y-%m-%d %H:%M:%S')
 
@@ -570,8 +583,9 @@ def _xlsx_bytes(cols: list, rows: list, total: dict = None, sheet: str = 'Data')
 
     for ri, radek in enumerate(rows, start=2):
         for ci, (_nad, field, typ, _w) in enumerate(cols, start=1):
-            c = ws.cell(row=ri, column=ci, value=_xlsx_hodnota(radek.get(field), typ))
-            c.number_format = _XLSX_FMT.get(typ, 'General')
+            hod = _xlsx_hodnota(radek.get(field), typ)
+            c = ws.cell(row=ri, column=ci, value=hod)
+            c.number_format = _xlsx_format(typ, hod)
 
     posledni = 1 + len(rows)
     ws.freeze_panes = 'A2'
@@ -584,8 +598,9 @@ def _xlsx_bytes(cols: list, rows: list, total: dict = None, sheet: str = 'Data')
         tucne = Font(bold=True)
         linka = Border(top=Side(style='thin', color='334155'))
         for ci, (_nad, field, typ, _w) in enumerate(cols, start=1):
-            c = ws.cell(row=tr, column=ci, value=_xlsx_hodnota(total.get(field), typ))
-            c.number_format = _XLSX_FMT.get(typ, 'General')
+            hod = _xlsx_hodnota(total.get(field), typ)
+            c = ws.cell(row=tr, column=ci, value=hod)
+            c.number_format = _xlsx_format(typ, hod)
             c.font, c.border = tucne, linka
 
     buf = io.BytesIO()
@@ -681,6 +696,7 @@ _EXP_VYSTAVENI = [
     ('Dod. pozdě MJ',  'dod_pozde_mj',     'num',   14),
     ('Obj.-cena',      'obj_cena',         'money', 13),
     ('Hodn. sankce',   'hodn_sankce',      'money', 14),
+    ('Nákupčí (pob.)', 'nakupci_pob',      'text',  14),
     ('Sleva na sankci', 'sleva',           'pct',   14),
     ('Poznámka',       'poznamka',         'text',  36),
 ]
@@ -689,6 +705,7 @@ _EXP_SOUHRN = [
     ('IČ',             'ico',              'text',  13),
     ('Dodavatel',      'jmeno_dodavatele', 'text',  40),
     ('Období',         'obdobi',           'text',  16),
+    ('Nákupčí (pob.)', 'nakupci_pob',      'text',  16),
     ('Položek',        'pocet',            'int',   10),
     ('Sankce celkem',  'sankce_celkem',    'money', 15),
     ('Sleva',          'sleva_castka',     'money', 14),
@@ -994,6 +1011,7 @@ def inicializace_sankce_db():
                 cislo_objednavky VARCHAR(40), id_pobocky VARCHAR(20),
                 objednano_mj DOUBLE, dodano_mj DOUBLE, dod_pozde_mj DOUBLE,
                 obj_cena DOUBLE, hodn_sankce DOUBLE,
+                nakupci_pob VARCHAR(120),
                 stav VARCHAR(20) DEFAULT 'nevyfakturovano',
                 stav2 VARCHAR(20) DEFAULT 'v_procesu',
                 sleva DOUBLE DEFAULT NULL,
@@ -1072,6 +1090,13 @@ def inicializace_sankce_db():
                     "AND COLUMN_NAME='sleva'")
         if cur.fetchone()[0] == 0:
             cur.execute("ALTER TABLE sankce_vystaveni ADD COLUMN sleva DOUBLE "
+                        "DEFAULT NULL AFTER hodn_sankce")
+        # Migrace: nákupčí pobočky (sloupec L exportu) do sankce_vystaveni.
+        cur.execute("SELECT COUNT(*) FROM information_schema.COLUMNS "
+                    "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='sankce_vystaveni' "
+                    "AND COLUMN_NAME='nakupci_pob'")
+        if cur.fetchone()[0] == 0:
+            cur.execute("ALTER TABLE sankce_vystaveni ADD COLUMN nakupci_pob VARCHAR(120) "
                         "DEFAULT NULL AFTER hodn_sankce")
         conn.commit()
         cur.close()
@@ -1699,7 +1724,8 @@ def _importuj_sync(raw: bytes, tabulka: str, mapa: dict, cisla: set,
         pole = mapa.get(_norm(h))
         if pole:
             idx_na_pole[i] = pole
-    chybi = set(mapa.values()) - set(idx_na_pole.values())
+    # Nákupčí (pob.) přibyl do exportu dodatečně – starší soubory smí přijít bez něj.
+    chybi = set(mapa.values()) - set(idx_na_pole.values()) - _VOLITELNE
     if chybi:
         return 0, 0, 'V listu DATA chybí sloupce: ' + ', '.join(sorted(chybi))
 
@@ -3130,6 +3156,7 @@ def _col_defs_vystaveni(je_ucetni: bool) -> list:
         {'headerName': 'Obj.-cena', 'field': 'obj_cena', 'width': 110, 'type': 'numericColumn', ':valueFormatter': _MONEY_FMT},
         {'headerName': 'Hodn. sankce', 'field': 'hodn_sankce', 'width': 120, 'type': 'numericColumn',
          ':valueFormatter': _MONEY_FMT, 'cellStyle': {'fontWeight': 'bold'}},
+        {'headerName': 'Nákupčí (pob.)', 'field': 'nakupci_pob', 'width': 110, 'sortable': True},
         {'headerName': 'Sleva na sankci', 'field': 'sleva', 'width': 130, 'sortable': True,
          ':editable': _edit, ':valueFormatter': _SLEVA_FMT,
          'cellStyle': ({'textAlign': 'right', 'backgroundColor': '#fffbeb'} if je_ucetni
@@ -3170,6 +3197,10 @@ def _col_defs_souhrn(je_ucetni: bool) -> list:
          'sortable': True, 'cellStyle': {'fontWeight': '600'}},
         {'headerName': 'Období', 'field': 'obdobi', 'width': 150, 'sortable': True,
          'cellStyle': {'fontSize': '12px', 'color': '#475569'}},
+        {'headerName': 'Nákupčí (pob.)', 'field': 'nakupci_pob', 'width': 120, 'sortable': True,
+         'tooltipField': 'nakupci_pob',
+         'headerTooltip': 'Nákupčí pobočky ze zobrazených řádků dodavatele; '
+                          'víc hodnot = dodavatel spadá pod víc nákupčích'},
         {'headerName': 'Položek', 'field': 'pocet', 'width': 95, 'sortable': True,
          'type': 'numericColumn', ':valueFormatter': _NUM_FMT,
          'headerTooltip': 'Počet řádků (položek) dodavatele v aktuálním filtru'},
@@ -3295,7 +3326,8 @@ async def _vykresli_vystaveni(user_id, user_name, vsechna_prava):
                                'jmeno_dodavatele': (r.get('jmeno_dodavatele') or '').strip(),
                                'pocet': 0, 'sankce_celkem': 0.0, 'sankce_uznana': 0.0,
                                'sleva_castka': 0.0,
-                               '_stavy': set(), '_stavy2': set(), '_obd': set()}
+                               '_stavy': set(), '_stavy2': set(), '_obd': set(),
+                               '_nak': set()}
             hs = _f(r.get('hodn_sankce')) or 0.0
             sl = _f(r.get('sleva')) or 0.0
             g['pocet'] += 1
@@ -3304,6 +3336,8 @@ async def _vykresli_vystaveni(user_id, user_name, vsechna_prava):
             g['_stavy'].add(r.get('stav'))
             g['_stavy2'].add(r.get('stav2') or STAV2_DEFAULT)
             g['_obd'].add(r.get('obdobi') or '')
+            if _s(r.get('nakupci_pob')):
+                g['_nak'].add(_s(r.get('nakupci_pob')))
         out = []
         for g in skup.values():
             g['sleva_castka'] = g['sankce_celkem'] - g['sankce_uznana']
@@ -3311,6 +3345,7 @@ async def _vykresli_vystaveni(user_id, user_name, vsechna_prava):
             g['stav_label'] = STAV_LABEL.get(next(iter(st)), '') if len(st) == 1 else _MIX_LABEL
             g['stav2_label'] = STAV2_LABEL.get(next(iter(st2)), '') if len(st2) == 1 else _MIX_LABEL
             g['obdobi'] = obd[0] if len(obd) == 1 else (f'{len(obd)} období' if obd else '')
+            g['nakupci_pob'] = ', '.join(sorted(g.pop('_nak')))
             out.append(g)
         out.sort(key=lambda x: -x['sankce_uznana'])
         return out
