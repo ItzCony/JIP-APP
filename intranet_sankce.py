@@ -22,6 +22,7 @@ Role (intranet_prava.py):
   • sankce_tiket_XX – nákupčí s kódem XX: řeší tikety svých dodavatelů.
   • sankce_tiket_provoz   – tikety předané na provoz.
   • sankce_tiket_kontrola – druhotná kontrola: schvaluje storno sankce.
+  • sankce_tiket_tvrde_storno – storno bez kontroly a bez mailu (rovnou Nevyfakturovat).
   • 'vse'           – vše.
 """
 
@@ -60,7 +61,6 @@ STAV_LABEL = {
     'nakup':             'Nákup',
     'provoz':            'Provoz',
     'vyfakturovano':     'Fakturovat',
-    'storno':            'Stornovat',
     'odevzdano_uctarne': 'Odevzdáno účtárně',
 }
 STAV_LABEL_REV = {v: k for k, v in STAV_LABEL.items()}
@@ -833,19 +833,60 @@ _EYE_RENDERER = (
     "return '<span title=\"Historie změn řádku\" style=\"cursor:pointer;font-size:15px;opacity:.65\">👁️</span>';"
     "}"
 )
-_STAV_STYLE = (
-    "function(p){"
-    "var v=p.value;"
-    "if(v==='Nová data')return{backgroundColor:'#fce7f3',color:'#9d174d',fontWeight:'600'};"
-    "if(v==='Nevyfakturovat')return{backgroundColor:'#fee2e2',color:'#991b1b',fontWeight:'600'};"
-    "if(v==='Rozpracováno')return{backgroundColor:'#fef9c3',color:'#854d0e',fontWeight:'600'};"
-    "if(v==='Nákup')return{backgroundColor:'#ffedd5',color:'#9a3412',fontWeight:'600'};"
-    "if(v==='Provoz')return{backgroundColor:'#ede9fe',color:'#5b21b6',fontWeight:'600'};"
-    "if(v==='Fakturovat')return{backgroundColor:'#dbeafe',color:'#1e40af',fontWeight:'600'};"
-    "if(v==='Stornovat')return{backgroundColor:'#fecaca',color:'#991b1b',fontWeight:'600'};"
-    "if(v==='Odevzdáno účtárně')return{backgroundColor:'#dcfce7',color:'#166534',fontWeight:'600'};"
-    "return null;}"
-)
+# ── Barvy stavů ────────────────────────────────────────────────────────────
+# Jediný zdroj pravdy: label → (bg buňky, barva textu, bg celého řádku).
+# Buňka stavu je sytější, celý řádek jemný tint téže barvy (ať jde text číst).
+_PALETA = {
+    # stavy řádku dat
+    'Nová data':           ('#ffe4e6', '#9f1239', '#fff1f2'),   # světle červená
+    'Nevyfakturovat':      ('#fecaca', '#991b1b', '#fee2e2'),   # červená
+    'Rozpracováno':        ('#ffedd5', '#9a3412', '#fff7ed'),   # oranžová
+    'Nákup':               ('#fef08a', '#854d0e', '#fefce8'),   # žlutá
+    'Provoz':              ('#ddd6fe', '#5b21b6', '#f5f3ff'),   # fialová
+    'Fakturovat':          ('#dbeafe', '#1e40af', '#eff6ff'),   # modrá
+    'Odevzdáno účtárně':   ('#dcfce7', '#166534', '#f0fdf4'),   # zelená
+    # stavy tiketu
+    'U nákupčího':         ('#fef08a', '#854d0e', '#fefce8'),
+    'U provozu':           ('#ddd6fe', '#5b21b6', '#f5f3ff'),
+    'Částečně rozhodnuto': ('#ccfbf1', '#115e59', '#f0fdfa'),
+    'K fakturaci':         ('#dbeafe', '#1e40af', '#eff6ff'),
+    'Storno – ke kontrole':('#fecaca', '#991b1b', '#fef2f2'),
+    'Nevyfakturováno':     ('#fecaca', '#991b1b', '#fee2e2'),
+    'Stornováno':          ('#fecaca', '#991b1b', '#fee2e2'),
+    'Abnormalita':         ('#e2e8f0', '#475569', '#f8fafc'),   # světle šedá
+    'Uzavřeno':            ('#dcfce7', '#166534', '#f0fdf4'),
+    # rozhodnutí v tiketu
+    'Stornovat':           ('#fecaca', '#991b1b', '#fee2e2'),
+    'Na provoz':           ('#ddd6fe', '#5b21b6', '#f5f3ff'),
+    'Na nákup':            ('#fef08a', '#854d0e', '#fefce8'),
+}
+_CELL_MAP = json.dumps({k: {'backgroundColor': v[0], 'color': v[1], 'fontWeight': '600'}
+                        for k, v in _PALETA.items()}, ensure_ascii=False)
+_ROW_MAP = json.dumps({k: v[2] for k, v in _PALETA.items()}, ensure_ascii=False)
+_PINNED_JS = ("{fontWeight:'700',backgroundColor:'#f1f5f9',"
+              "borderTop:'2px solid #cbd5e1'}")
+
+
+def _cell_style(*labels) -> str:
+    """cellStyle: obarví buňku podle své hodnoty (jen pro vyjmenované labely)."""
+    povol = json.dumps(list(labels), ensure_ascii=False)
+    return ("function(p){var M=%s;var OK=%s;var v=p.value;"
+            "if(OK.indexOf(v)<0)return null;return M[v]||null;}" % (_CELL_MAP, povol))
+
+
+def _row_style(*fields) -> str:
+    """getRowStyle: obarví CELÝ řádek podle prvního vyplněného pole (pořadí = priorita)."""
+    f = json.dumps(list(fields), ensure_ascii=False)
+    return ("function(p){if(p.node&&p.node.rowPinned)return %s;"
+            "var M=%s;var F=%s;var d=p.data||{};"
+            "for(var i=0;i<F.length;i++){var c=M[d[F[i]]];if(c)return{backgroundColor:c};}"
+            "return null;}" % (_PINNED_JS, _ROW_MAP, f))
+
+
+_STAV_LABELS = ('Nová data', 'Nevyfakturovat', 'Rozpracováno', 'Nákup', 'Provoz',
+                'Fakturovat', 'Odevzdáno účtárně')
+_STAV_STYLE = _cell_style(*_STAV_LABELS)
+_ROW_STYLE_STAV = _row_style('stav_label')
 _STAV2_STYLE = (
     "function(p){"
     "var v=p.value;"
@@ -1135,6 +1176,8 @@ def inicializace_sankce_db():
         if cur.fetchone()[0] == 0:
             cur.execute("ALTER TABLE sankce_vystaveni ADD COLUMN nakupci_pob VARCHAR(120) "
                         "DEFAULT NULL AFTER hodn_sankce")
+        # Migrace: stav „storno" zanikl — splynul s „nevyfakturovano" (Nevyfakturovat).
+        cur.execute("UPDATE sankce_vystaveni SET stav='nevyfakturovano' WHERE stav='storno'")
         conn.commit()
         cur.close()
         for _t in ('sankce_zamitnute', 'sankce_vystaveni'):
@@ -3839,7 +3882,7 @@ async def _vykresli_vystaveni(user_id, user_name, vsechna_prava):
         'suppressMovableColumns': True,
         'rowSelection': 'multiple',
         'suppressRowClickSelection': True,
-        ':getRowStyle': _PINNED_TOTAL_STYLE,
+        ':getRowStyle': _ROW_STYLE_STAV,
         ':onFirstDataRendered': _AUTOSIZE_FIT,
         ':onGridSizeChanged': _AUTOSIZE_FIT,
         ':onFilterChanged': _FILTER_RECALC_VYSTAVENI,
@@ -3862,7 +3905,7 @@ async def _vykresli_vystaveni(user_id, user_name, vsechna_prava):
         'suppressMovableColumns': True,
         'rowSelection': 'multiple',
         'suppressRowClickSelection': True,
-        ':getRowStyle': _PINNED_TOTAL_STYLE,
+        ':getRowStyle': _ROW_STYLE_STAV,
         ':onFirstDataRendered': _AUTOSIZE_FIT,
         ':onGridSizeChanged': _AUTOSIZE_FIT,
         ':onFilterChanged': _FILTER_RECALC_SOUHRN,
@@ -4274,7 +4317,8 @@ TIKET_STAV_LABEL = {
 }
 # „Otevřené" = někdo na nich ještě má něco udělat (výchozí filtr seznamu tiketů).
 TIKET_STAV_OTEVRENE = ('nakup', 'provoz', 'castecne', 'storno_ceka', 'abnormalita')
-ROZ_LABEL = {'vyfakturovat': 'Fakturovat', 'storno': 'Stornovat', 'provoz': 'Na provoz'}
+ROZ_LABEL = {'vyfakturovat': 'Fakturovat', 'storno': 'Stornovat', 'provoz': 'Na provoz',
+             'nakup': 'Na nákup'}
 ROZ_LABEL_REV = {v: k for k, v in ROZ_LABEL.items()}
 # Kódy nákupčích z listu DATA („Nákupčí (pob.)") → individuální právo na tikety.
 KODY_NAKUPCI = ['DR', 'SK', 'CK', 'VI', 'LT', 'NP', 'RD', 'HV', 'UP', 'KO', 'ML', 'OZ', 'VN']
@@ -4289,27 +4333,15 @@ def _radku(n: int) -> str:
     return f'{n} ' + ('řádek' if n == 1 else 'řádky' if 2 <= n <= 4 else 'řádků')
 
 
-_TIKET_STAV_STYLE = (
-    "function(p){"
-    "var v=p.value;"
-    "if(v==='U nákupčího')return{backgroundColor:'#fef9c3',color:'#854d0e',fontWeight:'600'};"
-    "if(v==='U provozu')return{backgroundColor:'#ede9fe',color:'#5b21b6',fontWeight:'600'};"
-    "if(v==='Částečně rozhodnuto')return{backgroundColor:'#ccfbf1',color:'#115e59',fontWeight:'600'};"
-    "if(v==='K fakturaci')return{backgroundColor:'#dbeafe',color:'#1e40af',fontWeight:'600'};"
-    "if(v==='Storno – ke kontrole')return{backgroundColor:'#ffedd5',color:'#9a3412',fontWeight:'600'};"
-    "if(v==='Stornováno')return{backgroundColor:'#fee2e2',color:'#991b1b',fontWeight:'600'};"
-    "if(v==='Abnormalita')return{backgroundColor:'#fae8ff',color:'#86198f',fontWeight:'600'};"
-    "if(v==='Uzavřeno')return{backgroundColor:'#dcfce7',color:'#166534',fontWeight:'600'};"
-    "return null;}"
-)
-_ROZ_STYLE = (
-    "function(p){"
-    "var v=p.value;"
-    "if(v==='Fakturovat')return{backgroundColor:'#dbeafe',color:'#1e40af',fontWeight:'600'};"
-    "if(v==='Stornovat')return{backgroundColor:'#fee2e2',color:'#991b1b',fontWeight:'600'};"
-    "if(v==='Na provoz')return{backgroundColor:'#ede9fe',color:'#5b21b6',fontWeight:'600'};"
-    "return null;}"
-)
+_TIKET_STAV_LABELS = ('U nákupčího', 'U provozu', 'Částečně rozhodnuto', 'K fakturaci',
+                      'Storno – ke kontrole', 'Stornováno', 'Nevyfakturováno',
+                      'Abnormalita', 'Uzavřeno')
+_TIKET_STAV_STYLE = _cell_style(*_TIKET_STAV_LABELS)
+_ROZ_LABELS = ('Fakturovat', 'Stornovat', 'Na provoz', 'Na nákup')
+_ROZ_STYLE = _cell_style(*_ROZ_LABELS)
+# Řádek tiketu = barva podle rozhodnutí; dokud není, podle stavu dat.
+_ROW_STYLE_TIKET_RADKY = _row_style('rozhodnuti_label', 'stav_label')
+_ROW_STYLE_TIKETY = _row_style('stav_label')
 
 
 # ── čistá logika (bez DB — testovatelná) ────────────────────────────────────
@@ -4346,7 +4378,7 @@ def _tiket_stav_z_rozhodnuti(hodnoty) -> str:
     if len(ruzna) > 1:
         return 'castecne'
     return {'vyfakturovat': 'vyfakturovano', 'storno': 'storno_ceka',
-            'provoz': 'provoz'}[ruzna.pop()]
+            'provoz': 'provoz', 'nakup': 'nakup'}[ruzna.pop()]
 
 
 def _tiket_cislo(tid) -> str:
@@ -4575,6 +4607,44 @@ def _uprav_tiket(tid, stav=None, poznamka=None):
         conn.close()
 
 
+def _smaz_tiket(tid, user_id, user_name) -> int:
+    """Úplné smazání tiketu (jen 'vse'): vazby, historie i diskuze tiketu zmizí.
+    Řádky, které ještě čekají na vyřízení (Nákup/Provoz), se vrátí na Rozpracováno,
+    už vyřízené (Fakturovat/Nevyfakturovat) zůstanou. Vrací počet vrácených řádků."""
+    rh = _tiket_rh(tid)
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return 0
+    vsechny, vraceno = [], []
+    try:
+        cur = conn.cursor(buffered=True)
+        cur.execute('SELECT v.id, v.row_hash, v.stav FROM sankce_tiket_radky r '
+                    'JOIN sankce_vystaveni v ON v.id = r.radek_id WHERE r.tiket_id=%s', (tid,))
+        vsechny = list(cur.fetchall())
+        vraceno = [r for r in vsechny if r[2] in ('nakup', 'provoz')]
+        if vraceno:
+            cur.executemany('UPDATE sankce_vystaveni SET stav=%s WHERE id=%s',
+                            [('rozpracovano', r[0]) for r in vraceno])
+        cur.execute('DELETE FROM sankce_tiket_radky WHERE tiket_id=%s', (tid,))
+        cur.execute('DELETE FROM sankce_tikety WHERE id=%s', (tid,))
+        for tab in ('sankce_audit', 'sankce_chat', 'sankce_chat_precteno'):
+            cur.execute(f'DELETE FROM {tab} WHERE tabulka=%s AND row_hash=%s',
+                        ('sankce_tikety', rh))
+        conn.commit(); cur.close()
+    except Exception as e:
+        print(f'[sankce] _smaz_tiket error: {e}')
+        return 0
+    finally:
+        conn.close()
+    cislo = _tiket_cislo(tid)
+    _zapis_audit_bulk(
+        [('sankce_vystaveni', r[1], r[0], 'tiket', cislo, 'smazán', user_id, user_name)
+         for r in vsechny]
+        + [('sankce_vystaveni', r[1], r[0], 'stav', STAV_LABEL.get(r[2], r[2]),
+            STAV_LABEL['rozpracovano'], user_id, user_name) for r in vraceno])
+    return len(vraceno)
+
+
 def _notifikuj_tiket(prava, predmet: str, text: str):
     """Zvoneček + e-mail všem s daným právem. Běží mimo event loop (DB + SMTP).
     Pozdrav, odkaz do modulu a patičku doplní tahle funkce — volající píše jen věc."""
@@ -4599,20 +4669,27 @@ def _notifikuj_tiket(prava, predmet: str, text: str):
         print(f'[sankce] _notifikuj_tiket error: {e}')
 
 
-def _odesli_rozhodnuti(tiket: dict, radky: list, user_id, user_name) -> tuple:
-    """Odeslání rozhodnutí řešitelem. „Fakturovat" a „Na provoz" se promítnou do
-    dat hned (na provoz navíc vznikne navazující provozní tiket), „Stornovat"
-    čeká na palec druhotné kontroly. Vrací (novy_stav_tiketu, hlaska)."""
+def _odesli_rozhodnuti(tiket: dict, radky: list, user_id, user_name,
+                       tvrde_storno: bool = False) -> tuple:
+    """Odeslání rozhodnutí řešitelem. „Fakturovat", „Na provoz" a „Na nákup" se
+    promítnou do dat hned (postoupení navíc založí navazující tiket druhé
+    strany), „Stornovat" čeká na palec druhotné kontroly.
+    S právem „Tvrdé storno" (tvrde_storno) jde storno rovnou na „Nevyfakturovat"
+    a neposílá se o něm žádný e-mail.
+    Vrací (novy_stav_tiketu, hlaska)."""
     tid = tiket.get('id')
     novy = _tiket_stav_z_rozhodnuti([r.get('rozhodnuti') for r in radky])
     if not novy:
         return None, 'Není vyplněné žádné rozhodnutí.'
+    if tvrde_storno and novy == 'storno_ceka':
+        novy = 'storno'
     rh, cislo = _tiket_rh(tid), _tiket_cislo(tid)
     _uloz_rozhodnuti([(r.get('rozhodnuti') or None, r.get('tr_id')) for r in radky])
 
     fakt = [r for r in radky if r.get('rozhodnuti') == 'vyfakturovat']
     prov = [r for r in radky if r.get('rozhodnuti') == 'provoz']
     stor = [r for r in radky if r.get('rozhodnuti') == 'storno']
+    nak = [r for r in radky if r.get('rozhodnuti') == 'nakup']
 
     audit = [('sankce_tikety', rh, tid, 'tiket_stav',
               TIKET_STAV_LABEL.get(tiket.get('stav')), TIKET_STAV_LABEL[novy],
@@ -4628,11 +4705,23 @@ def _odesli_rozhodnuti(tiket: dict, radky: list, user_id, user_name) -> tuple:
             audit.append(('sankce_vystaveni', r.get('row_hash'), r.get('id'), 'stav',
                           STAV_LABEL.get(r.get('stav')), STAV_LABEL['vyfakturovano'],
                           user_id, user_name))
+    if stor and tvrde_storno:
+        _nastav_stav_radku([r.get('id') for r in stor], 'nevyfakturovano')
+        for r in stor:
+            audit.append(('sankce_vystaveni', r.get('row_hash'), r.get('id'), 'stav',
+                          STAV_LABEL.get(r.get('stav')), STAV_LABEL['nevyfakturovano'],
+                          user_id, user_name))
+        audit.append(('sankce_tikety', rh, tid, 'tiket_stav', None,
+                      'Tvrdé storno (bez druhotné kontroly)', user_id, user_name))
     _zapis_audit_bulk(audit)
 
     if prov:
         _zaloz_tikety(prov, 'provoz', f'Postoupeno z tiketu {cislo}',
                       user_id, user_name, zdroj_tiket=tid)
+    zal_nak = []
+    if nak:
+        zal_nak = _zaloz_tikety(nak, 'nakup', f'Vráceno z tiketu {cislo}',
+                                user_id, user_name, zdroj_tiket=tid)
     _uprav_tiket(tid, stav=novy)
 
     dod = _s(tiket.get('jmeno_dodavatele'))
@@ -4646,26 +4735,37 @@ def _odesli_rozhodnuti(tiket: dict, radky: list, user_id, user_name) -> tuple:
                          f'Sankce – nový tiket pro provoz ({dod})',
                          f'{user_name} postoupil(a) {_radku(len(prov))} dodavatele {dod} '
                          f'na provoz (z tiketu {cislo}).')
-    if stor:
+    for ntid, kod, ndod, n in zal_nak:
+        _notifikuj_tiket((KOD_PRAVO.get(kod),),
+                         f'Sankce – nový tiket pro nákup ({ndod})',
+                         f'{user_name} vrátil(a) {_radku(n)} dodavatele {ndod} '
+                         f'na nákup (z tiketu {cislo}).')
+    if stor and not tvrde_storno:
         _notifikuj_tiket(('sankce_tiket_kontrola',),
                          f'Sankce – {cislo} ke schválení storna ({dod})',
                          f'{user_name} navrhuje stornovat {_radku(len(stor))} dodavatele '
                          f'{dod}. Bez vašeho schválení se data nemění.')
+    if stor and tvrde_storno:
+        return novy, (f'Rozhodnutí odesláno: {TIKET_STAV_LABEL[novy]} — tvrdé storno, '
+                      f'{_radku(len(stor))} rovnou na „Nevyfakturovat" (bez kontroly a mailu). '
+                      f'Fakturovat {len(fakt)}, provoz {len(prov)}, nákup {len(nak)}.')
     return novy, (f'Rozhodnutí odesláno: {TIKET_STAV_LABEL[novy]} '
-                  f'(fakturovat {len(fakt)}, storno {len(stor)}, provoz {len(prov)}).')
+                  f'(fakturovat {len(fakt)}, storno {len(stor)}, provoz {len(prov)}, '
+                  f'nákup {len(nak)}).')
 
 
 def _palec_storno(tiket: dict, radky: list, schvaleno: bool, user_id, user_name) -> str:
-    """Druhotná kontrola storna. Schváleno → řádky přejdou na „Stornovat" a jde
+    """Druhotná kontrola storna. Schváleno → řádky přejdou na „Nevyfakturovat" a jde
     mail účtárně. Zamítnuto → data se nemění a tiket se vrací řešiteli."""
     tid = tiket.get('id')
     rh, cislo = _tiket_rh(tid), _tiket_cislo(tid)
     stor = [r for r in radky if r.get('rozhodnuti') == 'storno']
     dod = _s(tiket.get('jmeno_dodavatele'))
     if schvaleno:
-        _nastav_stav_radku([r.get('id') for r in stor], 'storno')
+        _nastav_stav_radku([r.get('id') for r in stor], 'nevyfakturovano')
         audit = [('sankce_vystaveni', r.get('row_hash'), r.get('id'), 'stav',
-                  STAV_LABEL.get(r.get('stav')), STAV_LABEL['storno'], user_id, user_name)
+                  STAV_LABEL.get(r.get('stav')), STAV_LABEL['nevyfakturovano'],
+                  user_id, user_name)
                  for r in stor]
         audit.append(('sankce_tikety', rh, tid, 'tiket_stav',
                       TIKET_STAV_LABEL.get(tiket.get('stav')), TIKET_STAV_LABEL['storno'],
@@ -4675,8 +4775,8 @@ def _palec_storno(tiket: dict, radky: list, schvaleno: bool, user_id, user_name)
         _notifikuj_tiket(('vse', 'sankce_ucetni'),
                          f'Sankce – {cislo} storno schváleno ({dod})',
                          f'{user_name} schválil(a) storno {_radku(len(stor))} dodavatele '
-                         f'{dod}. Řádky jsou ve stavu „Stornovat".')
-        return f'Storno schváleno — {_radku(len(stor))} přešlo na „Stornovat".'
+                         f'{dod}. Řádky jsou ve stavu „Nevyfakturovat".')
+        return f'Storno schváleno — {_radku(len(stor))} přešlo na „Nevyfakturovat".'
 
     zpet = 'provoz' if _s(tiket.get('typ')) == 'provoz' else 'nakup'
     _uloz_rozhodnuti([(None, r.get('tr_id')) for r in stor])
@@ -4729,7 +4829,17 @@ def _col_defs_tikety() -> list:
 
 
 def _col_defs_tiket_radky(volby: list, editovatelne: bool) -> list:
-    return [
+    cols = []
+    if editovatelne:
+        cols.append(
+            {'headerName': '', 'field': '_sel', 'width': 44, 'minWidth': 44, 'maxWidth': 44,
+             'pinned': 'left', 'checkboxSelection': True, 'headerCheckboxSelection': True,
+             'headerCheckboxSelectionFilteredOnly': True,
+             'sortable': False, 'editable': False, 'resizable': False, 'filter': False,
+             'suppressSizeToFit': True, 'suppressAutoSize': True, 'suppressMovable': True,
+             'headerTooltip': 'Označení řádků — rozhodnutí se nastaví všem najednou '
+                              '(rozsah: Shift+klik)'})
+    return cols + [
         {'headerName': 'Poř. č.', 'field': 'nase_cislo', 'width': 104, 'pinned': 'left',
          'cellStyle': {'fontFamily': 'monospace', 'fontSize': '12px'}},
         {'headerName': 'Kód zboží', 'field': 'kod_zbozi', 'width': 110,
@@ -4765,13 +4875,13 @@ def _otevri_tiket(t: dict, user_id, user_name, vsechna_prava, refresh):
               (KOD_PRAVO.get(_s(t.get('kod_nakupci')).upper()),)
     muze_resit = ma_vse or bool({p for p in resitel if p} & set(vsechna_prava))
     muze_palec = ma_vse or 'sankce_tiket_kontrola' in vsechna_prava
+    tvrde_storno = ma_vse or 'sankce_tiket_tvrde_storno' in vsechna_prava
     rozhoduje_se = stav in ('nakup', 'provoz', 'castecne')
     editovatelne = muze_resit and rozhoduje_se
 
     radky = _nacti_tiket_radky(tid)
     volby = ['', ROZ_LABEL['vyfakturovat'], ROZ_LABEL['storno']]
-    if typ == 'nakup':
-        volby.append(ROZ_LABEL['provoz'])
+    volby.append(ROZ_LABEL['provoz'] if typ == 'nakup' else ROZ_LABEL['nakup'])
 
     with ui.dialog() as dlg, ui.card().classes('p-0 rounded-2xl gap-0') \
             .style('min-width:960px;max-width:96vw'):
@@ -4800,19 +4910,43 @@ def _otevri_tiket(t: dict, user_id, user_name, vsechna_prava, refresh):
             'rowHeight': 32,
             'singleClickEdit': True,
             'stopEditingWhenCellsLoseFocus': True,
+            'rowSelection': 'multiple',
+            'suppressRowClickSelection': True,
+            ':getRowStyle': _ROW_STYLE_TIKET_RADKY,
             ':getRowId': "function(p){var d=p.data||{};return ''+(d.tr_id!=null?d.tr_id:'');}",
         }).classes('w-full').style('height:46vh')
 
-        def _on_roz(e):
+        async def _on_roz(e):
             a = e.args or {}
             if (a.get('colId') or '') != 'rozhodnuti_label':
                 return
             d = a.get('data') or {}
             kod = ROZ_LABEL_REV.get(a.get('newValue') or '')
+
+            # Označené řádky (checkboxy vlevo) → nastav rozhodnutí všem najednou.
+            try:
+                sel = await ui.run_javascript(
+                    f'const c=getElement({g.id});'
+                    "return (c&&c.run_grid_method)?"
+                    "c.run_grid_method('getSelectedRows').map(r=>r.tr_id):[];",
+                    timeout=5,
+                )
+            except Exception:
+                sel = []
+            sel = {str(x) for x in (sel or []) if x is not None}
+
+            cile = {str(d.get('tr_id'))}
+            if str(d.get('tr_id')) in sel and len(sel) > 1:
+                cile = sel
+
             for r in radky:
-                if r.get('tr_id') == d.get('tr_id'):
+                if str(r.get('tr_id')) in cile:
                     r['rozhodnuti'] = kod
                     r['rozhodnuti_label'] = ROZ_LABEL.get(kod, '')
+            if len(cile) > 1:
+                g.run_grid_method('setGridOption', 'rowData', radky)
+                ui.notify(f'„{ROZ_LABEL.get(kod, "—")}" nastaveno u {len(cile)} označených řádků.',
+                          type='positive', position='top', timeout=3000)
         g.on('cellValueChanged', _on_roz)
 
         def _vse(kod):
@@ -4823,7 +4957,7 @@ def _otevri_tiket(t: dict, user_id, user_name, vsechna_prava, refresh):
 
         async def _odeslat():
             novy, hlaska = await asyncio.to_thread(
-                _odesli_rozhodnuti, t, radky, user_id, user_name)
+                _odesli_rozhodnuti, t, radky, user_id, user_name, tvrde_storno)
             if not novy:
                 ui.notify(hlaska, type='warning', position='top', timeout=6000)
                 return
@@ -4891,6 +5025,30 @@ def _otevri_tiket(t: dict, user_id, user_name, vsechna_prava, refresh):
             ui.notify('Tiket uzavřen.', type='positive', position='top-right', timeout=4000)
             dlg.close(); refresh()
 
+        def _smazat():
+            with ui.dialog() as d3, ui.card().classes('p-5 gap-3 rounded-xl') \
+                    .style('min-width:440px'):
+                ui.label(f'Opravdu smazat tiket {cislo}?').classes('text-base font-bold')
+                ui.label('Tiket, jeho historie i diskuze se nenávratně smažou. Řádky '
+                         'čekající na vyřízení (Nákup/Provoz) se vrátí na Rozpracováno, '
+                         'už rozhodnuté řádky zůstanou beze změny.') \
+                    .classes('text-sm text-gray-600')
+
+                async def _ok():
+                    d3.close()
+                    n = await asyncio.to_thread(_smaz_tiket, tid, user_id, user_name)
+                    intranet_logger.log_activity(user_name, 'Sankce',
+                                                 f'Tiket {cislo}: smazán ({n} řádků vráceno)')
+                    ui.notify(f'Tiket {cislo} smazán. Vráceno {n} řádků na Rozpracováno.',
+                              type='warning', position='top', timeout=6000)
+                    dlg.close(); refresh()
+
+                with ui.row().classes('w-full justify-end gap-2'):
+                    ui.button('Zrušit', on_click=d3.close).props('flat no-caps')
+                    ui.button('Smazat', icon='delete_forever', on_click=_ok) \
+                        .props('unelevated color=red-8 no-caps')
+            d3.open()
+
         ui.separator()
         with ui.row().classes('w-full items-center gap-2 px-4 py-3 flex-wrap'):
             ui.button('Historie', icon='history',
@@ -4915,13 +5073,22 @@ def _otevri_tiket(t: dict, user_id, user_name, vsechna_prava, refresh):
                     ui.button('Vše na provoz', icon='engineering',
                               on_click=lambda: _vse('provoz')) \
                         .props('outline color=purple-7 dense no-caps')
+                else:
+                    ui.button('Vše na nákup', icon='shopping_cart',
+                              on_click=lambda: _vse('nakup')) \
+                        .props('outline color=orange-9 dense no-caps') \
+                        .tooltip('Vrátit řádky nákupčímu — vznikne nový nákupní tiket')
                 ui.button('Abnormalita', icon='report_problem', on_click=_abnormalita) \
                     .props('outline color=orange-8 dense no-caps') \
                     .tooltip('Netypický případ — data se nemění, řeší účtárna')
                 ui.button('Odeslat rozhodnutí', icon='send', on_click=_odeslat) \
                     .props('unelevated no-caps') \
                     .classes('bg-emerald-600 hover:bg-emerald-700 text-white font-semibold '
-                             'rounded-lg shadow-md px-5')
+                             'rounded-lg shadow-md px-5') \
+                    .tooltip('Tvrdé storno: řádky jdou rovnou na „Nevyfakturovat", '
+                             'bez druhotné kontroly a bez mailu'
+                             if tvrde_storno else
+                             'Storno půjde ke schválení druhotné kontrole')
             if muze_palec and stav == 'storno_ceka':
                 ui.button('Vrátit řešiteli', icon='thumb_down',
                           on_click=lambda: _palec(False)) \
@@ -4935,6 +5102,11 @@ def _otevri_tiket(t: dict, user_id, user_name, vsechna_prava, refresh):
             if je_ucetni and stav in ('vyfakturovano', 'storno', 'abnormalita'):
                 ui.button('Uzavřít tiket', icon='task_alt', on_click=_uzavrit) \
                     .props('unelevated color=green-8 no-caps')
+            if ma_vse:
+                ui.button('Smazat tiket', icon='delete_forever', on_click=_smazat) \
+                    .props('outline color=red-8 dense no-caps') \
+                    .tooltip('Jen admin — tiket, historie i diskuze zmizí, '
+                             'čekající řádky se vrátí na Rozpracováno')
             if not (editovatelne or (muze_palec and stav == 'storno_ceka')):
                 ui.label('Tiket je jen ke čtení (není ve vaší frontě).') \
                     .classes('text-xs text-gray-400')
@@ -4977,6 +5149,7 @@ async def _vykresli_tikety(user_id, user_name, vsechna_prava):
         'defaultColDef': {'resizable': True, 'sortable': False, 'filter': True},
         'rowHeight': 32,
         'suppressMovableColumns': True,
+        ':getRowStyle': _ROW_STYLE_TIKETY,
         ':onFirstDataRendered': _AUTOSIZE_FIT,
         ':onGridSizeChanged': _AUTOSIZE_FIT,
         ':getRowId': _GET_ROW_ID,
