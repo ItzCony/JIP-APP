@@ -19,6 +19,9 @@ Role (intranet_prava.py):
   • sankce_ucetni   – Sankce k vystavení: mění stav + píše poznámky.
   • sankce_nakup    – Zamítnuté dodávky: píše poznámky.
   • sankce_ctenar   – obě sestavy jen pro čtení (filtry/řazení/export + diskuze).
+  • sankce_tiket_XX – nákupčí s kódem XX: řeší tikety svých dodavatelů.
+  • sankce_tiket_provoz   – tikety předané na provoz.
+  • sankce_tiket_kontrola – druhotná kontrola: schvaluje storno sankce.
   • 'vse'           – vše.
 """
 
@@ -26,6 +29,7 @@ from nicegui import ui, app
 import intranet_data
 import intranet_logger
 import intranet_notifikace
+import intranet_emaily
 from intranet_ui_utils import refreshable_na_klienta
 import datetime
 import hashlib
@@ -56,6 +60,7 @@ STAV_LABEL = {
     'nakup':             'Nákup',
     'provoz':            'Provoz',
     'vyfakturovano':     'Fakturovat',
+    'storno':            'Stornovat',
     'odevzdano_uctarne': 'Odevzdáno účtárně',
 }
 STAV_LABEL_REV = {v: k for k, v in STAV_LABEL.items()}
@@ -837,6 +842,7 @@ _STAV_STYLE = (
     "if(v==='Nákup')return{backgroundColor:'#ffedd5',color:'#9a3412',fontWeight:'600'};"
     "if(v==='Provoz')return{backgroundColor:'#ede9fe',color:'#5b21b6',fontWeight:'600'};"
     "if(v==='Fakturovat')return{backgroundColor:'#dbeafe',color:'#1e40af',fontWeight:'600'};"
+    "if(v==='Stornovat')return{backgroundColor:'#fecaca',color:'#991b1b',fontWeight:'600'};"
     "if(v==='Odevzdáno účtárně')return{backgroundColor:'#dcfce7',color:'#166534',fontWeight:'600'};"
     "return null;}"
 )
@@ -1070,6 +1076,37 @@ def inicializace_sankce_db():
                 INDEX idx_typ (typ), INDEX idx_vytvoreno (vytvoreno)
             ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
         """)
+        # Tikety: předání skupiny řádků „Sankce k vystavení" nákupčímu / provozu.
+        # Klíč skupiny = dodavatel (IČO) + kód nákupčího; provozní tiket je per dodavatel.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS sankce_tikety (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                typ VARCHAR(10) NOT NULL,
+                stav VARCHAR(20) NOT NULL,
+                kod_nakupci VARCHAR(20),
+                ico VARCHAR(30),
+                jmeno_dodavatele VARCHAR(255),
+                obdobi VARCHAR(120),
+                poznamka TEXT,
+                predal VARCHAR(255),
+                predano_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                zmeneno DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                zdroj_tiket INT DEFAULT NULL,
+                INDEX idx_tiket_stav (stav), INDEX idx_tiket_kod (kod_nakupci)
+            ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        """)
+        # Položky tiketu = odkaz na řádky sankce_vystaveni + rozhodnutí řešitele.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS sankce_tiket_radky (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                tiket_id INT NOT NULL,
+                radek_id INT,
+                row_hash VARCHAR(40),
+                rozhodnuti VARCHAR(20) DEFAULT NULL,
+                INDEX idx_tr_hash (row_hash),
+                UNIQUE KEY uniq_tr (tiket_id, radek_id)
+            ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        """)
         # Migrace: doplň sloupec „naše pořadové číslo" do starších tabulek + dočísluj.
         for _t in ('sankce_zamitnute', 'sankce_vystaveni'):
             cur.execute("SELECT COUNT(*) FROM information_schema.COLUMNS "
@@ -1295,19 +1332,23 @@ def _smaz_chat(tabulka, row_hash, msg_id, user_id, muze_mazat_vse=False) -> bool
 _KOMENTAR_PRAVA = {
     'sankce_vystaveni': ('vse', 'sankce_analytik', 'sankce_ucetni', 'sankce_ctenar'),
     'sankce_zamitnute': ('vse', 'sankce_analytik', 'sankce_nakup', 'sankce_ctenar'),
+    'sankce_tikety':    ('vse', 'sankce_analytik', 'sankce_ucetni'),
 }
 _KOMENTAR_SESTAVA = {
     'sankce_vystaveni': 'Sankce k vystavení',
     'sankce_zamitnute': 'Zamítnuté dodávky',
+    'sankce_tikety':    'Tiket',
 }
 
 
-def _notifikuj_novy_komentar(tabulka, row_hash, autor_id, autor_jmeno, popis):
+def _notifikuj_novy_komentar(tabulka, row_hash, autor_id, autor_jmeno, popis,
+                             prava_navic=()):
     """Po napsání komentáře k případu „cinkne" oznámení do zvonečku všem, kdo na
     danou sestavu mají právo (kromě autora). Volá se mimo event loop (DB dotazy),
-    takže se neblokuje odeslání zprávy."""
+    takže se neblokuje odeslání zprávy. `prava_navic` = adresáti navíc (u tiketu
+    jeho řešitel — nákupčí / provoz / kontrola)."""
     try:
-        prava = _KOMENTAR_PRAVA.get(tabulka)
+        prava = tuple(_KOMENTAR_PRAVA.get(tabulka) or ()) + tuple(prava_navic or ())
         if not prava:
             return
         prijemci = intranet_data.ziskej_uzivatele_s_pravem(*prava)  # {id: jmeno}
@@ -1935,7 +1976,8 @@ def _smaz_radky(tabulka: str, radek_ids: list) -> tuple:
 # DIALOG HISTORIE ŘÁDKU (očičko)
 # =========================================================
 _POLE_LABEL = {'stav': 'Stav', 'stav2': 'Aktivita 2', 'sleva': 'Sleva na sankci',
-               'poznamka': 'Poznámka'}
+               'poznamka': 'Poznámka', 'tiket': 'Tiket', 'rozhodnuti': 'Rozhodnutí',
+               'tiket_stav': 'Stav tiketu'}
 
 
 def _zobraz_historii(tabulka: str, row_hash: str, popis: str):
@@ -2719,7 +2761,7 @@ def _col_chat() -> dict:
 # DIALOG CHATU (diskuze k případu)
 # =========================================================
 def _otevri_chat(tabulka, row_hash, popis, user_id, user_name, on_badge,
-                 muze_mazat_vse=False):
+                 muze_mazat_vse=False, prava_navic=()):
     """Okno diskuze k jednomu případu. `on_badge()` překreslí indikátor v gridu.
     Vlákno se otevřením označí jako přečtené; dokud je okno otevřené, nové zprávy
     se průběžně dotahují (~5 s). `muze_mazat_vse` = smí mazat i cizí zprávy."""
@@ -2816,7 +2858,7 @@ def _otevri_chat(tabulka, row_hash, popis, user_id, user_name, on_badge,
                     # „cinkni" do zvonečku všem s právy na tuto sestavu (kromě autora)
                     asyncio.create_task(asyncio.to_thread(
                         _notifikuj_novy_komentar, tabulka, row_hash,
-                        user_id, user_name, popis))
+                        user_id, user_name, popis, tuple(prava_navic or ())))
                 else:
                     ui.notify('Zprávu se nepodařilo uložit.', type='negative')
 
@@ -3263,12 +3305,29 @@ async def _vykresli_vystaveni(user_id, user_name, vsechna_prava):
                     .classes('text-sm text-gray-400')
         return
 
-    # diskuze (chat) — indikátory nepřečtených zpráv pro tohoto uživatele
-    _chat_stav = await asyncio.to_thread(_nacti_chat_stav, 'sankce_vystaveni', user_id)
+    # Diskuze (chat) — indikátory nepřečtených zpráv pro tohoto uživatele.
+    # Řádek předaný na tiket sdílí vlákno s tiketem (klíč T{id}), aby se diskuze
+    # k případu nerozpadla na dvě poloviny.
+    def _chat_prehled():
+        return (_mapa_tiketu_radku(),
+                {'sankce_vystaveni': _nacti_chat_stav('sankce_vystaveni', user_id),
+                 'sankce_tikety': _nacti_chat_stav('sankce_tikety', user_id)})
+
+    def _uprav_chat(r, tik, stavy) -> bool:
+        """Nastaví řádku klíč vlákna + indikátory; vrací True při změně."""
+        tid = tik.get(r.get('row_hash'))
+        tab, rh = (('sankce_tikety', _tiket_rh(tid)) if tid
+                   else ('sankce_vystaveni', r.get('row_hash')))
+        st = stavy.get(tab, {}).get(rh) or {'pocet': 0, 'unread': False}
+        zmena = (r.get('_chat_pocet') != st['pocet']
+                 or r.get('_chat_unread') != st['unread'])
+        r['_chat_tab'], r['_chat_rh'] = tab, rh
+        r['_chat_pocet'], r['_chat_unread'] = st['pocet'], st['unread']
+        return zmena
+
+    _tik, _chat_stav = await asyncio.to_thread(_chat_prehled)
     for _r in vsechny:
-        _st = _chat_stav.get(_r.get('row_hash'))
-        _r['_chat_pocet'] = _st['pocet'] if _st else 0
-        _r['_chat_unread'] = _st['unread'] if _st else False
+        _uprav_chat(_r, _tik, _chat_stav)
 
     obdobi_list = _seznam_obdobi('sankce_vystaveni')
     VSE_OBD = '(všechna období)'
@@ -3605,6 +3664,118 @@ async def _vykresli_vystaveni(user_id, user_name, vsechna_prava):
                 f'Tisk {"podkladu" if jen_podklad else "oznámení"} (k vystavení) '
                 f'— {n_dod} dod. / {n_dok} dok., {n_pol} pol.')
 
+        async def _predat_na_tiket():
+            """Předání označených řádků k rozhodnutí: založí tikety (dodavatel ×
+            kód nákupčího) a přepne řádky na stav Nákup / Provoz. Funguje nad
+            označenými řádky i nad označenými dodavateli v souhrnu."""
+            je_souhrn = pohled['v'] == 'souhrn'
+            _g = souhrn if je_souhrn else grid
+            try:
+                sel_ids = await ui.run_javascript(
+                    f'const c=getElement({_g.id});'
+                    "return (c&&c.run_grid_method)?"
+                    "c.run_grid_method('getSelectedRows').map(r=>r.id):[];",
+                    timeout=30,
+                )
+            except TimeoutError:
+                ui.notify('Nepodařilo se získat označené řádky z prohlížeče (timeout).',
+                          type='negative', position='top', timeout=10000)
+                return
+            sel_ids = {str(x) for x in (sel_ids or []) if x is not None}
+            if not sel_ids:
+                ui.notify(('Označte dodavatele k předání (zaškrtnutím vlevo).' if je_souhrn else
+                           'Označte řádky k předání (zaškrtnutím vlevo).'),
+                          type='warning', position='top', timeout=8000)
+                return
+            if je_souhrn:
+                sel = [r for r in _zobrazene() if _gid(r) in sel_ids]
+            else:
+                sel = [r for r in vsechny if str(r.get('id')) in sel_ids]
+            if not sel:
+                ui.notify('Označené řádky se nepodařilo spárovat s daty.',
+                          type='negative', position='top', timeout=9000)
+                return
+
+            volba = {'typ': 'nakup'}
+            with ui.dialog() as d, ui.card().classes('p-6 rounded-2xl gap-3') \
+                    .style('min-width:520px;max-width:640px'):
+                ui.label('Předat na tiket').classes('text-xl font-bold text-gray-800')
+                ui.label(f'Označeno {len(sel)} řádků. Vznikne jeden tiket na dodavatele '
+                         'a kód nákupčího; provozní tiket je vždy jeden na dodavatele.') \
+                    .classes('text-sm text-gray-500')
+                tg = ui.toggle({'nakup': '🛒 Nákup', 'provoz': '🏭 Provoz'}, value='nakup') \
+                    .props('no-caps unelevated')
+                nahled = ui.label('').classes('text-sm text-gray-700 font-medium')
+                pozn = ui.textarea(label='Poznámka pro řešitele (nepovinná)') \
+                    .props('outlined autogrow').classes('w-full')
+
+                # Řádek už předaný (stav Nákup / Provoz) by dostal druhý tiket —
+                # účtárnu na to upozorni, ať nevzniknou dvě fronty nad týmiž daty.
+                uz_predane = len([r for r in sel if r.get('stav') in ('nakup', 'provoz')])
+
+                def _nahled():
+                    skup = _seskup_do_tiketu(sel, volba['typ'])
+                    bez = sum(len(v) for k, v in skup.items()
+                              if volba['typ'] == 'nakup' and not k[2])
+                    txt = f'Vznikne {len(skup)} tiketů z {len(sel)} řádků.'
+                    if bez:
+                        txt += f' Pozor: {bez} řádků nemá kód nákupčího — takový tiket '\
+                               'uvidí jen účtárna a admin.'
+                    if uz_predane:
+                        txt += f' Pozor: {uz_predane} řádků už je předaných (stav Nákup / '\
+                               'Provoz) — dostanou další tiket.'
+                    nahled.set_text(txt)
+                tg.on_value_change(lambda e: (volba.__setitem__('typ', e.value or 'nakup'),
+                                              _nahled()))
+                _nahled()
+
+                async def _potvrd():
+                    typ = volba['typ']
+                    txt = (pozn.value or '').strip()
+
+                    def _prace():
+                        zal = _zaloz_tikety(sel, typ, txt, user_id, user_name)
+                        for tid, kod, dod, n in zal:
+                            prava = (('sankce_tiket_provoz',) if typ == 'provoz'
+                                     else (KOD_PRAVO.get(kod),))
+                            _notifikuj_tiket(
+                                prava, f'Sankce – nový tiket {_tiket_cislo(tid)} ({dod})',
+                                f'{user_name} vám předal(a) {_radku(n)} dodavatele {dod} '
+                                f'k rozhodnutí.'
+                                + (f'\n\nPoznámka: {txt}' if txt else ''))
+                        return zal
+                    d.close()
+                    zal = await asyncio.to_thread(_prace)
+                    if not zal:
+                        ui.notify('Tikety se nepodařilo založit.',
+                                  type='negative', position='top', timeout=8000)
+                        return
+                    intranet_logger.log_activity(
+                        user_name, 'Sankce',
+                        f'Předání na tiket ({TIKET_TYP_LABEL[typ]}): '
+                        f'{len(zal)} tiketů / {len(sel)} řádků')
+                    ui.notify(f'Založeno {len(zal)} tiketů ({len(sel)} řádků) — '
+                              f'{TIKET_TYP_LABEL[typ]}.',
+                              type='positive', position='top', timeout=7000)
+                    _vykresli_vystaveni.refresh()
+
+                with ui.row().classes('w-full justify-end gap-2 mt-2'):
+                    ui.button('Zrušit', on_click=d.close).props('flat no-caps')
+                    ui.button('Předat', icon='send', on_click=_potvrd) \
+                        .props('unelevated no-caps') \
+                        .classes('bg-emerald-600 hover:bg-emerald-700 text-white '
+                                 'font-semibold rounded-lg shadow-md px-5')
+            d.open()
+
+        # Předání na tiket smí jen účtárna (vlastník fronty podkladů).
+        if je_ucetni:
+            ui.button('Předat na tiket', icon='confirmation_number',
+                      on_click=_predat_na_tiket) \
+                .props('unelevated no-caps') \
+                .classes('bg-emerald-600 hover:bg-emerald-700 text-white font-semibold '
+                         'rounded-lg shadow-md px-5') \
+                .tooltip('Označené řádky předá nákupčímu (podle kódu) nebo provozu — '
+                         'vznikne tiket a řádky přejdou do stavu Nákup / Provoz.')
         # Tisk oznámení i obnova ze zálohy jsou „ostré" operace → čtenář je nedostane.
         if je_ucetni or je_analytik:
             with ui.button('Tisk', icon='print') \
@@ -3794,10 +3965,11 @@ async def _vykresli_vystaveni(user_id, user_name, vsechna_prava):
 
     # diskuze (chat): překreslení indikátoru jednoho řádku v gridu
     def _chat_badge(row_hash):
-        st = _chat_stav_radku('sankce_vystaveni', row_hash, user_id)
         upd = []
         for r in vsechny:
             if r.get('row_hash') == row_hash:
+                st = _chat_stav_radku(r.get('_chat_tab') or 'sankce_vystaveni',
+                                      r.get('_chat_rh') or row_hash, user_id)
                 r['_chat_pocet'] = st['pocet']; r['_chat_unread'] = st['unread']
                 upd.append(r)
         if upd:
@@ -3815,7 +3987,8 @@ async def _vykresli_vystaveni(user_id, user_name, vsechna_prava):
         if col == '_eye':
             _zobraz_historii('sankce_vystaveni', rh, popis)
         elif col == '_chat':
-            _otevri_chat('sankce_vystaveni', rh, popis, user_id, user_name,
+            _otevri_chat(d.get('_chat_tab') or 'sankce_vystaveni',
+                         d.get('_chat_rh') or rh, popis, user_id, user_name,
                          lambda: _chat_badge(rh),
                          muze_mazat_vse=je_analytik or je_ucetni)
     grid.on('cellClicked', _on_click)
@@ -3823,13 +3996,8 @@ async def _vykresli_vystaveni(user_id, user_name, vsechna_prava):
     # živé „svítící" upozornění na nové zprávy (~20 s)
     async def _poll_chat():
         try:
-            stav_chat = await asyncio.to_thread(_nacti_chat_stav, 'sankce_vystaveni', user_id)
-            zmeneno = []
-            for r in vsechny:
-                st = stav_chat.get(r.get('row_hash')) or {'pocet': 0, 'unread': False}
-                if r.get('_chat_pocet') != st['pocet'] or r.get('_chat_unread') != st['unread']:
-                    r['_chat_pocet'] = st['pocet']; r['_chat_unread'] = st['unread']
-                    zmeneno.append(r)
+            tik, stav_chat = await asyncio.to_thread(_chat_prehled)
+            zmeneno = [r for r in vsechny if _uprav_chat(r, tik, stav_chat)]
             if zmeneno:
                 grid.run_grid_method('applyTransaction', {'update': zmeneno})
                 # Při aktivním filtru „jen s komentářem" musí nově okomentovaný
@@ -4088,6 +4256,777 @@ async def _vykresli_vystaveni(user_id, user_name, vsechna_prava):
 
 
 # =========================================================
+# TIKETY (předání sankcí nákupčímu / provozu)
+# =========================================================
+# Tiket = balík řádků „Sankce k vystavení", který účtárna předá k rozhodnutí.
+# Seskupení: dodavatel + kód nákupčího (provozní tiket kód neřeší → 1 na dodavatele).
+# Data řádků mění až POTVRZENÉ rozhodnutí; storno navíc čeká na druhotnou kontrolu.
+TIKET_TYP_LABEL = {'nakup': 'Nákup', 'provoz': 'Provoz'}
+TIKET_STAV_LABEL = {
+    'nakup':         'U nákupčího',
+    'provoz':        'U provozu',
+    'castecne':      'Částečně rozhodnuto',
+    'vyfakturovano': 'K fakturaci',
+    'storno_ceka':   'Storno – ke kontrole',
+    'storno':        'Stornováno',
+    'abnormalita':   'Abnormalita',
+    'uzavreno':      'Uzavřeno',
+}
+# „Otevřené" = někdo na nich ještě má něco udělat (výchozí filtr seznamu tiketů).
+TIKET_STAV_OTEVRENE = ('nakup', 'provoz', 'castecne', 'storno_ceka', 'abnormalita')
+ROZ_LABEL = {'vyfakturovat': 'Fakturovat', 'storno': 'Stornovat', 'provoz': 'Na provoz'}
+ROZ_LABEL_REV = {v: k for k, v in ROZ_LABEL.items()}
+# Kódy nákupčích z listu DATA („Nákupčí (pob.)") → individuální právo na tikety.
+KODY_NAKUPCI = ['DR', 'SK', 'CK', 'VI', 'LT', 'NP', 'RD', 'HV', 'UP', 'KO', 'ML', 'OZ', 'VN']
+KOD_PRAVO = {k: 'sankce_tiket_' + k.lower() for k in KODY_NAKUPCI}
+
+_SANKCE_URL = 'https://analytikasys.jip-napoje.cz/sankce'
+
+
+def _radku(n: int) -> str:
+    """„1 řádek" / „3 řádky" / „5 řádků" — česky do e-mailů."""
+    n = int(n or 0)
+    return f'{n} ' + ('řádek' if n == 1 else 'řádky' if 2 <= n <= 4 else 'řádků')
+
+
+_TIKET_STAV_STYLE = (
+    "function(p){"
+    "var v=p.value;"
+    "if(v==='U nákupčího')return{backgroundColor:'#fef9c3',color:'#854d0e',fontWeight:'600'};"
+    "if(v==='U provozu')return{backgroundColor:'#ede9fe',color:'#5b21b6',fontWeight:'600'};"
+    "if(v==='Částečně rozhodnuto')return{backgroundColor:'#ccfbf1',color:'#115e59',fontWeight:'600'};"
+    "if(v==='K fakturaci')return{backgroundColor:'#dbeafe',color:'#1e40af',fontWeight:'600'};"
+    "if(v==='Storno – ke kontrole')return{backgroundColor:'#ffedd5',color:'#9a3412',fontWeight:'600'};"
+    "if(v==='Stornováno')return{backgroundColor:'#fee2e2',color:'#991b1b',fontWeight:'600'};"
+    "if(v==='Abnormalita')return{backgroundColor:'#fae8ff',color:'#86198f',fontWeight:'600'};"
+    "if(v==='Uzavřeno')return{backgroundColor:'#dcfce7',color:'#166534',fontWeight:'600'};"
+    "return null;}"
+)
+_ROZ_STYLE = (
+    "function(p){"
+    "var v=p.value;"
+    "if(v==='Fakturovat')return{backgroundColor:'#dbeafe',color:'#1e40af',fontWeight:'600'};"
+    "if(v==='Stornovat')return{backgroundColor:'#fee2e2',color:'#991b1b',fontWeight:'600'};"
+    "if(v==='Na provoz')return{backgroundColor:'#ede9fe',color:'#5b21b6',fontWeight:'600'};"
+    "return null;}"
+)
+
+
+# ── čistá logika (bez DB — testovatelná) ────────────────────────────────────
+def _kod_nakupci(r) -> str:
+    """Kód nákupčího řádku (sloupec „Nákupčí (pob.)"). Vezme první token, který
+    odpovídá číselníku; jinak vrátí hodnotu tak, jak je — ať se řádky různých
+    nákupčích neslijí do jednoho tiketu."""
+    v = _s(r.get('nakupci_pob')).upper()
+    if not v:
+        return ''
+    for tok in re.split(r'[^A-Z0-9]+', v):
+        if tok in KOD_PRAVO:
+            return tok
+    return v[:20]
+
+
+def _seskup_do_tiketu(radky: list, typ: str) -> OrderedDict:
+    """Rozdělení řádků do tiketů: klíč = (IČO, dodavatel, kód nákupčího).
+    Dodavatel s řádky DR i CK dostane 2 nákupní tikety, každý svému nákupčímu.
+    Provozní tiket kód neřeší → jeden na dodavatele."""
+    skup = OrderedDict()
+    for r in radky:
+        kod = _kod_nakupci(r) if typ == 'nakup' else ''
+        skup.setdefault((_s(r.get('ico')), _s(r.get('jmeno_dodavatele')), kod), []).append(r)
+    return skup
+
+
+def _tiket_stav_z_rozhodnuti(hodnoty) -> str:
+    """Stav tiketu po odeslání: jednotné rozhodnutí → odpovídající stav, různá
+    rozhodnutí → „částečně". Bez rozhodnutí → None (nic se neposílá)."""
+    ruzna = {h for h in hodnoty if h}
+    if not ruzna:
+        return None
+    if len(ruzna) > 1:
+        return 'castecne'
+    return {'vyfakturovat': 'vyfakturovano', 'storno': 'storno_ceka',
+            'provoz': 'provoz'}[ruzna.pop()]
+
+
+def _tiket_cislo(tid) -> str:
+    return f'T{int(tid):05d}'
+
+
+def _tiket_rh(tid) -> str:
+    """Klíč vlákna diskuze i historie tiketu (sdílí ho všechny jeho řádky)."""
+    return f'T{int(tid)}'
+
+
+def _tiket_prava(t: dict) -> tuple:
+    """Kdo tiket zrovna řeší (adresáti notifikací)."""
+    if _s(t.get('stav')) == 'storno_ceka':
+        return ('sankce_tiket_kontrola',)
+    if _s(t.get('typ')) == 'provoz':
+        return ('sankce_tiket_provoz',)
+    p = KOD_PRAVO.get(_s(t.get('kod_nakupci')).upper())
+    return (p,) if p else ()
+
+
+def _viditelne_tikety(tikety: list, vsechna_prava) -> list:
+    """Účtárna, analytik, čtenář a admin vidí všechno; ostatní jen tikety, které
+    jsou směrované na jejich právo (nákupčí vidí i své storno u kontroly)."""
+    if {'vse', 'sankce_ucetni', 'sankce_analytik', 'sankce_ctenar'} & set(vsechna_prava):
+        return list(tikety)
+    out = []
+    for t in tikety:
+        prava = set()
+        kod_p = KOD_PRAVO.get(_s(t.get('kod_nakupci')).upper())
+        if kod_p:
+            prava.add(kod_p)
+        if _s(t.get('typ')) == 'provoz':
+            prava.add('sankce_tiket_provoz')
+        if _s(t.get('stav')) == 'storno_ceka':
+            prava.add('sankce_tiket_kontrola')
+        if prava & set(vsechna_prava):
+            out.append(t)
+    return out
+
+
+# ── DB vrstva ───────────────────────────────────────────────────────────────
+def _zapis_audit_bulk(zaznamy: list):
+    """Hromadný zápis do sankce_audit jedním spojením. Položka =
+    (tabulka, row_hash, radek_id, pole, stara, nova, user_id, jmeno)."""
+    if not zaznamy:
+        return
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return
+    try:
+        cur = conn.cursor()
+        cur.executemany(
+            'INSERT INTO sankce_audit '
+            '(tabulka,row_hash,radek_id,pole,stara_hodnota,nova_hodnota,user_id,jmeno) '
+            'VALUES (%s,%s,%s,%s,%s,%s,%s,%s)',
+            [(t, rh, rid, pole,
+              None if st is None else str(st), None if no is None else str(no),
+              uid, jm or '') for (t, rh, rid, pole, st, no, uid, jm) in zaznamy])
+        conn.commit(); cur.close()
+    except Exception as e:
+        print(f'[sankce] _zapis_audit_bulk error: {e}')
+    finally:
+        conn.close()
+
+
+def _nastav_stav_radku(ids: list, stav: str):
+    """Hromadná změna stavu řádků sankce_vystaveni (bez auditu — ten píše volající)."""
+    ids = [i for i in ids if i]
+    if not ids:
+        return
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return
+    try:
+        cur = conn.cursor()
+        cur.executemany('UPDATE sankce_vystaveni SET stav=%s WHERE id=%s',
+                        [(stav, i) for i in ids])
+        conn.commit(); cur.close()
+    finally:
+        conn.close()
+
+
+def _zaloz_tikety(radky: list, typ: str, poznamka: str, user_id, user_name,
+                  zdroj_tiket=None) -> list:
+    """Založí tikety nad označenými řádky a přepne jejich data na Nákup/Provoz.
+    Vrací [(tiket_id, kod_nakupci, jmeno_dodavatele, pocet_radku)]."""
+    skup = _seskup_do_tiketu(radky, typ)
+    if not skup:
+        return []
+    novy_stav = 'nakup' if typ == 'nakup' else 'provoz'
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return []
+    zalozene, audit = [], []
+    try:
+        cur = conn.cursor()
+        for (ico, dod, kod), rows in skup.items():
+            obd = sorted({_s(r.get('obdobi')) for r in rows if _s(r.get('obdobi'))})
+            obd_txt = obd[0] if len(obd) == 1 else (f'{len(obd)} období' if obd else '')
+            cur.execute(
+                'INSERT INTO sankce_tikety '
+                '(typ,stav,kod_nakupci,ico,jmeno_dodavatele,obdobi,poznamka,predal,zdroj_tiket) '
+                'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)',
+                (typ, novy_stav, kod, ico, dod, obd_txt, poznamka or '', user_name, zdroj_tiket))
+            tid = cur.lastrowid
+            cur.executemany(
+                'INSERT IGNORE INTO sankce_tiket_radky (tiket_id,radek_id,row_hash) '
+                'VALUES (%s,%s,%s)', [(tid, r.get('id'), r.get('row_hash')) for r in rows])
+            cur.executemany('UPDATE sankce_vystaveni SET stav=%s WHERE id=%s',
+                            [(novy_stav, r.get('id')) for r in rows])
+            conn.commit()
+            cislo = _tiket_cislo(tid)
+            audit.append(('sankce_tikety', _tiket_rh(tid), tid, 'tiket_stav',
+                          None, TIKET_STAV_LABEL[novy_stav], user_id, user_name))
+            for r in rows:
+                audit.append(('sankce_vystaveni', r.get('row_hash'), r.get('id'), 'stav',
+                              STAV_LABEL.get(r.get('stav'), r.get('stav')),
+                              STAV_LABEL[novy_stav], user_id, user_name))
+                audit.append(('sankce_vystaveni', r.get('row_hash'), r.get('id'), 'tiket',
+                              None, f'{cislo} ({TIKET_TYP_LABEL.get(typ, typ)})',
+                              user_id, user_name))
+            zalozene.append((tid, kod, dod, len(rows)))
+        cur.close()
+    except Exception as e:
+        print(f'[sankce] _zaloz_tikety error: {e}')
+    finally:
+        conn.close()
+    _zapis_audit_bulk(audit)
+    return zalozene
+
+
+def _nacti_tikety() -> list:
+    """Seznam tiketů s dopočtem počtu položek a částky (Σ sankce po slevě).
+    Částka se počítá živě z dat — po změně slevy sedí i ve starém tiketu."""
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return []
+    try:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("""
+            SELECT t.*,
+              (SELECT COUNT(*) FROM sankce_tiket_radky r WHERE r.tiket_id=t.id) AS pocet_radku,
+              (SELECT COALESCE(SUM(v.hodn_sankce*(1-COALESCE(v.sleva,0))),0)
+                 FROM sankce_tiket_radky r JOIN sankce_vystaveni v ON v.id=r.radek_id
+                WHERE r.tiket_id=t.id) AS castka
+            FROM sankce_tikety t ORDER BY t.id DESC
+        """)
+        rows = cur.fetchall()
+        for t in rows:
+            t['cislo'] = _tiket_cislo(t['id'])
+            t['stav_label'] = TIKET_STAV_LABEL.get(t.get('stav'), t.get('stav') or '')
+            t['typ_label'] = TIKET_TYP_LABEL.get(t.get('typ'), t.get('typ') or '')
+            t['castka'] = float(t.get('castka') or 0)
+            for k in ('predano_at', 'zmeneno'):
+                d = t.pop(k, None)
+                t[k + '_txt'] = d.strftime('%d.%m.%Y %H:%M') if hasattr(d, 'strftime') else ''
+        return rows
+    finally:
+        conn.close()
+
+
+def _nacti_tiket_radky(tid) -> list:
+    """Položky tiketu i s aktuálními daty řádku (řádek smazaný z dat se přeskočí)."""
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return []
+    try:
+        cur = conn.cursor(dictionary=True)
+        cur.execute('SELECT v.*, r.id AS tr_id, r.rozhodnuti FROM sankce_tiket_radky r '
+                    'JOIN sankce_vystaveni v ON v.id=r.radek_id '
+                    'WHERE r.tiket_id=%s ORDER BY r.id', (tid,))
+        rows = cur.fetchall()
+        for r in rows:
+            for k in ('obdobi_od', 'obdobi_do', 'import_at', 'imported_by'):
+                r.pop(k, None)
+            r['stav_label'] = STAV_LABEL.get(r.get('stav'), 'Nová data')
+            r['rozhodnuti_label'] = ROZ_LABEL.get(r.get('rozhodnuti'), '')
+        return rows
+    finally:
+        conn.close()
+
+
+def _mapa_tiketu_radku() -> dict:
+    """{row_hash: tiket_id} — poslední (nejnovější) tiket řádku vyhrává. Slouží
+    ke sdílení vlákna diskuze mezi řádkem sestavy a jeho tiketem."""
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return {}
+    try:
+        cur = conn.cursor()
+        cur.execute('SELECT row_hash, MAX(tiket_id) FROM sankce_tiket_radky '
+                    'WHERE row_hash IS NOT NULL GROUP BY row_hash')
+        return {r[0]: r[1] for r in cur.fetchall()}
+    finally:
+        conn.close()
+
+
+def _uloz_rozhodnuti(dvojice: list):
+    """Uloží rozhodnutí k položkám tiketu. Položka = (rozhodnuti|None, tr_id)."""
+    if not dvojice:
+        return
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return
+    try:
+        cur = conn.cursor()
+        cur.executemany('UPDATE sankce_tiket_radky SET rozhodnuti=%s WHERE id=%s', dvojice)
+        conn.commit(); cur.close()
+    finally:
+        conn.close()
+
+
+def _uprav_tiket(tid, stav=None, poznamka=None):
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return
+    try:
+        cur = conn.cursor()
+        if stav is not None:
+            cur.execute('UPDATE sankce_tikety SET stav=%s WHERE id=%s', (stav, tid))
+        if poznamka is not None:
+            cur.execute('UPDATE sankce_tikety SET poznamka=%s WHERE id=%s', (poznamka, tid))
+        conn.commit(); cur.close()
+    finally:
+        conn.close()
+
+
+def _notifikuj_tiket(prava, predmet: str, text: str):
+    """Zvoneček + e-mail všem s daným právem. Běží mimo event loop (DB + SMTP).
+    Pozdrav, odkaz do modulu a patičku doplní tahle funkce — volající píše jen věc."""
+    prava = tuple(p for p in prava if p)
+    if not prava:
+        return
+    telo = (f'Dobrý den,\n\n{text}\n\n'
+            f'Otevřít modul Sankce → Tikety: {_SANKCE_URL}\n\n'
+            'Tato zpráva byla odeslána automaticky systémem MojeJIPka.')
+    try:
+        for uid in (intranet_data.ziskej_uzivatele_s_pravem(*prava) or {}):
+            try:
+                intranet_notifikace.pridej(uid, predmet, 'info')
+            except Exception:
+                pass
+        for em in (intranet_data.ziskej_emaily_s_pravem(*prava) or []):
+            try:
+                intranet_emaily.odesli_upozorneni_email(em, predmet, telo)
+            except Exception as e:
+                print(f'[sankce] mail tiketu ({em}): {e}')
+    except Exception as e:
+        print(f'[sankce] _notifikuj_tiket error: {e}')
+
+
+def _odesli_rozhodnuti(tiket: dict, radky: list, user_id, user_name) -> tuple:
+    """Odeslání rozhodnutí řešitelem. „Fakturovat" a „Na provoz" se promítnou do
+    dat hned (na provoz navíc vznikne navazující provozní tiket), „Stornovat"
+    čeká na palec druhotné kontroly. Vrací (novy_stav_tiketu, hlaska)."""
+    tid = tiket.get('id')
+    novy = _tiket_stav_z_rozhodnuti([r.get('rozhodnuti') for r in radky])
+    if not novy:
+        return None, 'Není vyplněné žádné rozhodnutí.'
+    rh, cislo = _tiket_rh(tid), _tiket_cislo(tid)
+    _uloz_rozhodnuti([(r.get('rozhodnuti') or None, r.get('tr_id')) for r in radky])
+
+    fakt = [r for r in radky if r.get('rozhodnuti') == 'vyfakturovat']
+    prov = [r for r in radky if r.get('rozhodnuti') == 'provoz']
+    stor = [r for r in radky if r.get('rozhodnuti') == 'storno']
+
+    audit = [('sankce_tikety', rh, tid, 'tiket_stav',
+              TIKET_STAV_LABEL.get(tiket.get('stav')), TIKET_STAV_LABEL[novy],
+              user_id, user_name)]
+    for r in radky:
+        if r.get('rozhodnuti'):
+            audit.append(('sankce_tikety', rh, tid, 'rozhodnuti', None,
+                          f"{r.get('nase_cislo') or r.get('id')} → "
+                          f"{ROZ_LABEL[r['rozhodnuti']]}", user_id, user_name))
+    if fakt:
+        _nastav_stav_radku([r.get('id') for r in fakt], 'vyfakturovano')
+        for r in fakt:
+            audit.append(('sankce_vystaveni', r.get('row_hash'), r.get('id'), 'stav',
+                          STAV_LABEL.get(r.get('stav')), STAV_LABEL['vyfakturovano'],
+                          user_id, user_name))
+    _zapis_audit_bulk(audit)
+
+    if prov:
+        _zaloz_tikety(prov, 'provoz', f'Postoupeno z tiketu {cislo}',
+                      user_id, user_name, zdroj_tiket=tid)
+    _uprav_tiket(tid, stav=novy)
+
+    dod = _s(tiket.get('jmeno_dodavatele'))
+    if fakt:
+        _notifikuj_tiket(('vse', 'sankce_ucetni'),
+                         f'Sankce – {cislo} k fakturaci ({dod})',
+                         f'{user_name} rozhodl(a) o fakturaci {_radku(len(fakt))} '
+                         f'dodavatele {dod}. Řádky jsou ve stavu „Fakturovat".')
+    if prov:
+        _notifikuj_tiket(('sankce_tiket_provoz',),
+                         f'Sankce – nový tiket pro provoz ({dod})',
+                         f'{user_name} postoupil(a) {_radku(len(prov))} dodavatele {dod} '
+                         f'na provoz (z tiketu {cislo}).')
+    if stor:
+        _notifikuj_tiket(('sankce_tiket_kontrola',),
+                         f'Sankce – {cislo} ke schválení storna ({dod})',
+                         f'{user_name} navrhuje stornovat {_radku(len(stor))} dodavatele '
+                         f'{dod}. Bez vašeho schválení se data nemění.')
+    return novy, (f'Rozhodnutí odesláno: {TIKET_STAV_LABEL[novy]} '
+                  f'(fakturovat {len(fakt)}, storno {len(stor)}, provoz {len(prov)}).')
+
+
+def _palec_storno(tiket: dict, radky: list, schvaleno: bool, user_id, user_name) -> str:
+    """Druhotná kontrola storna. Schváleno → řádky přejdou na „Stornovat" a jde
+    mail účtárně. Zamítnuto → data se nemění a tiket se vrací řešiteli."""
+    tid = tiket.get('id')
+    rh, cislo = _tiket_rh(tid), _tiket_cislo(tid)
+    stor = [r for r in radky if r.get('rozhodnuti') == 'storno']
+    dod = _s(tiket.get('jmeno_dodavatele'))
+    if schvaleno:
+        _nastav_stav_radku([r.get('id') for r in stor], 'storno')
+        audit = [('sankce_vystaveni', r.get('row_hash'), r.get('id'), 'stav',
+                  STAV_LABEL.get(r.get('stav')), STAV_LABEL['storno'], user_id, user_name)
+                 for r in stor]
+        audit.append(('sankce_tikety', rh, tid, 'tiket_stav',
+                      TIKET_STAV_LABEL.get(tiket.get('stav')), TIKET_STAV_LABEL['storno'],
+                      user_id, user_name))
+        _zapis_audit_bulk(audit)
+        _uprav_tiket(tid, stav='storno')
+        _notifikuj_tiket(('vse', 'sankce_ucetni'),
+                         f'Sankce – {cislo} storno schváleno ({dod})',
+                         f'{user_name} schválil(a) storno {_radku(len(stor))} dodavatele '
+                         f'{dod}. Řádky jsou ve stavu „Stornovat".')
+        return f'Storno schváleno — {_radku(len(stor))} přešlo na „Stornovat".'
+
+    zpet = 'provoz' if _s(tiket.get('typ')) == 'provoz' else 'nakup'
+    _uloz_rozhodnuti([(None, r.get('tr_id')) for r in stor])
+    _uprav_tiket(tid, stav=zpet)
+    _zapis_audit_bulk([('sankce_tikety', rh, tid, 'tiket_stav',
+                        TIKET_STAV_LABEL.get(tiket.get('stav')), TIKET_STAV_LABEL[zpet],
+                        user_id, user_name)])
+    _notifikuj_tiket(_tiket_prava({'typ': tiket.get('typ'), 'stav': zpet,
+                                   'kod_nakupci': tiket.get('kod_nakupci')}),
+                     f'Sankce – {cislo} storno vráceno k přepracování ({dod})',
+                     f'{user_name} storno neschválil(a). Tiket {cislo} je zpět u vás '
+                     f'a data se nezměnila. Důvod najdete v diskuzi tiketu.')
+    return 'Storno zamítnuto — tiket se vrátil řešiteli, data se nezměnila.'
+
+
+# ── UI: seznam tiketů + detail ──────────────────────────────────────────────
+def _col_defs_tikety() -> list:
+    return [
+        _col_chat(),
+        {'headerName': '', 'field': '_eye', 'width': 46, 'minWidth': 46, 'maxWidth': 46,
+         'pinned': 'left', 'sortable': False, 'editable': False, 'resizable': False,
+         'filter': False, 'suppressSizeToFit': True, 'suppressAutoSize': True,
+         ':cellRenderer': _EYE_RENDERER,
+         'cellStyle': {'textAlign': 'center', 'cursor': 'pointer', 'padding': '0'},
+         'headerTooltip': 'Historie tiketu'},
+        {'headerName': 'Tiket', 'field': 'cislo', 'width': 100, 'pinned': 'left',
+         'sortable': True, 'cellStyle': {'fontFamily': 'monospace', 'fontWeight': '600',
+                                         'color': '#334155'}},
+        {'headerName': 'Stav', 'field': 'stav_label', 'width': 180, 'sortable': True,
+         ':cellStyle': _TIKET_STAV_STYLE},
+        {'headerName': 'Směr', 'field': 'typ_label', 'width': 95, 'sortable': True},
+        {'headerName': 'Nákupčí', 'field': 'kod_nakupci', 'width': 100, 'sortable': True,
+         'cellStyle': {'fontFamily': 'monospace'},
+         'headerTooltip': 'Kód nákupčího (vlastník tiketu)'},
+        {'headerName': 'IČO', 'field': 'ico', 'width': 100, 'sortable': True,
+         'cellStyle': {'fontFamily': 'monospace', 'fontSize': '12px', 'color': '#475569'}},
+        {'headerName': 'Dodavatel', 'field': 'jmeno_dodavatele', 'width': 280, 'sortable': True,
+         'cellStyle': {'fontWeight': '600'}},
+        {'headerName': 'Období', 'field': 'obdobi', 'width': 140, 'sortable': True},
+        {'headerName': 'Položek', 'field': 'pocet_radku', 'width': 100, 'sortable': True,
+         'type': 'numericColumn', ':valueFormatter': _NUM_FMT},
+        {'headerName': 'Sankce celkem', 'field': 'castka', 'width': 150, 'sortable': True,
+         'type': 'numericColumn', ':valueFormatter': _MONEY_FMT,
+         'cellStyle': {'fontWeight': 'bold'},
+         'headerTooltip': 'Σ Hodn. sankce po slevě (počítá se živě z dat)'},
+        {'headerName': 'Předáno dne', 'field': 'predano_at_txt', 'width': 140, 'sortable': True},
+        {'headerName': 'Předal', 'field': 'predal', 'width': 170, 'sortable': True},
+        {'headerName': 'Poznámka', 'field': 'poznamka', 'width': 240, 'sortable': True},
+    ]
+
+
+def _col_defs_tiket_radky(volby: list, editovatelne: bool) -> list:
+    return [
+        {'headerName': 'Poř. č.', 'field': 'nase_cislo', 'width': 104, 'pinned': 'left',
+         'cellStyle': {'fontFamily': 'monospace', 'fontSize': '12px'}},
+        {'headerName': 'Kód zboží', 'field': 'kod_zbozi', 'width': 110,
+         'cellStyle': {'fontFamily': 'monospace', 'fontSize': '12px'}},
+        {'headerName': 'Název zboží', 'field': 'nazev_zbozi', 'width': 260},
+        {'headerName': 'Č. objednávky', 'field': 'cislo_objednavky', 'width': 120},
+        {'headerName': 'Období', 'field': 'obdobi', 'width': 120},
+        {'headerName': 'Dod. pozdě MJ', 'field': 'dod_pozde_mj', 'width': 120,
+         'type': 'numericColumn', ':valueFormatter': _NUM_FMT},
+        {'headerName': 'Hodn. sankce', 'field': 'hodn_sankce', 'width': 130,
+         'type': 'numericColumn', ':valueFormatter': _MONEY_FMT,
+         'cellStyle': {'fontWeight': 'bold'}},
+        {'headerName': 'Stav dat', 'field': 'stav_label', 'width': 150,
+         ':cellStyle': _STAV_STYLE, 'editable': False},
+        {'headerName': 'Rozhodnutí', 'field': 'rozhodnuti_label', 'width': 150,
+         'editable': editovatelne, 'cellEditor': 'agSelectCellEditor',
+         'cellEditorParams': {'values': volby}, ':cellStyle': _ROZ_STYLE,
+         'headerTooltip': 'Co s řádkem uděláme (klikem změníte)'},
+    ]
+
+
+def _otevri_tiket(t: dict, user_id, user_name, vsechna_prava, refresh):
+    """Detail tiketu: položky s rozhodnutím + akce podle role (řešitel / druhotná
+    kontrola / účtárna). Data se mění výhradně přes tlačítka tady."""
+    tid = t.get('id')
+    rh, cislo = _tiket_rh(tid), _tiket_cislo(tid)
+    stav = _s(t.get('stav'))
+    typ = _s(t.get('typ'))
+    dod = _s(t.get('jmeno_dodavatele'))
+    ma_vse = 'vse' in vsechna_prava
+    je_ucetni = ma_vse or 'sankce_ucetni' in vsechna_prava
+    resitel = ('sankce_tiket_provoz',) if typ == 'provoz' else \
+              (KOD_PRAVO.get(_s(t.get('kod_nakupci')).upper()),)
+    muze_resit = ma_vse or bool({p for p in resitel if p} & set(vsechna_prava))
+    muze_palec = ma_vse or 'sankce_tiket_kontrola' in vsechna_prava
+    rozhoduje_se = stav in ('nakup', 'provoz', 'castecne')
+    editovatelne = muze_resit and rozhoduje_se
+
+    radky = _nacti_tiket_radky(tid)
+    volby = ['', ROZ_LABEL['vyfakturovat'], ROZ_LABEL['storno']]
+    if typ == 'nakup':
+        volby.append(ROZ_LABEL['provoz'])
+
+    with ui.dialog() as dlg, ui.card().classes('p-0 rounded-2xl gap-0') \
+            .style('min-width:960px;max-width:96vw'):
+        with ui.row().classes('items-center gap-3 px-5 pt-4 pb-2 w-full'):
+            ui.icon('confirmation_number', color='primary').classes('text-2xl')
+            with ui.column().classes('gap-0'):
+                ui.label(f'Tiket {cislo} — {dod or "dodavatel"}') \
+                    .classes('text-lg font-bold text-gray-800')
+                ui.label(f'{TIKET_TYP_LABEL.get(typ, typ)}'
+                         + (f' / {t.get("kod_nakupci")}' if t.get('kod_nakupci') else '')
+                         + f' · období {t.get("obdobi") or "—"}'
+                         + f' · předal {t.get("predal") or "—"} {t.get("predano_at_txt") or ""}') \
+                    .classes('text-xs text-gray-500')
+            ui.space()
+            ui.label(TIKET_STAV_LABEL.get(stav, stav)).classes(
+                'px-3 py-1 rounded-lg text-sm font-bold bg-gray-100 text-gray-700')
+            ui.button(icon='close', on_click=dlg.close).props('flat round dense color=grey-7')
+        if _s(t.get('poznamka')):
+            ui.label(f'📝 {t.get("poznamka")}').classes('text-xs text-gray-500 px-5 pb-1')
+        ui.separator()
+
+        g = ui.aggrid({
+            'columnDefs': _col_defs_tiket_radky(volby, editovatelne),
+            'rowData': radky,
+            'defaultColDef': {'resizable': True, 'sortable': True, 'filter': True},
+            'rowHeight': 32,
+            'singleClickEdit': True,
+            'stopEditingWhenCellsLoseFocus': True,
+            ':getRowId': "function(p){var d=p.data||{};return ''+(d.tr_id!=null?d.tr_id:'');}",
+        }).classes('w-full').style('height:46vh')
+
+        def _on_roz(e):
+            a = e.args or {}
+            if (a.get('colId') or '') != 'rozhodnuti_label':
+                return
+            d = a.get('data') or {}
+            kod = ROZ_LABEL_REV.get(a.get('newValue') or '')
+            for r in radky:
+                if r.get('tr_id') == d.get('tr_id'):
+                    r['rozhodnuti'] = kod
+                    r['rozhodnuti_label'] = ROZ_LABEL.get(kod, '')
+        g.on('cellValueChanged', _on_roz)
+
+        def _vse(kod):
+            for r in radky:
+                r['rozhodnuti'] = kod
+                r['rozhodnuti_label'] = ROZ_LABEL.get(kod, '')
+            g.run_grid_method('setGridOption', 'rowData', radky)
+
+        async def _odeslat():
+            novy, hlaska = await asyncio.to_thread(
+                _odesli_rozhodnuti, t, radky, user_id, user_name)
+            if not novy:
+                ui.notify(hlaska, type='warning', position='top', timeout=6000)
+                return
+            intranet_logger.log_activity(user_name, 'Sankce',
+                                         f'Tiket {cislo}: rozhodnutí → {TIKET_STAV_LABEL[novy]}')
+            ui.notify(hlaska, type='positive', position='top', timeout=6000, multi_line=True)
+            dlg.close()
+            refresh()
+
+        async def _palec(schvaleno: bool):
+            hlaska = await asyncio.to_thread(
+                _palec_storno, t, radky, schvaleno, user_id, user_name)
+            intranet_logger.log_activity(
+                user_name, 'Sankce',
+                f'Tiket {cislo}: storno {"schváleno" if schvaleno else "zamítnuto"}')
+            ui.notify(hlaska, type='positive' if schvaleno else 'warning',
+                      position='top', timeout=7000, multi_line=True)
+            dlg.close()
+            refresh()
+
+        def _abnormalita():
+            """Netypický případ — tiket se odloží a data zůstanou beze změny."""
+            with ui.dialog() as d2, ui.card().classes('p-5 gap-3').style('min-width:520px'):
+                ui.label('Označit případ jako abnormalitu').classes('text-lg font-bold')
+                ui.label('Data se nezmění. Popište, co je na případu nestandardní — '
+                         'text se uloží do diskuze tiketu.').classes('text-sm text-gray-500')
+                duvod = ui.textarea(placeholder='Důvod…').props('outlined autogrow') \
+                    .classes('w-full')
+
+                async def _ok():
+                    txt = (duvod.value or '').strip()
+                    if not txt:
+                        ui.notify('Vyplňte důvod.', type='warning', position='top')
+                        return
+
+                    def _prace():
+                        _uprav_tiket(tid, stav='abnormalita')
+                        _pridej_chat('sankce_tikety', rh, user_id, user_name,
+                                     f'⚠️ Abnormalita: {txt}')
+                        _zapis_audit_bulk([('sankce_tikety', rh, tid, 'tiket_stav',
+                                            TIKET_STAV_LABEL.get(stav),
+                                            TIKET_STAV_LABEL['abnormalita'],
+                                            user_id, user_name)])
+                        _notifikuj_tiket(('vse', 'sankce_ucetni', 'sankce_analytik'),
+                                         f'Sankce – {cislo} označen jako abnormalita ({dod})',
+                                         f'{user_name}: {txt}')
+                    await asyncio.to_thread(_prace)
+                    intranet_logger.log_activity(user_name, 'Sankce',
+                                                 f'Tiket {cislo}: abnormalita')
+                    ui.notify('Tiket označen jako abnormalita, data beze změny.',
+                              type='warning', position='top', timeout=6000)
+                    d2.close(); dlg.close(); refresh()
+
+                with ui.row().classes('w-full justify-end gap-2'):
+                    ui.button('Zrušit', on_click=d2.close).props('flat no-caps')
+                    ui.button('Označit', on_click=_ok).props('unelevated color=warning no-caps')
+            d2.open()
+
+        async def _uzavrit():
+            await asyncio.to_thread(_uprav_tiket, tid, 'uzavreno')
+            await asyncio.to_thread(_zapis_audit_bulk, [
+                ('sankce_tikety', rh, tid, 'tiket_stav', TIKET_STAV_LABEL.get(stav),
+                 TIKET_STAV_LABEL['uzavreno'], user_id, user_name)])
+            intranet_logger.log_activity(user_name, 'Sankce', f'Tiket {cislo}: uzavřen')
+            ui.notify('Tiket uzavřen.', type='positive', position='top-right', timeout=4000)
+            dlg.close(); refresh()
+
+        ui.separator()
+        with ui.row().classes('w-full items-center gap-2 px-4 py-3 flex-wrap'):
+            ui.button('Historie', icon='history',
+                      on_click=lambda: _zobraz_historii('sankce_tikety', rh,
+                                                        f'Tiket {cislo} — {dod}')) \
+                .props('outline color=teal dense no-caps')
+            ui.button('Diskuze', icon='forum',
+                      on_click=lambda: _otevri_chat(
+                          'sankce_tikety', rh, f'Tiket {cislo} — {dod}', user_id, user_name,
+                          lambda: None, muze_mazat_vse=je_ucetni,
+                          prava_navic=_tiket_prava(t))) \
+                .props('outline color=primary dense no-caps')
+            ui.space()
+            if editovatelne:
+                ui.button('Vše fakturovat', icon='done_all',
+                          on_click=lambda: _vse('vyfakturovat')) \
+                    .props('outline color=blue-8 dense no-caps')
+                ui.button('Vše stornovat', icon='block',
+                          on_click=lambda: _vse('storno')) \
+                    .props('outline color=red-7 dense no-caps')
+                if typ == 'nakup':
+                    ui.button('Vše na provoz', icon='engineering',
+                              on_click=lambda: _vse('provoz')) \
+                        .props('outline color=purple-7 dense no-caps')
+                ui.button('Abnormalita', icon='report_problem', on_click=_abnormalita) \
+                    .props('outline color=orange-8 dense no-caps') \
+                    .tooltip('Netypický případ — data se nemění, řeší účtárna')
+                ui.button('Odeslat rozhodnutí', icon='send', on_click=_odeslat) \
+                    .props('unelevated no-caps') \
+                    .classes('bg-emerald-600 hover:bg-emerald-700 text-white font-semibold '
+                             'rounded-lg shadow-md px-5')
+            if muze_palec and stav == 'storno_ceka':
+                ui.button('Vrátit řešiteli', icon='thumb_down',
+                          on_click=lambda: _palec(False)) \
+                    .props('outline color=red-7 dense no-caps') \
+                    .tooltip('Storno neschváleno — data se nemění')
+                ui.button('Schválit storno', icon='thumb_up',
+                          on_click=lambda: _palec(True)) \
+                    .props('unelevated no-caps') \
+                    .classes('bg-emerald-600 hover:bg-emerald-700 text-white font-semibold '
+                             'rounded-lg shadow-md px-5')
+            if je_ucetni and stav in ('vyfakturovano', 'storno', 'abnormalita'):
+                ui.button('Uzavřít tiket', icon='task_alt', on_click=_uzavrit) \
+                    .props('unelevated color=green-8 no-caps')
+            if not (editovatelne or (muze_palec and stav == 'storno_ceka')):
+                ui.label('Tiket je jen ke čtení (není ve vaší frontě).') \
+                    .classes('text-xs text-gray-400')
+    dlg.open()
+
+
+@refreshable_na_klienta
+async def _vykresli_tikety(user_id, user_name, vsechna_prava):
+    vsechny = _viditelne_tikety(await asyncio.to_thread(_nacti_tikety), vsechna_prava)
+    if not vsechny:
+        with ui.column().classes('items-center py-16 gap-3 w-full'):
+            ui.icon('confirmation_number', size='4rem', color='grey-4')
+            ui.label('Žádné tikety ve vaší frontě.').classes('text-xl text-gray-400 font-bold')
+            ui.label('Tiket vzniká v sestavě „Sankce k vystavení" tlačítkem „Předat na tiket".') \
+                .classes('text-sm text-gray-400')
+        return
+
+    chat = await asyncio.to_thread(_nacti_chat_stav, 'sankce_tikety', user_id)
+    for t in vsechny:
+        st = chat.get(_tiket_rh(t['id']))
+        t['_chat_pocet'] = st['pocet'] if st else 0
+        t['_chat_unread'] = st['unread'] if st else False
+
+    filtr = {'jen_otevrene': True}
+
+    def _zobrazene():
+        if filtr['jen_otevrene']:
+            return [t for t in vsechny if t.get('stav') in TIKET_STAV_OTEVRENE]
+        return list(vsechny)
+
+    with ui.row().classes('w-full items-center gap-3 mb-2 flex-wrap'):
+        sw = ui.switch('Jen otevřené', value=True) \
+            .tooltip('Skryje uzavřené a vyřešené tikety (stornováno / k fakturaci / uzavřeno)')
+        ui.space()
+        info = ui.label('').classes('text-sm text-gray-500')
+
+    grid = ui.aggrid({
+        'columnDefs': _col_defs_tikety(),
+        'rowData': _zobrazene(),
+        'defaultColDef': {'resizable': True, 'sortable': False, 'filter': True},
+        'rowHeight': 32,
+        'suppressMovableColumns': True,
+        ':onFirstDataRendered': _AUTOSIZE_FIT,
+        ':onGridSizeChanged': _AUTOSIZE_FIT,
+        ':getRowId': _GET_ROW_ID,
+    }).classes('w-full').style(_GRID_STYLE)
+
+    def _info(data):
+        castka = sum(_f(t.get('castka')) or 0 for t in data)
+        return f'Tiketů: {len(data)} · sankce celkem: {_cz_money(castka)}'
+
+    def _aplikuj():
+        data = _zobrazene()
+        grid.options['rowData'] = data
+        grid.run_grid_method('setGridOption', 'rowData', data)
+        info.set_text(_info(data))
+    sw.on_value_change(lambda e: (filtr.__setitem__('jen_otevrene', bool(e.value)), _aplikuj()))
+    info.set_text(_info(_zobrazene()))
+
+    def _chat_badge(t):
+        st = _chat_stav_radku('sankce_tikety', _tiket_rh(t['id']), user_id)
+        t['_chat_pocet'] = st['pocet']; t['_chat_unread'] = st['unread']
+        grid.run_grid_method('applyTransaction', {'update': [t]})
+
+    def _on_click(e):
+        a = e.args or {}
+        col = a.get('colId')
+        d = a.get('data') or {}
+        tid = d.get('id')
+        if not tid:
+            return
+        t = next((x for x in vsechny if x.get('id') == tid), None)
+        if not t:
+            return
+        popis = f'Tiket {_tiket_cislo(tid)} — {_s(t.get("jmeno_dodavatele"))}'
+        if col == '_eye':
+            _zobraz_historii('sankce_tikety', _tiket_rh(tid), popis)
+        elif col == '_chat':
+            _otevri_chat('sankce_tikety', _tiket_rh(tid), popis, user_id, user_name,
+                         lambda: _chat_badge(t),
+                         muze_mazat_vse='vse' in vsechna_prava or 'sankce_ucetni' in vsechna_prava,
+                         prava_navic=_tiket_prava(t))
+        else:
+            _otevri_tiket(t, user_id, user_name, vsechna_prava, _vykresli_tikety.refresh)
+    grid.on('cellClicked', _on_click)
+
+    ui.label('💡 Klikem na řádek otevřete detail tiketu (rozhodnutí o jednotlivých '
+             'položkách). 👁 = historie, 💬 = diskuze — vlákno je sdílené s řádky '
+             'sestavy „Sankce k vystavení".').classes('text-xs text-gray-500 mt-1')
+
+
+# =========================================================
 # VSTUPNÍ OBRAZOVKA — DVĚ DLAŽDICE
 # =========================================================
 def _dlazdice(emoji, nadpis, barva_border, barva_btn, on_click):
@@ -4116,11 +5055,15 @@ async def vykresli_sankce(user_id, user_name, vsechna_prava):
     je_ctenar = 'sankce_ctenar' in vsechna_prava
     vidi_vystaveni = ma_vse or je_ctenar or 'sankce_ucetni' in vsechna_prava or 'sankce_analytik' in vsechna_prava
     vidi_zamitnute = ma_vse or je_ctenar or 'sankce_nakup' in vsechna_prava or 'sankce_analytik' in vsechna_prava
+    vidi_tikety = vidi_vystaveni or bool(
+        {'sankce_tiket_provoz', 'sankce_tiket_kontrola', *KOD_PRAVO.values()} & set(vsechna_prava))
 
     pohled = app.storage.user.get('sankce_pohled')
     if pohled == 'vystaveni' and not vidi_vystaveni:
         pohled = None
     if pohled == 'zamitnute' and not vidi_zamitnute:
+        pohled = None
+    if pohled == 'tikety' and not vidi_tikety:
         pohled = None
 
     # ── Hlavička ──
@@ -4135,7 +5078,8 @@ async def vykresli_sankce(user_id, user_name, vsechna_prava):
         with ui.column().classes('gap-0'):
             ui.label('Sankce').classes('text-3xl font-extrabold text-gray-800')
             nadpis = {'zamitnute': 'Zamítnuté dodávky dodavatelem',
-                      'vystaveni': 'Sankce k vystavení'}.get(pohled,
+                      'vystaveni': 'Sankce k vystavení',
+                      'tikety': 'Tikety — rozhodnutí o sankcích'}.get(pohled,
                       'Přehled sankcí vůči dodavatelům')
             ui.label(nadpis).classes('text-sm text-gray-500')
 
@@ -4146,8 +5090,11 @@ async def vykresli_sankce(user_id, user_name, vsechna_prava):
     if pohled == 'vystaveni':
         await _vykresli_vystaveni(user_id, user_name, vsechna_prava)
         return
+    if pohled == 'tikety':
+        await _vykresli_tikety(user_id, user_name, vsechna_prava)
+        return
 
-    if not (vidi_vystaveni or vidi_zamitnute):
+    if not (vidi_vystaveni or vidi_zamitnute or vidi_tikety):
         with ui.column().classes('items-center py-20 gap-3 w-full'):
             ui.icon('lock', size='4rem', color='grey-4')
             ui.label('Nemáte přístup k žádné sestavě modulu Sankce.').classes('text-lg text-gray-400')
@@ -4166,3 +5113,9 @@ async def vykresli_sankce(user_id, user_name, vsechna_prava):
                 vykresli_sankce.refresh()
             _dlazdice('🧾', 'Sankce k vystavení',
                       'border-rose-200', 'bg-rose-600 hover:bg-rose-700', _otevri_v)
+        if vidi_tikety:
+            def _otevri_t():
+                app.storage.user['sankce_pohled'] = 'tikety'
+                vykresli_sankce.refresh()
+            _dlazdice('🎫', 'Tikety (nákup / provoz)',
+                      'border-emerald-200', 'bg-emerald-600 hover:bg-emerald-700', _otevri_t)
