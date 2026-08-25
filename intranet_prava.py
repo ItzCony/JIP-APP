@@ -113,6 +113,7 @@ ZAKLADNI_PRAVA = {
     # Tikety (workflow „předáno na nákup / provoz") — podskupiny, ať se seznam práv nezaplevelí.
     'sankce_tiket_provoz':    {'kategorie': 'Modul Sankce', 'podskupina': 'Tikety', 'nazev': 'Tiket: Provoz', 'popis': 'Dostává tikety předané na provoz a rozhoduje u nich Fakturovat / Stornovat.', 'ikona': 'engineering'},
     'sankce_tiket_kontrola':  {'kategorie': 'Modul Sankce', 'podskupina': 'Tikety', 'nazev': 'Tiket: Druhotná kontrola storna', 'popis': 'Schvaluje (palec nahoru) nebo vrací (palec dolů) požadavky na STORNOVÁNÍ sankce. Bez tohoto schválení se řádky nestornují.', 'ikona': 'thumbs_up_down'},
+    'sankce_tiket_tvrde_storno': {'kategorie': 'Modul Sankce', 'podskupina': 'Tikety', 'nazev': 'Tiket: Tvrdé storno', 'popis': 'Storno bez druhotné kontroly: řádky přejdou rovnou na „Nevyfakturovat" a nikomu se neposílá e-mail.', 'ikona': 'gavel'},
     'sankce_tiket_dr': {'kategorie': 'Modul Sankce', 'podskupina': 'Nákupčí (tikety)', 'nazev': 'Tiket: nákupčí DR', 'popis': 'Vidí a řeší tikety sankcí s kódem nákupčího DR.', 'ikona': 'assignment_ind'},
     'sankce_tiket_sk': {'kategorie': 'Modul Sankce', 'podskupina': 'Nákupčí (tikety)', 'nazev': 'Tiket: nákupčí SK', 'popis': 'Vidí a řeší tikety sankcí s kódem nákupčího SK.', 'ikona': 'assignment_ind'},
     'sankce_tiket_ck': {'kategorie': 'Modul Sankce', 'podskupina': 'Nákupčí (tikety)', 'nazev': 'Tiket: nákupčí CK', 'popis': 'Vidí a řeší tikety sankcí s kódem nákupčího CK.', 'ikona': 'assignment_ind'},
