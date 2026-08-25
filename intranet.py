@@ -780,7 +780,9 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
         'sankce_analytik' in vsechna_prava or
         'sankce_ucetni' in vsechna_prava or
         'sankce_nakup' in vsechna_prava or
-        'sankce_ctenar' in vsechna_prava
+        'sankce_ctenar' in vsechna_prava or
+        # řešitelé tiketů (nákupčí dle kódu, provoz, druhotná kontrola)
+        any(p.startswith('sankce_tiket_') for p in vsechna_prava)
     )
     if _ma_sankce and nastaveni.get('sankce_zapnuty', True):
         dostupne_taby.append('sankce')

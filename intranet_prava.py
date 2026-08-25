@@ -110,6 +110,23 @@ ZAKLADNI_PRAVA = {
     'sankce_nakup':    {'kategorie': 'Modul Sankce', 'nazev': 'Nákup (Zamítnuté dodávky)', 'popis': 'Vidí sestavu „Zamítnuté dodávky dodavatelem" a může u řádků psát poznámky. Každá změna se zaznamenává (očičko).', 'ikona': 'shopping_cart'},
     'sankce_ctenar':   {'kategorie': 'Modul Sankce', 'nazev': 'Čtenář (obě sestavy)', 'popis': 'Vidí obě sestavy (Zamítnuté dodávky i Sankce k vystavení) pouze pro čtení – může filtrovat, řadit, exportovat a psát do diskuze (bublina 💬). Nemůže editovat buňky, importovat ani mazat data.', 'ikona': 'visibility'},
 
+    # Tikety (workflow „předáno na nákup / provoz") — podskupiny, ať se seznam práv nezaplevelí.
+    'sankce_tiket_provoz':    {'kategorie': 'Modul Sankce', 'podskupina': 'Tikety', 'nazev': 'Tiket: Provoz', 'popis': 'Dostává tikety předané na provoz a rozhoduje u nich Fakturovat / Stornovat.', 'ikona': 'engineering'},
+    'sankce_tiket_kontrola':  {'kategorie': 'Modul Sankce', 'podskupina': 'Tikety', 'nazev': 'Tiket: Druhotná kontrola storna', 'popis': 'Schvaluje (palec nahoru) nebo vrací (palec dolů) požadavky na STORNOVÁNÍ sankce. Bez tohoto schválení se řádky nestornují.', 'ikona': 'thumbs_up_down'},
+    'sankce_tiket_dr': {'kategorie': 'Modul Sankce', 'podskupina': 'Nákupčí (tikety)', 'nazev': 'Tiket: nákupčí DR', 'popis': 'Vidí a řeší tikety sankcí s kódem nákupčího DR.', 'ikona': 'assignment_ind'},
+    'sankce_tiket_sk': {'kategorie': 'Modul Sankce', 'podskupina': 'Nákupčí (tikety)', 'nazev': 'Tiket: nákupčí SK', 'popis': 'Vidí a řeší tikety sankcí s kódem nákupčího SK.', 'ikona': 'assignment_ind'},
+    'sankce_tiket_ck': {'kategorie': 'Modul Sankce', 'podskupina': 'Nákupčí (tikety)', 'nazev': 'Tiket: nákupčí CK', 'popis': 'Vidí a řeší tikety sankcí s kódem nákupčího CK.', 'ikona': 'assignment_ind'},
+    'sankce_tiket_vi': {'kategorie': 'Modul Sankce', 'podskupina': 'Nákupčí (tikety)', 'nazev': 'Tiket: nákupčí VI', 'popis': 'Vidí a řeší tikety sankcí s kódem nákupčího VI.', 'ikona': 'assignment_ind'},
+    'sankce_tiket_lt': {'kategorie': 'Modul Sankce', 'podskupina': 'Nákupčí (tikety)', 'nazev': 'Tiket: nákupčí LT', 'popis': 'Vidí a řeší tikety sankcí s kódem nákupčího LT.', 'ikona': 'assignment_ind'},
+    'sankce_tiket_np': {'kategorie': 'Modul Sankce', 'podskupina': 'Nákupčí (tikety)', 'nazev': 'Tiket: nákupčí NP', 'popis': 'Vidí a řeší tikety sankcí s kódem nákupčího NP.', 'ikona': 'assignment_ind'},
+    'sankce_tiket_rd': {'kategorie': 'Modul Sankce', 'podskupina': 'Nákupčí (tikety)', 'nazev': 'Tiket: nákupčí RD', 'popis': 'Vidí a řeší tikety sankcí s kódem nákupčího RD.', 'ikona': 'assignment_ind'},
+    'sankce_tiket_hv': {'kategorie': 'Modul Sankce', 'podskupina': 'Nákupčí (tikety)', 'nazev': 'Tiket: nákupčí HV', 'popis': 'Vidí a řeší tikety sankcí s kódem nákupčího HV.', 'ikona': 'assignment_ind'},
+    'sankce_tiket_up': {'kategorie': 'Modul Sankce', 'podskupina': 'Nákupčí (tikety)', 'nazev': 'Tiket: nákupčí UP', 'popis': 'Vidí a řeší tikety sankcí s kódem nákupčího UP.', 'ikona': 'assignment_ind'},
+    'sankce_tiket_ko': {'kategorie': 'Modul Sankce', 'podskupina': 'Nákupčí (tikety)', 'nazev': 'Tiket: nákupčí KO', 'popis': 'Vidí a řeší tikety sankcí s kódem nákupčího KO.', 'ikona': 'assignment_ind'},
+    'sankce_tiket_ml': {'kategorie': 'Modul Sankce', 'podskupina': 'Nákupčí (tikety)', 'nazev': 'Tiket: nákupčí ML', 'popis': 'Vidí a řeší tikety sankcí s kódem nákupčího ML.', 'ikona': 'assignment_ind'},
+    'sankce_tiket_oz': {'kategorie': 'Modul Sankce', 'podskupina': 'Nákupčí (tikety)', 'nazev': 'Tiket: nákupčí OZ', 'popis': 'Vidí a řeší tikety sankcí s kódem nákupčího OZ.', 'ikona': 'assignment_ind'},
+    'sankce_tiket_vn': {'kategorie': 'Modul Sankce', 'podskupina': 'Nákupčí (tikety)', 'nazev': 'Tiket: nákupčí VN (vedoucí nákupu)', 'popis': 'Vidí a řeší tikety sankcí s kódem nákupčího VN.', 'ikona': 'assignment_ind'},
+
     'spolvecer_schvalovatel': {'kategorie': 'Modul Společenský večer', 'nazev': 'Schvalovatel', 'popis': 'Vidí všechny pobočky, komunikuje v chatu a schvaluje náklady (mění stav na Schváleno).', 'ikona': 'verified'},
     'spolvecer_ctenar':       {'kategorie': 'Modul Společenský večer', 'nazev': 'Čtenář', 'popis': 'Vidí všechny pobočky pouze pro čtení a může psát do chatu. Nemůže editovat tabulku ani schvalovat.', 'ikona': 'visibility'},
 

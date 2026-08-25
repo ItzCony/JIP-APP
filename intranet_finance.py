@@ -73,7 +73,7 @@ def posli_emaily_schvovatelum(schvalovatel_ids: list, typ: str, cislo: str, naze
             f"  Číslo: {cislo}\n"
             f"  Název: {nazev}\n\n"
             f"Přihlaste se prosím do intranetu a položku schvalte nebo zamítněte.\n\n"
-            f"Tato zpráva byla odeslána automaticky systémem Intranet."
+            f"Tato zpráva byla odeslána automaticky systémem MojeJIPka."
         )
         for email in emaily:
             try:
@@ -129,7 +129,7 @@ def posli_email_zadateli(zadavatel_id, udalost: str, cislo: str, nazev: str, duv
         if not predmet_text:
             return
         predmet = f"[Intranet] {predmet_text[0]}"
-        text = f"Dobrý den,\n\n{predmet_text[1]}\n\nTato zpráva byla odeslána automaticky systémem Intranet."
+        text = f"Dobrý den,\n\n{predmet_text[1]}\n\nTato zpráva byla odeslána automaticky systémem MojeJIPka."
         try:
             intranet_emaily.odesli_upozorneni_email(email, predmet, text)
         except Exception as e:
