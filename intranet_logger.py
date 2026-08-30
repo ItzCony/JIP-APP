@@ -11,6 +11,7 @@ from collections import deque
 import sys
 import traceback
 import intranet_monitor
+import intranet_data
 from intranet_ui_utils import refreshable_na_klienta
 
 LOG_FILE = "activity.log"
@@ -30,13 +31,37 @@ PRIKAZY = {
     '/reboot': 'Bezpečně vypne a znovu spustí celou aplikaci (uzavře DB spojení)',
     '/dark-mode on': 'Zapne tmavý režim (testovací fáze) pro tvůj účet',
     '/dark-mode off': 'Vypne tmavý režim pro tvůj účet',
+    '/moduly': 'Vypíše aktuální stav všech modulů portálu',
 }
+
+
+def _prikazy_modulu():
+    """Konkrétní varianty „/modul <alias> on|off" do našeptávače konzole.
+
+    Registr modulů žije v intranet_data.MODULY — odsud se jen odvozují aliasy,
+    aby seznam nebyl druhou kopií, která se s Nastavením portálu rozejde.
+    """
+    return [f'/modul {klic.removesuffix("_zapnuty")} {stav}'
+            for klic in intranet_data.MODULY for stav in ('on', 'off')]
 
 # ==========================================
 # --- GLOBÁLNÍ PAMĚŤ PRO LOGY (RAM CACHE) ---
 # ==========================================
 LOG_CACHE = deque(maxlen=500)
 CACHE_INITIALIZED = False
+_EMAIL_RE = re.compile(r'[\w.+-]+@[\w.-]+\.\w+')
+
+def je_skryty_radek(raw: str) -> bool:
+    """Řádek logu patří skrytému účtu (admin) — nesmí se nikde zobrazit.
+
+    Kategorie logu je jméno uživatele, proto ji porovnáme. Zprávy ale nesou
+    i e-mail (přihlášení, odhlášení), a ten identitu prozradí i tehdy, když
+    se jméno neshoduje (např. DB nedostupná). Filtrujeme i historické řádky,
+    které vznikly dřív, než se admin přestal zapisovat.
+    """
+    if intranet_data.je_skryty_ucet(jmeno=_parse_log_radek(raw)[1]):
+        return True
+    return any(intranet_data.je_skryty_ucet(email=e) for e in _EMAIL_RE.findall(raw))
 
 def init_log_cache():
     """Načte posledních 500 řádků z disku do RAM při prvním startu"""
@@ -48,7 +73,8 @@ def init_log_cache():
             with open(LOG_FILE, "r", encoding="utf-8") as f:
                 lines = f.readlines()
                 for line in lines[-500:]:
-                    if line.strip(): LOG_CACHE.append(line.strip())
+                    if line.strip() and not je_skryty_radek(line):
+                        LOG_CACHE.append(line.strip())
         except Exception: pass
     CACHE_INITIALIZED = True
 
@@ -191,6 +217,9 @@ _META_RE = re.compile(r'\s*⟦([^⟧]*)⟧\s*$')
 def log_activity(kategorie, uroven, zprava, ip=None, device=None):
     if uroven not in POVOLENE_UROVNE:
         return
+    # Skrytý admin a servisní účet se do logu nezapisují vůbec.
+    if intranet_data.je_skryty_ucet(jmeno=kategorie):
+        return
     init_log_cache()
     cas = datetime.datetime.now().strftime("%d.%m.%Y %H:%M:%S")
     log_entry = f"[{cas}] [{kategorie}] [{uroven}] {zprava}"
@@ -326,6 +355,97 @@ def _kat_color(kat: str) -> str:
         _kat_color_cache[kat] = _KAT_PALETTE[len(_kat_color_cache) % len(_KAT_PALETTE)]
     return _kat_color_cache[kat]
 
+# ==========================================
+# --- PŘEHLED PŘIHLÁŠENÝCH UŽIVATELŮ ---
+# ==========================================
+# Barvy avatarů — deterministicky podle e-mailu, ať má člověk pořád stejnou.
+_AVATAR_PALETTE = [
+    ('bg-sky-100',     'text-sky-700'),
+    ('bg-violet-100',  'text-violet-700'),
+    ('bg-emerald-100', 'text-emerald-700'),
+    ('bg-amber-100',   'text-amber-700'),
+    ('bg-rose-100',    'text-rose-700'),
+    ('bg-teal-100',    'text-teal-700'),
+    ('bg-indigo-100',  'text-indigo-700'),
+    ('bg-orange-100',  'text-orange-700'),
+]
+
+
+def _avatar_styl(email: str):
+    """(bg třída, text třída) pro avatar — stejný e-mail = vždy stejná barva."""
+    idx = sum(ord(z) for z in (email or '?')) % len(_AVATAR_PALETTE)
+    return _AVATAR_PALETTE[idx]
+
+
+def _inicialy(jmeno: str) -> str:
+    """'Jan Novák' → 'JN', 'admin' → 'AD'."""
+    casti = [c for c in (jmeno or '').replace('.', ' ').split() if c]
+    if not casti:
+        return '?'
+    if len(casti) == 1:
+        return casti[0][:2].upper()
+    return (casti[0][0] + casti[-1][0]).upper()
+
+
+def _ikona_zarizeni(os_nazev: str) -> str:
+    """Material ikona podle operačního systému z popisu zařízení."""
+    o = (os_nazev or '').lower()
+    if 'android' in o or 'ios' in o:
+        return 'smartphone'
+    if 'windows' in o:
+        return 'desktop_windows'
+    if 'mac' in o:
+        return 'laptop_mac'
+    if 'linux' in o:
+        return 'terminal'
+    return 'devices'
+
+
+def _posledni_aktivita_map() -> dict:
+    """kategorie logu (= jméno uživatele, lower) → čas jeho posledního záznamu.
+
+    Kategorie zapisuje ``log_activity`` jako ``user_name``, takže poslední řádek
+    dané kategorie je zároveň poslední aktivitou uživatele. Bereme z RAM cache,
+    žádné čtení disku navíc.
+    """
+    out: dict = {}
+    for raw in reversed(get_logs(500)):
+        cas, kat, _uroven, _msg, _ip, _dev = _parse_log_radek(raw)
+        klic = (kat or '').strip().lower()
+        if klic and klic not in out:
+            dt = _parse_cas(cas)
+            if dt:
+                out[klic] = dt
+    return out
+
+
+def _aktivni_relace() -> list:
+    """Aktivní uživatelé + stav živého připojení + poslední aktivita z logu.
+
+    ``intranet_session`` importuje tento modul, proto import až uvnitř funkce.
+    """
+    import intranet_session
+    posledni = _posledni_aktivita_map()
+    out = []
+    for zaznam in intranet_monitor.ziskej_aktivni():
+        u = dict(zaznam)
+        token = intranet_session.GLOBAL_ACTIVE_SESSIONS.get(u['email'])
+        u['zive'] = bool(token) and intranet_session.ZIVE_PRIPOJENI.get(token, 0) > 0
+        dt = posledni.get((u['jmeno'] or '').strip().lower())
+        u['aktivita'] = _relativni_cas(dt) if dt else ''
+        out.append(u)
+    return out
+
+
+def _pocet_relaci(n: int) -> str:
+    """České skloňování: 1 relace / 2–4 relace / 5+ relací."""
+    if n == 1:
+        return '1 relace'
+    if 2 <= n <= 4:
+        return f'{n} relace'
+    return f'{n} relací'
+
+
 def _severity(uroven: str, zprava: str):
     t = (uroven + ' ' + zprava).lower()
     if any(k in t for k in ('chyb', 'error', 'exception', 'kritick', 'pad')):
@@ -384,26 +504,28 @@ def vykresli_logy(user_name, vsechna_prava):
         with ui.row().classes('gap-2 items-center'):
             # ── Tlačítko přihlášených uživatelů ──────────────────
             def _otevrit_prihlasene():
-                stav: dict = {'emaily': set()}   # sleduje aktuálně zobrazené emaily
-
-                with ui.dialog() as dlg_uzivatele:
-                    with ui.element('div').classes('bg-white rounded-2xl overflow-hidden shadow-xl flex flex-col').style('width:460px'):
-                        # Hlavička
-                        with ui.element('div').classes('flex items-center gap-3 px-6 py-4 bg-emerald-600 w-full'):
-                            ui.icon('people', color='white', size='sm')
-                            ui.label('Aktuálně přihlášení').classes('text-white font-bold text-base flex-1')
-                            pocet_lbl = ui.label('0 online').classes(
-                                'bg-white text-emerald-700 text-xs font-bold px-2.5 py-1 rounded-full whitespace-nowrap')
-                        # Obsah — přestavitelný kontejner
-                        seznam_kontejner = ui.element('div').classes('flex flex-col divide-y divide-gray-100 w-full max-h-[60vh] overflow-y-auto')
-                        # Patička
-                        with ui.element('div').classes('flex justify-end px-6 py-3 bg-gray-50 border-t border-gray-100 w-full'):
-                            ui.button('Zavřít', on_click=dlg_uzivatele.close).props('flat dense').classes('text-gray-500')
+                # 'podpis' = seřazená množina (e-mail, živý) — seznam se přestaví
+                # jen při reálné změně, jinak se patchují pouze časové popisky.
+                stav: dict = {'podpis': None, 'labels': {}, 'hledat': '', 'rezim': 'vse'}
 
                 try:
                     _muj_email = str(app.storage.user.get('user_email', '')).lower()
                 except Exception:
                     _muj_email = ''
+
+                def _filtruj(relace):
+                    q = stav['hledat']
+                    rez = stav['rezim']
+                    out = []
+                    for u in relace:
+                        if rez == 'zivi' and not u['zive']:
+                            continue
+                        if rez == 'cekajici' and u['zive']:
+                            continue
+                        if q and q not in f"{u['jmeno']} {u['email']} {u.get('ip', '')}".lower():
+                            continue
+                        out.append(u)
+                    return out
 
                 def _odhlas_uzivatele(email, jmeno):
                     """Potvrzovací dialog → admin vynutí odhlášení uživatele."""
@@ -418,75 +540,149 @@ def vykresli_logy(user_name, vsechna_prava):
                                          f"Administrátor vynutil odhlášení uživatele: {jmeno} ({email})")
                             dlg_o.close()
                             ui.notify(f'Uživatel „{jmeno}" byl odhlášen.', type='positive')
-                            akt = intranet_monitor.ziskej_aktivni()
-                            pocet_lbl.set_text(f'{len(akt)} online')
-                            _sestav_seznam(akt)
+                            stav['podpis'] = None       # vynutí přestavbu seznamu
+                            _tick()
                         with ui.row().classes('w-full justify-between'):
                             ui.button('Zrušit', on_click=dlg_o.close).classes('bg-gray-200 text-gray-700 font-bold px-6')
                             ui.button('Odhlásit', icon='logout', on_click=_potvrd).classes(
                                 'bg-red-600 hover:bg-red-700 text-white font-bold px-6')
                     dlg_o.open()
 
-                def _sestav_seznam(aktivni):
-                    """Přestaví seznam uživatelů v kontejneru."""
-                    trvani_labels: dict = {}
+                def _prazdny_stav(je_filtr: bool):
+                    with ui.element('div').classes(
+                        'flex flex-col items-center justify-center gap-3 py-12 text-gray-400 w-full'
+                    ):
+                        ui.icon('search_off' if je_filtr else 'person_off', size='2.5rem')
+                        ui.label('Filtru neodpovídá žádná relace' if je_filtr
+                                 else 'Žádný přihlášený uživatel').classes('text-sm')
+
+                def _sestav_seznam(relace, je_filtr: bool):
+                    """Přestaví seznam — volá se jen při změně složení nebo filtru."""
+                    stav['labels'] = {}
                     seznam_kontejner.clear()
                     with seznam_kontejner:
-                        if not aktivni:
-                            with ui.element('div').classes('flex flex-col items-center justify-center gap-3 py-10 text-gray-400 w-full'):
-                                ui.icon('person_off', size='2.5rem')
-                                ui.label('Žádný přihlášený uživatel').classes('text-sm')
-                        else:
-                            for u in aktivni:
-                                with ui.element('div').classes('flex items-center gap-4 px-6 py-3 w-full'):
-                                    with ui.element('div').classes(
-                                        'w-9 h-9 rounded-full bg-emerald-100 flex items-center justify-center shrink-0'
-                                    ):
-                                        ui.icon('person', color='emerald-600', size='sm')
-                                    with ui.element('div').classes('flex flex-col flex-1 min-w-0'):
-                                        ui.label(u['jmeno']).classes('text-sm font-semibold text-gray-800')
-                                        ui.label(u['email']).classes('text-xs text-gray-400 truncate')
-                                        # IP + zařízení — profesionální stopa relace
-                                        radek_meta = []
-                                        if u.get('ip'):
-                                            radek_meta.append(u['ip'])
-                                        if u.get('device'):
-                                            radek_meta.append(u['device'])
-                                        if radek_meta:
-                                            with ui.element('div').classes('flex items-center gap-1.5 mt-0.5'):
-                                                ui.icon('public', size='12px', color='gray-400')
-                                                ui.label(' · '.join(radek_meta)).classes('text-[10px] text-gray-400 font-mono truncate')
-                                    with ui.element('div').classes('flex flex-col items-end shrink-0 pl-4'):
-                                        ui.label(f'od {u["od"]}').classes('text-xs text-gray-400 font-mono')
-                                        trvani_lbl = ui.label(u['trvani']).classes('text-xs font-bold text-emerald-600')
-                                        trvani_labels[u['email']] = trvani_lbl
-                                    # Křížek pro vynucené odhlášení (kromě sebe sama)
-                                    if u['email'].lower() != _muj_email:
-                                        ui.button(
-                                            icon='logout',
-                                            on_click=lambda e, em=u['email'], jm=u['jmeno']: _odhlas_uzivatele(em, jm)
-                                        ).props('flat round dense').classes(
-                                            'text-red-400 hover:text-red-600 shrink-0').tooltip(f'Odhlásit {u["jmeno"]}')
-                    stav['emaily'] = {u['email'] for u in aktivni}
-                    stav['trvani_labels'] = trvani_labels
+                        if not relace:
+                            _prazdny_stav(je_filtr)
+                            return
+                        for u in relace:
+                            je_ja = u['email'].lower() == _muj_email
+                            bg, fg = _avatar_styl(u['email'])
+                            prohlizec, os_nazev = _rozdel_zarizeni(u.get('device', ''))
+                            with ui.element('div').classes(
+                                'flex items-center gap-4 px-6 py-3 w-full hover:bg-gray-50 transition-colors'
+                            ):
+                                # Stavová tečka — živé připojení vs. čekání na reconnect
+                                ui.element('span').classes(
+                                    'w-2.5 h-2.5 rounded-full shrink-0 ' +
+                                    ('bg-emerald-500 animate-pulse' if u['zive'] else 'bg-gray-300')
+                                ).tooltip('Živé připojení' if u['zive'] else 'Čeká na obnovení spojení')
+                                # Avatar s iniciálami
+                                with ui.element('div').classes(
+                                    f'w-10 h-10 rounded-full {bg} flex items-center justify-center shrink-0'
+                                ):
+                                    ui.label(_inicialy(u['jmeno'])).classes(f'text-xs font-black {fg}')
+                                # Identita
+                                with ui.element('div').classes('flex flex-col flex-1 min-w-0'):
+                                    with ui.element('div').classes('flex items-center gap-2 min-w-0'):
+                                        ui.label(u['jmeno']).classes('text-sm font-semibold text-gray-800 truncate')
+                                        if je_ja:
+                                            ui.label('vy').classes(
+                                                'bg-emerald-100 text-emerald-700 text-[10px] font-bold '
+                                                'px-1.5 py-0.5 rounded shrink-0')
+                                    ui.label(u['email']).classes('text-xs text-gray-400 truncate')
+                                    if not u['zive']:
+                                        ui.label('čeká na obnovení spojení').classes(
+                                            'text-[10px] text-amber-600 font-semibold')
+                                # Zařízení + IP
+                                with ui.element('div').classes('hidden md:flex flex-col shrink-0 w-44 min-w-0'):
+                                    with ui.element('div').classes('flex items-center gap-1.5 min-w-0'):
+                                        ui.icon(_ikona_zarizeni(os_nazev), size='14px', color='gray-400')
+                                        ui.label(prohlizec or '—').classes('text-xs text-gray-600 truncate')
+                                        if os_nazev:
+                                            ui.label(os_nazev).classes('text-[10px] text-gray-400 truncate')
+                                    with ui.element('div').classes('flex items-center gap-1.5 min-w-0'):
+                                        ui.icon('lan', size='12px', color='gray-300')
+                                        ui.label(u.get('ip') or '—').classes(
+                                            'text-[11px] text-gray-400 font-mono truncate')
+                                # Časová osa relace
+                                with ui.element('div').classes('flex flex-col items-end shrink-0 w-32'):
+                                    ui.label(f'od {u["od"]}').classes('text-[11px] text-gray-400 font-mono')
+                                    trvani_lbl = ui.label(u['trvani']).classes('text-xs font-bold text-emerald-600')
+                                    akt_lbl = ui.label(u['aktivita'] or 'bez aktivity').classes('text-[10px] text-gray-400')
+                                stav['labels'][u['email']] = (trvani_lbl, akt_lbl)
+                                # Vynucené odhlášení (nikdy ne sebe sama)
+                                if je_ja:
+                                    ui.element('div').classes('w-[104px] shrink-0')
+                                else:
+                                    ui.button('Odhlásit', icon='logout',
+                                              on_click=lambda _e, em=u['email'], jm=u['jmeno']: _odhlas_uzivatele(em, jm)) \
+                                        .props('flat dense no-caps size=sm') \
+                                        .classes('text-red-500 hover:text-red-700 shrink-0 w-[104px]')
 
                 def _tick():
-                    aktivni = intranet_monitor.ziskej_aktivni()
-                    nove_emaily = {u['email'] for u in aktivni}
-                    if nove_emaily != stav['emaily']:
-                        # Někdo se přihlásil nebo odhlásil — přestavíme celý seznam
-                        pocet_lbl.set_text(f'{len(aktivni)} online')
-                        _sestav_seznam(aktivni)
-                    else:
-                        # Jen aktualizuj časy
-                        for info in aktivni:
-                            lbl = stav.get('trvani_labels', {}).get(info['email'])
-                            if lbl:
-                                lbl.set_text(info['trvani'])
+                    relace = _aktivni_relace()
+                    zivych = sum(1 for u in relace if u['zive'])
+                    ceka = len(relace) - zivych
+                    online_lbl.set_text(f'{zivych} online')
+                    ceka_lbl.set_text(f'{ceka} čeká na spojení')
+                    ceka_lbl.set_visibility(bool(ceka))
+                    patka_lbl.set_text(_pocet_relaci(len(relace)))
 
-                _sestav_seznam(intranet_monitor.ziskej_aktivni())
-                pocet_lbl.set_text(f'{len(stav["emaily"])} online')
-                _tick_timer = ui.timer(1.0, _tick)
+                    filtr = _filtruj(relace)
+                    podpis = tuple(sorted((u['email'], u['zive']) for u in filtr))
+                    if podpis != stav['podpis']:
+                        stav['podpis'] = podpis
+                        _sestav_seznam(filtr, je_filtr=bool(relace) and not filtr)
+                    else:
+                        for u in filtr:
+                            par = stav['labels'].get(u['email'])
+                            if par:
+                                par[0].set_text(u['trvani'])
+                                par[1].set_text(u['aktivita'] or 'bez aktivity')
+
+                def _nastav(klic, hodnota):
+                    stav[klic] = hodnota
+                    stav['podpis'] = None       # filtr se změnil → přestav seznam
+                    _tick()
+
+                with ui.dialog() as dlg_uzivatele:
+                    # Pevné okno 820 x 600 px; na malém displeji se smrskne na viewport.
+                    with ui.card().classes(
+                        'p-0 rounded-2xl overflow-hidden bg-white flex flex-col'
+                    ).style('width:820px; max-width:92vw; height:600px; max-height:85vh'):
+                        # Hlavička
+                        with ui.element('div').classes(
+                            'flex items-center gap-3 px-6 py-4 w-full bg-gradient-to-r from-emerald-600 to-teal-600'
+                        ):
+                            ui.icon('groups', color='white', size='sm')
+                            ui.label('Aktuálně přihlášení').classes('text-white font-bold text-base flex-1')
+                            online_lbl = ui.label('0 online').classes(
+                                'bg-white text-emerald-700 text-xs font-bold px-2.5 py-1 rounded-full whitespace-nowrap')
+                            ceka_lbl = ui.label('').classes(
+                                'bg-amber-100 text-amber-800 text-xs font-bold px-2.5 py-1 rounded-full whitespace-nowrap')
+                            ui.button(icon='close', on_click=dlg_uzivatele.close).props('flat round dense color=white')
+                        # Filtry
+                        with ui.element('div').classes(
+                            'flex items-center gap-3 px-6 py-3 w-full flex-wrap bg-gray-50 border-b border-gray-200'
+                        ):
+                            ui.input(placeholder='Hledat jméno, e-mail nebo IP…',
+                                     on_change=lambda e: _nastav('hledat', (e.value or '').strip().lower())) \
+                                .props('dense outlined clearable debounce=200').classes('flex-1 min-w-[220px]')
+                            ui.toggle({'vse': 'Vše', 'zivi': 'Připojení', 'cekajici': 'Čekající'}, value='vse',
+                                      on_change=lambda e: _nastav('rezim', e.value or 'vse')) \
+                                .props('dense unelevated no-caps toggle-color=teal-7')
+                        # Seznam
+                        seznam_kontejner = ui.element('div').classes(
+                            'flex flex-col divide-y divide-gray-100 w-full flex-1 overflow-y-auto')
+                        # Patička
+                        with ui.element('div').classes(
+                            'flex items-center justify-between px-6 py-3 w-full bg-gray-50 border-t border-gray-100'
+                        ):
+                            patka_lbl = ui.label('').classes('text-xs text-gray-500 font-semibold')
+                            ui.label('aktualizace každé 2 s').classes('text-[11px] text-gray-400')
+
+                _tick()
+                _tick_timer = ui.timer(2.0, _tick)
                 dlg_uzivatele.on('hide', lambda _: _tick_timer.cancel())
                 dlg_uzivatele.open()
 
@@ -512,8 +708,12 @@ def vykresli_logy(user_name, vsechna_prava):
             def stahnout_log():
                 if os.path.exists(LOG_FILE):
                     cesta_zip = os.path.join(EXPORT_DIR, f"Zaloha_Logu_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.zip")
+                    # Celý soubor, ale bez řádků skrytého admina (proto writestr,
+                    # ne write — zabalený originál by je vynesl ven).
+                    with open(LOG_FILE, 'r', encoding='utf-8') as f:
+                        obsah = ''.join(r for r in f if not je_skryty_radek(r))
                     with zipfile.ZipFile(cesta_zip, 'w', zipfile.ZIP_DEFLATED) as zf:
-                        zf.write(LOG_FILE, arcname="activity.log")
+                        zf.writestr("activity.log", obsah)
                     log_activity(user_name, "Export", "Uživatel stáhnul historii Audit Logu (.zip)")
                     ui.download(cesta_zip)
                     ui.notify('Logy staženy.', type='positive')
@@ -605,7 +805,7 @@ def vykresli_logy(user_name, vsechna_prava):
         'px-5 py-2.5 bg-white border-x border-t border-gray-200'
     ):
         hledat_input = ui.input(placeholder='Hledat: uživatel, IP, událost, zpráva…  ·  „/" pro příkazy',
-                                autocomplete=list(PRIKAZY)) \
+                                autocomplete=list(PRIKAZY) + _prikazy_modulu()) \
             .props('dense clearable outlined debounce=200 input-class=text-sm') \
             .classes('w-full sm:w-80')
 
@@ -875,6 +1075,38 @@ def vykresli_logy(user_name, vsechna_prava):
                   type='info', position='top', timeout=2000)
         ui.navigate.reload()  # přímo, bez ui.timer — konzole si přestavuje slot (padal parent slot)
 
+    def _stav_modulu():
+        nast = intranet_data.nacti_nastaveni_intranetu()
+        with ui.dialog() as dlg, ui.card().classes('p-6 gap-2 max-w-lg'):
+            ui.label('Stav modulů portálu').classes('text-lg font-bold mb-1')
+            for klic, (popisek, _) in intranet_data.MODULY.items():
+                zapnuty = nast.get(klic, True)
+                with ui.row().classes('items-center gap-2 w-full'):
+                    ui.icon('check_circle' if zapnuty else 'cancel', size='xs',
+                            color='green-600' if zapnuty else 'red-600')
+                    ui.label(klic.removesuffix('_zapnuty')).classes('text-xs font-mono w-40 text-gray-700')
+                    ui.label(popisek).classes('text-xs text-gray-500 flex-1')
+            ui.button('Zavřít', on_click=dlg.close).props('flat no-caps color=grey-8').classes('self-end mt-2')
+        dlg.open()
+
+    def _prepni_modul_prikazem(alias, zapnout):
+        # Konzoli vidí i právo admin_logy, ale moduly patří pod „Nastavení portálu"
+        # (právo mysql). Bez téhle kontroly by příkaz obešel oprávnění z UI.
+        if 'vse' not in vsechna_prava and 'mysql' not in vsechna_prava:
+            log_activity(user_name, 'Přepnutí modulu',
+                         f'ODMÍTNUTO — příkaz /modul {alias} {"on" if zapnout else "off"} '
+                         f'bez práva „Nastavení portálu"')
+            ui.notify('Nemáte oprávnění měnit moduly portálu.', type='negative')
+            return
+        klic = f'{alias}_zapnuty'
+        if klic not in intranet_data.MODULY:
+            ui.notify(f'Neznámý modul: {alias}. Seznam vypíše /moduly.', type='negative')
+            return
+        import intranet_nastaveni  # lazy — intranet_nastaveni importuje tenhle modul
+        intranet_nastaveni.prepni_modul(klic, zapnout, user_name)
+        ui.notify(f'{intranet_data.MODULY[klic][0]} — {"ZAPNUTO" if zapnout else "VYPNUTO"}. '
+                  'Změna se projeví všem uživatelům do 10 sekund.', type='positive')
+
     def _zpracuj_prikaz():
         prikaz = (hledat_input.value or '').strip()
         if not prikaz.startswith('/'):
@@ -886,6 +1118,10 @@ def vykresli_logy(user_name, vsechna_prava):
             _nastav_dark(True)
         elif prikaz == '/dark-mode off':
             _nastav_dark(False)
+        elif prikaz == '/moduly':
+            _stav_modulu()
+        elif (m := re.fullmatch(r'/modul\s+([\w-]+)\s+(on|off)', prikaz)):
+            _prepni_modul_prikazem(m.group(1), m.group(2) == 'on')
         else:
             ui.notify(f'Neznámý příkaz: {prikaz}', type='negative')
     hledat_input.on('keydown.enter', _zpracuj_prikaz)
