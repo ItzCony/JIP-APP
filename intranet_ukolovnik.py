@@ -11,6 +11,8 @@ import uuid
 import calendar
 import tempfile
 import time
+import io
+import unicodedata
 from collections import OrderedDict
 from intranet_ui_utils import refreshable_na_klienta
 
@@ -1089,6 +1091,223 @@ def _smazat_ukol_db(ukol_id):
         return False
     finally:
         cur.close(); conn.close()
+
+
+# =========================================================
+# HROMADNÉ MAZÁNÍ ÚKOLŮ ZA OBDOBÍ + IMPORT PLÁNU Z XLSX
+# =========================================================
+def _najdi_ukoly_obdobi(od, do, oddeleni: list, vcetne_hotovych: bool = False) -> list:
+    """Úkoly s termínem od–do přiřazené lidem ze zadaných oddělení.
+
+    Oddělení = členství v `department_To_user`, ne textový tag na úkolu — tag
+    se v praxi u části záznamů nevyplňuje a filtr by je minul.
+    Vrací [{'id','nazev','termin','prirazen_id','prirazen_jmeno','stav'}]."""
+    if not (od and do and oddeleni):
+        return []
+    uziv_ids = [u['id'] for u in _ziskej_uziv_dle_oddeleni(list(oddeleni))]
+    if not uziv_ids:
+        return []
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return []
+    try:
+        cur = conn.cursor(dictionary=True)
+        ph = ','.join(['%s'] * len(uziv_ids))
+        query = (f"SELECT id, nazev, termin, prirazen_id, prirazen_jmeno, stav "
+                 f"FROM ukolovnik_ukoly "
+                 f"WHERE prirazen_id IN ({ph}) AND termin BETWEEN %s AND %s")
+        if not vcetne_hotovych:
+            query += " AND stav NOT IN ('Hotovo', 'Zrušen')"
+        query += " ORDER BY prirazen_jmeno, termin"
+        cur.execute(query, uziv_ids + [od, do])
+        return cur.fetchall()
+    except Exception as e:
+        print(f'[_najdi_ukoly_obdobi] {e}')
+        return []
+    finally:
+        cur.close(); conn.close()
+
+
+def _smazat_ukoly_hromadne(ids: list) -> int:
+    """Cascade delete více úkolů najednou — stejné tabulky jako `_smazat_ukol_db`,
+    ale jedno spojení a `IN (...)` místo N×8 dotazů. Vrátí počet smazaných."""
+    ids = [int(i) for i in ids if i is not None]
+    if not ids:
+        return 0
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return 0
+    ph = ','.join(['%s'] * len(ids))
+    prilohy_cesty = []
+    smazano = 0
+    try:
+        cur = conn.cursor()
+        cur.execute(f"SELECT soubor_cesta FROM ukolovnik_ukol_prilohy WHERE ukol_id IN ({ph})", ids)
+        prilohy_cesty = [r[0] for r in cur.fetchall()]
+        cur.execute(f"DELETE FROM ukolovnik_ukol_poznamky WHERE ukol_id IN ({ph})", ids)
+        cur.execute(f"DELETE FROM ukolovnik_ukol_prilohy WHERE ukol_id IN ({ph})", ids)
+        cur.execute(f"DELETE FROM ukolovnik_ukol_plany WHERE ukol_id IN ({ph})", ids)
+        cur.execute(f"DELETE FROM ukolovnik_cas_zaznamy WHERE ukol_id IN ({ph})", ids)
+        cur.execute(f"DELETE FROM ukolovnik_sledovaci WHERE typ='ukol' AND ref_id IN ({ph})", ids)
+        cur.execute(f"DELETE FROM ukolovnik_log WHERE typ='ukol' AND ref_id IN ({ph})", ids)
+        cur.execute(f"DELETE FROM ukolovnik_poradi WHERE ukol_id IN ({ph})", ids)
+        cur.execute(f"DELETE FROM ukolovnik_ukoly WHERE id IN ({ph})", ids)
+        smazano = cur.rowcount
+        conn.commit()
+    except Exception as e:
+        print(f"[_smazat_ukoly_hromadne] {e}")
+        return 0
+    finally:
+        cur.close(); conn.close()
+    # Soubory až po úspěšném commitu — smazaný soubor se nedá vrátit rollbackem.
+    for cesta in prilohy_cesty:
+        try:
+            if cesta and os.path.isfile(cesta):
+                os.remove(cesta)
+        except Exception:
+            pass
+    _bump_data_verze('ukol', None)
+    return smazano
+
+
+def _norm_jmeno(s) -> str:
+    """Klíč pro párování jmen: bez diakritiky, malá písmena, jedna mezera."""
+    txt = unicodedata.normalize('NFKD', str(s or ''))
+    txt = ''.join(c for c in txt if not unicodedata.combining(c))
+    return ' '.join(txt.lower().split())
+
+
+# Hlavička plánu: normalizovaný název sloupce → klíč
+_PLAN_HLAVICKA = {
+    'datum': 'datum',
+    'ukol': 'nazev',
+    'typ/periodicita': 'periodicita',
+    'prideleno': 'prirazen',
+    'zadal': 'zadal',
+    'odhad (h)': 'odhad',
+    'odhad(h)': 'odhad',
+    'odhad': 'odhad',
+}
+
+
+def _parsuj_plan_xlsx(raw: bytes, od, do, uziv_opts: dict):
+    """Parsuje sešit „AO plán" (list 1) na řádky k importu.
+
+    Vrací (radky, nesparovana_jmena, mimo_rozsah, bez_data). Nesparované jméno
+    import zastavuje — volající to musí ošetřit, tady jen sbíráme.
+    """
+    import openpyxl
+    wb = openpyxl.load_workbook(io.BytesIO(raw), data_only=True, read_only=True)
+    ws = wb[wb.sheetnames[0]]
+    rows = ws.iter_rows(values_only=True)
+    try:
+        hlavicka = next(rows)
+    except StopIteration:
+        raise ValueError('Soubor je prázdný.')
+
+    idx = {}
+    for i, bunka in enumerate(hlavicka):
+        klic = _PLAN_HLAVICKA.get(_norm_jmeno(bunka))
+        if klic and klic not in idx:
+            idx[klic] = i
+    chybi = [s for s in ('datum', 'nazev', 'prirazen') if s not in idx]
+    if chybi:
+        raise ValueError(f"V souboru chybí sloupce: {', '.join(chybi)}. "
+                         f"Očekávám hlavičku Datum | Den v týdnu | Úkol | Typ/Periodicita | Přiděleno | Zadal | Odhad (h).")
+
+    podle_jmena = {}
+    for uid, jmeno in (uziv_opts or {}).items():
+        podle_jmena.setdefault(_norm_jmeno(jmeno), (uid, jmeno))
+
+    def _bunka(r, klic):
+        i = idx.get(klic)
+        return r[i] if i is not None and i < len(r) else None
+
+    radky, nesparovana, mimo_rozsah, bez_data = [], [], 0, 0
+    for r in rows:
+        if r is None or not any(v is not None and str(v).strip() != '' for v in r):
+            continue
+        nazev = str(_bunka(r, 'nazev') or '').strip()
+        if not nazev:
+            continue
+
+        syrove_datum = _bunka(r, 'datum')
+        if isinstance(syrove_datum, datetime.datetime):
+            datum = syrove_datum.date()
+        elif isinstance(syrove_datum, datetime.date):
+            datum = syrove_datum
+        else:
+            datum = None
+            for fmt in ('%d.%m.%Y', '%Y-%m-%d', '%d.%m.%y'):
+                try:
+                    datum = datetime.datetime.strptime(str(syrove_datum).strip(), fmt).date()
+                    break
+                except Exception:
+                    continue
+        if datum is None:
+            bez_data += 1
+            continue
+        if (od and datum < od) or (do and datum > do):
+            mimo_rozsah += 1
+            continue
+
+        jm_prirazen = str(_bunka(r, 'prirazen') or '').strip()
+        trefa = podle_jmena.get(_norm_jmeno(jm_prirazen))
+        if not trefa:
+            if jm_prirazen and jm_prirazen not in nesparovana:
+                nesparovana.append(jm_prirazen)
+            continue
+        prirazen_id, prirazen_jmeno = trefa
+
+        syrovy_odhad = _bunka(r, 'odhad')
+        try:
+            odhad = float(str(syrovy_odhad).replace(',', '.')) if syrovy_odhad not in (None, '') else None
+        except Exception:
+            odhad = None
+
+        radky.append({
+            'termin': datum,
+            'nazev': nazev[:255],
+            'periodicita': str(_bunka(r, 'periodicita') or '').strip(),
+            'prirazen_id': prirazen_id,
+            'prirazen_jmeno': prirazen_jmeno,
+            'odhad': odhad,
+        })
+    return radky, nesparovana, mimo_rozsah, bez_data
+
+
+def _vloz_ukoly_hromadne(radky: list, oddeleni_csv, user_id, user_name) -> int:
+    """Zapíše naparsované řádky plánu jako nové úkoly. Vrátí počet vložených."""
+    if not radky:
+        return 0
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return 0
+    davka = [(
+        r['nazev'],
+        f"Periodicita: {r['periodicita']}" if r.get('periodicita') else '',
+        r['prirazen_id'], r['prirazen_jmeno'],
+        user_id, 'Importováno',
+        r['termin'], r.get('odhad'),
+        'Normální', 'Zadáno', oddeleni_csv, 'Pravidelný',
+    ) for r in radky]
+    try:
+        cur = conn.cursor()
+        cur.executemany("""
+            INSERT INTO ukolovnik_ukoly
+                (nazev, popis, prirazen_id, prirazen_jmeno, zadal_id, zadal_jmeno,
+                 termin, odhad_hodin, priorita, stav, oddeleni, typ_ukolu)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, davka)
+        vlozeno = cur.rowcount
+        conn.commit()
+    except Exception as e:
+        print(f'[_vloz_ukoly_hromadne] {e}')
+        return 0
+    finally:
+        cur.close(); conn.close()
+    _bump_data_verze('ukol', None)
+    return vlozeno
 
 
 def _smazat_poradu_db(porada_id):
@@ -2235,6 +2454,307 @@ def _dialog_guard_close():
 
 
 # =========================================================
+# DIALOGY: hromadné mazání období + import plánu z XLSX
+# =========================================================
+def _plan_datum_input(label: str, vychozi: datetime.date):
+    inp = ui.input(label).classes('w-40').props('outlined dense')
+    inp.value = vychozi.strftime('%d.%m.%Y')
+    with inp.add_slot('append'):
+        ui.icon('event').classes('cursor-pointer text-blue-500').on('click', lambda: menu.open())
+    with ui.menu().props('no-parent-event') as menu:
+        ui.date(mask='DD.MM.YYYY').bind_value(inp).props('today-btn').classes('p-0')
+    return inp
+
+
+def _plan_preved_datum(inp):
+    try:
+        return datetime.datetime.strptime(str(inp.value).strip(), '%d.%m.%Y').date()
+    except Exception:
+        return None
+
+
+def _audit_meta() -> tuple:
+    """(ip, zařízení) přihlášeného klienta pro audit log — ze session z loginu."""
+    try:
+        return (app.storage.user.get('login_ip') or '',
+                app.storage.user.get('login_device') or '')
+    except Exception:
+        return ('', '')
+
+
+def _plan_obdobi_txt(od, do) -> str:
+    return f'{od.strftime("%d.%m.%Y")} – {do.strftime("%d.%m.%Y")}'
+
+
+def _plan_rozpad_osob(radky, klic_jmeno='prirazen_jmeno'):
+    """Seřazený seznam ('Jméno', počet) pro náhled."""
+    pocty = {}
+    for r in radky:
+        jm = r.get(klic_jmeno) or '(bez osoby)'
+        pocty[jm] = pocty.get(jm, 0) + 1
+    return sorted(pocty.items(), key=lambda x: (-x[1], x[0]))
+
+
+def _dialog_smazat_obdobi(user_id, user_name, on_refresh=None, dialog_anchor=None):
+    """Hromadné smazání úkolů za období + oddělení. Dvoukrokové: spočítat → potvrdit."""
+    dnes = datetime.date.today()
+    prvni = dnes.replace(day=1)
+    posledni = dnes.replace(day=calendar.monthrange(dnes.year, dnes.month)[1])
+    odd_opts = _ziskej_oddeleni_options()
+    stav = {'ukoly': None, 'potvrzeno': False}
+
+    with _dialog_kotva(dialog_anchor), \
+         ui.dialog().props('no-refocus') as dlg, \
+         ui.card().classes('w-full max-w-2xl p-6 rounded-xl'):
+        ui.label('Smazat úkoly z období').classes('text-2xl font-bold text-red-700 mb-1')
+        ui.label('Smaže úkoly, jejichž termín spadá do období a jejichž řešitel patří '
+                 'do vybraného oddělení. Mazání je nevratné.').classes('text-sm text-gray-500 mb-4')
+
+        with ui.row().classes('w-full gap-3 items-center'):
+            od_inp = _plan_datum_input('Od', prvni)
+            do_inp = _plan_datum_input('Do', posledni)
+        odd_sel = ui.select(odd_opts, label='Oddělení', multiple=True) \
+            .classes('w-full mt-3').props('outlined dense use-chips')
+        hotove_cb = ui.checkbox('Smazat i hotové a zrušené úkoly').classes('mt-1')
+
+        nahled = ui.column().classes('w-full mt-3 gap-1')
+
+        def _zneplatnit():
+            """Změna vstupů → výsledek už neplatí, potvrzení se resetuje."""
+            if stav['ukoly'] is None and not stav['potvrzeno']:
+                return
+            stav['ukoly'] = None
+            stav['potvrzeno'] = False
+            nahled.clear()
+            btn_smazat.set_visibility(False)
+
+        for el in (od_inp, do_inp, odd_sel, hotove_cb):
+            el.on_value_change(lambda _=None: _zneplatnit())
+
+        async def _spocitat():
+            od, do = _plan_preved_datum(od_inp), _plan_preved_datum(do_inp)
+            if not od or not do:
+                ui.notify('Neplatný formát data (DD.MM.RRRR).', type='warning'); return
+            if od > do:
+                ui.notify('„Od" je později než „Do".', type='warning'); return
+            if not odd_sel.value:
+                ui.notify('Vyberte alespoň jedno oddělení.', type='warning'); return
+            ukoly = await asyncio.to_thread(_najdi_ukoly_obdobi, od, do,
+                                            list(odd_sel.value), bool(hotove_cb.value))
+            stav['ukoly'] = ukoly
+            stav['potvrzeno'] = False
+            nahled.clear()
+            with nahled:
+                if not ukoly:
+                    ui.label('Žádné úkoly neodpovídají zadání.').classes('text-sm text-gray-500')
+                    btn_smazat.set_visibility(False)
+                    return
+                ui.label(f'Najde se {len(ukoly)} úkolů · {od.strftime("%d.%m.%Y")} – {do.strftime("%d.%m.%Y")}') \
+                    .classes('text-base font-bold text-gray-800')
+                with ui.column().classes('gap-0 max-h-48 overflow-auto w-full'):
+                    for jm, pocet in _plan_rozpad_osob(ukoly):
+                        ui.label(f'{jm}: {pocet}').classes('text-sm text-gray-600')
+            btn_smazat.set_text(f'Smazat {len(ukoly)} úkolů')
+            btn_smazat.set_visibility(True)
+
+        async def _smazat():
+            ukoly = stav['ukoly']
+            if not ukoly:
+                return
+            if not stav['potvrzeno']:
+                stav['potvrzeno'] = True
+                btn_smazat.set_text(f'Opravdu smazat {len(ukoly)} úkolů? Klikněte znovu')
+                return
+            btn_smazat.disable()
+            ids = [u['id'] for u in ukoly]
+            pocet = await asyncio.to_thread(_smazat_ukoly_hromadne, ids)
+            od, do = _plan_preved_datum(od_inp), _plan_preved_datum(do_inp)
+            _ip, _dev = _audit_meta()
+            _osoby = ', '.join(f'{jm} ({n})' for jm, n in _plan_rozpad_osob(ukoly))
+            intranet_logger.log_activity(
+                user_name, "Úkolovník",
+                f"Hromadné smazání plánu: {pocet} úkolů | období {_plan_obdobi_txt(od, do)}"
+                f" | oddělení: {', '.join(odd_sel.value)}"
+                f" | hotové/zrušené: {'ano' if hotove_cb.value else 'ne'}"
+                f" | osoby: {_osoby or '—'}",
+                ip=_ip, device=_dev)
+            dlg.close()
+            ui.notify(f'Smazáno {pocet} úkolů.', type='positive', position='top')
+            if on_refresh:
+                on_refresh()
+
+        with ui.row().classes('w-full justify-end gap-2 mt-4'):
+            ui.button('Zrušit', on_click=dlg.close).classes('bg-gray-400 text-white font-bold px-4')
+            ui.button('Spočítat', icon='search', on_click=_spocitat) \
+                .classes('bg-blue-600 text-white font-bold px-4')
+            btn_smazat = ui.button('Smazat', icon='delete_forever', on_click=_smazat) \
+                .classes('bg-red-600 text-white font-bold px-4')
+            btn_smazat.set_visibility(False)
+    dlg.open()
+
+
+def _dialog_nahrat_plan(user_id, user_name, on_refresh=None, dialog_anchor=None):
+    """Import plánu úkolů z XLSX pro období od–do a vybraná oddělení."""
+    dnes = datetime.date.today()
+    prvni = dnes.replace(day=1)
+    posledni = dnes.replace(day=calendar.monthrange(dnes.year, dnes.month)[1])
+    odd_opts = _ziskej_oddeleni_options()
+    stav = {'radky': None, 'soubor': '', 'existujici': [], 'potvrzeno': False}
+
+    with _dialog_kotva(dialog_anchor), \
+         ui.dialog().props('no-refocus') as dlg, \
+         ui.card().classes('w-full max-w-2xl p-6 rounded-xl'):
+        ui.label('Nahrát plán úkolů').classes('text-2xl font-bold text-blue-800 mb-1')
+        ui.label('Sloupce: Datum | Den v týdnu | Úkol | Typ/Periodicita | Přiděleno | Odhad (h). '
+                 'Řádky mimo období se přeskočí. Zadavatel bude „Importováno".').classes('text-sm text-gray-500 mb-4')
+
+        with ui.row().classes('w-full gap-3 items-center'):
+            od_inp = _plan_datum_input('Od', prvni)
+            do_inp = _plan_datum_input('Do', posledni)
+        odd_sel = ui.select(odd_opts, label='Oddělení', multiple=True) \
+            .classes('w-full mt-3').props('outlined dense use-chips')
+
+        nahled = ui.column().classes('w-full mt-3 gap-1')
+
+        def _zneplatnit():
+            if stav['radky'] is None:
+                return
+            stav['radky'] = None
+            stav['existujici'] = []
+            stav['potvrzeno'] = False
+            nahled.clear()
+            btn_import.set_visibility(False)
+
+        for el in (od_inp, do_inp, odd_sel):
+            el.on_value_change(lambda _=None: _zneplatnit())
+
+        async def _zpracuj(e):
+            od, do = _plan_preved_datum(od_inp), _plan_preved_datum(do_inp)
+            if not od or not do:
+                ui.notify('Neplatný formát data (DD.MM.RRRR).', type='warning'); return
+            if od > do:
+                ui.notify('„Od" je později než „Do".', type='warning'); return
+            if not odd_sel.value:
+                ui.notify('Vyberte alespoň jedno oddělení.', type='warning'); return
+            stav['soubor'] = getattr(e.file, 'name', '') or ''
+            raw = await e.file.read()
+            uziv_opts = await asyncio.to_thread(_ziskej_uzivatele_options)
+            try:
+                radky, nesparovana, mimo, bez_data = await asyncio.to_thread(
+                    _parsuj_plan_xlsx, raw, od, do, uziv_opts)
+            except Exception as ex:
+                ui.notify(f'Soubor se nepodařilo načíst: {ex}', type='negative', multi_line=True)
+                return
+
+            nahled.clear()
+            # Nespárované jméno = import se nespustí; radši nic než úkoly bez řešitele.
+            if nesparovana:
+                stav['radky'] = None
+                with nahled:
+                    ui.label(f'Import zastaven — {len(nesparovana)} jmen z Excelu neodpovídá '
+                             f'žádnému aktivnímu uživateli:').classes('text-base font-bold text-red-700')
+                    with ui.column().classes('gap-0 max-h-48 overflow-auto w-full'):
+                        for jm in nesparovana:
+                            ui.label(f'• {jm}').classes('text-sm text-gray-700')
+                    ui.label('Opravte jména v souboru (nebo uživatele v intranetu) a nahrajte znovu.') \
+                        .classes('text-sm text-gray-500 mt-1')
+                btn_import.set_visibility(False)
+                return
+
+            stav['radky'] = radky
+            stav['potvrzeno'] = False
+            # Import nepřepisuje — dělá nové řádky. Co už v období je, se zduplikuje.
+            stav['existujici'] = await asyncio.to_thread(
+                _najdi_ukoly_obdobi, od, do, list(odd_sel.value), True) if radky else []
+            with nahled:
+                if not radky:
+                    ui.label('V souboru není ani jeden řádek pro zvolené období.') \
+                        .classes('text-sm text-gray-500')
+                    btn_import.set_visibility(False)
+                    return
+                ui.label(f'Nahraje se {len(radky)} úkolů · {od.strftime("%d.%m.%Y")} – {do.strftime("%d.%m.%Y")}') \
+                    .classes('text-base font-bold text-gray-800')
+                popisky = []
+                if mimo:
+                    popisky.append(f'{mimo} řádků mimo období')
+                if bez_data:
+                    popisky.append(f'{bez_data} řádků bez platného data')
+                if popisky:
+                    ui.label('Přeskočeno: ' + ', '.join(popisky)).classes('text-sm text-orange-700')
+                with ui.column().classes('gap-0 max-h-48 overflow-auto w-full'):
+                    for jm, pocet in _plan_rozpad_osob(radky):
+                        ui.label(f'{jm}: {pocet}').classes('text-sm text-gray-600')
+
+                if stav['existujici']:
+                    with ui.column().classes('w-full mt-3 p-3 gap-1 rounded-xl '
+                                             'bg-red-50 border border-red-300'):
+                        ui.label(f'⚠ V období {_plan_obdobi_txt(od, do)} '
+                                 f'({", ".join(odd_sel.value)}) už existuje '
+                                 f'{len(stav["existujici"])} úkolů.') \
+                            .classes('text-base font-bold text-red-700')
+                        ui.label('Import je nepřepíše — vzniknou duplicity. '
+                                 'Nejdřív použij „Smazat úkoly z období".') \
+                            .classes('text-sm text-red-700')
+                        with ui.column().classes('gap-0 max-h-32 overflow-auto w-full mt-1'):
+                            for jm, pocet in _plan_rozpad_osob(stav['existujici']):
+                                ui.label(f'{jm}: {pocet}').classes('text-sm text-red-600')
+            btn_import.set_text(f'Nahrát {len(radky)} úkolů')
+            btn_import.set_visibility(True)
+
+        ui.upload(label='Vybrat soubor (.xlsx)', on_upload=_zpracuj, auto_upload=True,
+                  max_file_size=25 * 1024 * 1024,
+                  on_rejected=lambda _=None: ui.notify('Soubor je větší než 25 MB nebo má nepodporovaný typ.',
+                                                       type='warning')) \
+            .props('accept=".xlsx" flat color=blue-grey').classes('w-full mt-3')
+
+        async def _import():
+            radky = stav['radky']
+            if not radky:
+                return
+            # Duplicity = jediný nevratný scénář, tady chceme druhé kliknutí.
+            if stav['existujici'] and not stav['potvrzeno']:
+                stav['potvrzeno'] = True
+                btn_import.set_text(f'Opravdu nahrát dalších {len(radky)} úkolů '
+                                    f'k {len(stav["existujici"])} existujícím? Klikněte znovu')
+                return
+            btn_import.disable()
+            odd_csv = ','.join(odd_sel.value) if odd_sel.value else None
+            pocet = await asyncio.to_thread(_vloz_ukoly_hromadne, radky, odd_csv, user_id, user_name)
+            if not pocet:
+                btn_import.enable()
+                ui.notify('Import selhal — nic nebylo uloženo.', type='negative'); return
+            od, do = _plan_preved_datum(od_inp), _plan_preved_datum(do_inp)
+            obdobi = _plan_obdobi_txt(od, do)
+            _ip, _dev = _audit_meta()
+            _osoby = ', '.join(f'{jm} ({n})' for jm, n in _plan_rozpad_osob(radky))
+            intranet_logger.log_activity(
+                user_name, "Úkolovník",
+                f"Import plánu úkolů: {pocet} úkolů | soubor: {stav['soubor'] or '—'}"
+                f" | období {obdobi}"
+                f" | oddělení: {', '.join(odd_sel.value)}"
+                f" | existovalo předtím: {len(stav['existujici'])}"
+                f" | osoby: {_osoby or '—'}",
+                ip=_ip, device=_dev)
+            # Jedna souhrnná notifikace na osobu — ne 552 jednotlivých.
+            for jm, n in _plan_rozpad_osob(radky):
+                uid = next((r['prirazen_id'] for r in radky if r['prirazen_jmeno'] == jm), None)
+                if uid and uid != user_id:
+                    intranet_notifikace.pridej(
+                        uid, f"\U0001F4CB {user_name} ti nahrál/a {n} úkolů na období {obdobi}", 'info')
+            dlg.close()
+            ui.notify(f'Nahráno {pocet} úkolů.', type='positive', position='top')
+            if on_refresh:
+                on_refresh()
+
+        with ui.row().classes('w-full justify-end gap-2 mt-4'):
+            ui.button('Zrušit', on_click=dlg.close).classes('bg-gray-400 text-white font-bold px-4')
+            btn_import = ui.button('Nahrát', icon='upload_file', on_click=_import) \
+                .classes('bg-blue-600 text-white font-bold px-4')
+            btn_import.set_visibility(False)
+    dlg.open()
+
+
+# =========================================================
 # RUČNÍ POŘADÍ ÚKOLŮ (drag & drop v rámci dne) — individuální per uživatel
 # =========================================================
 def _nacti_poradi_uziv(user_id) -> dict:
@@ -2643,6 +3163,13 @@ async def _vykresli_ukoly(user_id, user_name, vsechna_prava, dialog_anchor=None,
             btn_novy = ui.button('Nový úkol', icon='add_task',
                       on_click=lambda: _dialog_novy_ukol(user_id, user_name, vsechna_prava, on_refresh=_safe_refresh, dialog_anchor=dialog_anchor)
                       ).classes('bg-green-600 text-white font-bold h-10 px-5 rounded-xl shadow-md')
+            if is_admin:
+                ui.button('Smazat úkoly z období', icon='delete_sweep',
+                          on_click=lambda: _dialog_smazat_obdobi(user_id, user_name, on_refresh=_safe_refresh, dialog_anchor=dialog_anchor)
+                          ).props('flat').classes('text-red-600 font-bold h-10 px-4 rounded-xl border border-red-200 hover:bg-red-50')
+                ui.button('Nahrát plán úkolů', icon='upload_file',
+                          on_click=lambda: _dialog_nahrat_plan(user_id, user_name, on_refresh=_safe_refresh, dialog_anchor=dialog_anchor)
+                          ).classes('bg-blue-600 text-white font-bold h-10 px-5 rounded-xl shadow-md')
 
     # ── FILTRY ──────────────────────────────────────────────────────────────────
     # Hodnoty filtrů drží rodič (ukoly_stav) — stejně jako stránka, řazení a pohled.

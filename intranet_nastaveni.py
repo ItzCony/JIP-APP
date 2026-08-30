@@ -6,6 +6,27 @@ import datetime
 import re
 
 
+def prepni_modul(klic, zapnout, user_name):
+    """Zapne/vypne modul portálu — zápis do nastavení, audit log a bump verze.
+
+    Verzi v app.storage.general sleduje timer u každého klienta (intranet.py),
+    takže vypnutý modul zmizí z menu do ~5 s. Vlastní verzi si uložíme, aby
+    timer nepřesměroval toho, kdo změnu právě provedl.
+    """
+    n = intranet_data.nacti_nastaveni_intranetu()
+    n[klic] = bool(zapnout)
+    intranet_data.uloz_nastaveni_intranetu(n)
+    nazev_log = intranet_data.MODULY.get(klic, (klic, klic))[1]
+    intranet_logger.log_activity(user_name, "Přepnutí modulu",
+                                 f"{nazev_log}: {'ZAPNUTO' if zapnout else 'VYPNUTO'}")
+    try:
+        nova_verze = app.storage.general.get('nastaveni_verze', 0) + 1
+        app.storage.general['nastaveni_verze'] = nova_verze
+        app.storage.user['nastaveni_verze_vlastni'] = nova_verze
+    except Exception:
+        pass
+
+
 def vykresli_nastaveni_portalu(user_name):
     with ui.column().classes('w-full px-4 md:px-8 xl:px-12 py-6 bg-gray-50/30 min-h-screen gap-6'):
 
@@ -17,58 +38,12 @@ def vykresli_nastaveni_portalu(user_name):
             ui.icon('settings_applications', size='3rem', color='gray-300')
 
         # --- ZÁLOŽKY ---
+        # Moduly se zapínají výhradně příkazem /modul v audit konzoli
+        # (intranet_logger._prepni_modul_prikazem → prepni_modul výše).
         with ui.tabs().classes('w-full') as tabs:
-            tab_moduly      = ui.tab('Moduly',      icon='view_module')
             tab_narozeniny  = ui.tab('Narozeniny',  icon='cake')
 
-        with ui.tab_panels(tabs, value=tab_moduly).classes('w-full'):
-
-            # =========================================================
-            # ZÁLOŽKA 2: MODULY
-            # =========================================================
-            with ui.tab_panel(tab_moduly):
-                with ui.column().classes('w-full gap-8'):
-
-                    # --- Viditelnost modulů ---
-                    with ui.card().classes('w-full p-6 xl:p-8 shadow-sm bg-white rounded-2xl border-l-[10px] border-purple-500 hover:shadow-md transition-shadow'):
-                        nastaveni_mod = intranet_data.nacti_nastaveni_intranetu()
-                        with ui.column().classes('gap-1 mb-6'):
-                            ui.label('Viditelnost modulů a globální funkce').classes('text-2xl font-bold text-gray-800')
-                            ui.label('Tyto přepínače okamžitě skryjí nebo zobrazí dané moduly v levém menu pro celou firmu.').classes('text-sm text-gray-500')
-
-                        def toggle_nast(klic, e, nazev_log):
-                            n = intranet_data.nacti_nastaveni_intranetu()
-                            n[klic] = e.value
-                            intranet_data.uloz_nastaveni_intranetu(n)
-                            intranet_logger.log_activity(user_name, "Přepnutí modulu", f"{nazev_log}: {'ZAPNUTO' if e.value else 'VYPNUTO'}")
-                            try:
-                                nova_verze = app.storage.general.get('nastaveni_verze', 0) + 1
-                                app.storage.general['nastaveni_verze'] = nova_verze
-                                # Uložíme vlastní verzi — timer na naší stránce nás pak nepřesměruje
-                                app.storage.user['nastaveni_verze_vlastni'] = nova_verze
-                            except Exception:
-                                pass
-                            ui.notify('Uloženo. Změna se projeví všem uživatelům do 10 sekund.', type='positive')
-
-                        with ui.grid(columns=1).classes('w-full gap-4 md:grid-cols-2 xl:grid-cols-4'):
-                            ui.switch('Modul Aprovia (Finance)', value=nastaveni_mod.get('finance_zapnuty', True), on_change=lambda e: toggle_nast('finance_zapnuty', e, 'Aprovia')).classes('w-full p-4 bg-purple-50 rounded-xl border border-purple-100 font-bold text-gray-800')
-                            ui.switch('Modul Zkouškový Kvíz', value=nastaveni_mod.get('kviz_zapnuty', True), on_change=lambda e: toggle_nast('kviz_zapnuty', e, 'Kvíz')).classes('w-full p-4 bg-purple-50 rounded-xl border border-purple-100 font-bold text-gray-800')
-                            ui.switch('Modul Veletrh', value=nastaveni_mod.get('veletrh_zapnuty', True), on_change=lambda e: toggle_nast('veletrh_zapnuty', e, 'Veletrh')).classes('w-full p-4 bg-purple-50 rounded-xl border border-purple-100 font-bold text-gray-800')
-                            ui.switch('Modul Značky JIP', value=nastaveni_mod.get('znacky_zapnuty', True), on_change=lambda e: toggle_nast('znacky_zapnuty', e, 'Značky JIP')).classes('w-full p-4 bg-purple-50 rounded-xl border border-purple-100 font-bold text-gray-800')
-                            ui.switch('E-maily: Modul Značky JIP', value=nastaveni_mod.get('znacky_emaily_zapnuty', True), on_change=lambda e: toggle_nast('znacky_emaily_zapnuty', e, 'E-maily Značky JIP')).classes('w-full p-4 bg-purple-50 rounded-xl border border-purple-100 font-bold text-gray-800 xl:col-span-2')
-                            ui.switch('Modul Plánování směn', value=nastaveni_mod.get('smeny_zapnuty', True), on_change=lambda e: toggle_nast('smeny_zapnuty', e, 'Plánování směn')).classes('w-full p-4 bg-purple-50 rounded-xl border border-purple-100 font-bold text-gray-800 xl:col-span-2')
-                            ui.switch('🚬 Modul Plánogram tabáku', value=nastaveni_mod.get('planogram_zapnuty', True), on_change=lambda e: toggle_nast('planogram_zapnuty', e, 'Plánogram tabáku')).classes('w-full p-4 bg-purple-50 rounded-xl border border-purple-100 font-bold text-gray-800 xl:col-span-2')
-                            ui.switch('🍽️ Modul Ochutnávky MO a CC', value=nastaveni_mod.get('ochutnavky_zapnuty', True), on_change=lambda e: toggle_nast('ochutnavky_zapnuty', e, 'Ochutnávky MO a CC')).classes('w-full p-4 bg-purple-50 rounded-xl border border-purple-100 font-bold text-gray-800 xl:col-span-2')
-                            ui.switch('⚖️ Modul Sankce', value=nastaveni_mod.get('sankce_zapnuty', True), on_change=lambda e: toggle_nast('sankce_zapnuty', e, 'Sankce')).classes('w-full p-4 bg-purple-50 rounded-xl border border-purple-100 font-bold text-gray-800 xl:col-span-2')
-                            ui.switch('🎉 Modul Společenský večer', value=nastaveni_mod.get('spolvecer_zapnuty', True), on_change=lambda e: toggle_nast('spolvecer_zapnuty', e, 'Společenský večer')).classes('w-full p-4 bg-purple-50 rounded-xl border border-purple-100 font-bold text-gray-800 xl:col-span-2')
-                            ui.switch('🪪 Modul Vizitky a podpisy', value=nastaveni_mod.get('vizitky_zapnuty', True), on_change=lambda e: toggle_nast('vizitky_zapnuty', e, 'Vizitky a podpisy')).classes('w-full p-4 bg-purple-50 rounded-xl border border-purple-100 font-bold text-gray-800 xl:col-span-2')
-                            ui.switch('🏷️ Modul Cenopřípad', value=nastaveni_mod.get('cenopripad_zapnuty', True), on_change=lambda e: toggle_nast('cenopripad_zapnuty', e, 'Cenopřípad')).classes('w-full p-4 bg-purple-50 rounded-xl border border-purple-100 font-bold text-gray-800 xl:col-span-2')
-                            ui.switch('📝 Modul Formuláře ASM', value=nastaveni_mod.get('asm_zapnuty', True), on_change=lambda e: toggle_nast('asm_zapnuty', e, 'Formuláře ASM')).classes('w-full p-4 bg-purple-50 rounded-xl border border-purple-100 font-bold text-gray-800 xl:col-span-2')
-                            ui.switch('🔍 Modul Lupou na obchod', value=nastaveni_mod.get('lupa_zapnuty', True), on_change=lambda e: toggle_nast('lupa_zapnuty', e, 'Lupou na obchod')).classes('w-full p-4 bg-purple-50 rounded-xl border border-purple-100 font-bold text-gray-800 xl:col-span-2')
-                            ui.switch('🗓️ Modul Schůzky s vedoucími', value=nastaveni_mod.get('schuzky_zapnuty', True), on_change=lambda e: toggle_nast('schuzky_zapnuty', e, 'Schůzky s vedoucími')).classes('w-full p-4 bg-purple-50 rounded-xl border border-purple-100 font-bold text-gray-800 xl:col-span-2')
-                            ui.switch('⏰ Přesčasy (Evidence absencí)', value=nastaveni_mod.get('presczasy_zapnuty', True), on_change=lambda e: toggle_nast('presczasy_zapnuty', e, 'Přesčasy')).classes('w-full p-4 bg-orange-50 rounded-xl border border-orange-100 font-bold text-gray-800 xl:col-span-4')
-
-
+        with ui.tab_panels(tabs, value=tab_narozeniny).classes('w-full'):
 
             # =========================================================
             # ZÁLOŽKA 3: NAROZENINY
