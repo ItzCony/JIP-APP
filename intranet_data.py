@@ -554,6 +554,43 @@ def uloz_nastaveni_intranetu(data):
     except Exception as e:
         print(f"Chyba uložení nastavení na disk: {e}")
 
+def nacti_predvolbu(user_id, klic, vychozi=None):
+    """Osobní předvolba uživatele z DB. Při chybě/bez DB vrací výchozí hodnotu."""
+    conn = None
+    cur = None
+    try:
+        conn = get_db_connection()
+        if not conn: return vychozi
+        cur = conn.cursor()
+        cur.execute("SELECT hodnota FROM uzivatel_predvolby WHERE user_id=%s AND klic=%s", (user_id, klic))
+        row = cur.fetchone()
+        return json.loads(row[0]) if row and row[0] else vychozi
+    except Exception:
+        return vychozi
+    finally:
+        if cur: cur.close()
+        if conn: conn.close()
+
+def uloz_predvolbu(user_id, klic, hodnota):
+    """Zapíše osobní předvolbu. Vrací True při úspěchu."""
+    conn = None
+    cur = None
+    try:
+        conn = get_db_connection()
+        if not conn: return False
+        cur = conn.cursor()
+        cur.execute("INSERT INTO uzivatel_predvolby (user_id, klic, hodnota) VALUES (%s,%s,%s) "
+                    "ON DUPLICATE KEY UPDATE hodnota=VALUES(hodnota)",
+                    (user_id, klic, json.dumps(hodnota, ensure_ascii=False)))
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"Chyba uložení předvolby {klic}: {e}")
+        return False
+    finally:
+        if cur: cur.close()
+        if conn: conn.close()
+
 def nacti_mysql():
     """Přístup k DB výhradně z proměnných prostředí JIPKA_DB_* — na disku nic není.
 
@@ -919,6 +956,18 @@ def inicializace_db():
             expiruje DATETIME NOT NULL,
             UNIQUE KEY uq_totp_duv_hash (token_hash),
             KEY idx_totp_duv_user (user_id),
+            FOREIGN KEY (user_id) REFERENCES user(iduser) ON DELETE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""")
+        conn.commit()
+
+        # Osobní předvolby UI (připnuté dlaždice nástěnky apod.). Jeden řádek na
+        # klíč, hodnota je JSON. Na rozdíl od app.storage.user platí napříč
+        # zařízeními a přežije vyčištění cookies.
+        cursor.execute("""CREATE TABLE IF NOT EXISTS uzivatel_predvolby (
+            user_id INT NOT NULL,
+            klic VARCHAR(50) NOT NULL,
+            hodnota TEXT,
+            PRIMARY KEY (user_id, klic),
             FOREIGN KEY (user_id) REFERENCES user(iduser) ON DELETE CASCADE
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""")
         conn.commit()

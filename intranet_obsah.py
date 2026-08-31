@@ -23,12 +23,16 @@ import csv
 import io
 import pyzipper
 import tempfile
-from intranet_ui_utils import refreshable_na_klienta, prepni_tab
+from intranet_ui_utils import refreshable_na_klienta, prepni_tab, zapis_naposledy
 
 # České řazení: č/ř/š/ž jsou samostatná písmena, 'ch' po 'h'; á/é/í… řadí k základnímu písmenu.
 # ponytail: vlastní klíč místo locale.strxfrm — locale 'cs' nemusí být na serveru dostupná
 _CZ_PRIM = 'a b c č d e f g h ch i j k l m n o p q r ř s š t u v w x y z ž'.split()
 _CZ_SEK = {'á': 'a', 'ď': 'd', 'é': 'e', 'ě': 'e', 'í': 'i', 'ň': 'n', 'ó': 'o', 'ť': 't', 'ú': 'u', 'ů': 'u', 'ý': 'y'}
+
+# Pás nad nástěnkou = jeden řádek mřížky (4 sloupce). Víc připnutých by přidalo
+# řádek navíc a rozbilo vejití celé nástěnky bez scrollování.
+MAX_PRIPNUTYCH = 4
 
 def cz_razeni(text):
     t = (text or '').lower()
@@ -571,10 +575,8 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
         nastaveni.get('lupa_zapnuty', True)
         and intranet_lupa.ma_pristup(user_id, vsechna_prava)
     )
-    is_admin = "vse" in vsechna_prava
 
     nazev_kviz       = "Zkouškový Kvíz"
-    nazev_dok        = "Dokumenty"
     nazev_dochazka   = "Docházka a Volno"
     nazev_veletrh    = "Plán Veletrh 2027"
     nazev_finance    = "Aprovia"
@@ -590,207 +592,199 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
         dlg.open()
         ui.timer(0.2, lambda: ui.navigate.to(url), once=True)
 
-    ui.label('Vítejte na hlavní nástěnce').classes('text-4xl font-extrabold text-gray-800 mb-6')
+    # ==========================================================
+    # NÁSTĚNKA — kompaktní mřížka; první řádek jsou naposledy použité moduly.
+    # Výška dlaždice se počítá z okna, aby se vše vešlo bez scrollování:
+    # 290 px = header + odsazení panelu + pozdrav + dva popisky + mezery mřížky.
+    # ==========================================================
+    ui.add_css('''
+    .jip-mrizka { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; width: 100%; }
+    .jip-dlazdice { transition: border-color .18s ease, box-shadow .18s ease, transform .18s ease; }
+    .jip-dlazdice:hover { border-color: var(--akcent) !important;
+                          box-shadow: 0 8px 20px -8px var(--akcent); transform: translateY(-2px); }
+    .jip-pin { opacity: 0; transition: opacity .15s ease; }
+    .jip-dlazdice:hover .jip-pin, .jip-pin--on { opacity: 1; }
+    /* Dotyk hover nemá — tam musí být špendlík vidět pořád. */
+    @media (hover: none) { .jip-pin { opacity: 1; } }
+    @media (max-width: 1200px) { .jip-mrizka { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+                                 .jip-dlazdice { height: 84px !important; } }
+    @media (max-width: 860px)  { .jip-mrizka { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+    @media (max-width: 600px)  { .jip-mrizka { grid-template-columns: 1fr; } }
+    ''')
 
-    with ui.row().classes('gap-8 flex-wrap items-stretch'):
-        if ma_pristup_kviz:
-            with ui.card().classes('w-80 h-72 items-center justify-center shadow-xl hover:scale-105 transition-transform duration-300 cursor-pointer bg-white rounded-2xl border border-green-100').on('click', lambda: naviguj_s_nacitanim('/kviz', nazev_kviz)):
-                ui.label('👨‍🎓').classes('text-7xl mb-6')
-                ui.label(nazev_kviz).classes('text-2xl font-bold text-gray-800 mb-4 text-center')
-                ui.button('Otevřít aplikaci', on_click=lambda: naviguj_s_nacitanim('/kviz', nazev_kviz)).classes('bg-green-500 hover:bg-green-600 text-white font-bold py-3 px-8 rounded-lg shadow-md')
+    def _akce(tab, reset_klic=None):
+        """Klik na dlaždici: volitelný reset podpohledu, pak přepnutí tabu."""
+        def _jdi():
+            if reset_klic:
+                app.storage.user[reset_klic] = None
+            prepni_tab(tab)
+        return _jdi
 
-        if ma_pristup_dochazka_zaklad_dlazdice:
-            def jit_do_dochazky():
-                app.storage.user['aktivni_slozka_dochazka'] = None
-                prepni_tab('dochazka')
-            with ui.card().classes('w-80 h-72 items-center justify-center shadow-md hover:scale-105 transition-transform duration-300 cursor-pointer bg-white rounded-2xl border border-orange-100').on('click', jit_do_dochazky):
-                ui.label('📅').classes('text-7xl mb-6')
-                ui.label(nazev_dochazka).classes('text-2xl font-bold text-gray-800 mb-4 text-center')
-                ui.button('Otevřít aplikaci', on_click=jit_do_dochazky).classes('bg-orange-500 hover:bg-orange-600 text-white font-bold py-3 px-8 rounded-lg shadow-md')
+    def _tint(barva, pruhlednost):
+        r, g, b = (int(barva[i:i + 2], 16) for i in (1, 3, 5))
+        return f'rgba({r},{g},{b},{pruhlednost})'
 
-        if ma_pristup_veletrh:
-            def jit_do_veletrhu():
-                prepni_tab('veletrh')
-            with ui.card().classes('w-80 h-72 items-center justify-center shadow-xl hover:scale-105 transition-transform duration-300 cursor-pointer bg-white rounded-2xl border border-purple-200').on('click', jit_do_veletrhu):
-                ui.label('🎪').classes('text-7xl mb-6')
-                ui.label(nazev_veletrh).classes('text-2xl font-bold text-gray-800 mb-4 text-center')
-                ui.button('Otevřít mapu a stánky', on_click=jit_do_veletrhu).classes('bg-purple-600 hover:bg-purple-700 text-white font-bold py-3 px-8 rounded-lg shadow-md')
+    def _otevri_kviz():
+        zapis_naposledy('kviz')  # kvíz jde přes URL, ne přes prepni_tab
+        naviguj_s_nacitanim('/kviz', nazev_kviz)
 
-        if ma_pristup_finance:
-            def jit_do_financi():
-                prepni_tab('finance')
-            with ui.card().classes('w-80 h-72 items-center justify-center shadow-xl hover:scale-105 transition-transform duration-300 cursor-pointer bg-white rounded-2xl border border-blue-200').on('click', jit_do_financi):
-                ui.label('💼').classes('text-7xl mb-6')
-                ui.label(nazev_finance).classes('text-2xl font-bold text-gray-800 mb-4 text-center')
-                ui.button('Přejít na modul', on_click=jit_do_financi).classes('bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-8 rounded-lg shadow-md')
+    def _d(klic, viditelna, ikona, nazev, barva, akce, pocet=0):
+        if not viditelna:
+            return None
+        return {'klic': klic, 'ikona': ikona, 'nazev': nazev,
+                'barva': barva, 'akce': akce, 'pocet': pocet}
 
-        if ma_pristup_znacky:
-            def jit_do_znacek():
-                prepni_tab('znacky')
-            with ui.card().classes('w-80 h-72 items-center justify-center shadow-xl hover:scale-105 transition-transform duration-300 cursor-pointer bg-white rounded-2xl border border-purple-300').on('click', jit_do_znacek):
-                ui.label('🏷️').classes('text-7xl mb-6')
-                ui.label('Privátní značky JIP').classes('text-2xl font-bold text-gray-800 mb-4 text-center')
-                ui.button('Přejít na hlasování', on_click=jit_do_znacek).classes('bg-purple-600 hover:bg-purple-700 text-white font-bold py-3 px-8 rounded-lg shadow-md')
+    # --- počty do odznaků (dotazy běží jen když má uživatel na modul právo) ---
+    _narozeniny_dnes = intranet_narozeniny.ziskej_pocet_narozenin_dnes(vsechna_prava) if ma_pristup_narozeniny else 0
 
-        if ma_pristup_znacky_provoz:
-            def jit_do_znacek_provoz():
-                prepni_tab('znacky_provoz')
-            with ui.card().classes('w-80 h-72 items-center justify-center shadow-xl hover:scale-105 transition-transform duration-300 cursor-pointer bg-white rounded-2xl border border-blue-300').on('click', jit_do_znacek_provoz):
-                ui.label('🏭').classes('text-7xl mb-6')
-                ui.label('Hlas Provozu').classes('text-2xl font-bold text-gray-800 mb-4 text-center')
-                ui.button('Přejít na hlasování', on_click=jit_do_znacek_provoz).classes('bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-8 rounded-lg shadow-md')
+    _pocet_ochutnavek = 0
+    if ma_pristup_ochutnavky:
+        try:
+            import intranet_ochutnavky as _och
+            _pocet_ochutnavek = _och.pocet_aktualnich_akci()
+        except Exception as e:
+            print(f"[Nástěnka] Počet ochutnávek: {e}")
 
-        if ma_pristup_prod_akt:
-            def jit_do_prod_akt():
-                prepni_tab('prod_akt')
-            with ui.card().classes('w-80 h-72 items-center justify-center shadow-xl hover:scale-105 transition-transform duration-300 cursor-pointer bg-white rounded-2xl border border-emerald-300').on('click', jit_do_prod_akt):
-                ui.label('📋').classes('text-7xl mb-6')
-                ui.label('Prodejní aktivity').classes('text-2xl font-bold text-gray-800 mb-4 text-center')
-                ui.button('Otevřít přehled', on_click=jit_do_prod_akt).classes('bg-emerald-600 hover:bg-emerald-700 text-white font-bold py-3 px-8 rounded-lg shadow-md')
+    _pocet_ukolu = 0
+    if ma_pristup_ukolovnik:
+        try:
+            _conn = intranet_data.get_db_connection()
+            if _conn:
+                try:
+                    _cur = _conn.cursor()
+                    _cur.execute(
+                        "SELECT COUNT(*) FROM ukolovnik_ukoly "
+                        "WHERE prirazen_id=%s AND stav NOT IN ('Hotovo','Zrušen') AND termin <= CURDATE()",
+                        (user_id,)
+                    )
+                    _row = _cur.fetchone()
+                    _pocet_ukolu = int(_row[0]) if _row else 0
+                finally:
+                    _cur.close(); _conn.close()
+        except Exception:
+            _pocet_ukolu = 0
 
-        if ma_pristup_narozeniny:
-            narozeniny_dnes = intranet_narozeniny.ziskej_pocet_narozenin_dnes(vsechna_prava)
-            def jit_do_narozenin():
-                prepni_tab('narozeniny')
-            with ui.card().classes('w-80 h-72 items-center justify-center shadow-xl hover:scale-105 transition-transform duration-300 cursor-pointer bg-white rounded-2xl border border-pink-200 relative').on('click', jit_do_narozenin):
-                if narozeniny_dnes > 0:
-                    ui.badge(str(narozeniny_dnes), color='red').classes('absolute top-3 right-3 text-lg font-black px-2')
-                ui.label('🎂').classes('text-7xl mb-6')
-                ui.label(nazev_narozeniny).classes('text-2xl font-bold text-gray-800 mb-4 text-center')
-                ui.button('Přejít na přehled', on_click=jit_do_narozenin).classes('bg-pink-500 hover:bg-pink-600 text-white font-bold py-3 px-8 rounded-lg shadow-md')
+    # klíč = název tabu, tedy to, co zapisuje prepni_tab do historie
+    dlazdice = [d for d in (
+        _d('kviz', ma_pristup_kviz, '👨‍🎓', nazev_kviz, '#22c55e', _otevri_kviz),
+        _d('dochazka', ma_pristup_dochazka_zaklad_dlazdice, '📅', nazev_dochazka, '#f97316',
+           _akce('dochazka', 'aktivni_slozka_dochazka')),
+        _d('veletrh', ma_pristup_veletrh, '🎪', nazev_veletrh, '#a855f7', _akce('veletrh')),
+        _d('finance', ma_pristup_finance, '💼', nazev_finance, '#3b82f6', _akce('finance')),
+        _d('znacky', ma_pristup_znacky, '🏷️', 'Privátní značky JIP', '#f59e0b', _akce('znacky')),
+        _d('znacky_provoz', ma_pristup_znacky_provoz, '🏭', 'Hlas Provozu', '#14b8a6', _akce('znacky_provoz')),
+        _d('prod_akt', ma_pristup_prod_akt, '📋', 'Prodejní aktivity', '#10b981', _akce('prod_akt')),
+        _d('narozeniny', ma_pristup_narozeniny, '🎂', nazev_narozeniny, '#ec4899',
+           _akce('narozeniny'), _narozeniny_dnes),
+        _d('smeny', _ma_smeny, '⌨️', 'Plánování směn', '#6366f1', _akce('smeny')),
+        _d('komunikace', ma_pristup_komunikace, '💬', nazev_komunikace, '#06b6d4', _akce('komunikace')),
+        _d('planogram', ma_pristup_planogram, '🚬', 'Plánogram tabákových výrobků', '#ef4444', _akce('planogram')),
+        _d('ochutnavky', ma_pristup_ochutnavky, '🍽️', 'Ochutnávky MO a CC', '#f43f5e',
+           _akce('ochutnavky'), _pocet_ochutnavek),
+        _d('ukolovnik', ma_pristup_ukolovnik, '📋', 'Porady a úkoly', '#3b82f6',
+           _akce('ukolovnik'), _pocet_ukolu),
+        _d('vysledky', ma_pristup_vysledky, '📊', 'Výsledky poboček', '#0ea5e9', _akce('vysledky')),
+        _d('sankce', ma_pristup_sankce, '⚖️', 'Sankce', '#ef4444', _akce('sankce', 'sankce_pohled')),
+        _d('spolvecer', ma_pristup_spolvecer, '🎉', 'Spol. večer 2026', '#d946ef',
+           _akce('spolvecer', f'spolvecer_sel_{user_id}')),
+        _d('vizitky', ma_pristup_vizitky, '🪪', 'Vizitky a podpisy', '#0ea5e9', _akce('vizitky')),
+        _d('cenopripad', ma_pristup_cenopripad, '🏷️', 'Cenopřípad', '#22c55e',
+           _akce('cenopripad', 'cenopripad_pohled')),
+        _d('asm', ma_pristup_asm, '📝', 'Formuláře ASM', '#6366f1', _akce('asm', 'asm_pohled')),
+        _d('lupa', ma_pristup_lupa, '🔍', 'Lupou na obchod', '#a855f7',
+           _akce('lupa', f'lupa_pohled_{user_id}')),
+    ) if d]
 
-        if _ma_smeny:
-            def jit_do_smen():
-                prepni_tab('smeny')
-            with ui.card().classes('w-80 h-72 items-center justify-center shadow-xl hover:scale-105 transition-transform duration-300 cursor-pointer bg-white rounded-2xl border border-teal-200').on('click', jit_do_smen):
-                ui.label('⌨️').classes('text-7xl mb-6')
-                ui.label('Plánování směn').classes('text-2xl font-bold text-gray-800 mb-4 text-center')
-                ui.button('Otevřít plán', on_click=jit_do_smen).classes('bg-teal-600 hover:bg-teal-700 text-white font-bold py-3 px-8 rounded-lg shadow-md')
+    podle_klice = {d['klic']: d for d in dlazdice}
 
-        if ma_pristup_komunikace:
-            def jit_do_komunikace():
-                prepni_tab('komunikace')
-            with ui.card().classes('w-80 h-72 items-center justify-center shadow-xl hover:scale-105 transition-transform duration-300 cursor-pointer bg-white rounded-2xl border border-cyan-200').on('click', jit_do_komunikace):
-                ui.label('💬').classes('text-7xl mb-6')
-                ui.label(nazev_komunikace).classes('text-2xl font-bold text-gray-800 mb-4 text-center')
-                ui.button('Otevřít portál', on_click=jit_do_komunikace).classes('bg-cyan-600 hover:bg-cyan-700 text-white font-bold py-3 px-8 rounded-lg shadow-md')
+    def _pripnute_klice():
+        """Připnuté dlaždice z DB — bez těch, na které uživatel mezitím ztratil právo."""
+        ulozene = intranet_data.nacti_predvolbu(user_id, 'prehled_pripnute', []) or []
+        return [k for k in ulozene if k in podle_klice][:MAX_PRIPNUTYCH]
 
-        if ma_pristup_planogram:
-            def jit_do_planogramu():
-                prepni_tab('planogram')
-            with ui.card().classes('w-80 h-72 items-center justify-center shadow-xl hover:scale-105 transition-transform duration-300 cursor-pointer bg-white rounded-2xl border border-amber-200').on('click', jit_do_planogramu):
-                ui.label('🚬').classes('text-7xl mb-6')
-                ui.label('Plánogram tabákových výrobků').classes('text-xl font-bold text-gray-800 mb-4 text-center')
-                ui.button('Otevřít plánogram', on_click=jit_do_planogramu).classes('bg-amber-600 hover:bg-amber-700 text-white font-bold py-3 px-8 rounded-lg shadow-md')
+    def _prepni_pin(klic):
+        def _kliknuto(_):
+            akt = _pripnute_klice()
+            if klic in akt:
+                akt.remove(klic)
+            elif len(akt) >= MAX_PRIPNUTYCH:
+                ui.notify(f'Připnout jde nejvýš {MAX_PRIPNUTYCH} dlaždice — nejdřív něco odepněte.',
+                          type='warning', position='top')
+                return
+            else:
+                akt.append(klic)
+            if not intranet_data.uloz_predvolbu(user_id, 'prehled_pripnute', akt):
+                ui.notify('Připnutí se nepodařilo uložit.', type='negative', position='top')
+                return
+            _mrizka.refresh()
+        return _kliknuto
 
-        if ma_pristup_ochutnavky:
-            _pocet_ochutnavek = 0
-            try:
-                import intranet_ochutnavky as _och
-                _pocet_ochutnavek = _och.pocet_aktualnich_akci()
-            except Exception as e:
-                print(f"[Nástěnka] Počet ochutnávek: {e}")
+    def _popisek(text):
+        with ui.row().classes('w-full items-center gap-3 no-wrap'):
+            ui.label(text).classes(
+                'text-[11px] font-bold uppercase tracking-widest text-gray-500 whitespace-nowrap')
+            ui.element('div').classes('grow h-px bg-gray-200')
 
-            def jit_do_ochutnavek():
-                prepni_tab('ochutnavky')
-            with ui.card().classes('w-80 h-72 items-center justify-center shadow-xl hover:scale-105 transition-transform duration-300 cursor-pointer bg-white rounded-2xl border border-green-200').on('click', jit_do_ochutnavek):
-                ui.label('🍽️').classes('text-7xl mb-4')
-                ui.label('Ochutnávky MO a CC').classes('text-xl font-bold text-gray-800 mb-2 text-center')
-                if _pocet_ochutnavek:
-                    ui.label(f'{_pocet_ochutnavek} probíhá nebo se blíží').classes('text-sm font-bold text-green-700 mb-2')
-                else:
-                    ui.label('Aktuálně nic neprobíhá').classes('text-sm text-gray-400 mb-2')
-                ui.button('Otevřít ochutnávky', on_click=jit_do_ochutnavek).classes('bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-8 rounded-lg shadow-md')
+    def _vykresli_dlazdici(d, zvyraznena, pripnuta, vyska):
+        styl = f"--akcent:{d['barva']}; height:{vyska}"
+        tridy = ('jip-dlazdice border rounded-2xl px-4 flex items-center gap-3 '
+                 'cursor-pointer relative shadow-sm')
+        if zvyraznena:
+            styl += f"; background:{_tint(d['barva'], 0.12)}; border-color:{_tint(d['barva'], 0.45)}"
+        else:
+            tridy += ' bg-white border-gray-200'
+        with ui.element('div').classes(tridy).style(styl).on('click', d['akce']):
+            ikona = ui.label(d['ikona']).classes(
+                'shrink-0 w-10 h-10 rounded-xl flex items-center justify-center text-2xl')
+            if zvyraznena:
+                ikona.classes('bg-white')  # dark režim si bílou přebarví na #1e293b
+            else:
+                ikona.style(f"background:{_tint(d['barva'], 0.12)}")
+            # pr-5 = místo pro špendlík, aby pod něj nezatekl dlouhý název na nízkých dlaždicích
+            ui.label(d['nazev']).classes('text-sm font-bold text-gray-800 leading-tight min-w-0 pr-5')
+            if d['pocet']:
+                ui.badge(str(d['pocet']), color='red').classes(
+                    'absolute top-2 right-2 text-xs font-black px-2')
+            # Špendlík v pravém dolním rohu — nahoře sedí odznak počtu.
+            # click.stop, jinak by kliknutí propadlo na dlaždici a otevřelo modul.
+            pin = ui.icon('push_pin' if pripnuta else 'o_push_pin').classes(
+                'jip-pin absolute bottom-1 right-1 p-1 text-base cursor-pointer text-gray-400')
+            if pripnuta:
+                pin.classes('jip-pin--on').style(f"color:{d['barva']}")
+            pin.on('click.stop', _prepni_pin(d['klic']))
+            pin.tooltip('Odepnout z nástěnky' if pripnuta else 'Připnout na nástěnku')
 
-        if ma_pristup_ukolovnik:
-            try:
-                import intranet_data as _id
-                _conn = _id.get_db_connection()
-                _pocet_ukolu = 0
-                if _conn:
-                    try:
-                        _cur = _conn.cursor()
-                        _cur.execute(
-                            "SELECT COUNT(*) FROM ukolovnik_ukoly "
-                            "WHERE prirazen_id=%s AND stav NOT IN ('Hotovo','Zrušen') AND termin <= CURDATE()",
-                            (user_id,)
-                        )
-                        _row = _cur.fetchone()
-                        _pocet_ukolu = int(_row[0]) if _row else 0
-                    finally:
-                        _cur.close(); _conn.close()
-            except Exception:
-                _pocet_ukolu = 0
+    @ui.refreshable
+    def _mrizka():
+        pripnute_klice = _pripnute_klice()
+        pripnute = [podle_klice[k] for k in pripnute_klice]
+        naposledy = [podle_klice[k] for k in app.storage.user.get('prehled_naposledy', []) or []
+                     if k in podle_klice and k not in pripnute_klice]
+        # Automatický pás má smysl až když je z čeho vybírat a je co si pamatovat;
+        # připnuté dlaždice se ale ukážou vždy — o ty si uživatel řekl sám.
+        if not pripnute and (len(dlazdice) < 8 or len(naposledy) < 2):
+            naposledy = []
+        pas = (pripnute + naposledy)[:MAX_PRIPNUTYCH]
+        _v_pasu = {d['klic'] for d in pas}
+        ostatni = [d for d in dlazdice if d['klic'] not in _v_pasu]
 
-            def jit_do_ukolovniku():
-                prepni_tab('ukolovnik')
-            with ui.card().classes('w-80 h-72 items-center justify-center shadow-xl hover:scale-105 transition-transform duration-300 cursor-pointer bg-white rounded-2xl border border-indigo-200 relative').on('click', jit_do_ukolovniku):
-                if _pocet_ukolu > 0:
-                    ui.badge(str(_pocet_ukolu), color='red').classes('absolute top-3 right-3 text-lg font-black px-2')
-                ui.label('📋').classes('text-7xl mb-6')
-                ui.label('Porady a úkoly').classes('text-2xl font-bold text-gray-800 mb-4 text-center')
-                ui.button('Otevřít přehled', on_click=jit_do_ukolovniku).classes('bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 px-8 rounded-lg shadow-md')
+        radky = (1 if pas else 0) + max(1, (len(ostatni) + 3) // 4)
+        # rezerva = header + odsazení panelu + popisky sekcí + mezery mřížky
+        _rezerva = 226 if pas else 190
+        vyska = f'clamp(74px, calc((100vh - {_rezerva}px) / {radky}), 118px)'
 
-        if ma_pristup_vysledky:
-            def jit_do_vysledku():
-                prepni_tab('vysledky')
-            with ui.card().classes('w-80 h-72 items-center justify-center shadow-xl hover:scale-105 transition-transform duration-300 cursor-pointer bg-white rounded-2xl border border-rose-200').on('click', jit_do_vysledku):
-                ui.label('📊').classes('text-7xl mb-6')
-                ui.label('Výsledky poboček').classes('text-2xl font-bold text-gray-800 mb-4 text-center')
-                ui.button('Otevřít přehled', on_click=jit_do_vysledku).classes('bg-rose-600 hover:bg-rose-700 text-white font-bold py-3 px-8 rounded-lg shadow-md')
+        with ui.column().classes('w-full gap-4 p-0'):
+            if pas:
+                _popisek('Připnuté a naposledy použité' if pripnute else 'Naposledy použité')
+                with ui.element('div').classes('jip-mrizka'):
+                    for d in pas:
+                        _vykresli_dlazdici(d, True, d['klic'] in pripnute_klice, vyska)
+            _popisek('Dostupné moduly')
+            with ui.element('div').classes('jip-mrizka'):
+                for d in ostatni:
+                    _vykresli_dlazdici(d, False, False, vyska)
 
-        if ma_pristup_sankce:
-            def jit_do_sankci():
-                app.storage.user['sankce_pohled'] = None  # po vstupu vždy přehled dvou dlaždic
-                prepni_tab('sankce')
-            with ui.card().classes('w-80 h-72 items-center justify-center shadow-xl hover:scale-105 transition-transform duration-300 cursor-pointer bg-white rounded-2xl border border-red-200').on('click', jit_do_sankci):
-                ui.label('⚖️').classes('text-7xl mb-6')
-                ui.label('Sankce').classes('text-2xl font-bold text-gray-800 mb-4 text-center')
-                ui.button('Otevřít přehled', on_click=jit_do_sankci).classes('bg-red-600 hover:bg-red-700 text-white font-bold py-3 px-8 rounded-lg shadow-md')
-
-        if ma_pristup_spolvecer:
-            def jit_do_spolvecer():
-                app.storage.user[f'spolvecer_sel_{user_id}'] = None  # po vstupu vždy přehled dlaždic poboček
-                prepni_tab('spolvecer')
-            with ui.card().classes('w-80 h-72 items-center justify-center shadow-xl hover:scale-105 transition-transform duration-300 cursor-pointer bg-white rounded-2xl border border-fuchsia-200').on('click', jit_do_spolvecer):
-                ui.label('🎉').classes('text-7xl mb-6')
-                ui.label('Spol. večer 2026').classes('text-2xl font-bold text-gray-800 mb-4 text-center')
-                ui.button('Otevřít přehled', on_click=jit_do_spolvecer).classes('bg-fuchsia-600 hover:bg-fuchsia-700 text-white font-bold py-3 px-8 rounded-lg shadow-md')
-
-        if ma_pristup_vizitky:
-            def jit_do_vizitek():
-                prepni_tab('vizitky')
-            with ui.card().classes('w-80 h-72 items-center justify-center shadow-xl hover:scale-105 transition-transform duration-300 cursor-pointer bg-white rounded-2xl border border-sky-200').on('click', jit_do_vizitek):
-                ui.label('🪪').classes('text-7xl mb-6')
-                ui.label('Vizitky a podpisy').classes('text-2xl font-bold text-gray-800 mb-4 text-center')
-                ui.button('Otevřít', on_click=jit_do_vizitek).classes('bg-sky-600 hover:bg-sky-700 text-white font-bold py-3 px-8 rounded-lg shadow-md')
-
-        if ma_pristup_cenopripad:
-            def jit_do_cenopripad():
-                app.storage.user['cenopripad_pohled'] = None  # po vstupu vždy rozcestník dlaždic
-                prepni_tab('cenopripad')
-            with ui.card().classes('w-80 h-72 items-center justify-center shadow-xl hover:scale-105 transition-transform duration-300 cursor-pointer bg-white rounded-2xl border border-emerald-200').on('click', jit_do_cenopripad):
-                ui.label('🏷️').classes('text-7xl mb-6')
-                ui.label('Cenopřípad').classes('text-2xl font-bold text-gray-800 mb-4 text-center')
-                ui.button('Otevřít přehled', on_click=jit_do_cenopripad).classes('bg-emerald-600 hover:bg-emerald-700 text-white font-bold py-3 px-8 rounded-lg shadow-md')
-
-        if ma_pristup_asm:
-            def jit_do_asm():
-                app.storage.user['asm_pohled'] = None  # po vstupu vždy rozcestník dlaždic
-                prepni_tab('asm')
-            with ui.card().classes('w-80 h-72 items-center justify-center shadow-xl hover:scale-105 transition-transform duration-300 cursor-pointer bg-white rounded-2xl border border-emerald-200').on('click', jit_do_asm):
-                ui.label('📝').classes('text-7xl mb-6')
-                ui.label('Formuláře ASM').classes('text-2xl font-bold text-gray-800 mb-4 text-center')
-                ui.button('Otevřít přehled', on_click=jit_do_asm).classes('bg-emerald-600 hover:bg-emerald-700 text-white font-bold py-3 px-8 rounded-lg shadow-md')
-
-        if ma_pristup_lupa:
-            def jit_do_lupa():
-                app.storage.user[f'lupa_pohled_{user_id}'] = None  # vždy rozcestník ASM
-                prepni_tab('lupa')
-            with ui.card().classes('w-80 h-72 items-center justify-center shadow-xl hover:scale-105 transition-transform duration-300 cursor-pointer bg-white rounded-2xl border border-indigo-200').on('click', jit_do_lupa):
-                ui.label('🔍').classes('text-7xl mb-6')
-                ui.label('Lupou na obchod').classes('text-2xl font-bold text-gray-800 mb-4 text-center')
-                ui.button('Otevřít přehled', on_click=jit_do_lupa).classes('bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 px-8 rounded-lg shadow-md')
+    _mrizka()
 
 
     # ==========================================
