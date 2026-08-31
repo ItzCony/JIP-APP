@@ -1084,8 +1084,8 @@ _TL_BARVY = {'Schváleno': '#16a34a', 'Čeká na schválení': '#d97706',
 
 
 def _tl_datum(z):
-    """Datum řádku – absence má 'from', přesčas 'datum_od'. Vždy date kvůli řazení."""
-    d = z.get('from') or z.get('datum_od')
+    """Datum řádku absence. Vždy date kvůli řazení."""
+    d = z.get('from')
     return d.date() if isinstance(d, datetime.datetime) else d
 
 
@@ -1108,7 +1108,6 @@ def _tl_karta(d, stav, storno_req=False, extra=''):
 @refreshable_na_klienta
 def vykresli_dochazku(user_id, user_name, vsechna_prava):
     _nast_doc = intranet_data.nacti_nastaveni_intranetu()
-    presczasy_zapnuty = _nast_doc.get('presczasy_zapnuty', True)
 
     vsichni_uzivatele_komplet = intranet_data.ziskej_vsechny_uzivatele()
     muj_ucet = next((u for u in vsichni_uzivatele_komplet.values() if u['id'] == user_id), {})
@@ -1474,31 +1473,6 @@ def vykresli_dochazku(user_id, user_name, vsechna_prava):
                 ui.button('Uložit úpravu', icon='save', on_click=potvrdit_upravu).classes('bg-blue-600 hover:bg-blue-700 text-white font-bold shadow-md')
         dlg_edit.open()
 
-    def _stornovat_presczas_btn(pid):
-        with ui.dialog() as dlg_ps, ui.card().classes('p-6 rounded-xl w-full max-w-md'):
-            ui.label('Stornování přesčasu').classes('text-xl font-bold mb-4 text-orange-600')
-            ui.label('Přesčas byl automaticky schválen. Stornováním jej zneplatníte.').classes('text-gray-600 text-sm mb-4')
-            duvod_ps = ui.textarea('Důvod storna (povinné) *').classes('w-full mb-4').props('outlined')
-            async def _potvrdit_storno_ps():
-                d = duvod_ps.value.strip() if duvod_ps.value else ''
-                if not d:
-                    ui.notify('Vyplňte důvod storna!', type='warning')
-                    return
-                ok = await asyncio.to_thread(intranet_data.stornuj_presczas, pid, user_id, d)
-                if ok:
-                    intranet_logger.log_activity(user_name, "Přesčas", f"Stornován přesčas ID: {pid} | Důvod: {d}")
-                    ui.notify('Přesčas stornován.', type='positive', position='top')
-                    dlg_ps.close()
-                    intranet_data.invaliduj_cache_dochazky()
-                    await asyncio.to_thread(intranet_data.ziskej_presczasy, None)
-                    ui.timer(0, _rf.get('fn', vykresli_dochazku.refresh), once=True)
-                else:
-                    ui.notify('Chyba při stornování.', type='negative', position='top')
-            with ui.row().classes('w-full justify-between'):
-                ui.button('Zpět', on_click=dlg_ps.close).classes('bg-gray-400 text-white font-bold')
-                ui.button('Stornovat', on_click=_potvrdit_storno_ps).classes('bg-orange-600 hover:bg-orange-700 text-white font-bold shadow-md')
-        dlg_ps.open()
-
     povoleny_schvalovat_oddeleni = []
     if is_global_admin:
         povoleny_schvalovat_oddeleni = list(aktualni_oddeleni_dict.keys())
@@ -1773,7 +1747,7 @@ def vykresli_dochazku(user_id, user_name, vsechna_prava):
     with ui.row().classes('w-full items-center justify-between mb-4'):
         with ui.column().classes('gap-0'):
             ui.label('Docházka a absence').classes('text-2xl font-bold text-gray-900 leading-tight')
-            ui.label('Žádosti, přesčasy a schvalování na jednom místě.').classes('text-xs text-gray-500')
+            ui.label('Žádosti a schvalování na jednom místě.').classes('text-xs text-gray-500')
 
         with ui.row().classes('gap-4'):
             import intranet_exporty
@@ -1949,23 +1923,7 @@ def vykresli_dochazku(user_id, user_name, vsechna_prava):
 
                             stat_data[typ] = stat_data.get(typ, 0.0) + float(z['sumaHours'])
 
-                        # Souhrn zadaných přesčasů (mimo storno)
-                        prescas_hodiny = 0.0
-                        if presczasy_zapnuty:
-                            for ot in intranet_data.ziskej_presczasy(None):
-                                if ot['stav_id'] == 4: continue
-                                if not (ot['datum_do'] >= od_val and ot['datum_od'] <= do_val): continue
-
-                                ot_id = ot['user_iduser']
-                                if vybrane_id == 'vse':
-                                    if ot_id == user_id: continue
-                                    if ot_id not in platna_id: continue
-                                else:
-                                    if ot_id != vybrane_id: continue
-
-                                prescas_hodiny += float(ot['sumaHours'])
-
-                        if not stat_data and prescas_hodiny == 0.0:
+                        if not stat_data:
                             ui.label('Žádné čerpání jiného volna ve vybraném období.').classes('text-gray-400 italic mt-2 text-sm')
                         else:
                             with ui.row().classes('w-full gap-4 mt-2 flex-wrap'):
@@ -1973,10 +1931,6 @@ def vykresli_dochazku(user_id, user_name, vsechna_prava):
                                     with ui.card().classes('p-3 shadow-sm bg-blue-50 border border-blue-100 rounded-lg min-w-[120px] items-center justify-center'):
                                         ui.label(typ).classes('text-[10px] text-blue-500 font-bold uppercase tracking-wider mb-1 text-center')
                                         ui.label(f'{hodiny:g} h').classes('text-xl font-black text-blue-700')
-                                if presczasy_zapnuty and prescas_hodiny > 0.0:
-                                    with ui.card().classes('p-3 shadow-sm bg-blue-50 border border-blue-100 rounded-lg min-w-[120px] items-center justify-center'):
-                                        ui.label('Přesčas').classes('text-[10px] text-blue-500 font-bold uppercase tracking-wider mb-1 text-center')
-                                        ui.label(f'{prescas_hodiny:g} h').classes('text-xl font-black text-blue-700')
 
                     obnovit_statistiky()
                     _sub_refreshes.append(obnovit_statistiky.refresh)
@@ -2133,16 +2087,10 @@ def vykresli_dochazku(user_id, user_name, vsechna_prava):
                             @ui.refreshable
                             def vykresli_moje_seznam():
                                 moje_z_s = intranet_data.ziskej_zadosti(user_id)
-                                moje_ot = intranet_data.ziskej_presczasy(user_id) if presczasy_zapnuty else []
                                 polozky = []
                                 for z in moje_z_s:
                                     z['_druh'] = 'absence'
                                     polozky.append(z)
-                                for ot in moje_ot:
-                                    ot['_druh'] = 'presczas'
-                                    ot['from'] = ot['datum_od']
-                                    ot['to'] = ot['datum_do']
-                                    polozky.append(ot)
                                 polozky.sort(key=lambda x: _tl_datum(x) or datetime.date.min, reverse=True)
                                 _tl_last = None
 
@@ -2183,94 +2131,48 @@ def vykresli_dochazku(user_id, user_name, vsechna_prava):
                                         if _d and (_d.year, _d.month) != _tl_last:
                                             _tl_last = (_d.year, _d.month)
                                             _tl_mesic(_d)
-                                        if z['_druh'] == 'presczas':
-                                            barva_ot = 'bg-gray-100 text-gray-600 border-gray-300' if z['stav_id'] == 4 else 'bg-green-100 text-green-700 border-green-300'
-                                            ikona_ot = '🛑' if z['stav_id'] == 4 else '✅'
-                                            cas_od_str = str(z['cas_od'])[:5] if z['cas_od'] else ''
-                                            cas_do_str = str(z['cas_do'])[:5] if z['cas_do'] else ''
-                                            with _tl_karta(_d, 'Stornováno' if z['stav_id'] == 4 else 'Schváleno'):
-                                                with ui.column().classes('flex-1 gap-0'):
-                                                    with ui.row().classes('items-center gap-2'):
-                                                        ui.label('⏰ Přesčas').classes('font-bold text-orange-700 text-sm')
-                                                        _zh, _zm = int(z.get('suma_hodin') or 0), int(z.get('suma_minut') or 0)
-                                                        _zdur = f"{_zh}h {_zm}min" if _zh and _zm else (f"{_zh}h" if _zh else f"{_zm}min")
-                                                        ui.label(_zdur).classes('text-xs bg-orange-100 text-orange-700 px-2 py-0.5 rounded-full font-bold')
-                                                    ui.label(f"{formatuj_datum(z['datum_od'])} {cas_od_str} – {formatuj_datum(z['datum_do'])} {cas_do_str}").classes('text-xs text-gray-500')
-                                                with ui.row().classes('items-center gap-1'):
-                                                    ui.label(f"{ikona_ot} {z['stav']}").classes(f'px-2 py-0.5 rounded-full text-xs font-bold border {barva_ot}')
-                                                    if z.get('duvod'):
-                                                        with ui.button(icon='info', on_click=lambda: None).props('flat round dense size=xs color=orange'):
-                                                            with ui.tooltip().classes('bg-white text-gray-800 shadow-xl border border-gray-200 p-3 rounded-xl max-w-xs'):
-                                                                ui.label('Důvod přesčasu:').classes('font-bold text-xs text-orange-700 mb-1')
-                                                                ui.label(z['duvod']).classes('text-xs')
-                                                                if z.get('storno_reason'):
-                                                                    ui.label('Důvod storna:').classes('font-bold text-xs text-red-600 mt-2 mb-1')
-                                                                    ui.label(z['storno_reason']).classes('text-xs text-red-600')
-                                                    if z['stav_id'] != 4 and (povoleny_schvalovat_oddeleni or jsem_neci_manazer or is_global_admin):
-                                                        ui.button(icon='block', on_click=lambda pid=z['idovertimeRequest']: _stornovat_presczas_btn(pid)).props('flat color=orange dense size=xs').tooltip('Stornovat přesčas')
-                                        else:
-                                            barva_ab = 'bg-yellow-100 text-yellow-800 border-yellow-300' if z['stav'] == 'Čeká na schválení' else ('bg-green-100 text-green-800 border-green-300' if z['stav'] == 'Schváleno' else ('bg-gray-100 text-gray-800 border-gray-300' if z['stav'] == 'Stornováno' else 'bg-red-100 text-red-800 border-red-300'))
-                                            ikona_ab = '⏳' if z['stav'] == 'Čeká na schválení' else ('✅' if z['stav'] == 'Schváleno' else ('🛑' if z['stav'] == 'Stornováno' else '❌'))
-                                            with _tl_karta(_d, z['stav'], bool(z.get('storno_req_at'))):
-                                                with ui.column().classes('gap-1'):
-                                                    _ab_h, _ab_m = int(z.get('suma_hodin') or 0), int(z.get('suma_minut') or 0)
-                                                    _ab_dur = f"{_ab_h}h {_ab_m}min" if _ab_h and _ab_m else (f"{_ab_h}h" if _ab_h else f"{_ab_m}min")
-                                                    ui.label(f"{z['typ']} ({_ab_dur})").classes('font-bold text-gray-800')
-                                                    _ab_cas_od = str(z['cas_od'])[:5] if z.get('cas_od') else ''
-                                                    _ab_cas_do = str(z['cas_do'])[:5] if z.get('cas_do') else ''
-                                                    _ab_cas_str = f"  {_ab_cas_od}–{_ab_cas_do}" if _ab_cas_od and _ab_cas_do else ""
-                                                    ui.label(f"{formatuj_datum(z['from'])} do {formatuj_datum(z['to'])}{_ab_cas_str}").classes('text-sm text-gray-600')
-                                                with ui.column().classes('items-end gap-1'):
-                                                    with ui.row().classes('items-center gap-2'):
-                                                        ui.label(f"{ikona_ab} {z['stav']}").classes(f'px-3 py-1 rounded-full text-sm font-bold border {barva_ab}')
+                                        barva_ab = 'bg-yellow-100 text-yellow-800 border-yellow-300' if z['stav'] == 'Čeká na schválení' else ('bg-green-100 text-green-800 border-green-300' if z['stav'] == 'Schváleno' else ('bg-gray-100 text-gray-800 border-gray-300' if z['stav'] == 'Stornováno' else 'bg-red-100 text-red-800 border-red-300'))
+                                        ikona_ab = '⏳' if z['stav'] == 'Čeká na schválení' else ('✅' if z['stav'] == 'Schváleno' else ('🛑' if z['stav'] == 'Stornováno' else '❌'))
+                                        with _tl_karta(_d, z['stav'], bool(z.get('storno_req_at'))):
+                                            with ui.column().classes('gap-1'):
+                                                _ab_h, _ab_m = int(z.get('suma_hodin') or 0), int(z.get('suma_minut') or 0)
+                                                _ab_dur = f"{_ab_h}h {_ab_m}min" if _ab_h and _ab_m else (f"{_ab_h}h" if _ab_h else f"{_ab_m}min")
+                                                ui.label(f"{z['typ']} ({_ab_dur})").classes('font-bold text-gray-800')
+                                                _ab_cas_od = str(z['cas_od'])[:5] if z.get('cas_od') else ''
+                                                _ab_cas_do = str(z['cas_do'])[:5] if z.get('cas_do') else ''
+                                                _ab_cas_str = f"  {_ab_cas_od}–{_ab_cas_do}" if _ab_cas_od and _ab_cas_do else ""
+                                                ui.label(f"{formatuj_datum(z['from'])} do {formatuj_datum(z['to'])}{_ab_cas_str}").classes('text-sm text-gray-600')
+                                            with ui.column().classes('items-end gap-1'):
+                                                with ui.row().classes('items-center gap-2'):
+                                                    ui.label(f"{ikona_ab} {z['stav']}").classes(f'px-3 py-1 rounded-full text-sm font-bold border {barva_ab}')
 
-                                                        zadatel_data_s = next((u for u in vsichni_uzivatele_komplet.values() if u['id'] == z['user_iduser']), {})
-                                                        is_manager_zadatele = user_id in zadatel_data_s.get('manager_id', [])
-                                                        is_watched_by_me = z['user_iduser'] in moji_sledovani
-                                                        ma_pravo_na_oddeleni = (z.get('oddeleni') and any(r.strip() in povoleny_schvalovat_oddeleni for r in z.get('oddeleni').split(',')))
-                                                        muze_mazat = (z['stav'] == 'Čeká na schválení' and z['user_iduser'] == user_id) or ma_pristup_mazani or is_global_admin or ma_pravo_na_oddeleni or is_manager_zadatele or is_watched_by_me
+                                                    zadatel_data_s = next((u for u in vsichni_uzivatele_komplet.values() if u['id'] == z['user_iduser']), {})
+                                                    is_manager_zadatele = user_id in zadatel_data_s.get('manager_id', [])
+                                                    is_watched_by_me = z['user_iduser'] in moji_sledovani
+                                                    ma_pravo_na_oddeleni = (z.get('oddeleni') and any(r.strip() in povoleny_schvalovat_oddeleni for r in z.get('oddeleni').split(',')))
+                                                    muze_mazat = (z['stav'] == 'Čeká na schválení' and z['user_iduser'] == user_id) or ma_pristup_mazani or is_global_admin or ma_pravo_na_oddeleni or is_manager_zadatele or is_watched_by_me
 
-                                                        if muze_mazat:
-                                                            if z['stav'] == 'Čeká na schválení':
-                                                                ui.button(icon='delete', on_click=lambda zid=z['idleaveRequest']: smazat_zadost_btn(zid)).props('flat color=red padding=none size=sm').tooltip('Smazat žádost')
-                                                            elif z['stav'] in ('Schváleno', 'Zamítnuto'):
-                                                                if z['stav'] == 'Schváleno':
-                                                                    ui.button(icon='edit', on_click=lambda zid=z['idleaveRequest'], zd=z: upravit_zadost_btn(zid, zd)).props('flat color=blue padding=none size=sm').tooltip('Upravit absenci')
-                                                                ui.button(icon='block', on_click=lambda zid=z['idleaveRequest'], zd=z: stornovat_zadost_btn(zid, zd)).props('flat color=orange padding=none size=sm').tooltip('Stornovat žádost')
+                                                    if muze_mazat:
+                                                        if z['stav'] == 'Čeká na schválení':
+                                                            ui.button(icon='delete', on_click=lambda zid=z['idleaveRequest']: smazat_zadost_btn(zid)).props('flat color=red padding=none size=sm').tooltip('Smazat žádost')
+                                                        elif z['stav'] in ('Schváleno', 'Zamítnuto'):
+                                                            if z['stav'] == 'Schváleno':
+                                                                ui.button(icon='edit', on_click=lambda zid=z['idleaveRequest'], zd=z: upravit_zadost_btn(zid, zd)).props('flat color=blue padding=none size=sm').tooltip('Upravit absenci')
+                                                            ui.button(icon='block', on_click=lambda zid=z['idleaveRequest'], zd=z: stornovat_zadost_btn(zid, zd)).props('flat color=orange padding=none size=sm').tooltip('Stornovat žádost')
 
-                                                        if (z['stav'] == 'Schváleno' and z['user_iduser'] == user_id
-                                                                and not z.get('storno_req_at') and z['from'] > datetime.date.today()):
-                                                            ui.button(icon='undo', on_click=lambda zid=z['idleaveRequest'], zd=z: pozadat_storno_btn(zid, zd)).props('flat color=orange padding=none size=sm').tooltip('Požádat o storno')
+                                                    if (z['stav'] == 'Schváleno' and z['user_iduser'] == user_id
+                                                            and not z.get('storno_req_at') and z['from'] > datetime.date.today()):
+                                                        ui.button(icon='undo', on_click=lambda zid=z['idleaveRequest'], zd=z: pozadat_storno_btn(zid, zd)).props('flat color=orange padding=none size=sm').tooltip('Požádat o storno')
 
-                                                    if z['stav_id'] != 1 and z['a_jmeno']:
-                                                        cas = formatuj_cas(z['approved_at'])
-                                                        ui.label(f"Vyřídil: {z['a_jmeno']} {z['a_prijmeni']} ({cas})").classes('text-xs text-gray-500 font-medium')
-                                                    if z['stav_id'] in (3, 4) and z['rejection_reason']:
-                                                        ui.label(f"Důvod: {z['rejection_reason']}").classes('text-xs text-red-600 italic')
-                                                    if z.get('storno_req_at'):
-                                                        ui.label(f"⏳ Žádost o storno odeslána: {z.get('storno_req_reason') or ''}").classes('text-xs text-orange-600 font-medium')
+                                                if z['stav_id'] != 1 and z['a_jmeno']:
+                                                    cas = formatuj_cas(z['approved_at'])
+                                                    ui.label(f"Vyřídil: {z['a_jmeno']} {z['a_prijmeni']} ({cas})").classes('text-xs text-gray-500 font-medium')
+                                                if z['stav_id'] in (3, 4) and z['rejection_reason']:
+                                                    ui.label(f"Důvod: {z['rejection_reason']}").classes('text-xs text-red-600 italic')
+                                                if z.get('storno_req_at'):
+                                                    ui.label(f"⏳ Žádost o storno odeslána: {z.get('storno_req_reason') or ''}").classes('text-xs text-orange-600 font-medium')
                             vykresli_moje_seznam()
                             _sub_refreshes.append(vykresli_moje_seznam.refresh)
-
-                    def _smazat_presczas_btn(pid):
-                        with ui.dialog() as dlg_p, ui.card().classes('p-6 rounded-xl w-full max-w-sm'):
-                            ui.label('Smazat přesčas?').classes('text-xl font-bold text-red-600 mb-4')
-                            ui.label('Záznam přesčasu bude nenávratně odstraněn.').classes('text-gray-600 mb-6')
-                            async def _potvrdit_smazat():
-                                ok = await asyncio.to_thread(intranet_data.smaz_presczas, pid)
-                                if ok:
-                                    intranet_logger.log_activity(user_name, "Přesčas", f"Smazán přesčas ID: {pid}")
-                                    ui.notify('Záznam smazán.', type='info', position='top')
-                                    dlg_p.close()
-                                    intranet_data.invaliduj_cache_dochazky()
-                                    await asyncio.to_thread(intranet_data.ziskej_presczasy, None)
-                                    ui.timer(0, _rf.get('fn', vykresli_dochazku.refresh), once=True)
-                                else:
-                                    ui.notify('Chyba.', type='negative', position='top')
-                            with ui.row().classes('w-full justify-between'):
-                                ui.button('Zrušit', on_click=dlg_p.close).classes('bg-gray-400 text-white font-bold')
-                                ui.button('Smazat', on_click=_potvrdit_smazat).classes('bg-red-600 text-white font-bold shadow-md')
-                        dlg_p.open()
 
                 if povoleny_schvalovat_oddeleni or jsem_neci_manazer or jsem_majitel:
                     ui.label('Záznamy ke schválení').classes('text-xs font-bold text-orange-500 uppercase tracking-widest mt-6 mb-3')
@@ -2423,7 +2325,6 @@ def vykresli_dochazku(user_id, user_name, vsechna_prava):
                     def vykresli_historie_sekce():
                         vsechny_zh = intranet_data.ziskej_zadosti(None)
                         vyrizene_zh = [z for z in vsechny_zh if z['stav_id'] != 1]
-                        vsechny_ot = intranet_data.ziskej_presczasy(None) if presczasy_zapnuty else []
 
                         historie_admin = []
                         for z in vyrizene_zh:
@@ -2435,20 +2336,6 @@ def vykresli_dochazku(user_id, user_name, vsechna_prava):
                             if is_global_admin or ma_odd_h or is_mgr_h or is_wtch_h:
                                 z['_typ_zaznamu'] = 'volno'
                                 historie_admin.append(z)
-
-                        # Přidej přesčasy do historie (vždy schválené nebo stornované)
-                        if presczasy_zapnuty:
-                            for ot in vsechny_ot:
-                                if 'admin' in ot.get('u_jmeno', '').lower() or 'admin' in ot.get('u_prijmeni', '').lower(): continue
-                                zd_ot = next((u for u in vsichni_uzivatele_komplet.values() if u['id'] == ot.get('user_iduser')), {})
-                                is_mgr_ot = user_id in zd_ot.get('manager_id', [])
-                                is_wtch_ot = ot.get('user_iduser') in moji_sledovani
-                                ma_odd_ot = (ot.get('oddeleni') and any(r.strip() in povoleny_schvalovat_oddeleni for r in ot.get('oddeleni').split(',')))
-                                if is_global_admin or ma_odd_ot or is_mgr_ot or is_wtch_ot:
-                                    ot['_typ_zaznamu'] = 'presczas'
-                                    ot['from'] = ot['datum_od']; ot['to'] = ot['datum_do']
-                                    ot['typ'] = 'Přesčas'; ot['a_jmeno'] = None
-                                    historie_admin.append(ot)
 
                         historie_admin.sort(key=lambda x: x.get('created_at') or datetime.datetime.min, reverse=True)
 
@@ -2516,60 +2403,37 @@ def vykresli_dochazku(user_id, user_name, vsechna_prava):
                                 ui.label(f'Zobrazeno {_od + 1}–{_od + len(strana)} z {len(filtered)} záznamů').classes('text-xs text-gray-400 mb-2 px-1')
                                 with ui.card().classes('w-full p-3 shadow-sm bg-white rounded-xl border border-blue-200 mb-2 justify-start').style('overflow: visible'):
                                     for z in strana:
-                                        je_presczas = z.get('_typ_zaznamu') == 'presczas'
                                         barva = 'text-green-600' if z['stav'] == 'Schváleno' else ('text-gray-500' if z['stav'] == 'Stornováno' else 'text-red-600')
-                                        ikona = '⏰' if je_presczas and z['stav'] == 'Schváleno' else ('✅' if z['stav'] == 'Schváleno' else ('🛑' if z['stav'] == 'Stornováno' else '❌'))
-                                        with _tl_karta(_tl_datum(z), z['stav'], bool(z.get('storno_req_at')), 'bg-orange-50' if je_presczas else ''):
+                                        ikona = '✅' if z['stav'] == 'Schváleno' else ('🛑' if z['stav'] == 'Stornováno' else '❌')
+                                        with _tl_karta(_tl_datum(z), z['stav'], bool(z.get('storno_req_at'))):
                                             with ui.column().classes('w-1/4 gap-0'):
                                                 ui.label(f"{z['u_jmeno']} {z['u_prijmeni']}").classes('font-bold text-gray-800')
-                                                if je_presczas:
-                                                    cas_od_h = str(z['cas_od'])[:5] if z.get('cas_od') else ''
-                                                    cas_do_h = str(z['cas_do'])[:5] if z.get('cas_do') else ''
-                                                    _zh2, _zm2 = int(z.get('suma_hodin') or 0), int(z.get('suma_minut') or 0)
-                                                    _zdur2 = f"{_zh2}h {_zm2}min" if _zh2 and _zm2 else (f"{_zh2}h" if _zh2 else f"{_zm2}min")
-                                                    ui.label(f"⏰ Přesčas  {cas_od_h}–{cas_do_h}  ({_zdur2})").classes('text-xs text-orange-600 font-semibold')
-                                                else:
-                                                    _ab_h2, _ab_m2 = int(z.get('suma_hodin') or 0), int(z.get('suma_minut') or 0)
-                                                    _ab_dur2 = f"{_ab_h2}h {_ab_m2}min" if _ab_h2 and _ab_m2 else (f"{_ab_h2}h" if _ab_h2 else f"{_ab_m2}min")
-                                                    _ab_cas_od2 = str(z['cas_od'])[:5] if z.get('cas_od') else ''
-                                                    _ab_cas_do2 = str(z['cas_do'])[:5] if z.get('cas_do') else ''
-                                                    _ab_cas_str2 = f"  {_ab_cas_od2}–{_ab_cas_do2}" if _ab_cas_od2 and _ab_cas_do2 else ""
-                                                    ui.label(f"{z['typ']}{_ab_cas_str2}  ({_ab_dur2})").classes('text-xs text-gray-500')
+                                                _ab_h2, _ab_m2 = int(z.get('suma_hodin') or 0), int(z.get('suma_minut') or 0)
+                                                _ab_dur2 = f"{_ab_h2}h {_ab_m2}min" if _ab_h2 and _ab_m2 else (f"{_ab_h2}h" if _ab_h2 else f"{_ab_m2}min")
+                                                _ab_cas_od2 = str(z['cas_od'])[:5] if z.get('cas_od') else ''
+                                                _ab_cas_do2 = str(z['cas_do'])[:5] if z.get('cas_do') else ''
+                                                _ab_cas_str2 = f"  {_ab_cas_od2}–{_ab_cas_do2}" if _ab_cas_od2 and _ab_cas_do2 else ""
+                                                ui.label(f"{z['typ']}{_ab_cas_str2}  ({_ab_dur2})").classes('text-xs text-gray-500')
                                             ui.label(f"{formatuj_datum(z['from'])} do {formatuj_datum(z['to'])}").classes('w-1/4 text-gray-600 self-center')
                                             with ui.column().classes('w-1/3 items-end gap-0'):
                                                 with ui.row().classes('items-center gap-2'):
                                                     ui.label(f"{ikona} {z['stav']}").classes(f'{barva} font-bold text-sm')
-                                                    if je_presczas:
-                                                        if z.get('duvod'):
-                                                            with ui.button(icon='info').props('flat round dense size=xs color=orange'):
-                                                                with ui.tooltip().classes('bg-white text-gray-800 shadow-xl border border-gray-200 p-3 rounded-xl max-w-xs'):
-                                                                    ui.label('Důvod přesčasu:').classes('font-bold text-xs text-orange-700 mb-1')
-                                                                    ui.label(z['duvod']).classes('text-xs')
-                                                                    if z.get('storno_reason'):
-                                                                        ui.label('Důvod storna:').classes('font-bold text-xs text-red-600 mt-2 mb-1')
-                                                                        ui.label(z['storno_reason']).classes('text-xs text-red-600')
-                                                        if z['stav_id'] != 4:
-                                                            ui.button(icon='block', on_click=lambda pid=z['idovertimeRequest']: _stornovat_presczas_btn(pid)).props('flat color=orange padding=none size=sm').tooltip('Stornovat přesčas')
-                                                    else:
-                                                        if z['stav'] == 'Čeká na schválení':
-                                                            ui.button(icon='delete', on_click=lambda zid=z['idleaveRequest']: smazat_zadost_btn(zid)).props('flat color=red padding=none size=sm').tooltip('Smazat žádost')
-                                                        elif z['stav'] in ('Schváleno', 'Zamítnuto'):
-                                                            if z['stav'] == 'Schváleno':
-                                                                ui.button(icon='edit', on_click=lambda zid=z['idleaveRequest'], zd=z: upravit_zadost_btn(zid, zd)).props('flat color=blue padding=none size=sm').tooltip('Upravit absenci')
-                                                            ui.button(icon='block', on_click=lambda zid=z['idleaveRequest'], zd=z: stornovat_zadost_btn(zid, zd)).props('flat color=orange padding=none size=sm').tooltip('Stornovat žádost')
-                                                        if z.get('storno_req_at') and z['stav'] == 'Schváleno':
-                                                            ui.button(icon='check', on_click=lambda zid=z['idleaveRequest'], zd=z: vyrid_storno_btn(zid, zd, True)).props('flat color=orange padding=none size=sm').tooltip('Schválit storno')
-                                                            ui.button(icon='close', on_click=lambda zid=z['idleaveRequest'], zd=z: vyrid_storno_btn(zid, zd, False)).props('flat color=grey padding=none size=sm').tooltip('Zamítnout storno')
-                                                if not je_presczas:
-                                                    cas = formatuj_cas(z['approved_at'])
-                                                    if z.get('a_jmeno'):
-                                                        ui.label(f"Vyřídil: {z['a_jmeno']} {z['a_prijmeni']} ({cas})").classes('text-xs text-gray-500 font-medium')
-                                                    if z['stav_id'] in (3, 4) and z['rejection_reason']:
-                                                        ui.label(f"Důvod: {z['rejection_reason']}").classes('text-xs text-red-500 italic mt-1')
-                                                    if z.get('storno_req_at'):
-                                                        ui.label(f"⏳ Žádost o storno: {z.get('storno_req_reason') or ''}").classes('text-xs text-orange-600 font-medium')
-                                                elif z.get('storno_at'):
-                                                    ui.label(f"Stornováno: {formatuj_cas(z['storno_at'])}").classes('text-xs text-gray-500 font-medium')
+                                                    if z['stav'] == 'Čeká na schválení':
+                                                        ui.button(icon='delete', on_click=lambda zid=z['idleaveRequest']: smazat_zadost_btn(zid)).props('flat color=red padding=none size=sm').tooltip('Smazat žádost')
+                                                    elif z['stav'] in ('Schváleno', 'Zamítnuto'):
+                                                        if z['stav'] == 'Schváleno':
+                                                            ui.button(icon='edit', on_click=lambda zid=z['idleaveRequest'], zd=z: upravit_zadost_btn(zid, zd)).props('flat color=blue padding=none size=sm').tooltip('Upravit absenci')
+                                                        ui.button(icon='block', on_click=lambda zid=z['idleaveRequest'], zd=z: stornovat_zadost_btn(zid, zd)).props('flat color=orange padding=none size=sm').tooltip('Stornovat žádost')
+                                                    if z.get('storno_req_at') and z['stav'] == 'Schváleno':
+                                                        ui.button(icon='check', on_click=lambda zid=z['idleaveRequest'], zd=z: vyrid_storno_btn(zid, zd, True)).props('flat color=orange padding=none size=sm').tooltip('Schválit storno')
+                                                        ui.button(icon='close', on_click=lambda zid=z['idleaveRequest'], zd=z: vyrid_storno_btn(zid, zd, False)).props('flat color=grey padding=none size=sm').tooltip('Zamítnout storno')
+                                                cas = formatuj_cas(z['approved_at'])
+                                                if z.get('a_jmeno'):
+                                                    ui.label(f"Vyřídil: {z['a_jmeno']} {z['a_prijmeni']} ({cas})").classes('text-xs text-gray-500 font-medium')
+                                                if z['stav_id'] in (3, 4) and z['rejection_reason']:
+                                                    ui.label(f"Důvod: {z['rejection_reason']}").classes('text-xs text-red-500 italic mt-1')
+                                                if z.get('storno_req_at'):
+                                                    ui.label(f"⏳ Žádost o storno: {z.get('storno_req_reason') or ''}").classes('text-xs text-orange-600 font-medium')
                                     # doplň prázdné sloty, ať má každá strana výšku 10 záznamů
                                     for _ in range(HIST_NA_STRANU - len(strana)):
                                         ui.element('div').classes('w-full mb-2 shrink-0').style('height: 74px')

@@ -148,7 +148,7 @@ def read_excel_vsechny_listy(raw_bytes: bytes) -> dict:
     return pd.read_excel(_io.BytesIO(raw_bytes), sheet_name=None)
 
 
-def build_dochazka_xlsx(vyfiltrovana, presczasy_detail_rows, zustatky_vypis,
+def build_dochazka_xlsx(vyfiltrovana, zustatky_vypis,
                         val_report, val_od, val_do) -> str:
     """[BĚŽÍ V PROCESU] Sestaví docházkový Excel z hotových dat (bez DB).
     Data se připraví v hlavním procesu (gather přes jobs.io), sem přijdou už
@@ -185,14 +185,11 @@ def build_dochazka_xlsx(vyfiltrovana, presczasy_detail_rows, zustatky_vypis,
         if val_report == 'komplet' and not df_souhrn.empty:
             df_souhrn.to_excel(writer, sheet_name='Souhrn absencí', index=False, startrow=2)
             ws = writer.sheets['Souhrn absencí']
-            ws['A1'] = f"Souhrn absencí + přesčasů za období: {val_od_fmt} - {val_do_fmt}"
+            ws['A1'] = f"Souhrn absencí za období: {val_od_fmt} - {val_do_fmt}"
             ws['A1'].font = openpyxl.styles.Font(bold=True, size=12)
             df_detail.to_excel(writer, sheet_name='Detailní výpis', index=False)
         if not df_zustatky.empty:
             df_zustatky.to_excel(writer, sheet_name='Zůstatky dovolené', index=False)
-        if presczasy_detail_rows:
-            df_ot = pd.DataFrame(presczasy_detail_rows).sort_values(by=['Oddělení', 'Jméno', 'Datum od'])
-            df_ot.to_excel(writer, sheet_name='Přesčasy detail', index=False)
 
     return cesta
 
@@ -242,7 +239,7 @@ def build_dochazka_ucetni_xlsx(vyfiltrovana, zustatky_vypis, val_report, val_od,
         if val_report == 'komplet' and not df_souhrn.empty:
             df_souhrn.to_excel(writer, sheet_name='Souhrn', index=False, startrow=2)
             ws = writer.sheets['Souhrn']
-            ws['A1'] = f"Souhrn absencí a přesčasů za období: {val_od_fmt} - {val_do_fmt}"
+            ws['A1'] = f"Souhrn absencí za období: {val_od_fmt} - {val_do_fmt}"
             ws['A1'].font = openpyxl.styles.Font(bold=True, size=12)
             df_detail.to_excel(writer, sheet_name='Detailní výpis', index=False)
         if not df_zustatky.empty:
@@ -436,9 +433,6 @@ def vykresli_exportni_tlacitka(user_name, vsechna_prava, vsichni_uzivatele_kompl
                         if t_nazev in povoleny_report_typy_b:
                             typy_pro_tisk_b[t_id] = t_nazev
 
-                    if intranet_data.nacti_nastaveni_intranetu().get('presczasy_zapnuty', True):
-                        typy_pro_tisk_b['presczas'] = 'Přesčas'
-
                     tisk_typ_b = ui.select(typy_pro_tisk_b, value=list(typy_pro_tisk_b.keys())[0] if typy_pro_tisk_b else None, label='Typ volna').classes('w-48 bg-white').props('outlined dense')
                     tisk_typ_reportu_b = ui.select({'komplet': 'Kompletní výpis (Vše)', 'zustatky': 'Pouze zůstatky dovolené'}, value='komplet', label='Druh reportu').classes('w-56 bg-white').props('outlined dense')
 
@@ -538,46 +532,6 @@ def vykresli_exportni_tlacitka(user_name, vsechna_prava, vsichni_uzivatele_kompl
                                     'Hodiny': _o_hod
                                 })
 
-                            # Přidej přesčasy (při výběru všech typů nebo explicitně "Přesčas")
-                            presczasy_detail_rows = []
-                            if intranet_data.nacti_nastaveni_intranetu().get('presczasy_zapnuty', True) and val_typ in ('vse', 'presczas'):
-                                vsechny_ot_ex = intranet_data.ziskej_presczasy(None)
-                                for ot in vsechny_ot_ex:
-                                    if ot['stav_id'] == 4: continue  # stornováno
-                                    if not (ot['datum_do'] >= d_od_val and ot['datum_od'] <= d_do_val): continue
-                                    cele_jmeno_ot = f"{ot['u_jmeno']} {ot['u_prijmeni']}"
-                                    odd_ot = ot.get('oddeleni') or 'Bez oddělení'
-                                    odd_ot_list = [o.strip() for o in odd_ot.split(',')]
-                                    z_data_ot = next((u for u in vsichni_uzivatele_komplet.values() if u['jmeno_cele'] == cele_jmeno_ot), {})
-                                    z_id_ot = z_data_ot.get('id')
-                                    ma_p = False
-                                    if ma_tisk_odd_vse_b or ma_pristup_vsechny_slozky: ma_p = True
-                                    else:
-                                        if any(o in povoleny_report_oddeleni_b for o in odd_ot_list): ma_p = True
-                                        if user_id in z_data_ot.get('manager_id', []): ma_p = True
-                                        if z_id_ot in moji_sledovani: ma_p = True
-                                    if not ma_p: continue
-                                    if val_role != 'vse' and val_role not in odd_ot_list: continue
-                                    if val_jmeno != 'vse' and val_jmeno != cele_jmeno_ot: continue
-                                    cas_od_s = _fmt_cas_hhmm(ot.get('cas_od'))
-                                    cas_do_s = _fmt_cas_hhmm(ot.get('cas_do'))
-                                    vyfiltrovana.append({
-                                        'Oddělení': odd_ot, 'Jméno': cele_jmeno_ot, 'Typ volna': 'Přesčas',
-                                        'Od': ot['datum_od'], 'Do': ot['datum_do'],
-                                        'Čas od': cas_od_s, 'Čas do': cas_do_s,
-                                        'Stav': 'Schváleno',
-                                        'Hodiny do součtu': float(ot['sumaHours']),
-                                        'Hodiny': float(ot['sumaHours'])
-                                    })
-                                    presczasy_detail_rows.append({
-                                        'Oddělení': odd_ot, 'Jméno': cele_jmeno_ot,
-                                        'Datum od': ot['datum_od'].strftime('%d.%m.%Y') if hasattr(ot['datum_od'], 'strftime') else str(ot['datum_od']),
-                                        'Datum do': ot['datum_do'].strftime('%d.%m.%Y') if hasattr(ot['datum_do'], 'strftime') else str(ot['datum_do']),
-                                        'Čas od': cas_od_s, 'Čas do': cas_do_s,
-                                        'Hodiny': float(ot['sumaHours']),
-                                        'Důvod': ot.get('duvod') or ''
-                                    })
-
                             if not vyfiltrovana and val_report == 'komplet':
                                 raise ValueError('Pro zadaný filtr nebyla nalezena žádná data k exportu.')
 
@@ -606,14 +560,14 @@ def vykresli_exportni_tlacitka(user_name, vsechna_prava, vsichni_uzivatele_kompl
 
                             # Stavba Excelu probíhá zvlášť v PROCESU (build_dochazka_xlsx);
                             # tady vracíme jen připravená picklovatelná data.
-                            return vyfiltrovana, presczasy_detail_rows, zustatky_vypis
+                            return vyfiltrovana, zustatky_vypis
 
                         try:
                             # 1) gather: DB + filtrování ve VLÁKNĚ (event-loop volná)
-                            vyf, presc, zust = await intranet_jobs.io(_zpracuj_excel)
+                            vyf, zust = await intranet_jobs.io(_zpracuj_excel)
                             # 2) build: stavba .xlsx v PROCESU (jiné jádro, obejde GIL)
                             vytvorena_cesta = await intranet_jobs.cpu(
-                                build_dochazka_xlsx, vyf, presc, zust, val_report, val_od, val_do,
+                                build_dochazka_xlsx, vyf, zust, val_report, val_od, val_do,
                             )
                             sim.cancel()
                             _bar_b.style('width:100%;transition:width 0.2s')
@@ -699,46 +653,6 @@ def vykresli_exportni_tlacitka(user_name, vsechna_prava, vsichni_uzivatele_kompl
                             'Hodiny': _o_hod
                         })
 
-                    # Přidej přesčasy do přehledu (při výběru všech typů nebo explicitně "Přesčas")
-                    presczasy_pro_nahled = []
-                    if intranet_data.nacti_nastaveni_intranetu().get('presczasy_zapnuty', True) and tisk_typ_b.value in ('vse', 'presczas'):
-                        vsechny_ot_nb = intranet_data.ziskej_presczasy(None)
-                        for ot in vsechny_ot_nb:
-                            if ot['stav_id'] == 4: continue
-                            if not (ot['datum_do'] >= d_od_val and ot['datum_od'] <= d_do_val): continue
-                            cele_jmeno_ot = f"{ot['u_jmeno']} {ot['u_prijmeni']}"
-                            odd_ot = ot.get('oddeleni') or 'Bez oddělení'
-                            odd_ot_list = [o.strip() for o in odd_ot.split(',')]
-                            z_data_ot = next((u for u in vsichni_uzivatele_komplet.values() if u['jmeno_cele'] == cele_jmeno_ot), {})
-                            z_id_ot = z_data_ot.get('id')
-                            ma_p = False
-                            if ma_tisk_odd_vse_b or ma_pristup_vsechny_slozky: ma_p = True
-                            else:
-                                if any(o in povoleny_report_oddeleni_b for o in odd_ot_list): ma_p = True
-                                if user_id in z_data_ot.get('manager_id', []): ma_p = True
-                                if z_id_ot in moji_sledovani: ma_p = True
-                            if not ma_p: continue
-                            if tisk_role_b.value != 'vse' and tisk_role_b.value not in odd_ot_list: continue
-                            if tisk_jmeno_b.value != 'vse' and tisk_jmeno_b.value != cele_jmeno_ot: continue
-                            cas_od_s = _fmt_cas_hhmm(ot.get('cas_od'))
-                            cas_do_s = _fmt_cas_hhmm(ot.get('cas_do'))
-                            vyfiltrovana.append({
-                                'Oddělení': odd_ot, 'Jméno': cele_jmeno_ot, 'Typ volna': 'Přesčas',
-                                'Od': ot['datum_od'], 'Do': ot['datum_do'],
-                                'Čas od': cas_od_s, 'Čas do': cas_do_s,
-                                'Stav': 'Schváleno',
-                                'Hodiny do součtu': float(ot['sumaHours']),
-                                'Hodiny': float(ot['sumaHours'])
-                            })
-                            presczasy_pro_nahled.append({
-                                'Oddělení': odd_ot, 'Jméno': cele_jmeno_ot,
-                                'Datum od': ot['datum_od'].strftime('%d.%m.%Y') if hasattr(ot['datum_od'], 'strftime') else str(ot['datum_od']),
-                                'Datum do': ot['datum_do'].strftime('%d.%m.%Y') if hasattr(ot['datum_do'], 'strftime') else str(ot['datum_do']),
-                                'Čas od': cas_od_s, 'Čas do': cas_do_s,
-                                'Hodiny': float(ot['sumaHours']),
-                                'Důvod': ot.get('duvod') or ''
-                            })
-
                     if not vyfiltrovana and tisk_typ_reportu_b.value == 'komplet':
                         _ui_prazdny_stav('Pro zadaný filtr nebyla nalezena žádná data.')
                         return
@@ -775,22 +689,7 @@ def vykresli_exportni_tlacitka(user_name, vsechna_prava, vsichni_uzivatele_kompl
                         cols_detail = [{'name': 'Oddělení', 'label': 'Oddělení', 'field': 'Oddělení', 'align': 'left'}, {'name': 'Jméno', 'label': 'Jméno', 'field': 'Jméno', 'align': 'left'}, {'name': 'Od', 'label': 'Od data', 'field': 'Od', 'align': 'left'}, {'name': 'Do', 'label': 'Do data', 'field': 'Do', 'align': 'left'}, {'name': 'Čas od', 'label': 'Čas od', 'field': 'Čas od', 'align': 'center'}, {'name': 'Čas do', 'label': 'Čas do', 'field': 'Čas do', 'align': 'center'}, {'name': 'Typ volna', 'label': 'Typ', 'field': 'Typ volna', 'align': 'left'}, {'name': 'Stav', 'label': 'Stav', 'field': 'Stav', 'align': 'left'}, {'name': 'Hodiny', 'label': 'Zadané hodiny', 'field': 'Hodiny', 'align': 'right'}]
                         ui.table(columns=cols_detail, rows=df_detail.to_dict('records')).props(_TBL_PROPS).classes(_TBL_CLASSES)
 
-                        if presczasy_pro_nahled:
-                            _ui_nadpis_sekce('3', 'Přesčasy — detail')
-                            df_ot_nb = pd.DataFrame(presczasy_pro_nahled).sort_values(by=['Oddělení', 'Jméno', 'Datum od'])
-                            cols_ot_nb = [
-                                {'name': 'Oddělení', 'label': 'Oddělení', 'field': 'Oddělení', 'align': 'left'},
-                                {'name': 'Jméno', 'label': 'Jméno', 'field': 'Jméno', 'align': 'left'},
-                                {'name': 'Datum od', 'label': 'Datum od', 'field': 'Datum od', 'align': 'left'},
-                                {'name': 'Datum do', 'label': 'Datum do', 'field': 'Datum do', 'align': 'left'},
-                                {'name': 'Čas od', 'label': 'Čas od', 'field': 'Čas od', 'align': 'center'},
-                                {'name': 'Čas do', 'label': 'Čas do', 'field': 'Čas do', 'align': 'center'},
-                                {'name': 'Hodiny', 'label': 'Hodiny', 'field': 'Hodiny', 'align': 'right'},
-                                {'name': 'Důvod', 'label': 'Důvod', 'field': 'Důvod', 'align': 'left'},
-                            ]
-                            ui.table(columns=cols_ot_nb, rows=df_ot_nb.to_dict('records')).props(_TBL_PROPS).classes(_TBL_CLASSES)
-
-                    _ui_nadpis_sekce('4' if tisk_typ_reportu_b.value == 'komplet' else None, 'Zůstatky dovolené', 'pro zadané období')
+                    _ui_nadpis_sekce('3' if tisk_typ_reportu_b.value == 'komplet' else None, 'Zůstatky dovolené', 'pro zadané období')
 
                     zustatky_vypis = []
                     for mail, udata in vsichni_uzivatele_komplet.items():
@@ -1000,26 +899,6 @@ def vykresli_exportni_tlacitka(user_name, vsechna_prava, vsichni_uzivatele_kompl
                                     'Zadáno': d.get('created_at')
                                 })
 
-                            # Přesčasy
-                            if intranet_data.nacti_nastaveni_intranetu().get('presczasy_zapnuty', True) and val_typ == 'vse':
-                                vsechny_ot_u = intranet_data.ziskej_presczasy(None)
-                                for ot in vsechny_ot_u:
-                                    if ot['stav_id'] == 4: continue
-                                    if not (ot['datum_do'] >= d_od_val and ot['datum_od'] <= d_do_val): continue
-                                    cele_jmeno_ot = f"{ot['u_jmeno']} {ot['u_prijmeni']}"
-                                    odd_ot = ot.get('oddeleni') or 'Bez oddělení'
-                                    if val_role != 'vse' and val_role not in [o.strip() for o in odd_ot.split(',')]: continue
-                                    if val_jmeno != 'vse' and val_jmeno != cele_jmeno_ot: continue
-                                    udata_ot = next((u for u in vsichni_uzivatele_komplet.values() if u['jmeno_cele'] == cele_jmeno_ot), {})
-                                    osobni_cislo_ot = udata_ot.get('id', "")
-                                    spolecnosti_ot = ", ".join([s['nazev'] for s in udata_ot.get('spolecnosti', [])]) or "Nepřiřazeno"
-                                    vyfiltrovana.append({
-                                        'Společnost': spolecnosti_ot, 'Oddělení': odd_ot, 'Osobní číslo': osobni_cislo_ot, 'Jméno a příjmení': cele_jmeno_ot, 'Typ volna': 'Přesčas',
-                                        'Od': ot['datum_od'], 'Do': ot['datum_do'], 'Stav': 'Schváleno',
-                                        'Hodiny do součtu': float(ot['sumaHours']),
-                                        'Hodiny': float(ot['sumaHours'])
-                                    })
-
                             if not vyfiltrovana and val_report == 'komplet':
                                 raise ValueError('Pro zadaný filtr nebyla nalezena žádná data k exportu.')
 
@@ -1129,26 +1008,6 @@ def vykresli_exportni_tlacitka(user_name, vsechna_prava, vsichni_uzivatele_kompl
                             'Zadáno': d.get('created_at')
                         })
 
-                    # Přesčasy
-                    if intranet_data.nacti_nastaveni_intranetu().get('presczasy_zapnuty', True) and tisk_typ_u.value == 'vse':
-                        vsechny_ot_u_prev = intranet_data.ziskej_presczasy(None)
-                        for ot in vsechny_ot_u_prev:
-                            if ot['stav_id'] == 4: continue
-                            if not (ot['datum_do'] >= d_od_val and ot['datum_od'] <= d_do_val): continue
-                            cele_jmeno_ot = f"{ot['u_jmeno']} {ot['u_prijmeni']}"
-                            odd_ot = ot.get('oddeleni') or 'Bez oddělení'
-                            if tisk_role_u.value != 'vse' and tisk_role_u.value not in [o.strip() for o in odd_ot.split(',')]: continue
-                            if tisk_jmeno_u.value != 'vse' and tisk_jmeno_u.value != cele_jmeno_ot: continue
-                            udata_ot = next((u for u in vsichni_uzivatele_komplet.values() if u['jmeno_cele'] == cele_jmeno_ot), {})
-                            osobni_cislo_ot = udata_ot.get('id', "")
-                            spolecnosti_ot = ", ".join([s['nazev'] for s in udata_ot.get('spolecnosti', [])]) or "Nepřiřazeno"
-                            vyfiltrovana.append({
-                                'Společnost': spolecnosti_ot, 'Oddělení': odd_ot, 'Osobní číslo': osobni_cislo_ot, 'Jméno a příjmení': cele_jmeno_ot, 'Typ volna': 'Přesčas',
-                                'Od': ot['datum_od'], 'Do': ot['datum_do'], 'Stav': 'Schváleno',
-                                'Hodiny do součtu': float(ot['sumaHours']),
-                                'Hodiny': float(ot['sumaHours'])
-                            })
-
                     if not vyfiltrovana and tisk_typ_reportu_u.value == 'komplet':
                         _ui_prazdny_stav('Pro zadaný filtr nebyla nalezena žádná data.')
                         return
@@ -1177,7 +1036,7 @@ def vykresli_exportni_tlacitka(user_name, vsechna_prava, vsichni_uzivatele_kompl
 
                         ui.table(columns=cols_souhrn, rows=df_souhrn.to_dict('records')).props(_TBL_PROPS).classes(_TBL_CLASSES)
 
-                        _ui_nadpis_sekce('2', 'Detailní výpis absencí a přesčasů')
+                        _ui_nadpis_sekce('2', 'Detailní výpis absencí')
                         df_detail = df.sort_values(by=['Oddělení', 'Jméno a příjmení', 'Od'])
                         df_detail['Od'] = df_detail['Od'].apply(lambda x: x.strftime('%d.%m.%Y') if hasattr(x, 'strftime') else str(x))
                         df_detail['Do'] = df_detail['Do'].apply(lambda x: x.strftime('%d.%m.%Y') if hasattr(x, 'strftime') else str(x))
