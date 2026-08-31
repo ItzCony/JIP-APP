@@ -208,14 +208,12 @@ _CACHE_ODDELENI = {'data': None, 'ts': 0.0}
 _CACHE_ROLE = {'data': None, 'ts': 0.0}
 _CACHE_TYPY_VOLNA = {'data': None, 'ts': 0.0}
 _CACHE_VOLNA_KALENDAR_ALL = {'data': None, 'ts': 0.0}
-_CACHE_PRESZASY_ALL = {'data': None, 'ts': 0.0}
 _CACHE_SPRAVA_TTL = 3600.0  # sekund (bylo 900) — oddělení/role/typy volna se mění zřídka
 
 def invaliduj_cache_dochazky():
     """Zneplatní cache žádostí i uživatelů — volat po každé změně stavu žádosti."""
     _CACHE_UZIVATELE['ts'] = 0.0
     _CACHE_ZADOSTI_ALL['ts'] = 0.0
-    _CACHE_PRESZASY_ALL['ts'] = 0.0
     _CACHE_VOLNA_KALENDAR_ALL['ts'] = 0.0
 
 def invaliduj_cache_sprava():
@@ -238,7 +236,6 @@ def _prehraj_cache_sync():
         (_CACHE_TYPY_VOLNA, ziskej_typy_volna),
         (_CACHE_UZIVATELE, ziskej_vsechny_uzivatele),
         (_CACHE_ZADOSTI_ALL, ziskej_zadosti),
-        (_CACHE_PRESZASY_ALL, ziskej_presczasy),
         (_CACHE_VOLNA_KALENDAR_ALL, ziskej_vsechna_volna_kalendar),
     ):
         try:
@@ -469,7 +466,6 @@ MODULY = {
     'asm_zapnuty':           ('📝 Modul Formuláře ASM',          'Formuláře ASM'),
     'lupa_zapnuty':          ('🔍 Modul Lupou na obchod',        'Lupou na obchod'),
     'schuzky_zapnuty':       ('🗓️ Modul Schůzky s vedoucími',    'Schůzky s vedoucími'),
-    'presczasy_zapnuty':     ('⏰ Přesčasy (Evidence absencí)',   'Přesčasy'),
     # Má i vlastní přepínač na záložce Narozeniny v Nastavení portálu.
     'narozeniny_zapnuty':    ('Modul Narozeniny',               'Narozeniny'),
 }
@@ -973,30 +969,6 @@ def inicializace_db():
         except Exception: pass
         try: cursor.execute("ALTER TABLE leaveRequest ADD COLUMN storno_req_reason TEXT")
         except Exception: pass
-        cursor.execute("""CREATE TABLE IF NOT EXISTS overtimeRequest (
-            idovertimeRequest INT AUTO_INCREMENT PRIMARY KEY,
-            user_iduser INT NOT NULL,
-            datum_od DATE NOT NULL,
-            datum_do DATE NOT NULL,
-            cas_od TIME NOT NULL,
-            cas_do TIME NOT NULL,
-            sumaHours DECIMAL(5,2) NOT NULL,
-            duvod TEXT,
-            created_at DATETIME DEFAULT NOW(),
-            leaveStatus_idleaveStatus INT NOT NULL DEFAULT 2,
-            storno_by_iduser INT,
-            storno_at DATETIME,
-            storno_reason TEXT,
-            FOREIGN KEY(user_iduser) REFERENCES user(iduser) ON DELETE CASCADE,
-            FOREIGN KEY(leaveStatus_idleaveStatus) REFERENCES leaveStatus(idleaveStatus) ON DELETE RESTRICT,
-            FOREIGN KEY(storno_by_iduser) REFERENCES user(iduser) ON DELETE SET NULL
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""")
-        try: cursor.execute("ALTER TABLE overtimeRequest ADD COLUMN suma_hodin INT NOT NULL DEFAULT 0")
-        except Exception: pass
-        try: cursor.execute("ALTER TABLE overtimeRequest ADD COLUMN suma_minut TINYINT UNSIGNED NOT NULL DEFAULT 0")
-        except Exception: pass
-        try: cursor.execute("UPDATE overtimeRequest SET suma_hodin = FLOOR(sumaHours), suma_minut = ROUND((sumaHours - FLOOR(sumaHours)) * 60) WHERE suma_hodin = 0 AND suma_minut = 0 AND sumaHours > 0")
-        except Exception: pass
         cursor.execute("CREATE TABLE IF NOT EXISTS vysledky_kvizu (id INT AUTO_INCREMENT PRIMARY KEY, user_iduser INT, stav_testu VARCHAR(50), uspesnost VARCHAR(20), body VARCHAR(20), doba_trvani VARCHAR(50), datum TIMESTAMP DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY(user_iduser) REFERENCES user(iduser) ON DELETE CASCADE) ENGINE=InnoDB")
         cursor.execute("CREATE TABLE IF NOT EXISTS zaznamy_odpovedi (id INT AUTO_INCREMENT PRIMARY KEY, vysledek_id INT, poradi INT, otazka TEXT, tvoje_volba TEXT, spravna_odpoved TEXT, hodnoceni VARCHAR(50), FOREIGN KEY (vysledek_id) REFERENCES vysledky_kvizu(id) ON DELETE CASCADE) ENGINE=InnoDB")
         cursor.execute("CREATE TABLE IF NOT EXISTS veletrh_smlouvy (id INT AUTO_INCREMENT PRIMARY KEY, res_id VARCHAR(100), dodavatel VARCHAR(255), ico VARCHAR(50), cesta_k_souboru VARCHAR(500), vytvoreno DATETIME DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB")
@@ -1017,9 +989,6 @@ def inicializace_db():
             "CREATE INDEX idx_lr_user    ON leaveRequest(user_iduser)",
             "CREATE INDEX idx_lr_status  ON leaveRequest(leaveStatus_idleaveStatus)",
             "CREATE INDEX idx_lr_dates   ON leaveRequest(`from`, `to`)",
-            # Přesčasy
-            "CREATE INDEX idx_ot_user    ON overtimeRequest(user_iduser)",
-            "CREATE INDEX idx_ot_status  ON overtimeRequest(leaveStatus_idleaveStatus)",
         ]
         for idx_sql in _perf_indexes:
             try:
@@ -1954,110 +1923,6 @@ def ziskej_vsechna_volna_kalendar(jen_budouci=False):
     except Exception as e:
         print(e)
         return _CACHE_VOLNA_KALENDAR_ALL['data'] if (not jen_budouci) else []
-    finally:
-        if cursor: cursor.close()
-        if conn: conn.close()
-
-# ==========================================
-# PŘESČASY (overtimeRequest)
-# ==========================================
-def pridej_presczas(user_id, datum_od, datum_do, cas_od, cas_do, hodin, minut, duvod):
-    conn = get_db_connection()
-    if not conn: return False
-    cursor = None
-    try:
-        cursor = conn.cursor(buffered=True)
-        suma_hours = round((hodin * 60 + minut) / 60, 4)
-        cursor.execute("""INSERT INTO overtimeRequest
-            (user_iduser, datum_od, datum_do, cas_od, cas_do, sumaHours, suma_hodin, suma_minut, duvod, created_at, leaveStatus_idleaveStatus)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), 2)""",
-            (user_id, datum_od, datum_do, cas_od, cas_do, suma_hours, hodin, minut, duvod or None))
-        conn.commit()
-        _CACHE_PRESZASY_ALL['ts'] = 0.0
-        return True
-    except Exception as e:
-        print(f"[pridej_presczas] {e}")
-        return False
-    finally:
-        if cursor: cursor.close()
-        if conn: conn.close()
-
-def ziskej_presczasy(user_id=None):
-    if user_id is None:
-        now = time.time()
-        if _CACHE_PRESZASY_ALL['data'] is not None and now - _CACHE_PRESZASY_ALL['ts'] < _CACHE_REFRESH_TTL:
-            return _CACHE_PRESZASY_ALL['data']
-    conn = get_db_connection()
-    if not conn: return []
-    cursor = None
-    try:
-        cursor = conn.cursor(dictionary=True, buffered=True)
-        q = """SELECT ot.idovertimeRequest, ot.user_iduser, ot.datum_od, ot.datum_do,
-                      ot.cas_od, ot.cas_do, ot.sumaHours, ot.suma_hodin, ot.suma_minut, ot.duvod, ot.created_at,
-                      ot.leaveStatus_idleaveStatus as stav_id, s.name as stav,
-                      u.name as u_jmeno, u.surname as u_prijmeni,
-                      sb.name as sb_jmeno, sb.surname as sb_prijmeni,
-                      ot.storno_at, ot.storno_reason,
-                      GROUP_CONCAT(d.name SEPARATOR ', ') as oddeleni
-               FROM overtimeRequest ot
-               JOIN leaveStatus s ON ot.leaveStatus_idleaveStatus = s.idleaveStatus
-               JOIN user u ON ot.user_iduser = u.iduser
-               LEFT JOIN user sb ON ot.storno_by_iduser = sb.iduser
-               LEFT JOIN department_To_user dtu ON u.iduser = dtu.user_iduser
-               LEFT JOIN department d ON dtu.department_iddepartment = d.iddepartment"""
-        if user_id:
-            q += " WHERE ot.user_iduser = %s GROUP BY ot.idovertimeRequest ORDER BY ot.created_at DESC"
-            cursor.execute(q, (user_id,))
-        else:
-            q += " GROUP BY ot.idovertimeRequest ORDER BY ot.created_at DESC"
-            cursor.execute(q)
-        res = cursor.fetchall()
-        if user_id is None:
-            _CACHE_PRESZASY_ALL['data'] = res
-            _CACHE_PRESZASY_ALL['ts'] = time.time()
-        return res
-    except Exception as e:
-        print(f"[ziskej_presczasy] {e}")
-        return []
-    finally:
-        if cursor: cursor.close()
-        if conn: conn.close()
-
-def stornuj_presczas(presczas_id, admin_id, duvod):
-    conn = get_db_connection()
-    if not conn: return False
-    cursor = None
-    try:
-        cursor = conn.cursor(buffered=True)
-        cursor.execute("SELECT idleaveStatus FROM leaveStatus WHERE name='Stornováno'")
-        res = cursor.fetchone()
-        stav_id = res[0] if res else 4
-        cursor.execute("""UPDATE overtimeRequest SET leaveStatus_idleaveStatus=%s,
-            storno_by_iduser=%s, storno_at=NOW(), storno_reason=%s
-            WHERE idovertimeRequest=%s""", (stav_id, admin_id, duvod, presczas_id))
-        conn.commit()
-        _CACHE_PRESZASY_ALL['ts'] = 0.0
-        return True
-    except Exception as e:
-        print(f"[stornuj_presczas] {e}")
-        return False
-    finally:
-        if cursor: cursor.close()
-        if conn: conn.close()
-
-def smaz_presczas(presczas_id):
-    conn = get_db_connection()
-    if not conn: return False
-    cursor = None
-    try:
-        cursor = conn.cursor(buffered=True)
-        cursor.execute("DELETE FROM overtimeRequest WHERE idovertimeRequest=%s", (presczas_id,))
-        conn.commit()
-        _CACHE_PRESZASY_ALL['ts'] = 0.0
-        return True
-    except Exception as e:
-        print(f"[smaz_presczas] {e}")
-        return False
     finally:
         if cursor: cursor.close()
         if conn: conn.close()

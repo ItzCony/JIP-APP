@@ -196,7 +196,6 @@ def _fyzicky_zapis_na_disk(log_entry):
 POVOLENE_UROVNE = {
     "Přihlášení", "Odhlášení", "Chyba přihlášení",
     "Podání žádosti", "Schválení žádosti", "Zamítnutí žádosti", "Stornování žádosti",
-    "Přesčas",
     "Export docházky", "Export účetní", "Export faktur", "IKOS Export",
     "Export práv", "Úkolovník", "Výsledky poboček",
     "Záloha DB", "Obnova DB",
