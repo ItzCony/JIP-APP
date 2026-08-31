@@ -280,9 +280,26 @@ def zaregistruj_prepinac_tabu(fn: Callable[[Any], None]) -> None:
         pass  # mimo klientský kontext (startup, background task)
 
 
+def slouc_historii(historie, nazev: str, max_polozek: int = 6):
+    """Nejnovější první, bez duplicit, oříznuto na max_polozek. Čistá funkce kvůli testu."""
+    if not isinstance(historie, list):
+        historie = []
+    return [nazev] + [k for k in historie if k != nazev][:max_polozek - 1]
+
+
+def zapis_naposledy(nazev: str) -> None:
+    """Historie modulů pro pás „Naposledy použité“ na nástěnce."""
+    try:
+        app.storage.user['prehled_naposledy'] = slouc_historii(
+            app.storage.user.get('prehled_naposledy', []), nazev)
+    except Exception:
+        pass  # mimo klientský kontext — historie není kritická
+
+
 def prepni_tab(nazev: str) -> None:
     """Přepne hlavní tab intranetu — zápis do storage + přímé nastavení elementu."""
     app.storage.user['intranet_tab'] = nazev
+    zapis_naposledy(nazev)
     try:
         fn = app.storage.client.get('_prepinac_tabu')
     except Exception:
