@@ -607,7 +607,7 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
     /* Dotyk hover nemá — tam musí být špendlík vidět pořád. */
     @media (hover: none) { .jip-pin { opacity: 1; } }
     @media (max-width: 1200px) { .jip-mrizka { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-                                 .jip-dlazdice { height: 84px !important; } }
+                                 .jip-dlazdice { height: 131px !important; } }
     @media (max-width: 860px)  { .jip-mrizka { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
     @media (max-width: 600px)  { .jip-mrizka { grid-template-columns: 1fr; } }
     ''')
@@ -722,7 +722,7 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
     def _popisek(text):
         with ui.row().classes('w-full items-center gap-3 no-wrap'):
             ui.label(text).classes(
-                'text-[11px] font-bold uppercase tracking-widest text-gray-500 whitespace-nowrap')
+                'text-sm font-bold uppercase tracking-widest text-gray-500 whitespace-nowrap')
             ui.element('div').classes('grow h-px bg-gray-200')
 
     def _vykresli_dlazdici(d, zvyraznena, pripnuta, vyska):
@@ -735,16 +735,16 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
             tridy += ' bg-white border-gray-200'
         with ui.element('div').classes(tridy).style(styl).on('click', d['akce']):
             ikona = ui.label(d['ikona']).classes(
-                'shrink-0 w-10 h-10 rounded-xl flex items-center justify-center text-2xl')
+                'shrink-0 w-16 h-16 rounded-2xl flex items-center justify-center text-4xl')
             if zvyraznena:
                 ikona.classes('bg-white')  # dark režim si bílou přebarví na #1e293b
             else:
                 ikona.style(f"background:{_tint(d['barva'], 0.12)}")
             # pr-5 = místo pro špendlík, aby pod něj nezatekl dlouhý název na nízkých dlaždicích
-            ui.label(d['nazev']).classes('text-sm font-bold text-gray-800 leading-tight min-w-0 pr-5')
+            ui.label(d['nazev']).classes('text-lg font-bold text-gray-800 leading-tight min-w-0 pr-5')
             if d['pocet']:
                 ui.badge(str(d['pocet']), color='red').classes(
-                    'absolute top-2 right-2 text-xs font-black px-2')
+                    'absolute top-2 right-2 text-sm font-black px-2')
             # Špendlík v pravém dolním rohu — nahoře sedí odznak počtu.
             # click.stop, jinak by kliknutí propadlo na dlaždici a otevřelo modul.
             pin = ui.icon('push_pin' if pripnuta else 'o_push_pin').classes(
@@ -771,7 +771,7 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
         radky = (1 if pas else 0) + max(1, (len(ostatni) + 3) // 4)
         # rezerva = header + odsazení panelu + popisky sekcí + mezery mřížky
         _rezerva = 226 if pas else 190
-        vyska = f'clamp(74px, calc((100vh - {_rezerva}px) / {radky}), 118px)'
+        vyska = f'clamp(92px, calc((100vh - {_rezerva}px) / {radky}), 185px)'
 
         with ui.column().classes('w-full gap-4 p-0'):
             if pas:
