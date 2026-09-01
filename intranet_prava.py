@@ -165,6 +165,9 @@ ZAKLADNI_PRAVA = {
     'asm_spravce':            {'kategorie': 'Modul Formuláře ASM', 'nazev': 'Správce obchod',      'popis': 'Finální arbitr při sporech. Vidí celou frontu, postoupené případy schvaluje nebo zamítá. Má i přístup k dlaždici „Data“.', 'ikona': 'local_police'},
     'asm_spravce_bez_emailu': {'kategorie': 'Modul Formuláře ASM', 'nazev': 'Správce obchod - Bez emailu', 'popis': 'Stejná práva jako Správce obchod, ale NECHODÍ mu e-mailové notifikace z modulu Formuláře ASM.', 'ikona': 'local_police'},
     'asm_vkladatel':          {'kategorie': 'Modul Formuláře ASM', 'nazev': 'Vkladatel dat',       'popis': 'AO. Smí pouze nahrávat číselníky v dlaždici „Data“ (Dealer + Kontaktní údaje VO). Nevidí žádné případy.', 'ikona': 'upload'},
+    'asm_oz_zadatel':         {'kategorie': 'Modul Formuláře ASM', 'nazev': 'Nový OZ - Žadatel',   'popis': 'Zakládá formulář „Nový OZ / Změna OZ". Vidí a doplňuje jen záznamy svých poboček.', 'ikona': 'person_add'},
+    'asm_oz_prijemce':        {'kategorie': 'Modul Formuláře ASM', 'nazev': 'Nový OZ - Příjemce',  'popis': 'Chodí mu e-mail o novém formuláři OZ. Vidí celý přehled včetně příloh a exportu, needituje.', 'ikona': 'mark_email_read'},
+    'asm_oz_analytik':        {'kategorie': 'Modul Formuláře ASM', 'nazev': 'Nový OZ - Analytik',  'popis': 'Import XLSX, kontrola proti kartám (Dealer), editace všech záznamů a doplňování údajů.', 'ikona': 'analytics'},
 
     # Lupou na obchod — přístup ASM a vedoucích se NEUDĚLUJE právem. Odvozuje se:
     # ASM se páruje s uživatelem podle příjmení, vedoucí vidí ASM svého oddělení

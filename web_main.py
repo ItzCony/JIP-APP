@@ -40,6 +40,7 @@ _UPLOAD_PREFIXY = (
     '/faktury_exporty_soubory', '/znacky_foto', '/znacky_provoz_foto',
     '/kom_prilohy', '/spolvecer_prilohy', '/planogram_fotos', '/ukol_prilohy',
     '/projekt_prilohy', '/narozeniny_podpisy_static', '/sankce_prilohy',
+    '/asm_oz_prilohy',
 )
 _NEBEZPECNE_PRIPONY = (
     '.html', '.htm', '.xhtml', '.shtml', '.svg', '.xml', '.js', '.mjs',
@@ -170,6 +171,9 @@ if __name__ == "__main__":
     app.on_startup(intranet_spolvecer.inicializace_db)
 
     app.on_startup(lambda: asyncio.create_task(intranet_narozeniny.bg_narozeniny_emaily()))
+    # Evidence OZ — ranní přepočet „Aktivní OZ" + kontrola proti kartám.
+    import intranet_asm
+    app.on_startup(lambda: asyncio.create_task(intranet_asm.bg_oz_denni()))
     # Nahrané soubory jen pro přihlášené (viz intranet_static)
     intranet_static.chranene_soubory('/znacky_foto', 'znacky_foto')
     intranet_static.chranene_soubory(znacky_provoz.foto_route, znacky_provoz.foto_dir)
