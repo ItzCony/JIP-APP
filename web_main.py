@@ -39,11 +39,11 @@ _UPLOAD_PREFIXY = (
     '/prilohy_predpoptavky', '/tisk_nakup', '/prilohy_nakup', '/faktury_soubory',
     '/faktury_exporty_soubory', '/znacky_foto', '/znacky_provoz_foto',
     '/kom_prilohy', '/spolvecer_prilohy', '/planogram_fotos', '/ukol_prilohy',
-    '/projekt_prilohy', '/narozeniny_podpisy_static',
+    '/projekt_prilohy', '/narozeniny_podpisy_static', '/sankce_prilohy',
 )
 _NEBEZPECNE_PRIPONY = (
     '.html', '.htm', '.xhtml', '.shtml', '.svg', '.xml', '.js', '.mjs',
-    '.mht', '.mhtml', '.swf', '.htc',
+    '.mht', '.mhtml', '.swf', '.htc', '.eml',
 )
 
 

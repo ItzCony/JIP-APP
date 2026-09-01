@@ -31,6 +31,7 @@ import intranet_data
 import intranet_logger
 import intranet_notifikace
 import intranet_emaily
+import intranet_static
 from intranet_ui_utils import refreshable_na_klienta
 import datetime
 import hashlib
@@ -44,8 +45,27 @@ import tempfile
 import unicodedata
 import asyncio
 import zipfile
+import uuid
+import email
+import email.policy
+import email.utils
+from functools import lru_cache
 from collections import OrderedDict
 from html import escape as _esc
+
+# Přílohy diskuze k případu. Servírují se jen přihlášeným (intranet_static);
+# soubor na disku má jméno {uuid}{přípona} — originální název žije jen v DB,
+# takže nahraným jménem nejde vyskočit z adresáře ani přepsat cizí soubor.
+SANKCE_PRILOHY_DIR = 'sankce_prilohy'
+os.makedirs(SANKCE_PRILOHY_DIR, exist_ok=True)
+intranet_static.chranene_soubory('/sankce_prilohy', SANKCE_PRILOHY_DIR)
+
+# Whitelist přípon — kontroluje se na serveru, `accept` v prohlížeči je jen nápověda.
+PRILOHA_POVOLENE = ('.png', '.jpg', '.jpeg', '.pdf', '.xlsx', '.xls',
+                    '.docx', '.doc', '.eml')
+PRILOHA_MAX_BYTU = 15 * 1024 * 1024                  # 15 MB / soubor
+_PRILOHA_OBRAZKY = ('.png', '.jpg', '.jpeg')
+_PRILOHA_SIRKA = 'width:260px;max-width:100%'      # strop náhledu i karty v bublině
 
 # =========================================================
 # KONSTANTY
@@ -1177,6 +1197,15 @@ def inicializace_sankce_db():
         if cur.fetchone()[0] == 0:
             cur.execute("ALTER TABLE sankce_vystaveni ADD COLUMN nakupci_pob VARCHAR(120) "
                         "DEFAULT NULL AFTER hodn_sankce")
+        # Migrace: přílohy v diskuzi — jedna příloha = jedna zpráva, takže stačí
+        # dva sloupce v sankce_chat (indikátor 💬, nepřečtené i mazání beze změny).
+        for _sl, _def in (('soubor_nazev', 'VARCHAR(500) DEFAULT NULL'),
+                          ('soubor_cesta', 'VARCHAR(500) DEFAULT NULL')):
+            cur.execute("SELECT COUNT(*) FROM information_schema.COLUMNS "
+                        "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='sankce_chat' "
+                        "AND COLUMN_NAME=%s", (_sl,))
+            if cur.fetchone()[0] == 0:
+                cur.execute(f'ALTER TABLE sankce_chat ADD COLUMN {_sl} {_def}')
         # Migrace: stav „storno" zanikl — splynul s „nevyfakturovano" (Nevyfakturovat).
         cur.execute("UPDATE sankce_vystaveni SET stav='nevyfakturovano' WHERE stav='storno'")
         conn.commit()
@@ -1267,6 +1296,71 @@ def nacti_audit(tabulka, row_hash) -> list:
 # =========================================================
 # CHAT / DISKUZE K PŘÍPADU (per řádek, klíč tabulka+row_hash)
 # =========================================================
+def _uloz_prilohu(nazev: str, obsah: bytes) -> tuple[str, str]:
+    """Uloží nahraný soubor pod náhodným jménem. Vrací (původní název, cesta).
+
+    Validace na serveru (`accept` v prohlížeči jde obejít): whitelist přípon
+    + strop velikosti. Cokoli jiného skončí ValueError a nic se nezapíše.
+    """
+    nazev = os.path.basename(nazev or '').strip() or 'priloha'
+    ext = os.path.splitext(nazev)[1].lower()
+    if ext not in PRILOHA_POVOLENE:
+        raise ValueError(f'Nepovolený typ souboru „{ext or "bez přípony"}". '
+                         f'Povoleno: {", ".join(PRILOHA_POVOLENE)}')
+    if len(obsah) > PRILOHA_MAX_BYTU:
+        raise ValueError(f'Soubor je větší než {PRILOHA_MAX_BYTU // (1024 * 1024)} MB.')
+    if not obsah:
+        raise ValueError('Prázdný soubor.')
+    os.makedirs(SANKCE_PRILOHY_DIR, exist_ok=True)
+    cesta = os.path.join(SANKCE_PRILOHY_DIR, f'{uuid.uuid4()}{ext}')
+    with open(cesta, 'wb') as f:
+        f.write(obsah)
+    if ext == '.pdf':
+        _vytvor_pdf_nahled(cesta)
+    return nazev, cesta
+
+
+def _smaz_soubor_prilohy(cesta: str) -> None:
+    """Smaže soubor přílohy i jeho případný PDF náhled. Chyby jen zaloguje."""
+    for c in (cesta, cesta + '.nahled.png'):
+        try:
+            if c and os.path.isfile(c):
+                os.remove(c)
+        except Exception as e:
+            print(f'[sankce] _smaz_soubor_prilohy {c}: {e}')
+
+
+def _vytvor_pdf_nahled(cesta: str) -> None:
+    """Vyrenderuje první stránku PDF do `<cesta>.nahled.png` (PyMuPDF už je v projektu).
+    Selhání (rozbité/zaheslované PDF) není chyba — jen nebude náhled."""
+    try:
+        import pymupdf
+        with pymupdf.open(cesta) as doc:
+            if not doc.page_count:
+                return
+            doc.load_page(0).get_pixmap(dpi=60).save(cesta + '.nahled.png')
+    except Exception as e:
+        print(f'[sankce] náhled PDF selhal ({os.path.basename(cesta)}): {e}')
+
+
+@lru_cache(maxsize=256)
+def _eml_hlavicka(cesta: str) -> tuple:
+    """(Od, Předmět, Datum) z .eml. Soubory jsou neměnné (jméno = uuid), takže
+    se výsledek smí cachovat. Nečitelný soubor = prázdné hodnoty."""
+    try:
+        with open(cesta, 'rb') as f:
+            msg = email.message_from_binary_file(f, policy=email.policy.default)
+        dt = msg.get('Date')
+        try:
+            dt = email.utils.parsedate_to_datetime(dt).strftime('%d.%m.%Y %H:%M')
+        except Exception:
+            dt = str(dt or '')
+        return (str(msg.get('From') or ''), str(msg.get('Subject') or ''), dt)
+    except Exception as e:
+        print(f'[sankce] _eml_hlavicka {os.path.basename(cesta)}: {e}')
+        return ('', '', '')
+
+
 def _nacti_chat_zpravy(tabulka, row_hash) -> list:
     """Zprávy vlákna chronologicky (nejstarší nahoře)."""
     conn = intranet_data.get_db_connection()
@@ -1274,7 +1368,8 @@ def _nacti_chat_zpravy(tabulka, row_hash) -> list:
         return []
     try:
         cur = conn.cursor(dictionary=True)
-        cur.execute('SELECT id,user_id,jmeno,zprava,kdy FROM sankce_chat '
+        cur.execute('SELECT id,user_id,jmeno,zprava,kdy,soubor_nazev,soubor_cesta '
+                    'FROM sankce_chat '
                     'WHERE tabulka=%s AND row_hash=%s ORDER BY id ASC',
                     (tabulka, row_hash))
         return cur.fetchall()
@@ -1318,15 +1413,20 @@ def _oznac_precteno(tabulka, row_hash, user_id):
         conn.close()
 
 
-def _pridej_chat(tabulka, row_hash, user_id, jmeno, zprava) -> int:
-    """Vloží zprávu a rovnou ji autorovi označí jako přečtenou. Vrací id zprávy."""
+def _pridej_chat(tabulka, row_hash, user_id, jmeno, zprava,
+                 soubor_nazev=None, soubor_cesta=None) -> int:
+    """Vloží zprávu (volitelně s přílohou) a rovnou ji autorovi označí jako
+    přečtenou. Vrací id zprávy."""
     conn = intranet_data.get_db_connection()
     if not conn:
         return 0
     try:
         cur = conn.cursor()
-        cur.execute('INSERT INTO sankce_chat (tabulka,row_hash,user_id,jmeno,zprava) '
-                    'VALUES (%s,%s,%s,%s,%s)', (tabulka, row_hash, user_id, jmeno or '', zprava))
+        cur.execute('INSERT INTO sankce_chat '
+                    '(tabulka,row_hash,user_id,jmeno,zprava,soubor_nazev,soubor_cesta) '
+                    'VALUES (%s,%s,%s,%s,%s,%s,%s)',
+                    (tabulka, row_hash, user_id, jmeno or '', zprava,
+                     soubor_nazev, soubor_cesta))
         new_id = cur.lastrowid
         cur.execute('INSERT INTO sankce_chat_precteno (tabulka,row_hash,user_id,precteno_id) '
                     'VALUES (%s,%s,%s,%s) ON DUPLICATE KEY UPDATE precteno_id=VALUES(precteno_id)',
@@ -1352,6 +1452,10 @@ def _smaz_chat(tabulka, row_hash, msg_id, user_id, muze_mazat_vse=False) -> bool
         return False
     try:
         cur = conn.cursor()
+        cur.execute('SELECT soubor_cesta FROM sankce_chat WHERE id=%s AND tabulka=%s '
+                    'AND row_hash=%s', (msg_id, tabulka, row_hash))
+        _r = cur.fetchone()
+        cesta = _r[0] if _r else None
         if muze_mazat_vse:
             cur.execute('DELETE FROM sankce_chat WHERE id=%s AND tabulka=%s AND row_hash=%s',
                         (msg_id, tabulka, row_hash))
@@ -1360,6 +1464,8 @@ def _smaz_chat(tabulka, row_hash, msg_id, user_id, muze_mazat_vse=False) -> bool
                         'AND user_id=%s', (msg_id, tabulka, row_hash, user_id))
         smazano = cur.rowcount > 0
         conn.commit(); cur.close()
+        if smazano and cesta:
+            _smaz_soubor_prilohy(cesta)
         return smazano
     except Exception as e:
         print(f'[sankce] _smaz_chat error: {e}')
@@ -2812,6 +2918,7 @@ def _otevri_chat(tabulka, row_hash, popis, user_id, user_name, on_badge,
     _oznac_precteno(tabulka, row_hash, user_id)
     on_badge()
     stav = {'max_id': _chat_max_id(tabulka, row_hash)}
+    cekajici = []                      # [(nazev, cesta)] – vybrané, zatím neodeslané přílohy
 
     def _smaz(z):
         async def _potvrd():
@@ -2831,6 +2938,58 @@ def _otevri_chat(tabulka, row_hash, popis, user_id, user_name, on_badge,
                     ui.notify('Zprávu se nepodařilo smazat.', type='negative')
         return _potvrd
 
+    def _priloha(z, moje):
+        """Příloha v bublině: náhled (obrázek / 1. strana PDF / hlavička .eml)
+        + odkaz na stažení. U ostatních typů jen ikona a název.
+
+        Vše je zastropované na `_PRILOHA_SIRKA`; dlouhé řetězce (e-mailová adresa,
+        název souboru) se ořezávají inline stylem — samotný `truncate` nestačí,
+        flex položka se bez `min-width:0` roztáhne na obsah a přeteče bublinu.
+        Plná hodnota zůstává v tooltipu.
+        """
+        cesta = z['soubor_cesta']
+        nazev = z.get('soubor_nazev') or os.path.basename(cesta)
+        ext = os.path.splitext(cesta)[1].lower()
+        url = f'/{SANKCE_PRILOHY_DIR}/{os.path.basename(cesta)}'
+        barva = 'color:#dbeafe' if moje else 'color:#475569'
+        oriz = ('min-width:0;max-width:100%;overflow:hidden;'
+                'text-overflow:ellipsis;white-space:nowrap;')
+
+        def _radek(text, styl=''):
+            ui.label(text).classes('text-xs w-full').style(oriz + barva + ';' + styl) \
+                .tooltip(text)
+
+        with ui.column().classes('gap-1 mt-1').style(
+                f'{_PRILOHA_SIRKA};min-width:0;overflow:hidden'):
+            if ext in _PRILOHA_OBRAZKY:
+                ui.image(url).classes('rounded-lg cursor-pointer') \
+                    .style('width:100%;max-height:200px') \
+                    .on('click', lambda: ui.navigate.to(url, new_tab=True))
+            elif ext == '.pdf' and os.path.isfile(cesta + '.nahled.png'):
+                ui.image(url + '.nahled.png').classes('rounded-lg cursor-pointer bg-white') \
+                    .style('width:100%;max-height:200px;object-fit:contain') \
+                    .on('click', lambda: ui.navigate.to(url, new_tab=True))
+            elif ext == '.eml':
+                od, predmet, kdy_ = _eml_hlavicka(cesta)
+                if predmet or od:
+                    bg = ('background:rgba(255,255,255,.18)' if moje else 'background:#fff')
+                    with ui.column().classes('rounded-lg px-2 py-1 gap-0 w-full') \
+                            .style(f'{bg};min-width:0;overflow:hidden'):
+                        _radek(predmet or '(bez předmětu)', 'font-weight:600')
+                        if od:
+                            _radek(f'Od: {od}')
+                        if kdy_:
+                            _radek(kdy_)
+            ikona = {'.pdf': 'picture_as_pdf', '.eml': 'mail',
+                     '.xlsx': 'table_chart', '.xls': 'table_chart',
+                     '.docx': 'description', '.doc': 'description'}.get(ext, 'image')
+            with ui.row().classes('items-center gap-1 no-wrap w-full') \
+                    .style('min-width:0;overflow:hidden'):
+                ui.icon(ikona, size='1rem').style(barva + ';flex:none')
+                ui.link(nazev, url).classes('text-xs underline') \
+                    .style(oriz + barva + ';display:block;flex:1 1 auto') \
+                    .props('target=_blank').tooltip(nazev)
+
     def _bublina(z):
         moje = (z.get('user_id') == user_id)
         muze_smazat = moje or muze_mazat_vse
@@ -2847,8 +3006,11 @@ def _otevri_chat(tabulka, row_hash, popis, user_id, user_name, on_badge,
                     ui.label(z.get('jmeno') or '—').classes('text-xs font-semibold text-gray-600 px-1')
                 bg = 'background:#2563eb;color:#fff' if moje else 'background:#f1f5f9;color:#1e293b'
                 with ui.element('div').classes('rounded-2xl px-3 py-2').style(bg):
-                    ui.label(z.get('zprava') or '').classes('text-sm') \
-                        .style('white-space:pre-wrap;word-break:break-word')
+                    if (z.get('zprava') or '').strip():
+                        ui.label(z['zprava']).classes('text-sm') \
+                            .style('white-space:pre-wrap;word-break:break-word')
+                    if z.get('soubor_cesta'):
+                        _priloha(z, moje)
                 ui.label(cas_txt).classes('text-gray-400 px-1 ' + ('self-end' if moje else '')) \
                     .style('font-size:10px')
             if not moje and muze_smazat:
@@ -2890,25 +3052,84 @@ def _otevri_chat(tabulka, row_hash, popis, user_id, user_name, on_badge,
                 .props('outlined autogrow dense input-style=max-height:120px').classes('flex-1')
 
             async def _send():
+                """Odešle text a/nebo čekající přílohy. Jedna příloha = jedna zpráva
+                (tak je postavené schéma); text se přilepí k první z nich."""
                 txt = (inp.value or '').strip()
-                if not txt:
+                if not txt and not cekajici:
                     return
-                if _pridej_chat(tabulka, row_hash, user_id, user_name, txt):
-                    inp.value = ''
+                davka = list(cekajici)
+                cekajici.clear()
+                ulozeno = 0
+                if davka:
+                    for i, (nazev, cesta) in enumerate(davka):
+                        if _pridej_chat(tabulka, row_hash, user_id, user_name,
+                                        txt if i == 0 else '', nazev, cesta):
+                            ulozeno += 1
+                            intranet_logger.log_activity(
+                                user_name, 'Sankce',
+                                f'Příloha v chatu ({tabulka}) #{row_hash[:8]}: {nazev}')
+                        else:
+                            _smaz_soubor_prilohy(cesta)
+                elif _pridej_chat(tabulka, row_hash, user_id, user_name, txt):
+                    ulozeno = 1
                     intranet_logger.log_activity(user_name, 'Sankce',
                                                  f'Chat ({tabulka}) #{row_hash[:8]}')
-                    _vykresli(scroll=True)
-                    on_badge()
-                    # „cinkni" do zvonečku všem s právy na tuto sestavu (kromě autora)
-                    asyncio.create_task(asyncio.to_thread(
-                        _notifikuj_novy_komentar, tabulka, row_hash,
-                        user_id, user_name, popis, tuple(prava_navic or ())))
-                else:
+                if not ulozeno:
                     ui.notify('Zprávu se nepodařilo uložit.', type='negative')
+                    _vykresli_cekajici()
+                    return
+                inp.value = ''
+                _vykresli_cekajici()
+                _vykresli(scroll=True)
+                on_badge()
+                # „cinkni" do zvonečku všem s právy na tuto sestavu (kromě autora)
+                asyncio.create_task(asyncio.to_thread(
+                    _notifikuj_novy_komentar, tabulka, row_hash,
+                    user_id, user_name, popis, tuple(prava_navic or ())))
+
+            async def _nahraj(e):
+                """Soubor se uloží na disk hned (ať uživatel zná chybu typu/velikosti
+                okamžitě), ale do chatu jde až odesláním. Neodeslané se uklidí
+                při odebrání nebo při zavření okna."""
+                try:
+                    nazev, cesta = _uloz_prilohu(e.file.name, await e.file.read())
+                except ValueError as ex:
+                    ui.notify(str(ex), type='negative')
+                    return
+                except Exception as ex:
+                    ui.notify(f'Přílohu se nepodařilo uložit: {ex}', type='negative')
+                    return
+                cekajici.append((nazev, cesta))
+                upl.reset()
+                _vykresli_cekajici()
+
+            def _zahod(polozka):
+                if polozka in cekajici:
+                    cekajici.remove(polozka)
+                _smaz_soubor_prilohy(polozka[1])
+                _vykresli_cekajici()
 
             inp.on('keydown.ctrl.enter', _send)
             ui.button(icon='send', on_click=_send).props('round unelevated color=primary') \
                 .tooltip('Odeslat (Ctrl+Enter)')
+
+        # Fronta vybraných, dosud neodeslaných příloh
+        cekajici_box = ui.row().classes('w-full px-4 gap-1 items-center')
+
+        def _vykresli_cekajici():
+            cekajici_box.clear()
+            with cekajici_box:
+                for polozka in cekajici:
+                    ui.chip(polozka[0][:40], icon='attach_file', removable=True,
+                            on_value_change=lambda _, p=polozka: _zahod(p)) \
+                        .props('dense outline color=primary').tooltip(polozka[0])
+
+        with ui.row().classes('w-full px-4 pb-3'):
+            upl = ui.upload(label='Přidat přílohu (PNG, JPG, PDF, XLSX, DOCX, EML — max 15 MB)',
+                            on_upload=_nahraj, auto_upload=True, multiple=True,
+                            max_file_size=PRILOHA_MAX_BYTU) \
+                .props(f'accept="{",".join(PRILOHA_POVOLENE)}" flat dense color=blue-grey') \
+                .classes('w-full')
 
         _vykresli(scroll=True)
 
@@ -2928,7 +3149,12 @@ def _otevri_chat(tabulka, row_hash, popis, user_id, user_name, on_badge,
                 pass
         chat_timer = ui.timer(5.0, _tick)
         # po zavření okna polling zastav (jinak by běžel dál na pozadí)
-        dlg.on('hide', lambda: chat_timer.cancel())
+        def _zavri():
+            chat_timer.cancel()
+            for _, _c in cekajici:        # neodeslané přílohy neplní disk
+                _smaz_soubor_prilohy(_c)
+            cekajici.clear()
+        dlg.on('hide', _zavri)
     dlg.open()
 
 
