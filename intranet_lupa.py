@@ -707,6 +707,63 @@ def _kc(hodnota):
     return f'{hodnota:,.0f}'.replace(',', ' ') + ' Kč'
 
 
+def _uzavrene_key(rok):
+    return f'lupa_uzavrene_mesice_{rok}'
+
+
+def _stav_bunka_mesic(rok, mesic, uzavren, editable, user_name, refresh):
+    """Jedna měsíční dlaždice (zelená = uzavřené období k dispozici).
+    Stejné značení jako ve Výsledcích poboček. Klik přepne stav (vkladatel)."""
+    bg = '#16a34a' if uzavren else '#dc2626'
+    cls = 'flex items-center justify-center rounded text-white select-none'
+    if editable:
+        cls += ' cursor-pointer hover:opacity-80 transition-opacity'
+    box = ui.element('div').classes(cls).style(
+        f'width:46px;height:36px;background:{bg};font-size:13px;font-weight:700')
+    with box:
+        ui.label(('✓ ' if uzavren else '') + f'{mesic:02d}')
+    popis = ('Uzavřené období — data k dispozici' if uzavren else
+             ('Klikněte pro označení uzavřeného období' if editable
+              else 'Období zatím není uzavřené'))
+    box.props(f'title="{popis}"')
+    if editable:
+        def _toggle(_=None, m=mesic):
+            akt = set(app.storage.general.get(_uzavrene_key(rok)) or [])
+            akt.symmetric_difference_update({m})
+            app.storage.general[_uzavrene_key(rok)] = sorted(akt)
+            intranet_logger.log_activity(
+                user_name, 'Lupa',
+                f'Uzavřené období {rok}-{m:02d}: '
+                f'{"označeno" if m in akt else "zrušeno"}')
+            refresh()
+        box.on('click', _toggle)
+
+
+def _vykresli_uzavrene_mesice(user_name, editable):
+    """Panel nahraných (uzavřených) měsíců aktuálního roku."""
+    rok = datetime.datetime.now().year
+
+    @ui.refreshable
+    def panel():
+        uzavrene = set(app.storage.general.get(_uzavrene_key(rok)) or [])
+        with ui.card().classes('w-full p-4 mb-6 rounded-2xl border border-gray-100'):
+            with ui.row().classes('items-center gap-2 mb-1'):
+                ui.icon('event_available', color='primary')
+                ui.label(f'Nahraná data za rok {rok}') \
+                    .classes('text-lg font-bold text-gray-800')
+            ui.label('🟢 zelené = uzavřené období k dispozici · 🔴 zatím nenahráno') \
+                .classes('text-xs text-gray-500 mb-2')
+            if not editable:
+                ui.label('Označuje ten, kdo nahrává obraty.') \
+                    .classes('text-xs text-gray-400 mb-2')
+            with ui.row().classes('items-center gap-1.5 flex-wrap'):
+                for m in range(1, 13):
+                    _stav_bunka_mesic(rok, m, m in uzavrene, editable,
+                                      user_name, panel.refresh)
+
+    panel()
+
+
 def vykresli_lupa(user_id, user_name, vsechna_prava):
     inicializace_db()
     stav_klic = f'lupa_pohled_{user_id}'
@@ -732,7 +789,9 @@ def vykresli_lupa(user_id, user_name, vsechna_prava):
 
         ui.label('🔍 Lupou na obchod').classes('text-3xl font-bold text-gray-800 mb-1')
         ui.label('Obratová analytika ASM, obchodních zástupců a zákazníků.') \
-            .classes('text-gray-500 mb-6')
+            .classes('text-gray-500 mb-4')
+
+        _vykresli_uzavrene_mesice(user_name, je_vkladatel(vsechna_prava))
 
         souhrny = _nacti_souhrny(moje)
         if not souhrny and not je_vkladatel(vsechna_prava):
@@ -1464,7 +1523,10 @@ def _popis_filtru(filtr, zakaznici_volby):
 
 def _pdf_html(asm, rows, total, popis_filtru, uzivatel, rozpad=False):
     e = html.escape
-    cols = _COLS_SOUHRN_ROZPAD if rozpad else _COLS_SOUHRN
+    # Rozpad po produktech = široká tabulka → adresa zákazníka se do PDF nevejde
+    cols = ([c for c in _COLS_SOUHRN_ROZPAD
+             if c[1] not in ('k_jmeno', 'k_ulice', 'k_mesto')]
+            if rozpad else _COLS_SOUHRN)
     des = {'int': 0, 'num': 1, 'money': 2}
     hlavicky = ''.join(f'<th>{e(n)}</th>' for n, _f, _t, _w in cols)
     textovych = sum(1 for _n, _f, t, _w in cols if t == 'text')
@@ -2015,15 +2077,18 @@ def _vykresli_odberatele(asm, user_id, user_name, vsechna_prava):
     chk_rozpad.on_value_change(_bez_klienta(prepni_rozpad))
 
 
-def _graf_zaklad(nadpis, legenda_vpravo=False):
+def _graf_zaklad(nadpis, legenda_vpravo=False, podnadpis=''):
+    # Podnadpis říká, co je na osách a co je série — bez něj se graf luští.
+    posun = 18 if podnadpis else 0
     return {
-        'title': {'text': nadpis, 'left': 'center', 'top': 6,
-                  'textStyle': {'fontSize': 14}},
+        'title': {'text': nadpis, 'subtext': podnadpis, 'left': 'center', 'top': 6,
+                  'textStyle': {'fontSize': 14},
+                  'subtextStyle': {'fontSize': 11, 'color': '#6B7280'}},
         'tooltip': {'trigger': 'axis'},
-        'legend': ({'type': 'scroll', 'orient': 'vertical', 'right': 0, 'top': 40,
-                    'bottom': 20} if legenda_vpravo else
-                   {'type': 'scroll', 'top': 30}),
-        'grid': {'top': 70 if not legenda_vpravo else 40, 'left': 80,
+        'legend': ({'type': 'scroll', 'orient': 'vertical', 'right': 0,
+                    'top': 40 + posun, 'bottom': 20} if legenda_vpravo else
+                   {'type': 'scroll', 'top': 30 + posun}),
+        'grid': {'top': (70 if not legenda_vpravo else 40) + posun, 'left': 80,
                  'right': 220 if legenda_vpravo else 24, 'bottom': 40},
         'yAxis': {'type': 'value'},
     }
@@ -2033,7 +2098,9 @@ def _graf_yoy_option(radky_mesice):
     """Osa X = měsíc 1–12, série = rok. Meziroční srovnání na první pohled."""
     kc = {r['klic']: r['kc'] for r in radky_mesice}
     roky = sorted({k // 100 for k in kc})
-    opt = _graf_zaklad('Obrat ASM po měsících (Kč bez DPH, meziroční srovnání)')
+    opt = _graf_zaklad(
+        'Obrat ASM po měsících (Kč bez DPH, meziroční srovnání)',
+        podnadpis='Sloupec = měsíc, barva = rok. Stejný měsíc vedle sebe rok po roce.')
     opt['xAxis'] = {'type': 'category', 'data': _MESICE_KR}
     opt['series'] = [{
         'name': str(rok), 'type': 'bar', 'emphasis': {'focus': 'series'},
@@ -2044,9 +2111,9 @@ def _graf_yoy_option(radky_mesice):
     return opt
 
 
-def _graf_rada_option(nadpis, mesice, serie):
+def _graf_rada_option(nadpis, mesice, serie, podnadpis=''):
     """Chronologická spojnice přes zvolené období; série = OZ nebo zákazník."""
-    opt = _graf_zaklad(nadpis, legenda_vpravo=True)
+    opt = _graf_zaklad(nadpis, legenda_vpravo=True, podnadpis=podnadpis)
     opt['xAxis'] = {'type': 'category', 'data': [_mesic_txt(m) for m in mesice]}
     opt['series'] = [{
         'name': s['name'], 'type': 'line', 'smooth': True, 'connectNulls': True,
@@ -2061,10 +2128,12 @@ def _graf_rada_option(nadpis, mesice, serie):
 def _graf_polozky_option(produkty, n=15):
     """Vodorovné sloupce — názvy produktů se na osu X nevejdou."""
     top = list(reversed(produkty[:n]))
-    opt = _graf_zaklad(f'TOP {len(top)} položek podle obratu (Kč bez DPH)')
+    opt = _graf_zaklad(
+        f'TOP {len(top)} položek podle obratu (Kč bez DPH)',
+        podnadpis='Nejsilnější produkt nahoře, součet za celé zvolené období.')
     opt['legend'] = {'show': False}
     opt['tooltip'] = {'trigger': 'axis', 'axis': 'shadow'}
-    opt['grid'] = {'top': 40, 'left': 240, 'right': 40, 'bottom': 30}
+    opt['grid'] = {'top': 62, 'left': 240, 'right': 40, 'bottom': 30}
     opt['xAxis'] = {'type': 'value'}
     opt['yAxis'] = {'type': 'category',
                     'data': [(p['nazev'] or p['kod'])[:38] for p in top],
@@ -2229,7 +2298,9 @@ def _vykresli_obraty(asm, user_id, user_name, vsechna_prava):
                     'Obrat OZ v čase (Kč bez DPH)', data['mesice'],
                     [{'name': d['dealer_jmeno'],
                       'data': [round(d['rada'].get(m, 0.0), 2) for m in data['mesice']]}
-                     for d in data['oz']])).classes('w-full').style('height: 360px')
+                     for d in data['oz']],
+                    podnadpis='Čára = jeden obchodní zástupce, měsíc po měsíci '
+                              'za zvolené období.')).classes('w-full').style('height: 360px')
                 _grid({
                     'columnDefs': [
                         {'headerName': 'OZ', 'field': 'dealer', 'width': 110},
@@ -2252,7 +2323,9 @@ def _vykresli_obraty(asm, user_id, user_name, vsechna_prava):
             with ui.card().classes('w-full shadow-sm rounded-xl mb-3'):
                 ui.echart(_graf_rada_option(
                     f'Vývoj obratů — TOP {len(data["zak_serie"])} zákazníků',
-                    data['mesice'], data['zak_serie'])) \
+                    data['mesice'], data['zak_serie'],
+                    podnadpis='Čára = jeden zákazník s největším obratem, '
+                              'měsíc po měsíci. Klik v legendě čáru skryje.')) \
                     .classes('w-full').style('height: 380px')
 
             with ui.card().classes('w-full shadow-sm rounded-xl'):
