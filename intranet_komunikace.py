@@ -231,14 +231,137 @@ def _notify_members(skupina_id, text, vyjimka_id=None):
             return
         placeholders = ','.join(['%s'] * len(emails))
         cur.execute(f"SELECT iduser FROM user WHERE LOWER(email) IN ({placeholders})", emails)
+        vyjimky = (vyjimka_id if isinstance(vyjimka_id, (set, frozenset, list, tuple))
+                   else {vyjimka_id})
         for (uid,) in cur.fetchall():
-            if uid != vyjimka_id:
+            if uid not in vyjimky:
                 intranet_notifikace.pridej(uid, text, 'info')
     except Exception as e:
         print(f'[Komunikace] notify_members: {e}')
     finally:
         if cur:  cur.close()
         if conn: conn.close()
+
+
+MENTION_MAX = 40          # max. délka rozepsaného jména za „@"
+MENTION_NABIDKA = 8      # kolik jmen ukázat v nabídce
+
+
+def _mention_dotaz(hodnota):
+    """Rozepsaný text za posledním „@" (None = uživatel právě @ nepíše)."""
+    i = (hodnota or '').rfind('@')
+    if i < 0:
+        return None
+    chunk = hodnota[i + 1:]
+    if len(chunk) > MENTION_MAX or '\n' in chunk or chunk.endswith(' '):
+        return None
+    return chunk.strip()
+
+
+def najdi_mentions(text, kandidati):
+    """Vrátí uid kandidátů, jejichž „@Jméno Příjmení" se vyskytuje v textu."""
+    # ponytail: prosté hledání podřetězce, stačí na desítky členů místnosti;
+    # „@Jan Novák" je i podřetězcem „@Jan Nováková" — dvojí notifikace je levnější
+    # než tokenizace jmen.
+    t = (text or '').lower()
+    if '@' not in t:
+        return set()
+    return {k['uid'] for k in kandidati if '@' + k['jmeno'].lower() in t}
+
+
+def ziskej_kandidaty_mention(skupina_id, je_verejna):
+    """Lidé, které lze v místnosti označit přes @ — ve veřejné místnosti všichni
+    aktivní uživatelé, jinak jen členové místnosti."""
+    vsichni = intranet_data.ziskej_vsechny_uzivatele()
+    povolene = None if je_verejna else {e.lower() for e in ziskej_clenove(skupina_id)}
+    kandidati = [
+        {'uid': u['id'], 'jmeno': u['jmeno_cele'].strip(), 'email': email}
+        for email, u in vsichni.items()
+        if u.get('aktivni') and (u.get('jmeno_cele') or '').strip()
+        and (povolene is None or email.lower() in povolene)
+    ]
+    kandidati.sort(key=lambda k: k['jmeno'].lower())
+    return kandidati
+
+
+def _notify_mentions(text, skupina_id, je_verejna, nazev, autor_jmeno, autor_id):
+    """Pošle zvoneček každému @označenému člověku místnosti. Vrací set uid."""
+    if '@' not in (text or ''):
+        return set()
+    oznaceni = najdi_mentions(text, ziskej_kandidaty_mention(skupina_id, je_verejna))
+    oznaceni.discard(autor_id)
+    nahled = text[:80] + ('…' if len(text) > 80 else '')
+    for uid in oznaceni:
+        intranet_notifikace.pridej(
+            uid, f'🔔 {autor_jmeno} vás označil/a v místnosti „{nazev}": {nahled}', 'warning')
+    return oznaceni
+
+
+MENTION_TRIDA = 'jip-mention-open'   # třída, podle které JS pozná otevřenou nabídku
+# Šipky/Enter/Tab/Esc si bereme (a rušíme jejich výchozí chování) jen když nabídka
+# opravdu visí v DOM — jinak klávesa projde do pole jako obvykle.
+MENTION_JS_V_MENU = ('(e) => { if (document.querySelector(".%s"))'
+                     ' { e.preventDefault(); emit(); } }' % MENTION_TRIDA)
+MENTION_JS_MIMO = ('(e) => { if (!document.querySelector(".%s")) emit(); }' % MENTION_TRIDA)
+
+
+def _pripoj_mention(vstup, kandidati):
+    """Napojí na textové pole nabídku členů místnosti, která vyskočí po „@".
+    V nabídce se chodí šipkami, potvrzuje Enterem/Tabem, zavírá Escapem."""
+    if not kandidati:
+        return
+    with vstup:
+        menu = ui.menu().props('no-focus no-refocus no-parent-event') \
+                        .classes(f'{MENTION_TRIDA} max-h-96 overflow-y-auto')
+    stav = {'shoda': [], 'idx': 0}
+
+    def _vloz(k):
+        hodnota = vstup.value or ''
+        i = hodnota.rfind('@')
+        if i < 0:
+            return
+        vstup.set_value(hodnota[:i] + '@' + k['jmeno'] + ' ')
+        _zavri()
+
+    def _zavri():
+        stav['shoda'] = []
+        menu.close()
+
+    def _vykresli():
+        menu.clear()
+        with menu:
+            for i, k in enumerate(stav['shoda']):
+                polozka = ui.menu_item(k['jmeno'], on_click=lambda _k=k: _vloz(_k))
+                if i == stav['idx']:
+                    polozka.classes('bg-blue-50 text-blue-700 font-bold')
+        menu.open()
+
+    def _obnov():
+        dotaz = _mention_dotaz(vstup.value)
+        stav['shoda'] = ([k for k in kandidati if dotaz.lower() in k['jmeno'].lower()]
+                         [:MENTION_NABIDKA] if dotaz is not None else [])
+        stav['idx'] = 0
+        if not stav['shoda']:
+            _zavri()
+            return
+        _vykresli()
+
+    def _posun(o):
+        if not stav['shoda']:
+            return
+        stav['idx'] = (stav['idx'] + o) % len(stav['shoda'])
+        _vykresli()
+
+    def _potvrd():
+        if stav['shoda']:
+            _vloz(stav['shoda'][stav['idx']])
+
+    vstup.on_value_change(lambda _: _obnov())
+    vstup.on('keydown.down', lambda e: _posun(1), js_handler=MENTION_JS_V_MENU)
+    vstup.on('keydown.up', lambda e: _posun(-1), js_handler=MENTION_JS_V_MENU)
+    vstup.on('keydown.enter', lambda e: _potvrd(), js_handler=MENTION_JS_V_MENU)
+    vstup.on('keydown.tab', lambda e: _potvrd(), js_handler=MENTION_JS_V_MENU)
+    vstup.on('keydown.esc', lambda e: _zavri(), js_handler=MENTION_JS_V_MENU)
 
 
 def _fmt_datum(dt):
@@ -813,12 +936,14 @@ def pridej_prispevek(skupina_id, text, autor_id, autor_jmeno):
             VALUES (%s, %s, %s, %s, %s)
         """, (prispevek_id, skupina_id, autor_id, autor_jmeno, text))
         conn.commit()
+        oznaceni = _notify_mentions(text, skupina_id, sk['je_verejna'],
+                                    sk['nazev'], autor_jmeno, autor_id)
         if not sk['je_verejna']:
             nahled = text[:80] + ('…' if len(text) > 80 else '')
             _notify_members(
                 skupina_id,
                 f'📌 Nový příspěvek v místnosti „{sk["nazev"]}" od {autor_jmeno}: {nahled}',
-                vyjimka_id=autor_id)
+                vyjimka_id={autor_id} | oznaceni)
         return prispevek_id
     except Exception as e:
         print(f'[Komunikace] pridej_prispevek: {e}')
@@ -840,7 +965,8 @@ def pridej_komentar(prispevek_id, skupina_id, text, autor_id, autor_jmeno):
         cur = conn.cursor(dictionary=True)
         cur.execute("SELECT autor_id, autor_jmeno FROM kom_prispevky WHERE id = %s", (prispevek_id,))
         prispevek = cur.fetchone()
-        cur.execute("SELECT nazev, archivovano FROM kom_skupiny WHERE id = %s", (skupina_id,))
+        cur.execute("SELECT nazev, archivovano, je_verejna FROM kom_skupiny WHERE id = %s",
+                    (skupina_id,))
         sk = cur.fetchone()
         if not prispevek or (sk and sk['archivovano']):
             return False
@@ -850,7 +976,9 @@ def pridej_komentar(prispevek_id, skupina_id, text, autor_id, autor_jmeno):
             VALUES (%s, %s, %s, %s, %s)
         """, (komentar_id, prispevek_id, autor_id, autor_jmeno, text))
         conn.commit()
-        if prispevek['autor_id'] != autor_id:
+        oznaceni = (_notify_mentions(text, skupina_id, sk['je_verejna'],
+                                     sk['nazev'], autor_jmeno, autor_id) if sk else set())
+        if prispevek['autor_id'] != autor_id and prispevek['autor_id'] not in oznaceni:
             nazev_sk = sk['nazev'] if sk else '?'
             nahled = text[:60] + ('…' if len(text) > 60 else '')
             intranet_notifikace.pridej(
@@ -1467,6 +1595,8 @@ async def _vykresli_telo(user_id, user_name, vsechna_prava, muj_refresh):
 
         clenove = await asyncio.to_thread(ziskej_clenove, sid_aktivni)
         is_verejna = bool(sk['je_verejna'])
+        kandidati_mention = await asyncio.to_thread(
+            ziskej_kandidaty_mention, sid_aktivni, is_verejna)
         je_archiv = bool(sk.get('archivovano'))
         muze_spravovat = muze_schvalovat or sk['vytvoril_id'] == user_id
         je_clen = (is_verejna
@@ -1714,8 +1844,10 @@ async def _vykresli_telo(user_id, user_name, vsechna_prava, muj_refresh):
 
                                                     with ui.row().classes('w-full gap-2 items-center'):
                                                         _refs['ki'] = ui.input(
-                                                            placeholder='Přidat komentář… (Enter odešle)') \
+                                                            placeholder='Přidat komentář… '
+                                                                        '(@ označí člena, Enter odešle)') \
                                                             .classes('flex-1').props('outlined dense')
+                                                        _pripoj_mention(_refs['ki'], kandidati_mention)
 
                                                         async def _nahrat_prilohu(e, _p=_pending,
                                                                                   _lbl=lbl_priloha):
@@ -1752,7 +1884,8 @@ async def _vykresli_telo(user_id, user_name, vsechna_prava, muj_refresh):
 
                                                         _refs['ki'].on(
                                                             'keydown.enter',
-                                                            lambda e, fn=_odesli_kom: fn())
+                                                            lambda e, fn=_odesli_kom: fn(),
+                                                            js_handler=MENTION_JS_MIMO)
                                                         _upl = ui.upload(
                                                             auto_upload=True,
                                                             on_upload=_nahrat_prilohu,
@@ -1782,8 +1915,10 @@ async def _vykresli_telo(user_id, user_name, vsechna_prava, muj_refresh):
                         with ui.row().classes('w-full items-end gap-3 px-5 py-4 bg-white '
                                               'border-t border-gray-200 shadow-lg flex-shrink-0'):
                             post_in = ui.textarea(
-                                placeholder='Napište příspěvek na nástěnku… (Ctrl+Enter odešle)') \
+                                placeholder='Napište příspěvek na nástěnku… '
+                                            '(@ označí člena, Ctrl+Enter odešle)') \
                                 .classes('flex-1').props('outlined rows=2 auto-grow')
+                            _pripoj_mention(post_in, kandidati_mention)
 
                             def _odesli_post():
                                 v = (post_in.value or '').strip()

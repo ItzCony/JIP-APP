@@ -108,7 +108,7 @@ ZAKLADNI_PRAVA = {
     'sankce_analytik': {'kategorie': 'Modul Sankce', 'nazev': 'Analytik (import)', 'popis': 'Importuje list DATA do obou sestav (Zamítnuté dodávky i Sankce k vystavení) a nastavuje/zamyká výchozí filtr období pro všechny.', 'ikona': 'upload_file'},
     'sankce_ucetni':   {'kategorie': 'Modul Sankce', 'nazev': 'Účtárna (Sankce k vystavení)', 'popis': 'Vidí sestavu „Sankce k vystavení", mění stav řádků (nevyfakturováno / rozpracováno / vyfakturováno) a píše poznámky. Každá změna se zaznamenává (očičko).', 'ikona': 'receipt_long'},
     'sankce_nakup':    {'kategorie': 'Modul Sankce', 'nazev': 'Nákup (Zamítnuté dodávky)', 'popis': 'Vidí sestavu „Zamítnuté dodávky dodavatelem" a může u řádků psát poznámky. Každá změna se zaznamenává (očičko).', 'ikona': 'shopping_cart'},
-    'sankce_ctenar':   {'kategorie': 'Modul Sankce', 'nazev': 'Čtenář (obě sestavy)', 'popis': 'Vidí obě sestavy (Zamítnuté dodávky i Sankce k vystavení) pouze pro čtení – může filtrovat, řadit, exportovat a psát do diskuze (bublina 💬). Nemůže editovat buňky, importovat ani mazat data.', 'ikona': 'visibility'},
+    'sankce_ctenar':   {'kategorie': 'Modul Sankce', 'nazev': 'Čtenář (všechny sestavy)', 'popis': 'Vidí sestavy Zamítnuté dodávky, Sankce k vystavení i Nedodávky pouze pro čtení – může filtrovat, řadit, exportovat a psát do diskuze (bublina 💬). Nemůže editovat buňky, importovat ani mazat data.', 'ikona': 'visibility'},
 
     # Tikety (workflow „předáno na nákup / provoz") — podskupiny, ať se seznam práv nezaplevelí.
     'sankce_tiket_provoz':    {'kategorie': 'Modul Sankce', 'podskupina': 'Tikety', 'nazev': 'Tiket: Provoz', 'popis': 'Dostává tikety předané na provoz a rozhoduje u nich Fakturovat / Stornovat.', 'ikona': 'engineering'},
@@ -125,6 +125,7 @@ ZAKLADNI_PRAVA = {
     'sankce_tiket_up': {'kategorie': 'Modul Sankce', 'podskupina': 'Nákupčí (tikety)', 'nazev': 'Tiket: nákupčí UP', 'popis': 'Vidí a řeší tikety sankcí s kódem nákupčího UP.', 'ikona': 'assignment_ind'},
     'sankce_tiket_ko': {'kategorie': 'Modul Sankce', 'podskupina': 'Nákupčí (tikety)', 'nazev': 'Tiket: nákupčí KO', 'popis': 'Vidí a řeší tikety sankcí s kódem nákupčího KO.', 'ikona': 'assignment_ind'},
     'sankce_tiket_ml': {'kategorie': 'Modul Sankce', 'podskupina': 'Nákupčí (tikety)', 'nazev': 'Tiket: nákupčí ML', 'popis': 'Vidí a řeší tikety sankcí s kódem nákupčího ML.', 'ikona': 'assignment_ind'},
+    'sankce_tiket_mr': {'kategorie': 'Modul Sankce', 'podskupina': 'Nákupčí (tikety)', 'nazev': 'Tiket: nákupčí MR', 'popis': 'Vidí a řeší tikety sankcí s kódem nákupčího MR.', 'ikona': 'assignment_ind'},
     'sankce_tiket_oz': {'kategorie': 'Modul Sankce', 'podskupina': 'Nákupčí (tikety)', 'nazev': 'Tiket: nákupčí OZ', 'popis': 'Vidí a řeší tikety sankcí s kódem nákupčího OZ.', 'ikona': 'assignment_ind'},
     'sankce_tiket_vn': {'kategorie': 'Modul Sankce', 'podskupina': 'Nákupčí (tikety)', 'nazev': 'Tiket: nákupčí VN (vedoucí nákupu)', 'popis': 'Vidí a řeší tikety sankcí s kódem nákupčího VN.', 'ikona': 'assignment_ind'},
 
@@ -168,6 +169,7 @@ ZAKLADNI_PRAVA = {
     'asm_oz_zadatel':         {'kategorie': 'Modul Formuláře ASM', 'nazev': 'Nový OZ - Žadatel',   'popis': 'Zakládá formulář „Nový OZ / Změna OZ". Vidí a doplňuje jen záznamy svých poboček.', 'ikona': 'person_add'},
     'asm_oz_prijemce':        {'kategorie': 'Modul Formuláře ASM', 'nazev': 'Nový OZ - Příjemce',  'popis': 'Chodí mu e-mail o novém formuláři OZ. Vidí celý přehled včetně příloh a exportu, needituje.', 'ikona': 'mark_email_read'},
     'asm_oz_analytik':        {'kategorie': 'Modul Formuláře ASM', 'nazev': 'Nový OZ - Analytik',  'popis': 'Import XLSX, kontrola proti kartám (Dealer), editace všech záznamů a doplňování údajů.', 'ikona': 'analytics'},
+    'asm_navyseni_office':    {'kategorie': 'Modul Formuláře ASM', 'nazev': 'Navýšení položek - Office obchod', 'popis': 'Vidí celou frontu formuláře „Navýšení položek v cenotvorbě“, případy zpracovává, vrací k opravě nebo postupuje správci, uzavírá. Chodí mu e-mail o novém případu. Žádosti zakládá běžný Žadatel, schvaluje je Správce obchod — právo Office obchod na tuto frontu NEVIDÍ.', 'ikona': 'task_alt'},
 
     # Lupou na obchod — přístup ASM a vedoucích se NEUDĚLUJE právem. Odvozuje se:
     # ASM se páruje s uživatelem podle příjmení, vedoucí vidí ASM svého oddělení

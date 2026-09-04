@@ -14,6 +14,7 @@ import asyncio
 import datetime
 import html
 import io
+import math
 import os
 import re
 import tempfile
@@ -957,6 +958,16 @@ def _volby_dodavatelu():
         "WHERE dodavatel <> '' ORDER BY dodavatel") if r[0]]
 
 
+def _volby_oz(asm):
+    """{'635': '635 · Jméno'} — kód zkrácený na 3 znaky, varianty 635A/635D
+    sloučené pod jeden klíč. Jméno bereme první ze skupiny, stejně jako grafy."""
+    return {
+        r[0]: f'{r[0]} · {r[1]}' if r[1] else r[0]
+        for r in _dotaz('SELECT LEFT(dealer, 3), MIN(jmeno) FROM lupa_dealer '
+                        'WHERE asm=%s GROUP BY LEFT(dealer, 3) ORDER BY 1', (asm,))
+    }
+
+
 def _filtr_sql(asm, filtr, produkt_uz_pripojen=False):
     """WHERE pro `lupa_obrat o`. Vrací (sql, params, je_potreba_join_produktu)."""
     kde, par = ['o.asm = %s'], [asm]
@@ -971,6 +982,12 @@ def _filtr_sql(asm, filtr, produkt_uz_pripojen=False):
     if ica:
         kde.append('o.ico IN (%s)' % ','.join(['%s'] * len(ica)))
         par += ica
+    oz = [d for d in (filtr.get('oz') or []) if d]
+    if oz:
+        # ponytail: LEFT() obchází idx_dealer, ale filtr na ASM scan zúží dost.
+        # Až bude pomalé: OR o.dealer LIKE '635%' přes prefixy.
+        kde.append('LEFT(o.dealer, 3) IN (%s)' % ','.join(['%s'] * len(oz)))
+        par += oz
     dod = [d for d in (filtr.get('dodavatel') or []) if d]
     if dod:
         kde.append('p.dodavatel IN (%s)' % ','.join(['%s'] * len(dod)))
@@ -1052,18 +1069,36 @@ def _mesic_txt(klic):
 
 def _rada_dealeru(asm, filtr):
     """Obrat po měsících × OZ. Jeden dotaz pokrývá i celkovou řadu ASM —
-    součet přes OZ je totéž a šetří druhý průchod tabulkou."""
+    součet přes OZ je totéž a šetří druhý průchod tabulkou.
+
+    Kód OZ zkrácen na první 3 znaky — varianty 635A-PLUS / 635D-PLUS
+    se sloučí pod jedno 635. Jméno = abecedně první ze skupiny."""
     kde, par, join_p = _filtr_sql(asm, filtr)
     jp = 'JOIN lupa_produkt p ON p.kod = o.kod' if join_p else ''
     return _dotaz(f"""
-        SELECT o.rok, o.mesic, o.dealer,
-               COALESCE(d.jmeno, o.dealer) AS dealer_jmeno,
+        SELECT o.rok, o.mesic, LEFT(o.dealer, 3) AS dealer,
+               MIN(COALESCE(d.jmeno, o.dealer)) AS dealer_jmeno,
                SUM(o.obrat_mj) AS mj, SUM(o.obrat_kc) AS kc
         FROM lupa_obrat o {jp}
         LEFT JOIN lupa_dealer d ON d.dealer = o.dealer
         WHERE {kde}
-        GROUP BY o.rok, o.mesic, o.dealer, COALESCE(d.jmeno, o.dealer)
+        GROUP BY o.rok, o.mesic, LEFT(o.dealer, 3)
         ORDER BY o.rok, o.mesic
+    """, par, slovnik=True)
+
+
+def _pokryti_oz(asm, filtr):
+    """Zákazníků a položek na OZ za celé období. Vlastní dotaz schválně: přidat
+    OZ do řady zákazníků by řádky rozmnožilo na zákazník × OZ × měsíc."""
+    kde, par, join_p = _filtr_sql(asm, filtr)
+    jp = 'JOIN lupa_produkt p ON p.kod = o.kod' if join_p else ''
+    return _dotaz(f"""
+        SELECT LEFT(o.dealer, 3) AS dealer,
+               COUNT(DISTINCT o.ico) AS zakazniku,
+               COUNT(DISTINCT o.kod) AS polozek
+        FROM lupa_obrat o {jp}
+        WHERE {kde}
+        GROUP BY LEFT(o.dealer, 3)
     """, par, slovnik=True)
 
 
@@ -1127,10 +1162,11 @@ def _propady(zak, mesice, prah_pct, prah_kc, okno=_PROPAD_OKNO):
 
 
 def _obraty_prehled(asm, filtr, prah_pct, prah_kc):
-    """Vše pro záložku obratů: 3 dotazy, zbytek dopočet nad načtenými řádky."""
+    """Vše pro záložku obratů: 4 dotazy, zbytek dopočet nad načtenými řádky."""
     dealeri = _rada_dealeru(asm, filtr)
     zakaznici = _rada_zakazniku(asm, filtr)
     produkty = _top_produkty(asm, filtr)
+    pokryti = {r['dealer']: r for r in _pokryti_oz(asm, filtr)}
 
     mes_kc, mes_mj = {}, {}
     oz = {}
@@ -1160,16 +1196,23 @@ def _obraty_prehled(asm, filtr, prah_pct, prah_kc):
     radky_mesice = [{'klic': k, 'mesic': _mesic_txt(k), 'kc': mes_kc[k],
                      'mj': mes_mj.get(k, 0.0),
                      'zakazniku': len(mes_zak.get(k, ()))} for k in mesice]
-    oz_radky = sorted(oz.values(), key=lambda d: d['kc'], reverse=True)
-    for d in oz_radky:
-        d['podil'] = d['kc'] / celkem_kc * 100.0 if celkem_kc else 0.0
-
-    top_zak = sorted(zak.items(), key=lambda p: p[1]['celkem'], reverse=True)
-    top_zak = top_zak[:_TOP_ZAK_GRAF]
-
     posl = mesice[-1] if mesice else None
     predch = mesice[-2] if len(mesice) > 1 else None
     lonske = (posl - 100) if posl else None
+
+    oz_radky = sorted(oz.values(), key=lambda d: d['kc'], reverse=True)
+    for d in oz_radky:
+        d['podil'] = d['kc'] / celkem_kc * 100.0 if celkem_kc else 0.0
+        p = pokryti.get(d['dealer'], {})
+        d['zakazniku'] = p.get('zakazniku', 0)
+        d['polozek'] = p.get('polozek', 0)
+        d['posl_kc'] = d['rada'].get(posl, 0.0)
+        d['mom'] = _zmena_pct(d['rada'].get(posl), d['rada'].get(predch))
+        d['yoy'] = _zmena_pct(d['rada'].get(posl), d['rada'].get(lonske))
+        d['prumer_kc'] = d['kc'] / len(mesice) if mesice else 0.0
+
+    top_zak = sorted(zak.items(), key=lambda p: p[1]['celkem'], reverse=True)
+    top_zak = top_zak[:_TOP_ZAK_GRAF]
     return {
         'mesice': mesice,
         'radky_mesice': radky_mesice,
@@ -1280,6 +1323,12 @@ _COLS_OZ = [
     ('Obrat v MJ', 'mj', 'num', 14),
     ('Obrat v Kč bez DPH', 'kc', 'money', 20),
     ('Podíl %', 'podil', 'num', 10),
+    ('Zákazníků', 'zakazniku', 'int', 12),
+    ('Položek', 'polozek', 'int', 10),
+    ('Průměr / měsíc Kč', 'prumer_kc', 'money', 18),
+    ('Poslední měsíc Kč', 'posl_kc', 'money', 18),
+    ('MoM %', 'mom', 'num', 10),
+    ('YoY %', 'yoy', 'num', 10),
 ]
 
 _COLS_PROPADY = [
@@ -1499,6 +1548,7 @@ _PDF_CSS = """
   .lupa-doc table.t tr.celkem td { background:#eef2ff; font-weight:bold;
         border-top:2px solid #3730A3; }
   .lupa-doc .pozn { margin-top:14px; font-size:9px; color:#6b7280; }
+  .lupa-doc .graf { margin:12px 0 2px; page-break-inside:avoid; break-inside:avoid; }
 </style>
 """
 
@@ -1512,6 +1562,10 @@ def _popis_filtru(filtr, zakaznici_volby):
         jmena = [zakaznici_volby.get(i, i) for i in ica[:5]]
         casti.append('Zákazníci: ' + ', '.join(jmena)
                      + (f' (+{len(ica) - 5} dalších)' if len(ica) > 5 else ''))
+    oz = filtr.get('oz') or []
+    if oz:
+        casti.append('OZ: ' + ', '.join(oz[:8])
+                     + (f' (+{len(oz) - 8} dalších)' if len(oz) > 8 else ''))
     dod = filtr.get('dodavatel') or []
     if dod:
         casti.append('Dodavatelé: ' + ', '.join(dod[:5])
@@ -1590,6 +1644,152 @@ def _pdf_tabulka(nadpis, cols, rows, limit=60):
             + ''.join(telo) + '</tbody></table>' + vic)
 
 
+# ── Grafy do PDF ───────────────────────────────────────────────────────────
+# Kreslíme SVG ručně v Pythonu. Grafy v UI dělá ECharts (JS) a tiskové
+# Chromium by na doběhnutí skriptu muselo čekat — render vrací PDF po `load`,
+# takže by graf vyšel prázdný. Tři typy grafů ručně jsou levnější než
+# přestavovat sdílenou tiskárnu na čekání a vozit do PDF 1 MB JS knihovny.
+_SVG_W = 720            # 190 mm sazby při 96 dpi
+_SVG_POLE = 210         # výška kreslicí plochy
+
+
+def _svg_txt(x, y, text, velikost=10, barva='#374151', kotva='middle', tucne=False):
+    return (f'<text x="{x:.1f}" y="{y:.1f}" font-size="{velikost}" fill="{barva}" '
+            f'text-anchor="{kotva}"{" font-weight=\"600\"" if tucne else ""}>'
+            f'{html.escape(str(text))}</text>')
+
+
+def _svg_kroky(maxv, n=4):
+    """Popisky osy Y v hezkých krocích (1/2/2,5/5 × 10^k), ne v 137 429."""
+    if not maxv or maxv <= 0:
+        return [0.0, 1.0]
+    hrubo = maxv / n
+    exp = 10 ** math.floor(math.log10(hrubo))
+    krok = next(m * exp for m in (1, 2, 2.5, 5, 10) if m * exp >= hrubo)
+    return [i * krok for i in range(int(maxv / krok) + 2)]
+
+
+def _svg_obal(vyska, telo):
+    return (f'<div class="graf"><svg viewBox="0 0 {_SVG_W} {vyska:.0f}" width="100%" '
+            f'xmlns="http://www.w3.org/2000/svg" font-family="Arial, sans-serif">'
+            f'{telo}</svg></div>')
+
+
+def _svg_graf(nadpis, podnadpis, popisky_x, serie, typ='line', pozn=''):
+    """Spojnice nebo skupinové sloupce; série = rok / OZ / zákazník."""
+    if not popisky_x or not serie:
+        return f'<h2>{html.escape(nadpis)}</h2><div class="filtr">Žádná data.</div>'
+    x0, x1 = 84, _SVG_W - 14
+    y0 = 46 if podnadpis else 32
+    y1 = y0 + _SVG_POLE
+    hodnoty = [v for s in serie for v in s['data'] if v is not None]
+    kroky = _svg_kroky(max(hodnoty) if hodnoty else 0)
+    vrchol = kroky[-1] or 1
+    o = [_svg_txt(_SVG_W / 2, 18, nadpis, 13, '#312e81', tucne=True)]
+    if podnadpis:
+        o.append(_svg_txt(_SVG_W / 2, 33, podnadpis, 10, '#6b7280'))
+    for k in kroky:
+        y = y1 - (k / vrchol) * _SVG_POLE
+        o.append(f'<line x1="{x0}" y1="{y:.1f}" x2="{x1}" y2="{y:.1f}" '
+                 f'stroke="#e5e7eb" stroke-width="1"/>')
+        o.append(_svg_txt(x0 - 6, y + 3.5, _cz(k, 0), 9, '#6b7280', 'end'))
+    krok_x = (x1 - x0) / len(popisky_x)
+    kazdy = max(1, -(-len(popisky_x) // 14))   # popisky ředíme, ať se nepřekrývají
+    for i, p in enumerate(popisky_x):
+        if i % kazdy == 0:
+            o.append(_svg_txt(x0 + (i + 0.5) * krok_x, y1 + 14, p, 9, '#6b7280'))
+    for si, s in enumerate(serie):
+        barva = _GRAF_PALETA[si % len(_GRAF_PALETA)]
+        if typ == 'bar':
+            sirka = max(1.2, krok_x * 0.74 / len(serie))
+            for i, v in enumerate(s['data']):
+                if not v or v <= 0:
+                    continue
+                x = x0 + (i + 0.5) * krok_x - len(serie) * sirka / 2 + si * sirka
+                y = y1 - (v / vrchol) * _SVG_POLE
+                o.append(f'<rect x="{x:.1f}" y="{y:.1f}" width="{sirka:.1f}" '
+                         f'height="{max(0.0, y1 - y):.1f}" fill="{barva}"/>')
+        else:
+            body = [(x0 + (i + 0.5) * krok_x, y1 - (v / vrchol) * _SVG_POLE)
+                    for i, v in enumerate(s['data']) if v is not None]
+            if not body:
+                continue
+            o.append(f'<polyline fill="none" stroke="{barva}" stroke-width="1.6" '
+                     'points="' + ' '.join(f'{x:.1f},{y:.1f}' for x, y in body) + '"/>')
+            o += [f'<circle cx="{x:.1f}" cy="{y:.1f}" r="1.7" fill="{barva}"/>'
+                  for x, y in body]
+    # Legenda pod osu; delší jména lámeme do dalšího řádku
+    y_leg, x_leg = y1 + 32, x0
+    for si, s in enumerate(serie):
+        jmeno = str(s['name'])[:28]
+        sirka_p = 22 + len(jmeno) * 5.2
+        if x_leg + sirka_p > x1 and x_leg > x0:
+            x_leg, y_leg = x0, y_leg + 14
+        o.append(f'<rect x="{x_leg:.1f}" y="{y_leg - 8}" width="9" height="9" '
+                 f'fill="{_GRAF_PALETA[si % len(_GRAF_PALETA)]}"/>')
+        o.append(_svg_txt(x_leg + 13, y_leg, jmeno, 9, '#374151', 'start'))
+        x_leg += sirka_p
+    if pozn:
+        y_leg += 14
+        o.append(_svg_txt(x0, y_leg, pozn, 9, '#6b7280', 'start'))
+    return _svg_obal(y_leg + 8, ''.join(o))
+
+
+def _svg_graf_polozky(produkty, n=15):
+    """Vodorovné sloupce — názvy produktů se na osu X nevejdou."""
+    top = [p for p in produkty[:n] if float(p['kc'] or 0) > 0]
+    if not top:
+        return ''
+    x0, x1, y0 = 250, _SVG_W - 70, 46
+    radek = 18
+    maxv = max(float(p['kc'] or 0) for p in top)
+    o = [_svg_txt(_SVG_W / 2, 18, f'TOP {len(top)} položek podle obratu (Kč bez DPH)',
+                  13, '#312e81', tucne=True),
+         _svg_txt(_SVG_W / 2, 33, 'Nejsilnější produkt nahoře, součet za celé '
+                                  'zvolené období.', 10, '#6b7280')]
+    for i, p in enumerate(top):
+        y = y0 + i * radek
+        v = float(p['kc'] or 0)
+        sirka = (v / maxv) * (x1 - x0)
+        o.append(_svg_txt(x0 - 6, y + 10, (p['nazev'] or p['kod'] or '')[:40],
+                          9, '#374151', 'end'))
+        o.append(f'<rect x="{x0}" y="{y + 2:.1f}" width="{sirka:.1f}" height="12" '
+                 f'fill="#4338CA"/>')
+        o.append(_svg_txt(x0 + sirka + 5, y + 12, _cz(v, 0), 9, '#374151', 'start'))
+    return _svg_obal(y0 + len(top) * radek + 8, ''.join(o))
+
+
+def _pdf_grafy(data, max_serii=10):
+    """Grafy z karty Obraty ve stejném pořadí jako v UI."""
+    mesice = data['mesice']
+    oz = data['oz'][:max_serii]
+    pozn_oz = (f'Zobrazeno {len(oz)} OZ s největším obratem z {len(data["oz"])} '
+               '— úplný přehled je v tabulce.') if len(data['oz']) > len(oz) else ''
+    return (
+        _svg_graf('Obrat ASM po měsících (Kč bez DPH, meziroční srovnání)',
+                  'Sloupec = měsíc, barva = rok.', _MESICE_KR,
+                  _serie_yoy(data['radky_mesice']), typ='bar')
+        + _svg_graf('Obrat OZ v čase (Kč bez DPH)',
+                    'Čára = jeden obchodní zástupce, měsíc po měsíci.',
+                    [_mesic_txt(m) for m in mesice],
+                    [{'name': d['dealer_jmeno'],
+                      'data': [round(d['rada'].get(m, 0.0), 2) for m in mesice]}
+                     for d in oz], pozn=pozn_oz)
+        + _svg_graf(f'Vývoj obratů — TOP {len(data["zak_serie"])} zákazníků',
+                    'Čára = jeden zákazník s největším obratem.',
+                    [_mesic_txt(m) for m in mesice], data['zak_serie'])
+        + _svg_graf_polozky(data['produkty'])
+    )
+
+
+def _serie_yoy(radky_mesice):
+    """Osa X = měsíc 1–12, série = rok (týž rozpad jako `_graf_yoy_option`)."""
+    kc = {r['klic']: r['kc'] for r in radky_mesice}
+    return [{'name': str(rok),
+             'data': [kc.get(rok * 100 + m) for m in range(1, 13)]}
+            for rok in sorted({k // 100 for k in kc})]
+
+
 def _pdf_obraty_html(asm, data, popis_filtru, uzivatel):
     e = html.escape
     k = data['kpi']
@@ -1614,6 +1814,7 @@ def _pdf_obraty_html(asm, data, popis_filtru, uzivatel):
         + _pdf_tabulka('Výsledky OZ', _COLS_OZ, data['oz'], 40)
         + _pdf_tabulka('Propady zákazníků', _COLS_PROPADY, data['propady'])
         + _pdf_tabulka('TOP odebrané položky', _COLS_POLOZKY, data['produkty'])
+        + _pdf_grafy(data)
         + '<div class="pozn">Obraty bez DPH. Poslední měsíc může být neúplný, '
         'pokud import proběhl v jeho průběhu. Zdrojem pravdy zůstává GIST.</div>'
         '</div></body></html>'
@@ -1800,6 +2001,13 @@ def _fmt_js(desetin):
     )
 
 
+_STYL_ZMENA = (
+    "function(p){"
+    "var n=parseFloat(p.value);if(isNaN(n))return null;"
+    "return {color: n<0 ? '#b91c1c' : '#15803d'};}"
+)
+
+
 _GRID_ZAKLAD = {
     'defaultColDef': {'resizable': True, 'sortable': True, 'wrapHeaderText': True,
                       'autoHeaderHeight': True},
@@ -1838,6 +2046,7 @@ def _vykresli_odberatele(asm, user_id, user_name, vsechna_prava):
     obdobi = _volby_obdobi(asm)
     zak_volby = _volby_zakazniku(asm)
     dod_volby = _volby_dodavatelu()
+    oz_volby = _volby_oz(asm)
 
     stav = {'rows': [], 'total': {}, 'filtr': {}, 'popis': ''}
 
@@ -1860,6 +2069,11 @@ def _vykresli_odberatele(asm, user_id, user_name, vsechna_prava):
             .props('dense outlined options-dense use-chips').style('min-width: 340px') \
             .tooltip('Prázdné = všichni zákazníci ASM. Pište jméno nebo IČO.')
         _pole_ica(sel_zak, zak_volby)
+        sel_oz = ui.select(
+            oz_volby, label='OZ', multiple=True, with_input=True, clearable=True,
+            value=[o for o in (ulozeny.get('oz') or []) if o in oz_volby]) \
+            .props('dense outlined options-dense use-chips').style('min-width: 240px') \
+            .tooltip('Prázdné = všichni OZ. Varianty 635A/635D jsou pod kódem 635.')
         sel_dod = ui.select(
             dod_volby, label='Dodavatelé', multiple=True, with_input=True, clearable=True,
             value=[d for d in (ulozeny.get('dodavatel') or []) if d in dod_volby]) \
@@ -1874,7 +2088,8 @@ def _vykresli_odberatele(asm, user_id, user_name, vsechna_prava):
 
     def _soucasny_filtr():
         return {'od': sel_od.value, 'do': sel_do.value,
-                'ico': list(sel_zak.value or []), 'dodavatel': list(sel_dod.value or []),
+                'ico': list(sel_zak.value or []), 'oz': list(sel_oz.value or []),
+                'dodavatel': list(sel_dod.value or []),
                 'rozpad': bool(chk_rozpad.value)}
 
     with ui.row().classes('w-full items-center gap-3 mb-3 flex-wrap'):
@@ -2153,6 +2368,7 @@ def _vykresli_obraty(asm, user_id, user_name, vsechna_prava):
     obdobi = _volby_obdobi(asm)
     zak_volby = _volby_zakazniku(asm)
     dod_volby = _volby_dodavatelu()
+    oz_volby = _volby_oz(asm)
 
     stav = {'data': None, 'filtr': {}, 'popis': ''}
 
@@ -2175,6 +2391,11 @@ def _vykresli_obraty(asm, user_id, user_name, vsechna_prava):
             .props('dense outlined options-dense use-chips').style('min-width: 340px') \
             .tooltip('Prázdné = všichni zákazníci ASM. Pište jméno nebo IČO.')
         _pole_ica(sel_zak, zak_volby)
+        sel_oz = ui.select(
+            oz_volby, label='OZ', multiple=True, with_input=True, clearable=True,
+            value=[o for o in (ulozeny.get('oz') or []) if o in oz_volby]) \
+            .props('dense outlined options-dense use-chips').style('min-width: 240px') \
+            .tooltip('Prázdné = všichni OZ. Varianty 635A/635D jsou pod kódem 635.')
         sel_dod = ui.select(
             dod_volby, label='Dodavatelé', multiple=True, with_input=True, clearable=True,
             value=[d for d in (ulozeny.get('dodavatel') or []) if d in dod_volby]) \
@@ -2191,7 +2412,8 @@ def _vykresli_obraty(asm, user_id, user_name, vsechna_prava):
 
     def _soucasny_filtr():
         return {'od': sel_od.value, 'do': sel_do.value,
-                'ico': list(sel_zak.value or []), 'dodavatel': list(sel_dod.value or [])}
+                'ico': list(sel_zak.value or []), 'oz': list(sel_oz.value or []),
+                'dodavatel': list(sel_dod.value or [])}
 
     with ui.row().classes('w-full items-center gap-3 mb-3 flex-wrap'):
         btn_nacti = ui.button('Načíst', icon='insights').props('unelevated color=indigo-7')
@@ -2312,13 +2534,31 @@ def _vykresli_obraty(asm, user_id, user_name, vsechna_prava):
                          'type': 'numericColumn', ':valueFormatter': _fmt_js(2)},
                         {'headerName': 'Podíl %', 'field': 'podil', 'width': 110,
                          'type': 'numericColumn', ':valueFormatter': _fmt_js(1)},
+                        {'headerName': 'Zákazníků', 'field': 'zakazniku', 'width': 120,
+                         'type': 'numericColumn', ':valueFormatter': _fmt_js(0)},
+                        {'headerName': 'Položek', 'field': 'polozek', 'width': 110,
+                         'type': 'numericColumn', ':valueFormatter': _fmt_js(0)},
+                        {'headerName': 'Průměr / měsíc Kč', 'field': 'prumer_kc',
+                         'width': 150, 'type': 'numericColumn',
+                         ':valueFormatter': _fmt_js(2)},
+                        {'headerName': 'Poslední měsíc Kč', 'field': 'posl_kc',
+                         'width': 150, 'type': 'numericColumn',
+                         ':valueFormatter': _fmt_js(2)},
+                        {'headerName': 'MoM %', 'field': 'mom', 'width': 110,
+                         'type': 'numericColumn', ':valueFormatter': _fmt_js(1),
+                         ':cellStyle': _STYL_ZMENA},
+                        {'headerName': 'YoY %', 'field': 'yoy', 'width': 110,
+                         'type': 'numericColumn', ':valueFormatter': _fmt_js(1),
+                         ':cellStyle': _STYL_ZMENA},
                     ],
                     'rowData': data['oz'],
                     'pinnedBottomRowData': [{
                         'dealer_jmeno': f"CELKEM {len(data['oz'])} OZ",
-                        'mj': k['celkem_mj'], 'kc': k['celkem_kc'], 'podil': 100.0}],
+                        'mj': k['celkem_mj'], 'kc': k['celkem_kc'], 'podil': 100.0,
+                        'zakazniku': k['zakazniku'], 'posl_kc': k['posl_kc'],
+                        'mom': k['mom'], 'yoy': k['yoy']}],
                     **_GRID_ZAKLAD,
-                }).classes('w-full mt-2').style('height: 260px')
+                }).classes('w-full mt-2').style('height: 300px')
 
             with ui.card().classes('w-full shadow-sm rounded-xl mb-3'):
                 ui.echart(_graf_rada_option(
@@ -2408,7 +2648,8 @@ def _vykresli_obraty(asm, user_id, user_name, vsechna_prava):
                  {'mesic': 'CELKEM', 'mj': k['celkem_mj'], 'kc': k['celkem_kc']}),
                 ('OZ', _COLS_OZ, data['oz'],
                  {'dealer_jmeno': f"CELKEM {len(data['oz'])} OZ",
-                  'mj': k['celkem_mj'], 'kc': k['celkem_kc'], 'podil': 100.0}),
+                  'mj': k['celkem_mj'], 'kc': k['celkem_kc'], 'podil': 100.0,
+                  'posl_kc': k['posl_kc'], 'mom': k['mom'], 'yoy': k['yoy']}),
                 ('Propady', _COLS_PROPADY, data['propady'],
                  {'jmeno': f"CELKEM {len(data['propady'])} zákazníků",
                   'rozdil': sum(p['rozdil'] for p in data['propady'])}),

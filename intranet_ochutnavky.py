@@ -1412,6 +1412,10 @@ def vykresli_ochutnavky(user_id, user_name, vsechna_prava):
             ui.label(f'{obdobi_text(a["datum_od"], a["datum_do"])}  ·  '
                      f'{DIVIZE.get(a["divize"], a["divize"])}') \
                 .classes('text-sm text-gray-500')
+            if a.get('autor_jmeno') or a.get('vytvoreno'):
+                ui.label('Zadal/a: ' + ' · '.join(x for x in (
+                    a.get('autor_jmeno'), _fmt_dt(a.get('vytvoreno'))) if x)) \
+                    .classes('text-xs text-gray-400')
             if a.get('popis'):
                 ui.label(a['popis']).classes('text-sm text-gray-700 whitespace-pre-wrap')
             with ui.row().classes('gap-4 flex-wrap'):
@@ -1578,6 +1582,10 @@ def vykresli_ochutnavky(user_id, user_name, vsechna_prava):
                     DIVIZE.get(a['divize'], a['divize']),
                     a.get('dodavatel'), a.get('sortiment')) if x)
                 ui.label(detaily).classes('text-xs text-gray-500 truncate')
+                if a.get('autor_jmeno') or a.get('vytvoreno'):
+                    ui.label('Zadal/a: ' + ' · '.join(x for x in (
+                        a.get('autor_jmeno'), _fmt_dt(a.get('vytvoreno'))) if x)) \
+                        .classes('text-xs text-gray-400 truncate')
             if zobraz_pobocky:
                 with ui.row().classes('gap-1 flex-wrap max-w-md justify-end'):
                     for p in a['pobocky'][:6]:
