@@ -101,6 +101,18 @@ _SEKCE_IDENT_LIMITY = ("1. Obecné informace a identifikace", _SEKCE_IDENT_POLE 
     ("smlouva_zajisteni", "Smlouva se zajištěním / ručením",  "select", ["ANO", "NE"]),
 ])
 
+# Sekce 1 pro „Navýšení položek v cenotvorbě" — místo slité adresy místa dodání
+# se zobrazují 4 samostatná K.* pole (dodací) z Kontaktních údajů VO.
+_SEKCE_IDENT_NAVYSENI = ("1. Obecné informace a identifikace", [
+    ("ico",        "IČO zákazníka",              "ico"),
+    ("pobocka",    "Pobočka (Město)",            "auto"),
+    ("fakt_nazev", "Fakturační název zákazníka", "auto"),
+    ("k_jmeno",    "K.Jméno",                    "auto"),
+    ("k_ulice",    "K.Ulice",                    "auto"),
+    ("k_mesto",    "K.Město",                    "auto"),
+    ("k_psc",      "K.PSČ",                      "auto"),
+])
+
 _FORMULARE = {
     "limity": {
         "nazev": "Navýšení limitů a splatností", "emoji": "💳", "barva": "border-amber-200",
@@ -140,6 +152,19 @@ _FORMULARE = {
                 ("navrh_splatnost1", "Návrh nové splatnosti 1 (zboží) [ve dnech]",    "text"),
                 ("navrh_splatnost2", "Návrh nové splatnosti 2 (cigarety) [ve dnech]", "text"),
                 ("zduvodneni",       "Zdůvodnění požadované změny / žádosti",         "textarea"),
+            ]),
+        ],
+    },
+    "navyseni": {
+        "nazev": "Navýšení položek v cenotvorbě", "emoji": "🧾", "barva": "border-violet-200",
+        "sekce": [
+            _SEKCE_IDENT_NAVYSENI,
+            ("2. Původní stav", [
+                ("akt_pocet_polozek", "Aktuální počet položek", "number"),
+            ]),
+            ("3. Žádost o navýšení", [
+                ("navrh_pocet_polozek", "Navýšení počtu položek na", "number"),
+                ("zduvodneni",          "Zdůvodnění žádosti",       "textarea"),
             ]),
         ],
     },
@@ -204,6 +229,7 @@ def _ico_auto_hodnoty(k, o=None, maskovat_obrat=False):
     sestaví auto pole formulářů (sekce 1 i ekonomické ukazatele sekce 3).
     maskovat_obrat=True → obrat nad 2 mil. Kč se žadateli zamaskuje („> 2 mil. Kč")."""
     out = {"pobocka": "", "fakt_nazev": "", "provozovna": "", "adresa": "",
+           "k_jmeno": "", "k_ulice": "", "k_mesto": "", "k_psc": "",
            "akt_limit": "", "splatnost1_akt": "", "splatnost2_akt": "",
            "obrat_1m": "", "obrat_3m": ""}
     if k:
@@ -225,6 +251,11 @@ def _ico_auto_hodnoty(k, o=None, maskovat_obrat=False):
             "fakt_nazev":     k.get("jmeno") or "",
             "provozovna":     provozovna,
             "adresa":         adresa,
+            # K.* (dodací) jako samostatná pole — formulář „navyseni".
+            "k_jmeno":        k.get("k_jmeno") or "",
+            "k_ulice":        k.get("k_ulice") or "",
+            "k_mesto":        k.get("k_mesto") or "",
+            "k_psc":          k.get("k_psc") or "",
             "akt_limit":      _cislo_cz(k.get("limit_salda")),
             "splatnost1_akt": _cislo_cz(spl1),
             "splatnost2_akt": _cislo_cz(spl2),
@@ -233,6 +264,21 @@ def _ico_auto_hodnoty(k, o=None, maskovat_obrat=False):
         out["obrat_1m"] = _obrat_zobraz(o.get("obrat_1m"), maskovat_obrat)
         out["obrat_3m"] = _obrat_zobraz(o.get("obrat_3m"), maskovat_obrat)
     return out
+
+
+def _chyba_cisel(formular, data):
+    """Kontrola polí typu „number“ — povinná, celé nezáporné číslo.
+    Vrací text chyby, nebo None když je vše v pořádku."""
+    for spec in _formular_pole(formular):
+        key, label, typ = spec[0], spec[1], spec[2]
+        if typ != "number":
+            continue
+        v = str(data.get(key) or "").strip().replace(" ", "").replace("\u00a0", "")
+        if not v:
+            return f"Vyplňte „{label}“."
+        if not v.isdigit():
+            return f"„{label}“ musí být celé číslo."
+    return None
 
 
 def _formular_pole(formular):
@@ -246,15 +292,34 @@ def _formular_pole(formular):
 # ============================================================================
 # Práva / viditelnost
 # ============================================================================
-def _je_spravce(p):
+# Formuláře s vlastní sadou práv: (žadatel, office, správce). Hodnota None =
+# platí globální role modulu. Dnes je u „navyseni" oddělený jen Office —
+# žadatelem je běžný asm_zadatel (vč. dědění) a správcem běžný asm_spravce
+# (vč. varianty bez e-mailů), takže globální Office obchod na frontu navýšení
+# NEVIDÍ a naopak asm_navyseni_office nevidí ostatní formuláře.
+_PRAVA_FORMULARE = {
+    "navyseni": (None, "asm_navyseni_office", None),
+}
+
+
+def _je_spravce(p, formular=None):
+    r = _PRAVA_FORMULARE.get(formular)
+    if r and r[2] is not None:
+        return "vse" in p or r[2] in p
     return ("vse" in p or "asm_spravce" in p or "asm_spravce_bez_emailu" in p)
 
 
-def _je_office(p):
+def _je_office(p, formular=None):
+    r = _PRAVA_FORMULARE.get(formular)
+    if r:
+        return _je_spravce(p, formular) or (_je_office(p) if r[1] is None else r[1] in p)
     return _je_spravce(p) or "asm_office" in p
 
 
-def _je_zadatel(p):
+def _je_zadatel(p, formular=None):
+    r = _PRAVA_FORMULARE.get(formular)
+    if r:
+        return _je_office(p, formular) or (_je_zadatel(p) if r[0] is None else r[0] in p)
     return _je_spravce(p) or _je_office(p) or "asm_zadatel" in p
 
 
@@ -263,14 +328,15 @@ def _vidi_import(p):
     return _je_spravce(p) or "asm_vkladatel" in p
 
 
-def _vidi_vsechny_pripady(p):
+def _vidi_vsechny_pripady(p, formular=None):
     """Office/správce vidí celou frontu; žadatel jen své případy."""
-    return _je_spravce(p) or "asm_office" in p
+    return _je_office(p, formular)
 
 
 def _ma_pristup(p):
     """Brána modulu — má uživatel přístup k dlaždici „Formuláře ASM"?"""
-    return (_je_zadatel(p) or _vidi_import(p))
+    return (_je_zadatel(p) or _vidi_import(p)
+            or any(_je_zadatel(p, f) for f in _PRAVA_FORMULARE))
 
 
 # ============================================================================
@@ -417,6 +483,7 @@ def inicializace_asm_db():
                 nova_provize VARCHAR(40),
                 oz2 VARCHAR(120),
                 datum_od VARCHAR(20), datum_do VARCHAR(20),
+                cislo_novy_oz VARCHAR(40), jmeno_novy_oz VARCHAR(255),
                 INDEX idx_pripad (pripad_id)
             ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
         """)
@@ -500,7 +567,8 @@ def inicializace_asm_db():
                 cur.execute(f"ALTER TABLE asm_radky CHANGE COLUMN {_novy} {_stary} {_typ}")
             elif not _ma_sloupec("asm_radky", _stary):
                 cur.execute(f"ALTER TABLE asm_radky ADD COLUMN {_stary} {_typ}")
-        for _col, _typ in (("k_jmeno", "VARCHAR(255)"), ("k_jmeno2", "VARCHAR(255)")):
+        for _col, _typ in (("k_jmeno", "VARCHAR(255)"), ("k_jmeno2", "VARCHAR(255)"),
+                           ("cislo_novy_oz", "VARCHAR(40)"), ("jmeno_novy_oz", "VARCHAR(255)")):
             if not _ma_sloupec("asm_radky", _col):
                 cur.execute(f"ALTER TABLE asm_radky ADD COLUMN {_col} {_typ}")
         # Migrace: log importu — sloupce pro obraty (GIST)
@@ -1261,13 +1329,15 @@ def _emaily_s_pravy(*role_keys):
     return list(dict.fromkeys(intranet_data.ziskej_emaily_s_pravem(*klice)))
 
 
-def _emaily_office():
-    return _emaily_s_pravy("asm_office")
+def _emaily_office(formular=None):
+    r = _PRAVA_FORMULARE.get(formular)
+    return _emaily_s_pravy((r[1] if r else None) or "asm_office")
 
 
-def _emaily_spravce():
+def _emaily_spravce(formular=None):
     # Varianta `asm_spravce_bez_emailu` se ZÁMĚRNĚ nezahrnuje do příjemců.
-    return _emaily_s_pravy("asm_spravce")
+    r = _PRAVA_FORMULARE.get(formular)
+    return _emaily_s_pravy((r[2] if r else None) or "asm_spravce")
 
 
 def _app_url():
@@ -1504,13 +1574,16 @@ def zaloz_pripad(hlavicka, radky, user_id, user_name):
                     (str(r.get("oz2") or ""))[:120],
                     (str(r.get("datum_od") or ""))[:20],
                     (str(r.get("datum_do") or ""))[:20],
+                    (str(r.get("cislo_novy_oz") or ""))[:40],
+                    (str(r.get("jmeno_novy_oz") or ""))[:255],
                 ))
             cur.executemany("""
                 INSERT INTO asm_radky
                     (pripad_id, poradi, ico, jmeno, k_jmeno, k_jmeno2, k_ulice,
                      k_mesto, k_psc, dealer, id_kontakt, prodejni_doba,
-                     puvodni_provize, nova_provize, oz2, datum_od, datum_do)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                     puvodni_provize, nova_provize, oz2, datum_od, datum_do,
+                     cislo_novy_oz, jmeno_novy_oz)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             """, data)
         conn.commit()
         cur.close()
@@ -1533,7 +1606,7 @@ def nacti_pripady(user_id, prava, formular="oz_zmena"):
     try:
         cur = conn.cursor(dictionary=True)
         kde = "COALESCE(formular,'oz_zmena')=%s"
-        if _vidi_vsechny_pripady(prava):
+        if _vidi_vsechny_pripady(prava, formular):
             cur.execute(f"SELECT * FROM asm_pripady WHERE {kde} ORDER BY id DESC", (formular,))
         else:
             cur.execute(f"SELECT * FROM asm_pripady WHERE {kde} AND zadavatel_id=%s "
@@ -1641,7 +1714,8 @@ def uloz_radky(pid, radky):
                 UPDATE asm_radky SET
                     ico=%s, jmeno=%s, k_jmeno=%s, k_jmeno2=%s, k_ulice=%s, k_mesto=%s,
                     k_psc=%s, dealer=%s, id_kontakt=%s, prodejni_doba=%s,
-                    puvodni_provize=%s, nova_provize=%s, oz2=%s, datum_od=%s, datum_do=%s
+                    puvodni_provize=%s, nova_provize=%s, oz2=%s, datum_od=%s, datum_do=%s,
+                    cislo_novy_oz=%s, jmeno_novy_oz=%s
                 WHERE id=%s AND pripad_id=%s
             """, (
                 (str(r.get("ico") or ""))[:40], _str(r.get("jmeno")), _str(r.get("k_jmeno")),
@@ -1650,6 +1724,7 @@ def uloz_radky(pid, radky):
                 _str(r.get("prodejni_doba"), 120), (str(r.get("puvodni_provize") or ""))[:10],
                 (str(r.get("nova_provize") or ""))[:40], (str(r.get("oz2") or ""))[:120],
                 (str(r.get("datum_od") or ""))[:20], (str(r.get("datum_do") or ""))[:20],
+                (str(r.get("cislo_novy_oz") or ""))[:40], _str(r.get("jmeno_novy_oz")),
                 rid, pid,
             ))
         cur.execute("UPDATE asm_pripady SET pocet_radku=("
@@ -3482,6 +3557,8 @@ async def _vykresli_asm(user_id, user_name, vsechna_prava):
         pohled = None
     if pohled in ("zmena", "limity", "dodaci") and not _je_zadatel(vsechna_prava):
         pohled = None
+    if pohled in _PRAVA_FORMULARE and not _je_zadatel(vsechna_prava, pohled):
+        pohled = None
     if pohled == "schuzky" and not _vidi_schuzky(vsechna_prava):
         pohled = None
     if pohled == "novy_oz" and not _vidi_oz(vsechna_prava):
@@ -3490,10 +3567,10 @@ async def _vykresli_asm(user_id, user_name, vsechna_prava):
     # Deep-link z e-mailu (/asm?pripad=<id>): přepni na správnou frontu a otevři detail,
     # aby se posuzovatel neproklikával. Zpracuje se jen jednou (pop).
     deep_pid = app.storage.user.pop("asm_deep_pripad", None)
-    if deep_pid and _je_zadatel(vsechna_prava):
+    if deep_pid:
         dp = await asyncio.to_thread(nacti_pripad, deep_pid)
-        if dp:
-            _f = dp.get("formular") or "oz_zmena"
+        _f = (dp or {}).get("formular") or "oz_zmena"
+        if dp and _je_zadatel(vsechna_prava, _f if _f in _PRAVA_FORMULARE else None):
             pohled = "zmena" if _f == "oz_zmena" else _f
             app.storage.user["asm_pohled"] = pohled
             ui.timer(0.25, lambda pid=deep_pid: _detail_dialog(pid, user_id, user_name, vsechna_prava),
@@ -3519,8 +3596,9 @@ async def _vykresli_asm(user_id, user_name, vsechna_prava):
                 podtitul = _FORMULARE[pohled]["nazev"]
             ui.label(podtitul).classes("text-sm text-gray-500")
         ui.space()
-        # Manuál popisuje formuláře ASM — v schůzkách ani v evidenci OZ nedává smysl.
-        if pohled not in ("schuzky", "novy_oz"):
+        # Manuál popisuje formuláře ASM — v schůzkách, evidenci OZ ani v navýšení
+        # položek (příručka ho nepokrývá) nedává smysl.
+        if pohled not in ("schuzky", "novy_oz", "navyseni"):
             ui.button("Manuál", icon="menu_book", on_click=_dialog_manual) \
                 .props("outline no-caps") \
                 .classes("text-emerald-700 font-semibold rounded-lg") \
@@ -3547,7 +3625,8 @@ async def _vykresli_asm(user_id, user_name, vsechna_prava):
 
     # Rozcestník dlaždic
     # Hláška o datech se týká jen formulářů — kdo sem chodí jen na schůzky, nemá ji vidět.
-    if _je_zadatel(vsechna_prava) or _vidi_import(vsechna_prava):
+    _navyseni = _je_zadatel(vsechna_prava, "navyseni")
+    if _je_zadatel(vsechna_prava) or _vidi_import(vsechna_prava) or _navyseni:
         with ui.row().classes(
                 "w-full items-center gap-2 mb-6 px-4 py-3 rounded-lg "
                 "bg-emerald-50 border border-emerald-200 text-emerald-800"):
@@ -3563,6 +3642,9 @@ async def _vykresli_asm(user_id, user_name, vsechna_prava):
                   "border-amber-200", lambda: _nav("limity"))
             _tile("🚚", "Změna splatnosti dodacích listů", "formulář + fronta",
                   "border-cyan-200", lambda: _nav("dodaci"))
+        if _navyseni:
+            _tile("🧾", "Navýšení položek v cenotvorbě", "formulář + fronta",
+                  "border-violet-200", lambda: _nav("navyseni"))
         if _vidi_oz(vsechna_prava):
             _tile("🧑\u200d💼", "Nový OZ", "nový / změna OZ + evidence",
                   "border-teal-200", lambda: _nav("novy_oz"))
@@ -3573,7 +3655,8 @@ async def _vykresli_asm(user_id, user_name, vsechna_prava):
             _tile("🗓️", "Schůzky s vedoucími", "rezervace individuální schůzky",
                   "border-indigo-200", lambda: _nav("schuzky"))
     if (not _je_zadatel(vsechna_prava) and not _vidi_import(vsechna_prava)
-            and not _vidi_schuzky(vsechna_prava) and not _vidi_oz(vsechna_prava)):
+            and not _vidi_schuzky(vsechna_prava) and not _vidi_oz(vsechna_prava)
+            and not _navyseni):
         with ui.column().classes("items-center py-20 gap-3 w-full"):
             ui.icon("lock", size="4rem", color="grey-4")
             ui.label("Nemáte přístup k žádné dlaždici modulu Formuláře ASM.") \
@@ -3948,7 +4031,10 @@ def _render_form_pole(formular, hodnoty, editable, auto_editovatelne=False,
                             "Dotaženo dle IČO — lze ručně upravit" if auto_editovatelne
                             else "Dotaženo automaticky podle IČO")
                     auto_refs[key] = w
-                else:   # ico / text / number
+                elif typ == "number":
+                    w = ui.input(label, value=val) \
+                        .props("outlined dense type=number min=0").classes("min-w-56")
+                else:   # ico / text
                     w = ui.input(label, value=val).props("outlined dense").classes("min-w-56")
                 widgets[key] = w
 
@@ -4295,13 +4381,17 @@ def _formular_novy_obecny(formular, user_id, user_name, prava, zpet_fn):
 
         # Žadatel vidí jen IČ 10 své pobočky (dle „Prod. kanál 6"). Office/správce
         # a uživatel bez nastavené pobočky vidí všechna.
-        _pob = None if _je_office(prava) else _pobocka_uzivatele(user_id)
+        _pob = None if _je_office(prava, formular) else _pobocka_uzivatele(user_id)
         cti = _render_form_pole(formular, {}, editable=True, pobocka_filtr=_pob)
 
         async def _odeslat():
             data = cti()
             if not (data.get("ico") or "").strip():
                 ui.notify("Vyplňte IČO zákazníka.", type="warning")
+                return
+            chyba = _chyba_cisel(formular, data)
+            if chyba:
+                ui.notify(chyba, type="warning")
                 return
             data["notifikovat_oz"] = list(notif_oz_in.value or [])
             pid, cislo = zaloz_pripad_formular(formular, data, user_id, user_name)
@@ -4310,7 +4400,7 @@ def _formular_novy_obecny(formular, user_id, user_name, prava, zpet_fn):
                 return
             zaznam_historie(pid, "Odesláno", user_name, f"Vytvořen formulář „{cfg['nazev']}“")
             p = nacti_pripad(pid)
-            _odesli_emaily(_emaily_office(),
+            _odesli_emaily(_emaily_office(formular),
                            f"Formuláře ASM — nový případ {cislo} ({cfg['nazev']})",
                            f"Máte nový případ k vyřešení.\n\nČíslo: {cislo}\n"
                            f"Typ: {cfg['nazev']}\nŽadatel: {user_name}\n"
@@ -4336,7 +4426,7 @@ def _formular_novy_obecny(formular, user_id, user_name, prava, zpet_fn):
 async def _view_formular(formular, user_id, user_name, prava):
     cfg = _FORMULARE[formular]
     sekce = app.storage.user.get("asm_sekce", "seznam")
-    if sekce == "novy" and not _je_zadatel(prava):
+    if sekce == "novy" and not _je_zadatel(prava, formular):
         sekce = "seznam"
 
     def _set_sekce(s):
@@ -4348,7 +4438,7 @@ async def _view_formular(formular, user_id, user_name, prava):
         return
 
     with ui.row().classes("w-full items-center gap-3 mb-3"):
-        if _je_zadatel(prava):
+        if _je_zadatel(prava, formular):
             ui.button("Nový formulář", icon="add", on_click=lambda: _set_sekce("novy")) \
                 .props("unelevated no-caps") \
                 .classes("bg-emerald-600 text-white font-semibold rounded-lg")
@@ -4433,6 +4523,8 @@ def _grid_col_defs():
         {"headerName": "OZ2", "field": "oz2", "width": 110, "editable": True},
         {"headerName": "Datum od", "field": "datum_od", "width": 120, "editable": True},
         {"headerName": "Datum do", "field": "datum_do", "width": 120, "editable": True},
+        # Nový OZ je per řádek — jeden případ může přesouvat zákazníky na víc OZ.
+        {"headerName": "Číslo nový OZ", "field": "cislo_novy_oz", "width": 120, "editable": True},
     ]
 
 
@@ -4462,13 +4554,16 @@ def _formular_novy(user_id, user_name, prava, zpet_fn):
         r = {"_rid": _rid_seq["n"], "ico": "", "jmeno": "", "k_jmeno": "", "k_jmeno2": "",
              "k_ulice": "", "k_mesto": "", "k_psc": "", "dealer": "", "id_kontakt": "",
              "prodejni_doba": "", "puvodni_provize": "", "nova_provize": "",
-             "oz2": "", "datum_od": "", "datum_do": ""}
+             "oz2": "", "datum_od": "", "datum_do": "",
+             "cislo_novy_oz": "", "jmeno_novy_oz": ""}
         r.update(kw)
         return r
 
     rows = [_novy_radek()]
 
-    with ui.card().classes("w-full max-w-5xl p-5 rounded-2xl shadow-lg mb-6"):
+    # Karta je široká tak, aby se detailní tabulka vešla celá (12 sloupců) bez
+    # vodorovného rolování; na užších monitorech ji omezí w-full.
+    with ui.card().classes("w-full max-w-[1600px] p-5 rounded-2xl shadow-lg mb-6"):
         with ui.row().classes("w-full items-center gap-3"):
             ui.label("Nový formulář — Změna zákazníků na OZ/ASM") \
                 .classes("text-xl font-bold text-gray-800")
@@ -4494,18 +4589,18 @@ def _formular_novy(user_id, user_name, prava, zpet_fn):
                 .props("outlined dense").classes("flex-1 min-w-56")
 
         ui.label("Změna OZ").classes("text-sm font-semibold text-gray-500 uppercase mt-2")
+
         with ui.row().classes("w-full gap-3 flex-wrap"):
             cislo_oz_in = ui.select(oz_opts, label="Číslo OZ", with_input=True) \
                 .props("outlined dense").classes("flex-1 min-w-48")
             jmeno_oz_in = ui.input("Jméno OZ").props("outlined dense").classes("flex-1 min-w-48")
-            cislo_novy_oz_in = ui.select(oz_opts, label="Číslo nový OZ", with_input=True) \
-                .props("outlined dense").classes("flex-1 min-w-48")
-            jmeno_novy_oz_in = ui.input("Jméno nový OZ").props("outlined dense").classes("flex-1 min-w-48")
+            ui.label("Nový OZ se zadává u každého zákazníka v detailní tabulce "
+                     "(sloupce Číslo nový OZ / Jméno nový OZ).") \
+                .classes("flex-1 min-w-48 text-sm text-gray-400 italic self-center")
 
         def _dotahni_oz(src, dst):
             dst.value = oz_jmena.get(src.value, "")
         cislo_oz_in.on("update:model-value", lambda _=None: _dotahni_oz(cislo_oz_in, jmeno_oz_in))
-        cislo_novy_oz_in.on("update:model-value", lambda _=None: _dotahni_oz(cislo_novy_oz_in, jmeno_novy_oz_in))
 
         ui.label("Změna provize").classes("text-sm font-semibold text-gray-500 uppercase mt-2")
         with ui.row().classes("w-full gap-3 flex-wrap items-start"):
@@ -4532,8 +4627,10 @@ def _formular_novy(user_id, user_name, prava, zpet_fn):
             "rowSelection": "multiple",
             "stopEditingWhenCellsLoseFocus": True,
             "singleClickEdit": False,   # editace buňky dvojklikem
+            # Hlavičky na jeden řádek (bez lámání) — šířku dá autoSizeAllColumns
+            # podle delšího z (obsah, název sloupce).
             "defaultColDef": {"resizable": True, "sortable": False,
-                              "wrapHeaderText": True, "autoHeaderHeight": True},
+                              "wrapHeaderText": False, "autoHeaderHeight": False},
             "rowHeight": 32,
             # Bez virtualizace → všechny buňky jsou v DOM, takže Ctrl+C zkopíruje
             # i řádky mimo viditelnou oblast (výběr celého sloupce apod.).
@@ -4637,6 +4734,10 @@ def _formular_novy(user_id, user_name, prava, zpet_fn):
                         r[key] = k.get(key, "") or ""
                     r["puvodni_provize"] = k.get("puvodni_provize", "") or ""
                     _tx(update=[r])
+            # Jméno nového OZ se nezobrazuje jako sloupec — dotáhne se na pozadí
+            # z číselníku (do DB, hlavičky případu a e-mailů).
+            if field == "cislo_novy_oz":
+                r["jmeno_novy_oz"] = oz_jmena.get(str(new_val or "").strip(), "")
         grid.on("cellValueChanged", _on_cell_change)
 
         # ── Excel-like schránka v gridu (Community AG Grid, vlastní JS) ──────
@@ -4644,7 +4745,8 @@ def _formular_novy(user_id, user_name, prava, zpet_fn):
         # z Excelu od aktivní buňky (vyplní dolů/doprava, řádky se dle potřeby
         # přidají), Ctrl+Shift+šipky rozšíří výběr. Sloupce v pořadí zobrazení:
         _GRID_COLS = ["ico", "jmeno", "k_mesto", "dealer", "puvodni_provize",
-                      "nova_provize", "oz2", "datum_od", "datum_do"]
+                      "nova_provize", "oz2", "datum_od", "datum_do",
+                      "cislo_novy_oz"]
 
         def _on_grid_paste(e):
             a = e.args or {}
@@ -5022,6 +5124,8 @@ def _formular_novy(user_id, user_name, prava, zpet_fn):
             if not platne:
                 ui.notify("Detailní tabulka neobsahuje žádné IČO.", type="warning")
                 return
+            # Nový OZ je per řádek; do hlavičky (fronta, detail, export) jde první vyplněný.
+            _prvni_novy = next((r for r in platne if (r.get("cislo_novy_oz") or "").strip()), {})
             hlavicka = {
                 "duvod_zmeny": (duvod_in.value or "").strip(),
                 "asm_jmeno": user_name,
@@ -5029,8 +5133,8 @@ def _formular_novy(user_id, user_name, prava, zpet_fn):
                 "novy_asm_jmeno": (novy_asm_in.value or "") or "",
                 "cislo_oz": (cislo_oz_in.value or "") or "",
                 "jmeno_oz": (jmeno_oz_in.value or "").strip(),
-                "cislo_novy_oz": (cislo_novy_oz_in.value or "") or "",
-                "jmeno_novy_oz": (jmeno_novy_oz_in.value or "").strip(),
+                "cislo_novy_oz": str(_prvni_novy.get("cislo_novy_oz") or "").strip(),
+                "jmeno_novy_oz": str(_prvni_novy.get("jmeno_novy_oz") or "").strip(),
                 "datum_zmeny_od": (datum_od_in.value or "").strip(),
                 "zakaznik_v_regionu_oz": (region_in.value or "NE"),
                 "oduvodneni": (oduvodneni_in.value or "").strip(),
@@ -5048,7 +5152,9 @@ def _formular_novy(user_id, user_name, prava, zpet_fn):
                            f"Žadatel: {user_name}\nDůvod: {hlavicka['duvod_zmeny']}\n"
                            f"Počet řádků: {len(platne)}", pripad_id=pid)
             # Notifikace dotčených OZ (původní + nový) při podání žádosti.
-            _notifikuj_oz([hlavicka.get("cislo_oz"), hlavicka.get("cislo_novy_oz")],
+            _notifikuj_oz(list(dict.fromkeys(
+                              [hlavicka.get("cislo_oz")]
+                              + [str(r.get("cislo_novy_oz") or "").strip() for r in platne])),
                           cislo, "Změna zákazníků na OZ/ASM", user_name,
                           f"{len(platne)} řádků", pid)
             intranet_logger.log_activity(user_name, "Podání žádosti",
@@ -5074,8 +5180,9 @@ def _detail_dialog(pid, user_id, user_name, prava):
         return
     radky = nacti_radky(pid)
     historie = nacti_historie(pid)
-    je_office = _je_office(prava)
-    je_spravce = _je_spravce(prava)
+    formular = p.get("formular") or "oz_zmena"
+    je_office = _je_office(prava, formular)
+    je_spravce = _je_spravce(prava, formular)
     je_zadatel_vlastnik = (p.get("zadavatel_id") == user_id)
     stav = p.get("stav")
 
@@ -5091,7 +5198,6 @@ def _detail_dialog(pid, user_id, user_name, prava):
             ui.space()
             ui.button(icon="close", on_click=dlg.close).props("flat round color=grey-7")
 
-        formular = p.get("formular") or "oz_zmena"
         # Žadatel-vlastník smí po vrácení k opravě editovat (dvojklik / vstupy).
         lze_upravit = je_zadatel_vlastnik and stav == "vraceno_oprava"
         cti_form = None   # getter dat pro unifikované formuláře v režimu úpravy
@@ -5139,12 +5245,13 @@ def _detail_dialog(pid, user_id, user_name, prava):
                 {"headerName": "OZ2", "field": "oz2", "width": 110, "editable": lze_upravit},
                 {"headerName": "Datum od", "field": "datum_od", "width": 120, "editable": lze_upravit},
                 {"headerName": "Datum do", "field": "datum_do", "width": 120, "editable": lze_upravit},
+                {"headerName": "Číslo nový OZ", "field": "cislo_novy_oz", "width": 120, "editable": lze_upravit},
             ]
             det_grid = ui.aggrid({
                 "columnDefs": det_cols,
                 "rowData": radky,
                 "defaultColDef": {"resizable": True, "sortable": True,
-                                  "wrapHeaderText": True, "autoHeaderHeight": True},
+                                  "wrapHeaderText": False, "autoHeaderHeight": False},
                 # Sloupce roztažené dle nejdelšího textu (spolehlivě už při prvním renderu).
                 "autoSizeStrategy": {"type": "fitCellContents"},
                 "rowHeight": 30,
@@ -5202,7 +5309,7 @@ def _detail_dialog(pid, user_id, user_name, prava):
             # formuláři.
             cti_form = _render_form_pole(
                 formular, _fdata, editable=lze_upravit, auto_editovatelne=lze_upravit,
-                pobocka_filtr=(None if not lze_upravit or _je_office(prava)
+                pobocka_filtr=(None if not lze_upravit or _je_office(prava, formular)
                                else _pobocka_uzivatele(user_id)))
 
         # Průběh („očičko")
@@ -5247,15 +5354,21 @@ def _detail_dialog(pid, user_id, user_name, prava):
             # ── Workflow akce ───────────────────────────────────────
             with ui.row().classes("gap-2 flex-wrap"):
                 def _akce_email_office(predmet, text):
-                    _odesli_emaily(_emaily_office(), predmet, text, pripad_id=pid)
+                    _odesli_emaily(_emaily_office(formular), predmet, text, pripad_id=pid)
 
                 # Žadatel – případ vrácen k opravě
                 if je_zadatel_vlastnik and stav == "vraceno_oprava":
                     def _uloz_opravu():
                         if formular == "oz_zmena":
                             ok = uloz_radky(pid, radky)
+                        elif cti_form:
+                            _d = cti_form()
+                            chyba = _chyba_cisel(formular, _d)
+                            if chyba:
+                                ui.notify(chyba, type="warning"); return
+                            ok = uloz_data_formular(pid, _d)
                         else:
-                            ok = uloz_data_formular(pid, cti_form()) if cti_form else False
+                            ok = False
                         if not ok:
                             ui.notify("Uložení opravy selhalo.", type="negative"); return
                         zmen_stav(pid, "odeslano")
@@ -5329,7 +5442,7 @@ def _detail_dialog(pid, user_id, user_name, prava):
                                     ui.notify("Vyplňte poznámku správci.", type="warning"); return
                                 zmen_stav(pid, "u_spravce", spravce_pozn=txt)
                                 zaznam_historie(pid, "Postoupeno správci", user_name, txt)
-                                _odesli_emaily(_emaily_spravce(),
+                                _odesli_emaily(_emaily_spravce(formular),
                                                f"Formuláře ASM — případ {p.get('cislo')} ke schválení",
                                                f"Office ({user_name}) postoupil případ "
                                                f"{p.get('cislo')} k rozhodnutí.\n\n"
@@ -5367,7 +5480,7 @@ def _detail_dialog(pid, user_id, user_name, prava):
                         zaznam_historie(pid, "Správce schválil", user_name)
                         _odesli_emaily_zadateli(p, f"Formuláře ASM — případ {p.get('cislo')} schválen",
                                                 f"Váš případ {p.get('cislo')} byl správcem schválen (nahráno).")
-                        _odesli_emaily(_emaily_office(),
+                        _odesli_emaily(_emaily_office(formular),
                                        f"Formuláře ASM — případ {p.get('cislo')} správce schválil",
                                        f"Správce schválil případ {p.get('cislo')}. Proveďte realizaci.", pripad_id=pid)
                         intranet_logger.log_activity(user_name, "Schválení žádosti",
@@ -5421,7 +5534,7 @@ def _detail_dialog(pid, user_id, user_name, prava):
                                 if not je_zadatel_vlastnik:
                                     pass
                                 else:
-                                    _odesli_emaily(_emaily_office(),
+                                    _odesli_emaily(_emaily_office(formular),
                                                    f"Formuláře ASM — případ {p.get('cislo')} stornován žadatelem",
                                                    f"Žadatel {user_name} stornoval případ {p.get('cislo')}.\n\n"
                                                    f"Důvod: {(duv.value or '').strip()}", pripad_id=pid)
@@ -5567,10 +5680,12 @@ def _export_xlsx(p, radky):
     r += 1
     sloupce = (["#", "IČO"]
                + [lbl for _, lbl in _KONTAKT_SLOUPCE]
-               + ["Původní provize", "Nová provize", "OZ2", "Datum od", "Datum do"])
+               + ["Původní provize", "Nová provize", "OZ2", "Datum od", "Datum do",
+                  "Číslo nový OZ"])
     klice = (["poradi", "ico"]
              + [key for key, _ in _KONTAKT_SLOUPCE]
-             + ["puvodni_provize", "nova_provize", "oz2", "datum_od", "datum_do"])
+             + ["puvodni_provize", "nova_provize", "oz2", "datum_od", "datum_do",
+                "cislo_novy_oz"])
     hlav_radek = r
     for c, lbl in enumerate(sloupce, 1):
         cell = ws.cell(row=r, column=c, value=lbl)

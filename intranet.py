@@ -821,7 +821,8 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
         ma_vse or
         any(p in vsechna_prava for p in (
             'asm_zadatel', 'asm_office', 'asm_spravce',
-            'asm_spravce_bez_emailu', 'asm_vkladatel'))
+            'asm_spravce_bez_emailu', 'asm_vkladatel',
+            'asm_navyseni_office'))
     )
     # Schůzky s vedoucími jsou dlaždice uvnitř Formulářů ASM — kdo má právo jen
     # na ně, musí záložku vidět taky (uvnitř pak uvidí jen tu jednu dlaždici).

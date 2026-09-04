@@ -1,7 +1,8 @@
-"""Modul Sankce — dvě sestavy nad importovanými daty z listu DATA:
+"""Modul Sankce — tři sestavy nad importovanými daty z listu DATA:
 
   • Zamítnuté dodávky dodavatelem  (pro nákupní oddělení + analytika importuje)
   • Sankce k vystavení             (pro účtárnu + analytika importuje)
+  • Nedodávky dod. k vyjádření     (nákupčí píší důvod nevykrytí dodavatelem)
 
 Data přibývají po týdnech. Každý import nese „období", podle kterého se pozná,
 co je nové. Re-import stejného období dávku nahradí, ale ručně zadané stavy a
@@ -19,7 +20,8 @@ Role (intranet_prava.py):
   • sankce_ucetni   – Sankce k vystavení: mění stav + píše poznámky.
   • sankce_nakup    – Zamítnuté dodávky: píše poznámky.
   • sankce_ctenar   – obě sestavy jen pro čtení (filtry/řazení/export + diskuze).
-  • sankce_tiket_XX – nákupčí s kódem XX: řeší tikety svých dodavatelů.
+  • sankce_tiket_XX – nákupčí s kódem XX: řeší tikety svých dodavatelů a píše
+    vyjádření k Nedodávkám u řádků se svým kódem NAK.
   • sankce_tiket_provoz   – tikety předané na provoz.
   • sankce_tiket_kontrola – druhotná kontrola: schvaluje storno i abnormalitu.
   • sankce_tiket_tvrde_storno – storno bez kontroly a bez mailu (rovnou Nevyfakturovat).
@@ -105,6 +107,8 @@ _ZALOHA_TABLE = 'sankce_vystaveni_zalohy'
 _ZALOHA_INTERVAL_H = 4                               # jak často se dělá AUTO záloha (hodiny)
 _ZALOHA_AUTO_MAX = 10                                # kolik AUTO záloh držet (přebytek se prořezává – padá nejstarší)
 _ZALOHA_TYP_LABEL = {'auto': 'Automatická záloha', 'rucni': 'Ruční bod obnovy'}
+# Sestavy, které se automaticky zálohují (nesou ručně zadané hodnoty).
+_ZALOHOVANE_SESTAVY = ('sankce_vystaveni', 'sankce_nedodavky')
 
 # Mapování hlaviček listu DATA → DB sloupce (klíč = normalizovaný název hlavičky).
 _MAPA_ZAMITNUTE = {
@@ -147,6 +151,27 @@ _CISLA_ZAMITNUTE = {'objednano_mj', 'dodano_mj', 'odmitnuto_mj', 'obj_cena',
                     'hodn_sankce', 'odmitnuto_kc_celkem'}
 _CISLA_VYSTAVENI = {'objednano_mj', 'dodano_mj', 'dod_pozde_mj', 'obj_cena', 'hodn_sankce'}
 
+# ── Nedodávky dod. k vyjádření ──
+# Zdroj je jiný sešit (.xlsb, list „data") s jinými hlavičkami; zajímá nás jen
+# podmnožina sloupců — zbytek (mezisoučty, pomocné sloupce) do sestavy nepatří.
+_MAPA_NEDODAVKY = {
+    'ico':                  'ico',
+    'jmeno':                'jmeno_dodavatele',
+    'dodavatel-popis':      'dodavatel_popis',
+    'kodzbozi':             'kod_zbozi',
+    'nazevzbozi':           'nazev_zbozi',
+    'kod2':                 'kod2',
+    'cisloobj.':            'cislo_obj',
+    'pobocka':              'pobocka',
+    'pozadovano':           'pozadovano',
+    'dat.zalozenizdokladu': 'datum_zalozeni',
+    'rozdildodanokc':       'rozdil_dodano_kc',
+    'odmitnutomj':          'odmitnuto_mj',
+    'nak':                  'nak',
+}
+_CISLA_NEDODAVKY = {'rozdil_dodano_kc', 'odmitnuto_mj'}
+_DATUMY_NEDODAVKY = {'pozadovano', 'datum_zalozeni'}
+
 # Sloupce, které v importovaném souboru chybět SMĚJÍ (import je nepovažuje za chybu).
 _VOLITELNE = {'nakupci_pob'}
 
@@ -154,6 +179,34 @@ _VOLITELNE = {'nakupci_pob'}
 # (Obj.-cena je cena za 1 MJ; její sečtení napříč řádky nic nevypovídá.)
 _SOUCET_ZAMITNUTE = _CISLA_ZAMITNUTE - {'obj_cena'}
 _SOUCET_VYSTAVENI = _CISLA_VYSTAVENI - {'obj_cena'}
+_SOUCET_NEDODAVKY = set(_CISLA_NEDODAVKY)
+
+# Popis importu per sestava: pole do row_hash, ručně zadané sloupce (re-import je
+# zachová a spáruje přes row_hash), datumové sloupce a pevný filtr řádků.
+# Filtr = {normalizovaná hlavička v souboru: normalizovaná povolená hodnota};
+# u Nedodávek nese list „data" celý sešit včetně dodaných položek, sestavu tvoří
+# jen skutečné nedodávky (shodné s listem „Souhrn").
+_SESTAVA_IMPORT = {
+    'sankce_zamitnute': {
+        'nazev': 'Zamítnuté dodávky',
+        'hash': ('ico', 'kod_zbozi', 'cislo_objednavky', 'id_pobocky',
+                 'datum_pozadovano', 'odmitnuto_mj', 'hodn_sankce'),
+        'rucni': ('poznamka',),
+    },
+    'sankce_vystaveni': {
+        'nazev': 'Sankce k vystavení',
+        'hash': ('ico', 'kod_zbozi', 'cislo_objednavky', 'id_pobocky', 'hodn_sankce'),
+        'rucni': ('stav', 'stav2', 'sleva', 'poznamka'),
+    },
+    'sankce_nedodavky': {
+        'nazev': 'Nedodávky dod. k vyjádření',
+        'hash': ('ico', 'kod_zbozi', 'cislo_obj', 'pobocka', 'pozadovano',
+                 'rozdil_dodano_kc'),
+        'rucni': ('vyjadreni', 'vyjadreni_by', 'vyjadreni_at'),
+        'datumy': _DATUMY_NEDODAVKY,
+        'filtr': {'dcera': 'ne', 'status': 'nedodano', 'stavprijemky': 'prijemka'},
+    },
+}
 
 
 # =========================================================
@@ -726,6 +779,35 @@ _EXP_VYSTAVENI = [
     ('Poznámka',       'poznamka',         'text',  36),
 ]
 
+_EXP_NEDODAVKY = [
+    ('Období',            'obdobi',           'text',  16),
+    ('IČO',               'ico',              'text',  12),
+    ('Dodavatel',         'jmeno_dodavatele', 'text',  34),
+    ('Dodavatel-popis',   'dodavatel_popis',  'text',  28),
+    ('Kód zboží',         'kod_zbozi',        'text',  14),
+    ('Název zboží',       'nazev_zbozi',      'text',  40),
+    ('KOD 2',             'kod2',             'text',  12),
+    ('Č.obj.',            'cislo_obj',        'text',  14),
+    ('Pobočka',           'pobocka',          'text',  12),
+    ('Požadováno',        'pozadovano',       'date',  13),
+    ('Dat. založení',     'datum_zalozeni',   'date',  13),
+    ('Odmítnuto MJ',      'odmitnuto_mj',     'num',   13),
+    ('Rozdíl dodáno Kč',  'rozdil_dodano_kc', 'money', 16),
+    ('NAK',               'nak',              'text',  10),
+    ('Vyjádření nákupčího', 'vyjadreni',      'text',  46),
+]
+
+_EXP_NEDODAVKY_SOUHRN = [
+    ('IČO',               'ico',              'text',  13),
+    ('Dodavatel',         'jmeno_dodavatele', 'text',  40),
+    ('Dodavatel-popis',   'dodavatel_popis',  'text',  28),
+    ('NAK',               'nak',              'text',  12),
+    ('Položek',           'pocet',            'int',   10),
+    ('Odmítnuto MJ',      'odmitnuto_mj',     'num',   13),
+    ('Rozdíl dodáno Kč',  'rozdil_dodano_kc', 'money', 16),
+    ('Vyjádření nákupčího', 'vyjadreni',      'text',  46),
+]
+
 _EXP_SOUHRN = [
     ('IČ',             'ico',              'text',  13),
     ('Dodavatel',      'jmeno_dodavatele', 'text',  40),
@@ -875,6 +957,8 @@ _PALETA = {
     'Stornováno':          ('#fecaca', '#991b1b', '#fee2e2'),
     'Abnormalita – ke kontrole': ('#fed7aa', '#9a3412', '#fff7ed'),
     'Abnormalita':         ('#e2e8f0', '#475569', '#f8fafc'),   # světle šedá
+    'Předáno na provoz':   ('#fae8ff', '#86198f', '#fdf4ff'),   # archiv – purpurová
+    'Předáno na nákup':    ('#fae8ff', '#86198f', '#fdf4ff'),
     'Uzavřeno':            ('#dcfce7', '#166534', '#f0fdf4'),
     # rozhodnutí v tiketu
     'Stornovat':           ('#fecaca', '#991b1b', '#fee2e2'),
@@ -1003,6 +1087,7 @@ _SLEVA_FMT = (
 # Předgenerované callbacky per sestava — set sčítaných sloupců se v běhu nemění.
 _FILTER_RECALC_ZAMITNUTE = _make_filter_recalc_js(_SOUCET_ZAMITNUTE)
 _FILTER_RECALC_VYSTAVENI = _make_filter_recalc_js(_SOUCET_VYSTAVENI, sleva_col='sleva')
+_FILTER_RECALC_NEDODAVKY = _make_filter_recalc_js(_SOUCET_NEDODAVKY)
 
 
 # ── Souhrnný pohled po dodavatelích (agregace nad stejnými daty) ──
@@ -1025,6 +1110,20 @@ _FILTER_RECALC_SOUHRN = (
     "function(p){"
     "var api=p.api;if(!api||!api.forEachNodeAfterFilter)return;"
     "var COLS=['pocet','sankce_celkem','sleva_castka','sankce_uznana'];"
+    "var tot={};COLS.forEach(function(k){tot[k]=0;});var cnt=0;"
+    "api.forEachNodeAfterFilter(function(n){"
+    "if(n.rowPinned)return;cnt++;var d=n.data||{};"
+    "COLS.forEach(function(k){var v=parseFloat(d[k]);if(!isNaN(v))tot[k]+=v;});"
+    "});"
+    "tot['ico']='CELKEM';"
+    "tot['jmeno_dodavatele']=cnt+' dod.';"
+    "api.setGridOption('pinnedBottomRowData',[tot]);"
+    "}"
+)
+_FILTER_RECALC_NEDOD_SOUHRN = (
+    "function(p){"
+    "var api=p.api;if(!api||!api.forEachNodeAfterFilter)return;"
+    "var COLS=['pocet','odmitnuto_mj','rozdil_dodano_kc'];"
     "var tot={};COLS.forEach(function(k){tot[k]=0;});var cnt=0;"
     "api.forEachNodeAfterFilter(function(n){"
     "if(n.rowPinned)return;cnt++;var d=n.data||{};"
@@ -1125,17 +1224,52 @@ def inicializace_sankce_db():
                 PRIMARY KEY (tabulka, row_hash, user_id)
             ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
         """)
-        # Zálohy / body obnovení sestavy „Sankce k vystavení" — celá tabulka jako
-        # JSON snímek. Druh 'auto' (hodinová) / 'rucni' (ruční bod obnovy).
+        # Nedodávky dod. k vyjádření — důvod nevykrytí dodavatelem.
+        # Data z jiného sešitu (.xlsb, list „data"), profiltrovaná na skutečné
+        # nedodávky; jediná ručně psaná hodnota je vyjádření nákupčího.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS sankce_nedodavky (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                obdobi VARCHAR(60),
+                obdobi_od DATE, obdobi_do DATE,
+                row_hash VARCHAR(40),
+                nase_cislo VARCHAR(20),
+                ico VARCHAR(30),
+                jmeno_dodavatele VARCHAR(255),
+                dodavatel_popis VARCHAR(255),
+                kod_zbozi VARCHAR(40),
+                nazev_zbozi VARCHAR(255),
+                kod2 VARCHAR(40),
+                cislo_obj VARCHAR(40),
+                pobocka VARCHAR(60),
+                pozadovano DATE,
+                datum_zalozeni DATE,
+                rozdil_dodano_kc DOUBLE,
+                odmitnuto_mj DOUBLE,
+                nak VARCHAR(20),
+                vyjadreni TEXT,
+                vyjadreni_by VARCHAR(255),
+                vyjadreni_at DATETIME DEFAULT NULL,
+                import_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                imported_by VARCHAR(255),
+                INDEX idx_obdobi (obdobi), INDEX idx_hash (row_hash),
+                INDEX idx_nak (nak)
+            ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        """)
+        # Zálohy / body obnovení sestav — celá tabulka jako JSON snímek.
+        # Druh 'auto' (pravidelná) / 'rucni' (ruční bod obnovy); sloupec `tabulka`
+        # říká, ke které sestavě snímek patří.
         cur.execute(f"""
             CREATE TABLE IF NOT EXISTS {_ZALOHA_TABLE} (
                 id INT AUTO_INCREMENT PRIMARY KEY,
+                tabulka VARCHAR(30) NOT NULL DEFAULT 'sankce_vystaveni',
                 typ VARCHAR(20) NOT NULL,
                 vytvoreno DATETIME DEFAULT CURRENT_TIMESTAMP,
                 vytvoril VARCHAR(255),
                 pocet_radku INT DEFAULT 0,
                 data LONGTEXT,
-                INDEX idx_typ (typ), INDEX idx_vytvoreno (vytvoreno)
+                INDEX idx_typ (typ), INDEX idx_vytvoreno (vytvoreno),
+                INDEX idx_zal_tab (tabulka)
             ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
         """)
         # Tikety: předání skupiny řádků „Sankce k vystavení" nákupčímu / provozu.
@@ -1206,11 +1340,20 @@ def inicializace_sankce_db():
                         "AND COLUMN_NAME=%s", (_sl,))
             if cur.fetchone()[0] == 0:
                 cur.execute(f'ALTER TABLE sankce_chat ADD COLUMN {_sl} {_def}')
+        # Migrace: zálohy byly původně jen pro „Sankce k vystavení" — starým
+        # snímkům dopiš, ke které sestavě patří.
+        cur.execute("SELECT COUNT(*) FROM information_schema.COLUMNS "
+                    "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s "
+                    "AND COLUMN_NAME='tabulka'", (_ZALOHA_TABLE,))
+        if cur.fetchone()[0] == 0:
+            cur.execute(f"ALTER TABLE {_ZALOHA_TABLE} ADD COLUMN tabulka VARCHAR(30) "
+                        f"NOT NULL DEFAULT 'sankce_vystaveni' AFTER id")
+            cur.execute(f'ALTER TABLE {_ZALOHA_TABLE} ADD INDEX idx_zal_tab (tabulka)')
         # Migrace: stav „storno" zanikl — splynul s „nevyfakturovano" (Nevyfakturovat).
         cur.execute("UPDATE sankce_vystaveni SET stav='nevyfakturovano' WHERE stav='storno'")
         conn.commit()
         cur.close()
-        for _t in ('sankce_zamitnute', 'sankce_vystaveni'):
+        for _t in ('sankce_zamitnute', 'sankce_vystaveni', 'sankce_nedodavky'):
             _backfill_cisla(_t)
     except Exception as e:
         print(f'Chyba při inicializaci DB Sankcí: {e}')
@@ -1361,18 +1504,52 @@ def _eml_hlavicka(cesta: str) -> tuple:
         return ('', '', '')
 
 
+def _tiket_predci(tid) -> list:
+    """Tikety, ze kterých byl tenhle postupně předán – od nejstaršího. Řetěz jde
+    přes `zdroj_tiket`, strop 20 skoků kvůli případnému cyklu v datech."""
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return []
+    out, videne = [], {int(tid)}          # videne drží i výchozí tiket – ten se dědit nesmí
+    try:
+        cur = conn.cursor()
+        for _ in range(20):
+            cur.execute('SELECT zdroj_tiket FROM sankce_tikety WHERE id=%s', (tid,))
+            r = cur.fetchone()
+            tid = r[0] if r else None
+            if not tid or tid in videne:
+                break
+            videne.add(tid)
+            out.append(tid)
+    except Exception as e:
+        print(f'[sankce] _tiket_predci error: {e}')
+    finally:
+        conn.close()
+    return list(reversed(out))
+
+
 def _nacti_chat_zpravy(tabulka, row_hash) -> list:
-    """Zprávy vlákna chronologicky (nejstarší nahoře)."""
+    """Zprávy vlákna chronologicky (nejstarší nahoře). U tiketu se nad ně poskládá
+    i diskuze tiketů, ze kterých vznikl – jen ke čtení (`_zdedeno` = jejich číslo)."""
+    hashe, zdedene = [row_hash], {}
+    if tabulka == 'sankce_tikety' and (row_hash or ' ')[0] == 'T' and row_hash[1:].isdigit():
+        for p in _tiket_predci(int(row_hash[1:])):
+            zdedene[_tiket_rh(p)] = _tiket_cislo(p)
+        hashe = list(zdedene) + [row_hash]
     conn = intranet_data.get_db_connection()
     if not conn:
         return []
     try:
         cur = conn.cursor(dictionary=True)
-        cur.execute('SELECT id,user_id,jmeno,zprava,kdy,soubor_nazev,soubor_cesta '
+        cur.execute('SELECT id,row_hash,user_id,jmeno,zprava,kdy,soubor_nazev,soubor_cesta '
                     'FROM sankce_chat '
-                    'WHERE tabulka=%s AND row_hash=%s ORDER BY id ASC',
-                    (tabulka, row_hash))
-        return cur.fetchall()
+                    'WHERE tabulka=%s AND row_hash IN (' + ','.join(['%s'] * len(hashe)) + ') '
+                    'ORDER BY id ASC',
+                    (tabulka, *hashe))
+        zpravy = cur.fetchall()
+        for z in zpravy:
+            z['_zdedeno'] = zdedene.get(z.get('row_hash'))
+        return zpravy
     finally:
         conn.close()
 
@@ -1482,7 +1659,9 @@ def _smaz_chat(tabulka, row_hash, msg_id, user_id, muze_mazat_vse=False) -> bool
 _KOMENTAR_PRAVA = {
     'sankce_vystaveni': ('vse', 'sankce_analytik', 'sankce_ucetni', 'sankce_ctenar'),
     'sankce_zamitnute': ('vse', 'sankce_analytik', 'sankce_nakup', 'sankce_ctenar'),
-    'sankce_tikety':    ('vse', 'sankce_analytik', 'sankce_ucetni'),
+    # U tiketu jen účtárna (vlastník fronty) + řešitel přes `prava_navic`.
+    # Analytik tikety neřeší, jen importuje data — komentáře mu necinkají.
+    'sankce_tikety':    ('sankce_ucetni',),
 }
 _KOMENTAR_SESTAVA = {
     'sankce_vystaveni': 'Sankce k vystavení',
@@ -1582,17 +1761,17 @@ def _json_default(o):
     return str(o)
 
 
-def _vytvor_zalohu(typ: str, vytvoril: str, skip_if_empty: bool = False):
-    """Vytvoří snímek celé tabulky sankce_vystaveni a uloží ho jako zálohu typu
+def _vytvor_zalohu(tabulka: str, typ: str, vytvoril: str, skip_if_empty: bool = False):
+    """Vytvoří snímek celé tabulky sestavy a uloží ho jako zálohu typu
     'auto' / 'rucni'. U automatické zálohy umí přeskočit prázdnou tabulku
-    (skip_if_empty) a po uložení prořeže staré AUTO zálohy. Ruční body obnovy se
-    nemažou. Vrací (id|None, počet_řádků, chyba|None)."""
+    (skip_if_empty) a po uložení prořeže staré AUTO zálohy TÉŽE sestavy. Ruční body
+    obnovy se nemažou. Vrací (id|None, počet_řádků, chyba|None)."""
     conn = intranet_data.get_db_connection()
     if not conn:
         return None, 0, 'Není spojení s databází.'
     try:
         cur = conn.cursor(dictionary=True)
-        cur.execute('SELECT * FROM sankce_vystaveni ORDER BY id ASC')
+        cur.execute(f'SELECT * FROM {tabulka} ORDER BY id ASC')
         rows = cur.fetchall()
         cur.close()
         if skip_if_empty and not rows:
@@ -1600,18 +1779,18 @@ def _vytvor_zalohu(typ: str, vytvoril: str, skip_if_empty: bool = False):
         data_json = json.dumps(rows, ensure_ascii=False, default=_json_default)
         cur = conn.cursor()
         cur.execute(
-            f'INSERT INTO {_ZALOHA_TABLE} (typ, vytvoril, pocet_radku, data) '
-            'VALUES (%s,%s,%s,%s)',
-            (typ, vytvoril or '', len(rows), data_json),
+            f'INSERT INTO {_ZALOHA_TABLE} (tabulka, typ, vytvoril, pocet_radku, data) '
+            'VALUES (%s,%s,%s,%s,%s)',
+            (tabulka, typ, vytvoril or '', len(rows), data_json),
         )
         new_id = cur.lastrowid
         if typ == 'auto':
             # prořež staré automatické zálohy (ruční body obnovy zůstávají)
             cur.execute(
-                f'DELETE FROM {_ZALOHA_TABLE} WHERE typ=%s AND id NOT IN '
-                f'(SELECT id FROM (SELECT id FROM {_ZALOHA_TABLE} WHERE typ=%s '
+                f'DELETE FROM {_ZALOHA_TABLE} WHERE tabulka=%s AND typ=%s AND id NOT IN '
+                f'(SELECT id FROM (SELECT id FROM {_ZALOHA_TABLE} WHERE tabulka=%s AND typ=%s '
                 f'ORDER BY id DESC LIMIT %s) keep)',
-                ('auto', 'auto', _ZALOHA_AUTO_MAX),
+                (tabulka, 'auto', tabulka, 'auto', _ZALOHA_AUTO_MAX),
             )
         conn.commit()
         cur.close()
@@ -1626,8 +1805,8 @@ def _vytvor_zalohu(typ: str, vytvoril: str, skip_if_empty: bool = False):
         conn.close()
 
 
-def _nacti_zalohy() -> list:
-    """Seznam záloh (jen metadata — bez datového blobu), nejnovější nahoře."""
+def _nacti_zalohy(tabulka: str) -> list:
+    """Seznam záloh dané sestavy (jen metadata — bez datového blobu), nejnovější nahoře."""
     conn = intranet_data.get_db_connection()
     if not conn:
         return []
@@ -1635,7 +1814,8 @@ def _nacti_zalohy() -> list:
         cur = conn.cursor(dictionary=True)
         cur.execute(
             f'SELECT id, typ, vytvoreno, vytvoril, pocet_radku '
-            f'FROM {_ZALOHA_TABLE} ORDER BY vytvoreno DESC, id DESC'
+            f'FROM {_ZALOHA_TABLE} WHERE tabulka=%s ORDER BY vytvoreno DESC, id DESC',
+            (tabulka,)
         )
         return cur.fetchall()
     finally:
@@ -1643,27 +1823,28 @@ def _nacti_zalohy() -> list:
 
 
 def _nacti_zaloha_data(zaloha_id: int):
-    """Vrátí JSON snímek (string) zvolené zálohy nebo None, když neexistuje."""
+    """Vrátí (tabulka, JSON snímek) zvolené zálohy nebo (None, None), když neexistuje."""
     conn = intranet_data.get_db_connection()
     if not conn:
-        return None
+        return None, None
     try:
         cur = conn.cursor(dictionary=True)
-        cur.execute(f'SELECT data FROM {_ZALOHA_TABLE} WHERE id=%s', (zaloha_id,))
+        cur.execute(f'SELECT tabulka, data FROM {_ZALOHA_TABLE} WHERE id=%s', (zaloha_id,))
         z = cur.fetchone()
-        return (z.get('data') if z else None)
+        return ((z.get('tabulka'), z.get('data')) if z else (None, None))
     finally:
         conn.close()
 
 
-def _posledni_auto_zaloha_cas():
-    """Čas poslední automatické zálohy (datetime) nebo None."""
+def _posledni_auto_zaloha_cas(tabulka: str):
+    """Čas poslední automatické zálohy dané sestavy (datetime) nebo None."""
     conn = intranet_data.get_db_connection()
     if not conn:
         return None
     try:
         cur = conn.cursor()
-        cur.execute(f"SELECT MAX(vytvoreno) FROM {_ZALOHA_TABLE} WHERE typ='auto'")
+        cur.execute(f"SELECT MAX(vytvoreno) FROM {_ZALOHA_TABLE} "
+                    f"WHERE tabulka=%s AND typ='auto'", (tabulka,))
         r = cur.fetchone()
         return r[0] if r and r[0] else None
     finally:
@@ -1672,11 +1853,13 @@ def _posledni_auto_zaloha_cas():
 
 def _obnov_zalohu(zaloha_id: int, vytvoril: str):
     """Přehraje data: nejdřív pojistně zazálohuje AKTUÁLNÍ stav (auto), pak nahradí
-    celý obsah tabulky sankce_vystaveni daty ze zvolené zálohy. Díky pojistné záloze
-    jde obnovu vrátit zpět. Vrací (ok, počet_obnovených_řádků, chyba|None)."""
-    raw = _nacti_zaloha_data(zaloha_id)
-    if raw is None:
+    celý obsah sestavy daty ze zvolené zálohy. Cílovou tabulku nese sama záloha, takže
+    nejde přehrát sestavu snímkem jiné. Vrací (ok, počet_obnovených_řádků, chyba|None)."""
+    tabulka, raw = _nacti_zaloha_data(zaloha_id)
+    if raw is None or not tabulka:
         return False, 0, 'Záloha nebyla nalezena (možná byla mezitím odstraněna).'
+    if tabulka not in _SESTAVA_IMPORT:
+        return False, 0, f'Záloha odkazuje na neznámou sestavu „{tabulka}".'
     try:
         rows = json.loads(raw or '[]')
     except Exception as e:
@@ -1684,7 +1867,7 @@ def _obnov_zalohu(zaloha_id: int, vytvoril: str):
 
     # Pojistka: aktuální stav ulož jako automatickou zálohu, ať jde obnova vrátit zpět.
     try:
-        _vytvor_zalohu('auto', f'{vytvoril} (před obnovou)', skip_if_empty=True)
+        _vytvor_zalohu(tabulka, 'auto', f'{vytvoril} (před obnovou)', skip_if_empty=True)
     except Exception:
         pass
 
@@ -1693,14 +1876,14 @@ def _obnov_zalohu(zaloha_id: int, vytvoril: str):
         return False, 0, 'Není spojení s databází.'
     try:
         cur = conn.cursor()
-        cur.execute('DELETE FROM sankce_vystaveni')
+        cur.execute(f'DELETE FROM {tabulka}')
         if rows:
             cols = list(rows[0].keys())
             col_sql = ','.join('`' + c + '`' for c in cols)
             ph = ','.join(['%s'] * len(cols))
             vals = [[r.get(c) for c in cols] for r in rows]
             cur.executemany(
-                f'INSERT INTO sankce_vystaveni ({col_sql}) VALUES ({ph})', vals)
+                f'INSERT INTO {tabulka} ({col_sql}) VALUES ({ph})', vals)
         conn.commit()
         cur.close()
         return True, len(rows), None
@@ -1773,29 +1956,31 @@ def _smaz_zalohy_hromadne(ids: list, povolit_auto: bool = False):
 
 async def bg_sankce_zaloha():
     """Serverová smyčka: každé 4 hodiny (zarovnáno na 00/04/08/12/16/20 h) zazálohuje
-    celou tabulku sankce_vystaveni jako automatickou zálohu. Stav drží DB (čas
-    poslední auto zálohy), takže záloha přežije restart, neudělá se dvakrát v jednom
+    zálohované sestavy jako automatickou zálohu. Stav drží DB (čas poslední auto
+    zálohy per sestava), takže záloha přežije restart, neudělá se dvakrát v jednom
     4hodinovém slotu a běží jen jednou pro celý server. Drží se posledních
-    _ZALOHA_AUTO_MAX (10) auto záloh — při překročení padá vždy ta nejstarší.
-    Prázdnou tabulku přeskakuje."""
+    _ZALOHA_AUTO_MAX (10) auto záloh každé sestavy — při překročení padá vždy ta
+    nejstarší. Prázdnou tabulku přeskakuje."""
     try:
         await asyncio.to_thread(inicializace_sankce_db)
     except Exception as e:
         print(f'[sankce] bg_sankce_zaloha init error: {e}')
     while True:
         try:
-            posledni = await asyncio.to_thread(_posledni_auto_zaloha_cas)
             now = datetime.datetime.now()
             # začátek aktuálního 4hodinového slotu (00:00, 04:00, 08:00, …)
             slot_h = (now.hour // _ZALOHA_INTERVAL_H) * _ZALOHA_INTERVAL_H
             tento_slot = now.replace(hour=slot_h, minute=0, second=0, microsecond=0)
-            if posledni is None or posledni < tento_slot:
+            for _tab in _ZALOHOVANE_SESTAVY:
+                posledni = await asyncio.to_thread(_posledni_auto_zaloha_cas, _tab)
+                if posledni is not None and posledni >= tento_slot:
+                    continue
                 _id, cnt, err = await asyncio.to_thread(
-                    _vytvor_zalohu, 'auto', 'Systém', True)
+                    _vytvor_zalohu, _tab, 'auto', 'Systém', True)
                 if err:
-                    print(f'[sankce] automatická záloha CHYBA: {err}')
+                    print(f'[sankce] automatická záloha {_tab} CHYBA: {err}')
                 elif _id is not None:
-                    print(f'[sankce] automatická záloha OK (#{_id}, {cnt} řádků)')
+                    print(f'[sankce] automatická záloha {_tab} OK (#{_id}, {cnt} řádků)')
         except Exception as e:
             print(f'[sankce] bg_sankce_zaloha error: {e}')
         await asyncio.sleep(60)
@@ -1832,6 +2017,12 @@ def _nacti(tabulka: str) -> list:
             # Datum/čas sloupce do gridu nepatří (JSON serializace) — odstraníme je.
             for k in ('obdobi_od', 'obdobi_do', 'import_at', 'imported_by'):
                 r.pop(k, None)
+            # Ostatní datumové sloupce (Nedodávky) do gridu jako český text.
+            for k, v in r.items():
+                if isinstance(v, datetime.datetime):
+                    r[k] = v.strftime('%d.%m.%Y %H:%M')
+                elif isinstance(v, datetime.date):
+                    r[k] = v.strftime('%d.%m.%Y')
             if 'stav' in r:
                 r['stav_label'] = STAV_LABEL.get(r.get('stav'), 'Nová data')
             if 'stav2' in r:
@@ -1883,6 +2074,73 @@ def _seznam_obdobi_detail(tabulka: str) -> list:
 # =========================================================
 # IMPORT (list DATA)
 # =========================================================
+def _je_xlsb(raw: bytes) -> bool:
+    """Binární sešit (.xlsb) je jako .xlsx ZIP balíček, ale workbook v něm leží
+    binárně (`workbook.bin`) — podle toho ho poznáme bez ohledu na příponu."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as z:
+            return 'xl/workbook.bin' in z.namelist()
+    except Exception:
+        return False
+
+
+def _cti_list_data(raw: bytes):
+    """Otevře sešit (.xlsx přes openpyxl, .xlsb přes pyxlsb) a vrátí
+    (hlavička, iterátor řádků, chyba|None) listu „DATA" (název se porovnává bez
+    ohledu na velikost písmen — jiné exporty ho mají jako „data").
+    Pozn.: pyxlsb vrací každé číslo jako float, takže kódy a čísla objednávek by
+    skončily jako „87527.0" — celá čísla proto vracíme zpět jako int."""
+    if _je_xlsb(raw):
+        from pyxlsb import open_workbook
+        try:
+            wb = open_workbook(io.BytesIO(raw))
+        except Exception as e:
+            return None, None, f'Soubor nelze otevřít: {e}'
+        jmeno = next((s for s in wb.sheets if _norm(s) == 'data'), None)
+        if not jmeno:
+            return None, None, 'Soubor neobsahuje list „DATA".'
+
+        def _cely(v):
+            return int(v) if isinstance(v, float) and v.is_integer() else v
+
+        radky = []
+        with wb.get_sheet(jmeno) as sh:
+            for r in sh.rows():
+                radky.append([_cely(c.v) for c in r])
+        if not radky:
+            return None, None, 'List DATA je prázdný.'
+        return radky[0], iter(radky[1:]), None
+
+    import openpyxl
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(raw), data_only=True, read_only=True)
+    except Exception as e:
+        return None, None, f'Soubor nelze otevřít: {e}'
+    jmeno = next((s for s in wb.sheetnames if _norm(s) == 'data'), None)
+    if not jmeno:
+        return None, None, 'Soubor neobsahuje list „DATA".'
+    rows_iter = wb[jmeno].iter_rows(values_only=True)
+    try:
+        return next(rows_iter), rows_iter, None
+    except StopIteration:
+        return None, None, 'List DATA je prázdný.'
+
+
+def _excel_datum(v):
+    """Datum z buňky → ISO řetězec. Binární sešit ho podává jako Excel sériové
+    číslo (dny od 30. 12. 1899), openpyxl rovnou jako datetime."""
+    if v is None or v == '':
+        return None
+    if isinstance(v, (datetime.datetime, datetime.date)):
+        return v.date().isoformat() if isinstance(v, datetime.datetime) else v.isoformat()
+    if isinstance(v, (int, float)):
+        try:
+            return (datetime.date(1899, 12, 30) + datetime.timedelta(days=int(v))).isoformat()
+        except (ValueError, OverflowError):
+            return None
+    return _s(v) or None
+
+
 def _importuj_sync(raw: bytes, tabulka: str, mapa: dict, cisla: set,
                    obdobi: str, od_iso: str, do_iso: str, user_name: str,
                    pripoj: bool = False):
@@ -1892,55 +2150,56 @@ def _importuj_sync(raw: bytes, tabulka: str, mapa: dict, cisla: set,
       • pripoj=True — jen DOPLNÍ k existujícím datům NOVÉ řádky (nové row_hash) ve stavu
         „Rozpracováno". Stará dávka se nemaže, existující řádky (vč. stavu/poznámky)
         zůstanou beze změny; řádky, které už v daném období jsou, se přeskočí.
+    Co je pro kterou sestavu specifické (pole do row_hash, ručně psané sloupce,
+    datumy, pevný filtr řádků), popisuje `_SESTAVA_IMPORT`.
     Vrací (počet_vložených, počet_přeskočených, chyba|None)."""
-    import openpyxl
-    try:
-        wb = openpyxl.load_workbook(io.BytesIO(raw), data_only=True, read_only=True)
-    except Exception as e:
-        return 0, 0, f'Soubor nelze otevřít: {e}'
+    spec = _SESTAVA_IMPORT[tabulka]
+    rucni_pole = spec['rucni']
+    datumy = spec.get('datumy') or ()
+    filtr = spec.get('filtr') or {}
 
-    if 'DATA' not in wb.sheetnames:
-        return 0, 0, 'Soubor neobsahuje list „DATA".'
-    ws = wb['DATA']
+    header, rows_iter, chyba = _cti_list_data(raw)
+    if chyba:
+        return 0, 0, chyba
 
-    rows_iter = ws.iter_rows(values_only=True)
-    try:
-        header = next(rows_iter)
-    except StopIteration:
-        return 0, 0, 'List DATA je prázdný.'
-
-    # index sloupce → DB pole
+    # index sloupce → DB pole (a zvlášť sloupce, podle kterých se řádky filtrují)
     idx_na_pole = {}
+    filtr_idx = {}
     for i, h in enumerate(header):
-        pole = mapa.get(_norm(h))
+        n = _norm(h)
+        pole = mapa.get(n)
         if pole:
             idx_na_pole[i] = pole
+        if n in filtr:
+            filtr_idx[i] = filtr[n]
     # Nákupčí (pob.) přibyl do exportu dodatečně – starší soubory smí přijít bez něj.
     chybi = set(mapa.values()) - set(idx_na_pole.values()) - _VOLITELNE
     if chybi:
         return 0, 0, 'V listu DATA chybí sloupce: ' + ', '.join(sorted(chybi))
+    chybi_f = set(filtr) - {_norm(h) for h in header}
+    if chybi_f:
+        return 0, 0, 'V listu DATA chybí sloupce filtru: ' + ', '.join(sorted(chybi_f))
 
     je_vystaveni = (tabulka == 'sankce_vystaveni')
     zaznamy = []
     for r in rows_iter:
         if r is None or all(c is None or c == '' for c in r):
             continue
+        # pevný filtr sestavy (např. Nedodávky: DCERA=NE, STATUS=Nedodáno, s příjemkou)
+        if any(_norm(r[i] if i < len(r) else None) != ocek for i, ocek in filtr_idx.items()):
+            continue
         radek = {}
         for i, pole in idx_na_pole.items():
             v = r[i] if i < len(r) else None
-            radek[pole] = _f(v) if pole in cisla else _s(v)
+            if pole in datumy:
+                radek[pole] = _excel_datum(v)
+            else:
+                radek[pole] = _f(v) if pole in cisla else _s(v)
         # přeskoč úplně prázdné (bez IČO i názvu)
         if not radek.get('ico') and not radek.get('nazev_zbozi'):
             continue
-        # row_hash z rozlišujících polí
-        if je_vystaveni:
-            casti = [radek.get('ico'), radek.get('kod_zbozi'), radek.get('cislo_objednavky'),
-                     radek.get('id_pobocky'), radek.get('hodn_sankce')]
-        else:
-            casti = [radek.get('ico'), radek.get('kod_zbozi'), radek.get('cislo_objednavky'),
-                     radek.get('id_pobocky'), radek.get('datum_pozadovano'),
-                     radek.get('odmitnuto_mj'), radek.get('hodn_sankce')]
-        radek['row_hash'] = _row_hash(tabulka, obdobi, casti)
+        radek['row_hash'] = _row_hash(tabulka, obdobi,
+                                      [radek.get(p) for p in spec['hash']])
         zaznamy.append(radek)
 
     if not zaznamy:
@@ -1951,30 +2210,19 @@ def _importuj_sync(raw: bytes, tabulka: str, mapa: dict, cisla: set,
         return 0, 0, 'Chyba připojení k databázi.'
     try:
         cur = conn.cursor(dictionary=True)
+        existujici = set()
+        rucni = {}
         if pripoj:
             # Režim PŘIDÁNÍ: dávku NEMAŽEME. Zjisti, co už v daném období je, ať
             # doplníme jen nové řádky (existující — vč. jejich stavu — neměníme).
-            existujici = set()
             cur.execute(f'SELECT row_hash FROM {tabulka} WHERE obdobi=%s', (obdobi,))
             for x in cur.fetchall():
                 existujici.add(x['row_hash'])
-            rucni = {}
         else:
             # Režim NAHRAZENÍ: zachovej ručně zadané hodnoty (vč. „našeho čísla").
-            existujici = set()
-            rucni = {}
-            if je_vystaveni:
-                cur.execute('SELECT row_hash,stav,stav2,sleva,poznamka,nase_cislo FROM sankce_vystaveni WHERE obdobi=%s', (obdobi,))
-                for x in cur.fetchall():
-                    rucni[x['row_hash']] = {'stav': x.get('stav'), 'stav2': x.get('stav2'),
-                                            'sleva': x.get('sleva'),
-                                            'poznamka': x.get('poznamka'),
-                                            'nase_cislo': x.get('nase_cislo')}
-            else:
-                cur.execute('SELECT row_hash,poznamka,nase_cislo FROM sankce_zamitnute WHERE obdobi=%s', (obdobi,))
-                for x in cur.fetchall():
-                    rucni[x['row_hash']] = {'poznamka': x.get('poznamka'),
-                                            'nase_cislo': x.get('nase_cislo')}
+            cur.execute(f'SELECT row_hash,nase_cislo,{",".join(rucni_pole)} '
+                        f'FROM {tabulka} WHERE obdobi=%s', (obdobi,))
+            rucni = {x['row_hash']: x for x in cur.fetchall()}
 
         # „Naše pořadové číslo": rok z období + další volné pořadí v rámci roku
         # (počítáno PŘED smazáním, takže nová čísla nikdy nekolidují se zachovanými).
@@ -1991,12 +2239,8 @@ def _importuj_sync(raw: bytes, tabulka: str, mapa: dict, cisla: set,
 
         # vlož nové řádky
         pole_data = list(mapa.values())
-        if je_vystaveni:
-            sloupce = ['obdobi', 'obdobi_od', 'obdobi_do', 'row_hash', 'nase_cislo'] + pole_data + \
-                      ['stav', 'stav2', 'sleva', 'poznamka', 'imported_by']
-        else:
-            sloupce = ['obdobi', 'obdobi_od', 'obdobi_do', 'row_hash', 'nase_cislo'] + pole_data + \
-                      ['poznamka', 'imported_by']
+        sloupce = ['obdobi', 'obdobi_od', 'obdobi_do', 'row_hash', 'nase_cislo'] + \
+                  pole_data + list(rucni_pole) + ['imported_by']
         placeholders = ','.join(['%s'] * len(sloupce))
         sql = f"INSERT INTO {tabulka} ({','.join(sloupce)}) VALUES ({placeholders})"
 
@@ -2015,19 +2259,16 @@ def _importuj_sync(raw: bytes, tabulka: str, mapa: dict, cisla: set,
             if not cislo:
                 next_seq += 1
                 cislo = f'{rok}{next_seq:05d}'
-            zaklad = [obdobi, od_iso or None, do_iso or None, rh, cislo] + \
-                     [radek.get(p) for p in pole_data]
+            hodnoty = {p: zachov.get(p) for p in rucni_pole}
             if je_vystaveni:
                 # Re-import (nahrazení) zachová předchozí stav řádku; nový řádek startuje
                 # ve „Nová data". Dodatečně PŘIDANÝ dodavatel (pripoj) startuje rovnou ve
                 # stavu „Rozpracováno".
-                vychozi_stav = 'rozpracovano' if pripoj else 'nova_data'
-                zaklad += [zachov.get('stav') or vychozi_stav,
-                           zachov.get('stav2') or STAV2_DEFAULT,
-                           zachov.get('sleva'),
-                           zachov.get('poznamka'), user_name]
-            else:
-                zaklad += [zachov.get('poznamka'), user_name]
+                hodnoty['stav'] = hodnoty['stav'] or ('rozpracovano' if pripoj else 'nova_data')
+                hodnoty['stav2'] = hodnoty['stav2'] or STAV2_DEFAULT
+            zaklad = [obdobi, od_iso or None, do_iso or None, rh, cislo] + \
+                     [radek.get(p) for p in pole_data] + \
+                     [hodnoty[p] for p in rucni_pole] + [user_name]
             davka.append(tuple(zaklad))
         if davka:
             cur2.executemany(sql, davka)
@@ -2208,7 +2449,7 @@ def _potvrd_smaz_zaloha_dialog(zaloha: dict, user_name: str, refresh_list):
             else:
                 intranet_logger.log_activity(
                     user_name, 'Sankce',
-                    f'Smazání ručního bodu obnovy (k vystavení) #{zaloha.get("id")}')
+                    f'Smazání ručního bodu obnovy #{zaloha.get("id")}')
                 ui.notify('Ruční bod obnovy byl smazán.',
                           type='positive', position='top-right', timeout=4000)
             dlg.close()
@@ -2244,7 +2485,7 @@ def _potvrd_hromadne_smazani_dialog(ids: list, user_name: str, refresh_list, vyb
                 return
             intranet_logger.log_activity(
                 user_name, 'Sankce',
-                f'Hromadné smazání záloh (k vystavení) — {pocet} ks')
+                f'Hromadné smazání záloh — {pocet} ks')
             ui.notify(f'Smazáno {pocet} záloh.',
                       type='positive', position='top-right', timeout=4000)
             vybrane.clear()
@@ -2260,7 +2501,8 @@ def _potvrd_hromadne_smazani_dialog(ids: list, user_name: str, refresh_list, vyb
     dlg.open()
 
 
-def _potvrd_obnova_dialog(zaloha: dict, user_name: str, refresh_fn, close_parent=None):
+def _potvrd_obnova_dialog(zaloha: dict, user_name: str, refresh_fn, close_parent=None,
+                          nazev: str = 'Sankce k vystavení'):
     """Potvrzení „Opravdu přehrát data?" — obnova přepíše celý přehled.
     Po potvrzení („Ano") se data přehrají, zavřou se oba dialogy a sestava se obnoví."""
     cas = zaloha.get('vytvoreno')
@@ -2274,7 +2516,7 @@ def _potvrd_obnova_dialog(zaloha: dict, user_name: str, refresh_fn, close_parent
         ui.label(f'Záloha: {typ_lbl} z {cas_txt} '
                  f'({zaloha.get("pocet_radku") or 0} řádků).') \
             .classes('text-sm text-gray-700 font-medium')
-        ui.label('Aktuální obsah sestavy „Sankce k vystavení" bude nahrazen daty z této '
+        ui.label(f'Aktuální obsah sestavy „{nazev}" bude nahrazen daty z této '
                  'zálohy. Pro jistotu se současný stav před přehráním sám zazálohuje '
                  '(automatická záloha), takže obnovu lze vrátit zpět.') \
             .classes('text-sm text-gray-500')
@@ -2287,7 +2529,7 @@ def _potvrd_obnova_dialog(zaloha: dict, user_name: str, refresh_fn, close_parent
                 return
             intranet_logger.log_activity(
                 user_name, 'Sankce',
-                f'Obnova dat (k vystavení) ze zálohy #{zaloha.get("id")} — {cnt} řádků')
+                f'Obnova dat ({nazev}) ze zálohy #{zaloha.get("id")} — {cnt} řádků')
             ui.notify(f'Data byla obnovena ({cnt} řádků).',
                       type='positive', position='top-right', timeout=5000)
             dlg.close()
@@ -2304,13 +2546,15 @@ def _potvrd_obnova_dialog(zaloha: dict, user_name: str, refresh_fn, close_parent
     dlg.open()
 
 
-def _obnova_button(user_name: str, refresh_fn, text: str = None, je_hlavni_admin: bool = False):
+def _obnova_button(user_name: str, refresh_fn, text: str = None, je_hlavni_admin: bool = False,
+                   tabulka: str = 'sankce_vystaveni', nazev: str = 'Sankce k vystavení'):
     """Tlačítko pro otevření dialogu obnovení dat ze zálohy. Bez textu = kompaktní
     ikonka (do lišty); s textem = popisné tlačítko (do prázdného stavu, kde je obnova
     hlavní akcí). Dostupné účetní i analytikovi; hlavní administrátor (`je_hlavni_admin`)
     navíc může zálohy hromadně mazat."""
     b = ui.button(text or '', icon='restore',
-                  on_click=lambda: _otevri_obnova_dialog(user_name, refresh_fn, je_hlavni_admin))
+                  on_click=lambda: _otevri_obnova_dialog(user_name, refresh_fn, je_hlavni_admin,
+                                                         tabulka, nazev))
     if text:
         b.props('outline color=teal no-caps').classes('font-semibold')
     else:
@@ -2320,8 +2564,10 @@ def _obnova_button(user_name: str, refresh_fn, text: str = None, je_hlavni_admin
     return b
 
 
-def _otevri_obnova_dialog(user_name: str, refresh_fn, je_hlavni_admin: bool = False):
-    """Dialog „Obnovení dat" pro Sankce k vystavení: seznam záloh (automatické +
+def _otevri_obnova_dialog(user_name: str, refresh_fn, je_hlavni_admin: bool = False,
+                          tabulka: str = 'sankce_vystaveni',
+                          nazev: str = 'Sankce k vystavení'):
+    """Dialog „Obnovení dat" pro jednu sestavu: seznam jejích záloh (automatické +
     ruční body obnovy) s možností přehrát data a tlačítkem pro ruční bod obnovy.
     Hlavní administrátor navíc může označit více záloh (i automatických) a smazat
     je najednou. Zálohy nejdou stahovat — slouží jen k obnovení."""
@@ -2353,7 +2599,7 @@ def _otevri_obnova_dialog(user_name: str, refresh_fn, je_hlavni_admin: bool = Fa
 
         @ui.refreshable
         def _seznam():
-            zalohy = _nacti_zalohy()
+            zalohy = _nacti_zalohy(tabulka)
             # z výběru zahoď id, která už neexistují (např. po prořezání auto záloh)
             vybrane.intersection_update({z.get('id') for z in zalohy})
             _aktualizuj_smaz_btn()
@@ -2409,18 +2655,19 @@ def _otevri_obnova_dialog(user_name: str, refresh_fn, je_hlavni_admin: bool = Fa
                                     .tooltip('Smazat tento ruční bod obnovy')
                             ui.button('Obnovit', icon='restore',
                                       on_click=lambda _z=z: _potvrd_obnova_dialog(
-                                          _z, user_name, refresh_fn, dlg.close)) \
+                                          _z, user_name, refresh_fn, dlg.close, nazev)) \
                                 .props('outline color=teal dense no-caps')
         _seznam()
 
         async def _novy_bod():
-            _id, cnt, err = await asyncio.to_thread(_vytvor_zalohu, 'rucni', user_name, False)
+            _id, cnt, err = await asyncio.to_thread(_vytvor_zalohu, tabulka, 'rucni',
+                                                   user_name, False)
             if err:
                 ui.notify(f'Bod obnovení se nepodařilo vytvořit: {err}',
                           type='negative', position='top', timeout=8000)
                 return
             intranet_logger.log_activity(user_name, 'Sankce',
-                                         f'Ruční bod obnovy (k vystavení) — {cnt} řádků')
+                                         f'Ruční bod obnovy ({nazev}) — {cnt} řádků')
             ui.notify(f'Ruční bod obnovy vytvořen ({cnt} řádků).',
                       type='positive', position='top-right', timeout=4000)
             _seznam.refresh()
@@ -2575,13 +2822,13 @@ def _otevri_import_dialog(tabulka: str, mapa: dict, cisla: set, user_name: str, 
                     zprava += f' Přeskočeno {skipped} již existujících.'
                 intranet_logger.log_activity(
                     user_name, 'Sankce',
-                    f'Doplnění dodavatelů (k vystavení) – období {obdobi}: '
-                    f'+{count} řádků (přeskočeno {skipped})')
+                    f'Doplnění dodavatelů ({_SESTAVA_IMPORT[tabulka]["nazev"]}) – období '
+                    f'{obdobi}: +{count} řádků (přeskočeno {skipped})')
             else:
                 zprava = f'Import dokončen — období {obdobi}, načteno {count} řádků.'
                 intranet_logger.log_activity(
                     user_name, 'Sankce',
-                    f'Import {"Sankce k vystavení" if tabulka=="sankce_vystaveni" else "Zamítnuté dodávky"} '
+                    f'Import {_SESTAVA_IMPORT[tabulka]["nazev"]} '
                     f'– období {obdobi}: {count} řádků')
             ui.notify(zprava, type='positive', position='top-right', timeout=6000)
             drzeny['raw'] = None
@@ -2613,12 +2860,13 @@ def _otevri_import_dialog(tabulka: str, mapa: dict, cisla: set, user_name: str, 
 
         async def _on_import_click():
             if not drzeny['raw']:
-                ui.notify('Nejdřív vyberte soubor .xlsx.', type='warning')
+                ui.notify('Nejdřív vyberte soubor .xlsx / .xlsb.', type='warning')
                 return
             await _zpracuj(drzeny['raw'], drzeny['name'])
 
         up = ui.upload(on_upload=_on_upload, auto_upload=True, max_file_size=50_000_000,
-                       label='Vybrat .xlsx soubor').props('accept=.xlsx').classes('w-full')
+                       label='Vybrat soubor .xlsx / .xlsb') \
+            .props('accept=.xlsx,.xlsb').classes('w-full')
 
         stav_lbl = ui.label('').classes('text-xs text-amber-700 font-medium')
         stav_lbl.set_visibility(False)
@@ -2660,7 +2908,9 @@ def _otevri_smazat_dialog(tabulka: str, nazev: str, user_name: str, refresh_fn):
     """Dialog před nevratným smazáním dat sestavy — lze zvolit konkrétní období,
     nebo všechna data. Výběr + tlačítko „Smazat" je zároveň potvrzení."""
     obdobi_list = _seznam_obdobi(tabulka)
-    ma_stavy = (tabulka == 'sankce_vystaveni')
+    rucni_txt = {'sankce_vystaveni': ' a ručně zadané stavy/poznámky.',
+                 'sankce_nedodavky': ' a vyjádření nákupčích k nedodávkám.'}.get(
+        tabulka, ' a ručně zadané poznámky.')
     VSE = '(všechna období)'
 
     with ui.dialog() as dlg, ui.card().classes('p-6 rounded-2xl gap-3') \
@@ -2670,7 +2920,7 @@ def _otevri_smazat_dialog(tabulka: str, nazev: str, user_name: str, refresh_fn):
             ui.label('Smazat data sestavy').classes('text-xl font-bold text-gray-800')
         ui.label(f'Sestava „{nazev}". Vyberte, co se má nevratně smazat — celá sestava, '
                  'nebo jen jedno období. Smaže se i historie změn (👁)' +
-                 (' a ručně zadané stavy/poznámky.' if ma_stavy else ' a ručně zadané poznámky.')) \
+                 rucni_txt) \
             .classes('text-sm text-gray-600')
 
         sel = ui.select([VSE] + obdobi_list, value=VSE, label='Co smazat') \
@@ -2875,10 +3125,11 @@ def _zaregistruj_mazani_radku(user_name, vsechna_prava):
                 cisla.append(int(x))
             except (TypeError, ValueError):
                 pass
-        if tabulka not in ('sankce_zamitnute', 'sankce_vystaveni') or not cisla:
+        refresh_fn = {'sankce_zamitnute': _vykresli_zamitnute.refresh,
+                      'sankce_vystaveni': _vykresli_vystaveni.refresh,
+                      'sankce_nedodavky': _vykresli_nedodavky.refresh}.get(tabulka)
+        if not refresh_fn or not cisla:
             return
-        refresh_fn = (_vykresli_zamitnute.refresh if tabulka == 'sankce_zamitnute'
-                      else _vykresli_vystaveni.refresh)
         _otevri_smazat_radky_dialog(tabulka, cisla, a.get('popis') or '', user_name, refresh_fn)
 
     ui.on('sankce_radek_del', _on_del)
@@ -2991,8 +3242,9 @@ def _otevri_chat(tabulka, row_hash, popis, user_id, user_name, on_badge,
                     .props('target=_blank').tooltip(nazev)
 
     def _bublina(z):
-        moje = (z.get('user_id') == user_id)
-        muze_smazat = moje or muze_mazat_vse
+        zdedeno = z.get('_zdedeno')          # zpráva z tiketu, ze kterého byl tenhle předán
+        moje = (z.get('user_id') == user_id) and not zdedeno
+        muze_smazat = (moje or muze_mazat_vse) and not zdedeno
         cas = z.get('kdy')
         cas_txt = cas.strftime('%d.%m.%Y %H:%M') if hasattr(cas, 'strftime') else str(cas or '')
         with ui.row().classes('w-full items-center group ' +
@@ -3003,8 +3255,20 @@ def _otevri_chat(tabulka, row_hash, popis, user_id, user_name, on_badge,
                     .classes('opacity-0 group-hover:opacity-100').tooltip('Smazat zprávu')
             with ui.column().classes('gap-0').style('max-width:78%'):
                 if not moje:
-                    ui.label(z.get('jmeno') or '—').classes('text-xs font-semibold text-gray-600 px-1')
-                bg = 'background:#2563eb;color:#fff' if moje else 'background:#f1f5f9;color:#1e293b'
+                    with ui.row().classes('items-center gap-1 px-1 no-wrap'):
+                        ui.label(z.get('jmeno') or '—').classes('text-xs font-semibold text-gray-600')
+                        if zdedeno:
+                            rh_z = _s(z.get('row_hash'))
+                            ui.label(f'z tiketu {zdedeno}') \
+                                .classes('text-gray-500 bg-gray-100 rounded px-1 underline '
+                                         'cursor-pointer hover:bg-blue-50 hover:text-blue-700') \
+                                .style('font-size:10px') \
+                                .tooltip('Zobrazit náhled tiketu') \
+                                .on('click', lambda p=rh_z: _nahled_tiketu(int(p[1:]))
+                                    if p[1:].isdigit() else None)
+                bg = ('background:#f8fafc;color:#475569;border:1px dashed #cbd5e1' if zdedeno
+                      else 'background:#2563eb;color:#fff' if moje
+                      else 'background:#f1f5f9;color:#1e293b')
                 with ui.element('div').classes('rounded-2xl px-3 py-2').style(bg):
                     if (z.get('zprava') or '').strip():
                         ui.label(z['zprava']).classes('text-sm') \
@@ -3033,7 +3297,8 @@ def _otevri_chat(tabulka, row_hash, popis, user_id, user_name, on_badge,
 
         def _vykresli(scroll=False):
             zpravy = _nacti_chat_zpravy(tabulka, row_hash)
-            stav['max_id'] = zpravy[-1]['id'] if zpravy else 0
+            # jen vlastní vlákno – zděděné zprávy nesmí rozhodit polling proti _chat_max_id
+            stav['max_id'] = max([z['id'] for z in zpravy if not z.get('_zdedeno')] or [0])
             box.clear()
             with box:
                 with ui.column().classes('w-full gap-2 px-3 py-2'):
@@ -4541,18 +4806,24 @@ TIKET_STAV_LABEL = {
     'storno':        'Stornováno',
     'abnormalita_ceka': 'Abnormalita – ke kontrole',
     'abnormalita':   'Abnormalita',
+    'predano_provoz': 'Předáno na provoz',
+    'predano_nakup':  'Předáno na nákup',
     'uzavreno':      'Uzavřeno',
 }
 # „Otevřené" = někdo na nich ještě má něco udělat (výchozí filtr seznamu tiketů).
 TIKET_STAV_OTEVRENE = ('nakup', 'provoz', 'castecne', 'storno_ceka',
                        'abnormalita_ceka', 'abnormalita')
+# Archiv: tiket předaný dál. Ze seznamu mizí úplně — práce pokračuje v novém
+# tiketu, sem se dostaneš odkazem „z tiketu …" v jeho poznámce nebo diskuzi.
+TIKET_STAV_ARCHIV = ('predano_provoz', 'predano_nakup')
 # Stavy čekající na palec druhotné kontroly (právo sankce_tiket_kontrola).
 TIKET_STAV_KONTROLA = ('storno_ceka', 'abnormalita_ceka')
 ROZ_LABEL = {'vyfakturovat': 'Fakturovat', 'storno': 'Stornovat', 'provoz': 'Na provoz',
              'nakup': 'Na nákup'}
 ROZ_LABEL_REV = {v: k for k, v in ROZ_LABEL.items()}
 # Kódy nákupčích z listu DATA („Nákupčí (pob.)") → individuální právo na tikety.
-KODY_NAKUPCI = ['DR', 'SK', 'CK', 'VI', 'LT', 'NP', 'RD', 'HV', 'UP', 'KO', 'ML', 'OZ', 'VN']
+KODY_NAKUPCI = ['DR', 'SK', 'CK', 'VI', 'LT', 'NP', 'RD', 'HV', 'UP', 'KO', 'ML', 'MR',
+                'OZ', 'VN']
 KOD_PRAVO = {k: 'sankce_tiket_' + k.lower() for k in KODY_NAKUPCI}
 
 _SANKCE_URL = 'https://analytikasys.jip-napoje.cz/sankce'
@@ -4566,7 +4837,8 @@ def _radku(n: int) -> str:
 
 _TIKET_STAV_LABELS = ('U nákupčího', 'U provozu', 'Částečně rozhodnuto', 'K fakturaci',
                       'Storno – ke kontrole', 'Stornováno', 'Nevyfakturováno',
-                      'Abnormalita – ke kontrole', 'Abnormalita', 'Uzavřeno')
+                      'Abnormalita – ke kontrole', 'Abnormalita', 'Uzavřeno',
+                      'Předáno na provoz', 'Předáno na nákup')
 _TIKET_STAV_STYLE = _cell_style(*_TIKET_STAV_LABELS)
 _ROZ_LABELS = ('Fakturovat', 'Stornovat', 'Na provoz', 'Na nákup')
 _ROZ_STYLE = _cell_style(*_ROZ_LABELS)
@@ -4600,16 +4872,22 @@ def _seskup_do_tiketu(radky: list, typ: str) -> OrderedDict:
     return skup
 
 
-def _tiket_stav_z_rozhodnuti(hodnoty) -> str:
-    """Stav tiketu po odeslání: jednotné rozhodnutí → odpovídající stav, různá
-    rozhodnutí → „částečně". Bez rozhodnutí → None (nic se neposílá)."""
-    ruzna = {h for h in hodnoty if h}
-    if not ruzna:
-        return None
-    if len(ruzna) > 1:
+def _stav_tiketu_po_odeslani(fakt, prov, stor, nak, zbytek, tvrde_storno) -> str:
+    """Stav tiketu po odeslání se řídí tím, co ZBÝVÁ udělat, ne mixem rozhodnutí.
+    Pořadí je závazné:
+    1. navržené storno čeká na palec → tiket musí být vidět u kontroly,
+    2. zbyl nerozhodnutý řádek → „částečně", tiket zůstává u řešitele,
+    3. nezbývá nic → tiket se uzavírá podle toho, co se v něm reálně stalo
+       (k fakturaci / stornováno / předáno dál = archiv)."""
+    if stor and not tvrde_storno:
+        return 'storno_ceka'
+    if zbytek:
         return 'castecne'
-    return {'vyfakturovat': 'vyfakturovano', 'storno': 'storno_ceka',
-            'provoz': 'provoz', 'nakup': 'nakup'}[ruzna.pop()]
+    if fakt:
+        return 'vyfakturovano'
+    if stor:
+        return 'storno'
+    return 'predano_provoz' if prov else 'predano_nakup'
 
 
 def _tiket_cislo(tid) -> str:
@@ -4744,7 +5022,8 @@ def _zaloz_tikety(radky: list, typ: str, poznamka: str, user_id, user_name,
 
 def _nacti_tikety() -> list:
     """Seznam tiketů s dopočtem počtu položek a částky (Σ sankce po slevě).
-    Částka se počítá živě z dat — po změně slevy sedí i ve starém tiketu."""
+    Částka se počítá živě z dat — po změně slevy sedí i ve starém tiketu.
+    Archivované (předané dál) se sem nedostanou — viz TIKET_STAV_ARCHIV."""
     conn = intranet_data.get_db_connection()
     if not conn:
         return []
@@ -4753,11 +5032,21 @@ def _nacti_tikety() -> list:
         cur.execute("""
             SELECT t.*,
               (SELECT COUNT(*) FROM sankce_tiket_radky r WHERE r.tiket_id=t.id) AS pocet_radku,
+              (SELECT COUNT(*) FROM sankce_tiket_radky r
+                 JOIN sankce_vystaveni v ON v.id=r.radek_id
+                WHERE r.tiket_id=t.id
+                  AND v.stav NOT IN ('vyfakturovano','nevyfakturovano')
+                  AND NOT EXISTS (SELECT 1 FROM sankce_tiket_radky p
+                                    JOIN sankce_tikety c ON c.id=p.tiket_id
+                                   WHERE c.zdroj_tiket=t.id
+                                     AND p.radek_id=r.radek_id)) AS zbyva_radku,
               (SELECT COALESCE(SUM(v.hodn_sankce*(1-COALESCE(v.sleva,0))),0)
                  FROM sankce_tiket_radky r JOIN sankce_vystaveni v ON v.id=r.radek_id
                 WHERE r.tiket_id=t.id) AS castka
-            FROM sankce_tikety t ORDER BY t.id DESC
-        """)
+            FROM sankce_tikety t
+            WHERE t.stav NOT IN (""" + ','.join(['%s'] * len(TIKET_STAV_ARCHIV)) + """)
+            ORDER BY t.id DESC
+        """, TIKET_STAV_ARCHIV)
         rows = cur.fetchall()
         for t in rows:
             t['cislo'] = _tiket_cislo(t['id'])
@@ -4783,12 +5072,49 @@ def _nacti_tiket_radky(tid) -> list:
                     'JOIN sankce_vystaveni v ON v.id=r.radek_id '
                     'WHERE r.tiket_id=%s ORDER BY r.id', (tid,))
         rows = cur.fetchall()
+        predane = _predane_radky(tid)
         for r in rows:
             for k in ('obdobi_od', 'obdobi_do', 'import_at', 'imported_by'):
                 r.pop(k, None)
             r['stav_label'] = STAV_LABEL.get(r.get('stav'), 'Nová data')
             r['rozhodnuti_label'] = ROZ_LABEL.get(r.get('rozhodnuti'), '')
+            # Vyřízený nebo už předaný řádek se v tiketu nedá znovu rozhodnout.
+            r['_hotovo'] = bool(_s(r.get('stav')) in _HOTOVE_STAVY
+                                or r.get('id') in predane)
         return rows
+    finally:
+        conn.close()
+
+
+_HOTOVE_STAVY = ('vyfakturovano', 'nevyfakturovano')
+
+
+def _otevrene_radky(tid, radky: list) -> list:
+    """Řádky tiketu, které ještě čekají na vyřízení. Hotové (Fakturovat /
+    Nevyfakturovat) ani už předané do navazujícího tiketu se do dalšího
+    odeslání nepočítají — jinak by tiket v „částečně rozhodnuto" posílal
+    tatáž storna na kontrolu a zakládal tytéž tikety znovu."""
+    predane = _predane_radky(tid)
+    return [r for r in radky if _s(r.get('stav')) not in _HOTOVE_STAVY
+            and r.get('id') not in predane]
+
+
+def _predane_radky(tid) -> set:
+    """{radek_id} řádků tiketu, které už mají navazující (dceřiný) tiket.
+    Tiket v „částečně rozhodnuto" jde odeslat opakovaně — bez tohohle filtru
+    by se pro tytéž řádky založil další tiket."""
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return set()
+    try:
+        cur = conn.cursor()
+        cur.execute('SELECT r.radek_id FROM sankce_tiket_radky r '
+                    'JOIN sankce_tikety c ON c.id=r.tiket_id '
+                    'WHERE c.zdroj_tiket=%s', (tid,))
+        return {r[0] for r in cur.fetchall()}
+    except Exception as e:
+        print(f'[sankce] _predane_radky error: {e}')
+        return set()
     finally:
         conn.close()
 
@@ -4909,23 +5235,22 @@ def _odesli_rozhodnuti(tiket: dict, radky: list, user_id, user_name,
     a neposílá se o něm žádný e-mail.
     Vrací (novy_stav_tiketu, hlaska)."""
     tid = tiket.get('id')
-    novy = _tiket_stav_z_rozhodnuti([r.get('rozhodnuti') for r in radky])
-    if not novy:
+    zive = _otevrene_radky(tid, radky)  # už vyřízené řádky do rozhodování nevstupují
+    fakt = [r for r in zive if r.get('rozhodnuti') == 'vyfakturovat']
+    prov = [r for r in zive if r.get('rozhodnuti') == 'provoz']
+    stor = [r for r in zive if r.get('rozhodnuti') == 'storno']
+    nak = [r for r in zive if r.get('rozhodnuti') == 'nakup']
+    if not (fakt or prov or stor or nak):
         return None, 'Není vyplněné žádné rozhodnutí.'
-    if tvrde_storno and novy == 'storno_ceka':
-        novy = 'storno'
+    zbytek = [r for r in zive if not r.get('rozhodnuti')]
+    novy = _stav_tiketu_po_odeslani(fakt, prov, stor, nak, zbytek, tvrde_storno)
     rh, cislo = _tiket_rh(tid), _tiket_cislo(tid)
     _uloz_rozhodnuti([(r.get('rozhodnuti') or None, r.get('tr_id')) for r in radky])
-
-    fakt = [r for r in radky if r.get('rozhodnuti') == 'vyfakturovat']
-    prov = [r for r in radky if r.get('rozhodnuti') == 'provoz']
-    stor = [r for r in radky if r.get('rozhodnuti') == 'storno']
-    nak = [r for r in radky if r.get('rozhodnuti') == 'nakup']
 
     audit = [('sankce_tikety', rh, tid, 'tiket_stav',
               TIKET_STAV_LABEL.get(tiket.get('stav')), TIKET_STAV_LABEL[novy],
               user_id, user_name)]
-    for r in radky:
+    for r in zive:
         if r.get('rozhodnuti'):
             audit.append(('sankce_tikety', rh, tid, 'rozhodnuti', None,
                           f"{r.get('nase_cislo') or r.get('id')} → "
@@ -4990,7 +5315,8 @@ def _palec_kontrola(tiket: dict, radky: list, schvaleno: bool, user_id, user_nam
     účtárně. Zamítnuto → data se nemění a tiket se vrací řešiteli."""
     tid = tiket.get('id')
     rh, cislo = _tiket_rh(tid), _tiket_cislo(tid)
-    stor = [r for r in radky if r.get('rozhodnuti') == 'storno']
+    stor = [r for r in radky if r.get('rozhodnuti') == 'storno'
+            and _s(r.get('stav')) not in _HOTOVE_STAVY]
     dod = _s(tiket.get('jmeno_dodavatele'))
     je_abn = _s(tiket.get('stav')) == 'abnormalita_ceka'
     if je_abn and schvaleno:
@@ -5005,19 +5331,26 @@ def _palec_kontrola(tiket: dict, radky: list, schvaleno: bool, user_id, user_nam
         return 'Abnormalita schválena — tiket čeká na účtárnu, data beze změny.'
     if schvaleno:
         _nastav_stav_radku([r.get('id') for r in stor], 'nevyfakturovano')
+        # Zbyly nerozhodnuté řádky → tiket se vrací řešiteli, ne do „Storno".
+        zbyva = [r for r in radky if not r.get('rozhodnuti')]
+        novy = ('provoz' if _s(tiket.get('typ')) == 'provoz' else 'nakup') if zbyva \
+            else 'storno'
         audit = [('sankce_vystaveni', r.get('row_hash'), r.get('id'), 'stav',
                   STAV_LABEL.get(r.get('stav')), STAV_LABEL['nevyfakturovano'],
                   user_id, user_name)
                  for r in stor]
         audit.append(('sankce_tikety', rh, tid, 'tiket_stav',
-                      TIKET_STAV_LABEL.get(tiket.get('stav')), TIKET_STAV_LABEL['storno'],
+                      TIKET_STAV_LABEL.get(tiket.get('stav')), TIKET_STAV_LABEL[novy],
                       user_id, user_name))
         _zapis_audit_bulk(audit)
-        _uprav_tiket(tid, stav='storno')
+        _uprav_tiket(tid, stav=novy)
         _notifikuj_tiket(('vse', 'sankce_ucetni'),
                          f'Sankce – {cislo} storno schváleno ({dod})',
                          f'{user_name} schválil(a) storno {_radku(len(stor))} dodavatele '
                          f'{dod}. Řádky jsou ve stavu „Nevyfakturovat".')
+        if zbyva:
+            return (f'Storno schváleno — {_radku(len(stor))} přešlo na „Nevyfakturovat". '
+                    f'Tiket zůstává otevřený, {_radku(len(zbyva))} čeká na rozhodnutí.')
         return f'Storno schváleno — {_radku(len(stor))} přešlo na „Nevyfakturovat".'
 
     vec = 'Abnormalita' if je_abn else 'Storno'
@@ -5061,7 +5394,12 @@ def _col_defs_tikety() -> list:
          'cellStyle': {'fontWeight': '600'}},
         {'headerName': 'Období', 'field': 'obdobi', 'width': 140, 'sortable': True},
         {'headerName': 'Položek', 'field': 'pocet_radku', 'width': 100, 'sortable': True,
-         'type': 'numericColumn', ':valueFormatter': _NUM_FMT},
+         'type': 'numericColumn', ':valueFormatter': _NUM_FMT,
+         'headerTooltip': 'Všechny řádky tiketu včetně už vyřízených a předaných'},
+        {'headerName': 'Zbývá', 'field': 'zbyva_radku', 'width': 90, 'sortable': True,
+         'type': 'numericColumn', ':valueFormatter': _NUM_FMT,
+         'headerTooltip': 'Řádky, které v tiketu ještě čekají na rozhodnutí '
+                          '(bez vyřízených a bez předaných do navazujícího tiketu)'},
         {'headerName': 'Sankce celkem', 'field': 'castka', 'width': 150, 'sortable': True,
          'type': 'numericColumn', ':valueFormatter': _MONEY_FMT,
          'cellStyle': {'fontWeight': 'bold'},
@@ -5077,7 +5415,8 @@ def _col_defs_tiket_radky(volby: list, editovatelne: bool) -> list:
     if editovatelne:
         cols.append(
             {'headerName': '', 'field': '_sel', 'width': 44, 'minWidth': 44, 'maxWidth': 44,
-             'pinned': 'left', 'checkboxSelection': True, 'headerCheckboxSelection': True,
+             'pinned': 'left', 'headerCheckboxSelection': True,
+             ':checkboxSelection': "function(p){return !(p.data&&p.data._hotovo);}",
              'headerCheckboxSelectionFilteredOnly': True,
              'sortable': False, 'editable': False, 'resizable': False, 'filter': False,
              'suppressSizeToFit': True, 'suppressAutoSize': True, 'suppressMovable': True,
@@ -5099,10 +5438,78 @@ def _col_defs_tiket_radky(volby: list, editovatelne: bool) -> list:
         {'headerName': 'Stav dat', 'field': 'stav_label', 'width': 150,
          ':cellStyle': _STAV_STYLE, 'editable': False},
         {'headerName': 'Rozhodnutí', 'field': 'rozhodnuti_label', 'width': 150,
-         'editable': editovatelne, 'cellEditor': 'agSelectCellEditor',
+         ':editable': ('function(p){return %s && !(p.data&&p.data._hotovo);}'
+                       % ('true' if editovatelne else 'false')),
+         'cellEditor': 'agSelectCellEditor',
          'cellEditorParams': {'values': volby}, ':cellStyle': _ROZ_STYLE,
-         'headerTooltip': 'Co s řádkem uděláme (klikem změníte)'},
+         'headerTooltip': 'Co s řádkem uděláme (klikem změníte). Už vyřízené '
+                          'a předané řádky měnit nelze.'},
     ]
+
+
+def _poznamka_tiketu(t: dict):
+    """Poznámka pod hlavičkou; „…z tiketu T00024" je odkaz na náhled zdroje."""
+    if not _s(t.get('poznamka')):
+        return
+    lbl = ui.label(f"\U0001F4DD {t['poznamka']}").classes('text-xs text-gray-500 px-5 pb-1')
+    zdroj = t.get('zdroj_tiket')
+    if zdroj:
+        lbl.classes('underline cursor-pointer hover:text-blue-700') \
+            .tooltip('Zobrazit náhled zdrojového tiketu') \
+            .on('click', lambda z=int(zdroj): _nahled_tiketu(z))
+
+
+def _nacti_tiket(tid) -> dict:
+    """Hlavička jednoho tiketu (pro náhled předchůdce z diskuze)."""
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return {}
+    try:
+        cur = conn.cursor(dictionary=True)
+        cur.execute('SELECT * FROM sankce_tikety WHERE id=%s', (tid,))
+        t = cur.fetchone() or {}
+        if t:
+            t['cislo'] = _tiket_cislo(t['id'])
+            t['stav_label'] = TIKET_STAV_LABEL.get(t.get('stav'), t.get('stav') or '')
+            t['typ_label'] = TIKET_TYP_LABEL.get(t.get('typ'), t.get('typ') or '')
+        return t
+    finally:
+        conn.close()
+
+
+def _nahled_tiketu(tid):
+    """Jen ke čtení: tiket, ze kterého sem byla předána diskuze (odkaz „z tiketu …")."""
+    t = _nacti_tiket(tid)
+    if not t:
+        ui.notify('Tiket už neexistuje.', type='warning', position='top')
+        return
+    radky = _nacti_tiket_radky(t['id'])
+    barvy = _PALETA.get(t['stav_label'])
+    with ui.dialog() as d, ui.card().classes('p-0 rounded-2xl gap-0') \
+            .style('min-width:900px;max-width:96vw'):
+        with ui.row().classes('w-full items-center gap-3 px-5 pt-4 pb-2'):
+            ui.icon('history_toggle_off', color='grey-7').classes('text-2xl')
+            with ui.column().classes('gap-0'):
+                ui.label(f"Tiket {t['cislo']} — {_s(t.get('jmeno_dodavatele')) or '—'}") \
+                    .classes('text-lg font-bold text-gray-800')
+                ui.label(' · '.join(x for x in (
+                    t['typ_label'], _s(t.get('kod_nakupci')), _s(t.get('obdobi')),
+                    _radku(len(radky)),
+                    f"předal {_s(t.get('predal'))}" if _s(t.get('predal')) else '') if x)) \
+                    .classes('text-xs text-gray-500')
+            ui.space()
+            ui.label(t['stav_label']).classes('px-3 py-1 rounded-lg text-sm font-bold') \
+                .style(f'background:{barvy[0]};color:{barvy[1]}' if barvy else '')
+            ui.button(icon='close', on_click=d.close).props('flat round dense color=grey-7')
+        _poznamka_tiketu(t)
+        ui.separator()
+        ui.aggrid({'columnDefs': _col_defs_tiket_radky([], False), 'rowData': radky,
+                   'defaultColDef': {'resizable': True, 'sortable': True, 'filter': True},
+                   'rowHeight': 32, ':getRowStyle': _ROW_STYLE_TIKET_RADKY}) \
+            .classes('w-full').style('height:46vh')
+        ui.label('Náhled — rozhodovat lze jen v aktuálním tiketu.') \
+            .classes('text-xs text-gray-400 px-5 py-2')
+    d.open()
 
 
 def _otevri_tiket(t: dict, user_id, user_name, vsechna_prava, refresh):
@@ -5143,8 +5550,7 @@ def _otevri_tiket(t: dict, user_id, user_name, vsechna_prava, refresh):
             ui.label(TIKET_STAV_LABEL.get(stav, stav)).classes(
                 'px-3 py-1 rounded-lg text-sm font-bold bg-gray-100 text-gray-700')
             ui.button(icon='close', on_click=dlg.close).props('flat round dense color=grey-7')
-        if _s(t.get('poznamka')):
-            ui.label(f'📝 {t.get("poznamka")}').classes('text-xs text-gray-500 px-5 pb-1')
+        _poznamka_tiketu(t)
         ui.separator()
 
         g = ui.aggrid({
@@ -5184,7 +5590,7 @@ def _otevri_tiket(t: dict, user_id, user_name, vsechna_prava, refresh):
                 cile = sel
 
             for r in radky:
-                if str(r.get('tr_id')) in cile:
+                if str(r.get('tr_id')) in cile and not r.get('_hotovo'):
                     r['rozhodnuti'] = kod
                     r['rozhodnuti_label'] = ROZ_LABEL.get(kod, '')
             if len(cile) > 1:
@@ -5195,6 +5601,8 @@ def _otevri_tiket(t: dict, user_id, user_name, vsechna_prava, refresh):
 
         def _vse(kod):
             for r in radky:
+                if r.get('_hotovo'):      # vyřízené a předané řádky se nepřepisují
+                    continue
                 r['rozhodnuti'] = kod
                 r['rozhodnuti_label'] = ROZ_LABEL.get(kod, '')
             g.run_grid_method('setGridOption', 'rowData', radky)
@@ -5390,7 +5798,8 @@ async def _vykresli_tikety(user_id, user_name, vsechna_prava):
 
     with ui.row().classes('w-full items-center gap-3 mb-2 flex-wrap'):
         sw = ui.switch('Jen otevřené', value=True) \
-            .tooltip('Skryje uzavřené a vyřešené tikety (stornováno / k fakturaci / uzavřeno)')
+            .tooltip('Skryje uzavřené a vyřešené tikety (stornováno / k fakturaci / uzavřeno). '
+                     'Předané tikety jsou v archivu — v seznamu nejsou vůbec.')
         ui.space()
         info = ui.label('').classes('text-sm text-gray-500')
 
@@ -5451,7 +5860,457 @@ async def _vykresli_tikety(user_id, user_name, vsechna_prava):
 
 
 # =========================================================
-# VSTUPNÍ OBRAZOVKA — DVĚ DLAŽDICE
+# POHLED: NEDODÁVKY — VYJÁDŘENÍ NÁKUPČÍCH
+# =========================================================
+_NEDOD_TABULKA = 'sankce_nedodavky'
+_NEDOD_NAZEV = 'Nedodávky dod. k vyjádření'
+
+
+def _nedod_edit_js(moje_kody, vse_kody: bool) -> str:
+    """`:editable` pro sloupec Vyjádření: nikdy na připnutém řádku „Celkem";
+    nákupčí smí psát jen do řádků se svým kódem NAK (kontrola se opakuje i na
+    serveru, tohle jen zamkne buňku v gridu)."""
+    if vse_kody:
+        return "function(p){return !(p.node&&p.node.rowPinned);}"
+    return ("function(p){if(p.node&&p.node.rowPinned)return false;"
+            "var OK=%s;var d=p.data||{};"
+            "return String(d.nak||'').split(', ').some(function(k){return OK.indexOf(k)>=0;});}"
+            % json.dumps(sorted(moje_kody)))
+
+
+def _col_defs_nedodavky(edit_js: str) -> list:
+    return [
+        {'headerName': '', 'field': '_eye', 'width': 46, 'minWidth': 46, 'maxWidth': 46,
+         'pinned': 'left', 'sortable': False, 'editable': False, 'resizable': False,
+         'suppressSizeToFit': True, 'suppressAutoSize': True,
+         ':cellRenderer': _EYE_RENDERER,
+         'cellStyle': {'textAlign': 'center', 'cursor': 'pointer', 'padding': '0'},
+         'headerTooltip': 'Historie změn řádku'},
+        _col_poradi(),
+        {'headerName': 'Období', 'field': 'obdobi', 'width': 150, 'pinned': 'left',
+         'sortable': True, 'cellStyle': {'fontSize': '12px', 'color': '#475569'}},
+        {'headerName': 'IČO', 'field': 'ico', 'width': 95, 'sortable': True,
+         'cellStyle': {'fontFamily': 'monospace', 'fontSize': '12px'}},
+        {'headerName': 'Dodavatel', 'field': 'jmeno_dodavatele', 'width': 200, 'sortable': True},
+        {'headerName': 'Dodavatel-popis', 'field': 'dodavatel_popis', 'width': 180},
+        {'headerName': 'Kód zboží', 'field': 'kod_zbozi', 'width': 100,
+         'cellStyle': {'fontFamily': 'monospace', 'fontSize': '12px'}},
+        {'headerName': 'Název zboží', 'field': 'nazev_zbozi', 'width': 260, 'sortable': True},
+        {'headerName': 'KOD 2', 'field': 'kod2', 'width': 90},
+        {'headerName': 'Č.obj.', 'field': 'cislo_obj', 'width': 110},
+        {'headerName': 'Pobočka', 'field': 'pobocka', 'width': 100, 'sortable': True},
+        {'headerName': 'Požadováno', 'field': 'pozadovano', 'width': 110},
+        {'headerName': 'Dat. založení', 'field': 'datum_zalozeni', 'width': 115},
+        {'headerName': 'Odmítnuto MJ', 'field': 'odmitnuto_mj', 'width': 115,
+         'type': 'numericColumn', ':valueFormatter': _NUM_FMT},
+        {'headerName': 'Rozdíl dodáno Kč', 'field': 'rozdil_dodano_kc', 'width': 140,
+         'type': 'numericColumn', ':valueFormatter': _MONEY_FMT,
+         'cellStyle': {'fontWeight': 'bold'}},
+        {'headerName': 'NAK', 'field': 'nak', 'width': 80, 'sortable': True,
+         'cellStyle': {'fontFamily': 'monospace', 'fontWeight': '600'}},
+        {'headerName': 'Vyjádření nákupčího', 'field': 'vyjadreni', 'width': 320,
+         ':editable': edit_js, 'cellEditor': 'agLargeTextCellEditor',
+         'cellEditorPopup': True, 'cellStyle': {'backgroundColor': '#fffbeb'},
+         'headerTooltip': 'Důvod nevykrytí dodávky dodavatelem — píše nákupčí (kód NAK)'},
+        {'headerName': 'Zapsal', 'field': 'vyjadreni_by', 'width': 150, 'editable': False},
+        {'headerName': 'Kdy', 'field': 'vyjadreni_at', 'width': 130, 'editable': False,
+         'cellStyle': {'fontSize': '12px', 'color': '#475569'}},
+    ]
+
+
+def _col_defs_nedod_souhrn(edit_js: str) -> list:
+    return [
+        {'headerName': 'IČO', 'field': 'ico', 'width': 100, 'sortable': True,
+         'pinned': 'left', 'checkboxSelection': True, 'headerCheckboxSelection': True,
+         'headerCheckboxSelectionFilteredOnly': True,
+         'cellStyle': {'fontFamily': 'monospace', 'fontSize': '12px'}},
+        {'headerName': 'Dodavatel', 'field': 'jmeno_dodavatele', 'width': 260, 'sortable': True,
+         'cellStyle': {'fontWeight': '600', 'cursor': 'pointer', 'color': '#1d4ed8'},
+         'headerTooltip': 'Klik na jméno rozbalí detailní řádky tohoto dodavatele'},
+        {'headerName': 'Dodavatel-popis', 'field': 'dodavatel_popis', 'width': 200},
+        {'headerName': 'NAK', 'field': 'nak', 'width': 100, 'sortable': True,
+         'cellStyle': {'fontFamily': 'monospace', 'fontWeight': '600'}},
+        {'headerName': 'Položek', 'field': 'pocet', 'width': 90, 'type': 'numericColumn',
+         ':valueFormatter': _NUM_FMT},
+        {'headerName': 'Odmítnuto MJ', 'field': 'odmitnuto_mj', 'width': 125,
+         'type': 'numericColumn', ':valueFormatter': _NUM_FMT},
+        {'headerName': 'Rozdíl dodáno Kč', 'field': 'rozdil_dodano_kc', 'width': 150,
+         'type': 'numericColumn', ':valueFormatter': _MONEY_FMT,
+         'cellStyle': {'fontWeight': 'bold'}},
+        {'headerName': 'Vyjádření nákupčího', 'field': 'vyjadreni', 'width': 420,
+         ':editable': edit_js, 'cellEditor': 'agLargeTextCellEditor',
+         'cellEditorPopup': True, 'cellStyle': {'backgroundColor': '#fffbeb'},
+         'headerTooltip': 'Zápis se propíše do VŠECH zobrazených řádků dodavatele '
+                          '(a všech označených dodavatelů)'},
+    ]
+
+
+@refreshable_na_klienta
+async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
+    ma_vse = 'vse' in vsechna_prava
+    je_analytik = ma_vse or 'sankce_analytik' in vsechna_prava
+    # Nákupčí vidí a edituje jen řádky se svým kódem NAK; ostatní role čtou vše.
+    moje_kody = {k for k, p in KOD_PRAVO.items() if p in vsechna_prava}
+    vidi_vse = je_analytik or bool({'sankce_ucetni', 'sankce_ctenar', 'sankce_nakup'}
+                                   & set(vsechna_prava))
+
+    vsechny = await asyncio.to_thread(_nacti, _NEDOD_TABULKA)
+    if not vidi_vse:
+        vsechny = [r for r in vsechny if (r.get('nak') or '') in moje_kody]
+
+    if not vsechny:
+        if je_analytik:
+            with ui.row().classes('w-full justify-end mb-2 gap-2'):
+                _import_button(_NEDOD_TABULKA, _MAPA_NEDODAVKY, _CISLA_NEDODAVKY,
+                               user_name, _vykresli_nedodavky.refresh)
+                _obnova_button(user_name, _vykresli_nedodavky.refresh, text='Obnovit data',
+                               je_hlavni_admin=ma_vse, tabulka=_NEDOD_TABULKA,
+                               nazev=_NEDOD_NAZEV)
+        with ui.column().classes('items-center py-16 gap-3 w-full'):
+            ui.icon('inventory_2', size='4rem', color='grey-4')
+            ui.label('Zatím nejsou naimportována žádná data.').classes('text-xl text-gray-400 font-bold')
+            if je_analytik:
+                ui.label('Nahrajte soubor tlačítkem „Nahrát data" vpravo nahoře.') \
+                    .classes('text-sm text-gray-400')
+            elif moje_kody:
+                ui.label(f'Pro váš kód nákupčího ({", ".join(sorted(moje_kody))}) '
+                         'nejsou žádné nedodávky.').classes('text-sm text-gray-400')
+        return
+
+    obdobi_list = _seznam_obdobi(_NEDOD_TABULKA)
+    VSE_OBD = '(všechna období)'
+    pohled = {'v': 'souhrn' if app.storage.user.get('sankce_nedodavky_pohled', 'souhrn')
+                              == 'souhrn' else 'radky'}
+    stav = {'obdobi': obdobi_list[0] if obdobi_list else None,
+            'jen_bez': False, 'ico': None}
+
+    edit_js = _nedod_edit_js(moje_kody, je_analytik)
+
+    def _smi_psat(r) -> bool:
+        return je_analytik or (r.get('nak') or '') in moje_kody
+
+    def _zobrazene():
+        data = vsechny
+        if stav['obdobi']:
+            data = [r for r in data if r.get('obdobi') == stav['obdobi']]
+        if stav['jen_bez']:
+            data = [r for r in data if not (r.get('vyjadreni') or '').strip()]
+        if stav['ico']:
+            data = [r for r in data if str(r.get('ico') or '') == stav['ico']]
+        return data
+
+    def _celkem_row(data):
+        radek = {p: sum(_f(r.get(p)) or 0 for r in data) for p in _SOUCET_NEDODAVKY}
+        radek['obdobi'] = 'CELKEM'
+        radek['jmeno_dodavatele'] = f'{len(data)} pol.'
+        return radek
+
+    def _souhrn_data(data=None):
+        """Agregace po dodavatelích (IČO). Vyjádření: společné jen tehdy, když ho
+        mají všechny podkladové řádky stejné — jinak „— různé —"."""
+        data = _zobrazene() if data is None else data
+        skup = OrderedDict()
+        for r in data:
+            k = str(r.get('ico') or '')
+            g = skup.get(k)
+            if g is None:
+                g = skup[k] = {'id': k, 'ico': k,
+                               'jmeno_dodavatele': (r.get('jmeno_dodavatele') or '').strip(),
+                               'dodavatel_popis': (r.get('dodavatel_popis') or '').strip(),
+                               'pocet': 0, 'odmitnuto_mj': 0.0, 'rozdil_dodano_kc': 0.0,
+                               '_nak': set(), '_vyj': set()}
+            g['pocet'] += 1
+            g['odmitnuto_mj'] += _f(r.get('odmitnuto_mj')) or 0.0
+            g['rozdil_dodano_kc'] += _f(r.get('rozdil_dodano_kc')) or 0.0
+            if r.get('nak'):
+                g['_nak'].add(r['nak'])
+            g['_vyj'].add((r.get('vyjadreni') or '').strip())
+        out = []
+        for g in skup.values():
+            g['nak'] = ', '.join(sorted(g.pop('_nak')))
+            vyj = g.pop('_vyj')
+            g['vyjadreni'] = next(iter(vyj)) if len(vyj) == 1 else _MIX_LABEL
+            out.append(g)
+        out.sort(key=lambda x: x['rozdil_dodano_kc'])
+        return out
+
+    def _souhrn_celkem(rows):
+        radek = {p: sum(_f(g.get(p)) or 0 for g in rows)
+                 for p in ('pocet', 'odmitnuto_mj', 'rozdil_dodano_kc')}
+        radek['ico'] = 'CELKEM'
+        radek['jmeno_dodavatele'] = f'{len(rows)} dod.'
+        return radek
+
+    def _info_text(data=None):
+        data = _zobrazene() if data is None else data
+        bez = sum(1 for r in data if not (r.get('vyjadreni') or '').strip())
+        return (f'Zobrazeno řádků: {len(data)} • dodavatelů: '
+                f'{len({r.get("ico") for r in data})} • bez vyjádření: {bez}')
+
+    async def _export():
+        """Export do .xlsx podle právě zvoleného pohledu — detailní řádky, nebo
+        souhrn po dodavatelích. Respektuje filtry v hlavičkách i řazení."""
+        je_souhrn = pohled['v'] == 'souhrn'
+        data = _souhrn_data() if je_souhrn else _zobrazene()
+        ids = await _viditelne_ids(souhrn if je_souhrn else grid)
+        data, dle_gridu = _serad_dle_ids(data, ids)
+        if not dle_gridu:
+            ui.notify('Filtry v hlavičkách sloupců se nepodařilo přečíst — '
+                      'exportuji vše podle filtrů nahoře.',
+                      type='warning', position='top', timeout=6000, multi_line=True)
+        if not data:
+            ui.notify('Aktuální filtr nevrací žádné řádky — není co exportovat.',
+                      type='warning', position='top', timeout=6000)
+            return
+        if je_souhrn:
+            await _export_xlsx(_EXP_NEDODAVKY_SOUHRN, data, _souhrn_celkem(data),
+                               'nedodavky_dodavatele', 'Dodavatelé')
+        else:
+            await _export_xlsx(_EXP_NEDODAVKY, data, _celkem_row(data),
+                               'nedodavky', 'Nedodávky')
+
+    def _aplikuj_souhrn(data=None):
+        s = _souhrn_data(data)
+        souhrn.options['rowData'] = s
+        souhrn.options['pinnedBottomRowData'] = [_souhrn_celkem(s)]
+        souhrn.run_grid_method('setGridOption', 'rowData', s)
+        souhrn.run_grid_method('onFilterChanged')
+        return s
+
+    def _aplikuj():
+        data = _zobrazene()
+        grid.options['rowData'] = data
+        grid.options['pinnedBottomRowData'] = [_celkem_row(data)]
+        grid.update()
+        grid.run_grid_method('onFilterChanged')
+        _aplikuj_souhrn(data)
+        info.set_text(_info_text(data))
+        lbl_dod.set_text(f'Dodavatel: {stav["ico"]}' if stav['ico'] else '')
+        btn_zrus_dod.set_visibility(bool(stav['ico']))
+
+    # ── Ovládací lišta ──
+    with ui.row().classes('w-full items-center gap-3 mb-2 flex-wrap'):
+        prep = ui.toggle({'souhrn': '📇 Dodavatelé (souhrn)', 'radky': '📋 Řádky (detail)'},
+                         value=pohled['v']).props('no-caps dense unelevated')
+
+        sel_obd = ui.select([VSE_OBD] + obdobi_list,
+                            value=stav['obdobi'] or VSE_OBD, label='Období') \
+            .props('outlined dense options-dense').classes('w-60')
+
+        def _on_obd(e):
+            stav['obdobi'] = None if e.value == VSE_OBD else e.value
+            _aplikuj()
+        sel_obd.on_value_change(_on_obd)
+
+        sw_bez = ui.switch('Jen bez vyjádření', value=False) \
+            .tooltip('Zobrazí pouze řádky, ke kterým nákupčí zatím nic nenapsal')
+
+        def _on_bez(e):
+            stav['jen_bez'] = bool(e.value)
+            _aplikuj()
+        sw_bez.on_value_change(_on_bez)
+
+        lbl_dod = ui.label('').classes('text-sm font-semibold text-blue-700')
+        btn_zrus_dod = ui.button(icon='close', on_click=lambda: _zrus_dodavatele()) \
+            .props('flat round dense color=grey-7').tooltip('Zrušit filtr na dodavatele')
+        btn_zrus_dod.set_visibility(False)
+
+        ui.space()
+        info = ui.label('').classes('text-sm text-gray-500')
+        ui.button(icon='download', text='Export', on_click=_export) \
+            .props('color=secondary outline dense no-caps') \
+            .tooltip('Stáhne .xlsx podle zvoleného pohledu (detail / dodavatelé) '
+                     'včetně filtrů v hlavičkách i řazení.')
+        if je_analytik:
+            # Obnova přepíše celou sestavu — jen analytik / 'vse'.
+            _obnova_button(user_name, _vykresli_nedodavky.refresh, je_hlavni_admin=ma_vse,
+                           tabulka=_NEDOD_TABULKA, nazev=_NEDOD_NAZEV)
+            _import_button(_NEDOD_TABULKA, _MAPA_NEDODAVKY, _CISLA_NEDODAVKY,
+                           user_name, _vykresli_nedodavky.refresh)
+            _smazat_button(_NEDOD_TABULKA, _NEDOD_NAZEV,
+                           user_name, _vykresli_nedodavky.refresh)
+
+    if not je_analytik and moje_kody:
+        ui.label(f'✍ Vidíte a vyplňujete nedodávky svého nákupu ({", ".join(sorted(moje_kody))}). '
+                 'V souhrnu se zápis propíše do všech zobrazených řádků dodavatele.') \
+            .classes('text-xs text-gray-500 mb-1')
+    elif not je_analytik:
+        ui.label('👁 Sestavu vidíte jen pro čtení — filtrovat, řadit a exportovat můžete, '
+                 'vyjádření píší nákupčí podle kódu NAK.').classes('text-xs text-gray-500 mb-1')
+
+    _opts = {
+        'columnDefs': _col_defs_nedodavky(edit_js),
+        'rowData': _zobrazene(),
+        'pinnedBottomRowData': [_celkem_row(_zobrazene())],
+        'defaultColDef': {'resizable': True, 'sortable': False, 'filter': True},
+        'rowHeight': 32,
+        'singleClickEdit': True,
+        'stopEditingWhenCellsLoseFocus': True,
+        'suppressMovableColumns': True,
+        ':getRowStyle': _PINNED_TOTAL_STYLE,
+        ':onFirstDataRendered': _AUTOSIZE_FIT,
+        ':onGridSizeChanged': _AUTOSIZE_FIT,
+        ':onFilterChanged': _FILTER_RECALC_NEDODAVKY,
+        ':getRowId': _GET_ROW_ID,
+    }
+    if je_analytik:
+        _opts.update(_grid_mazani_js(_NEDOD_TABULKA))
+    grid = ui.aggrid(_opts).classes('w-full').style(_GRID_STYLE)
+
+    _s0 = _souhrn_data()
+    souhrn = ui.aggrid({
+        'columnDefs': _col_defs_nedod_souhrn(edit_js),
+        'rowData': _s0,
+        'pinnedBottomRowData': [_souhrn_celkem(_s0)],
+        'defaultColDef': {'resizable': True, 'sortable': False, 'filter': True},
+        'rowHeight': 32,
+        'singleClickEdit': True,
+        'stopEditingWhenCellsLoseFocus': True,
+        'suppressMovableColumns': True,
+        'rowSelection': 'multiple',
+        'suppressRowClickSelection': True,
+        ':getRowStyle': _PINNED_TOTAL_STYLE,
+        ':onFirstDataRendered': _AUTOSIZE_FIT,
+        ':onGridSizeChanged': _AUTOSIZE_FIT,
+        ':onFilterChanged': _FILTER_RECALC_NEDOD_SOUHRN,
+        ':getRowId': _GET_ROW_ID,
+    }).classes('w-full').style(_GRID_STYLE)
+
+    def _prepni(v: str):
+        pohled['v'] = v
+        app.storage.user['sankce_nedodavky_pohled'] = v
+        je_s = v == 'souhrn'
+        souhrn.set_visibility(je_s)
+        grid.set_visibility(not je_s)
+        (souhrn if je_s else grid).run_grid_method('sizeColumnsToFit')
+    prep.on_value_change(lambda e: _prepni(e.value or 'radky'))
+    _prepni(pohled['v'])
+
+    def _zrus_dodavatele():
+        stav['ico'] = None
+        _aplikuj()
+
+    info.set_text(_info_text())
+
+    # ── Zápis vyjádření ──
+    def _uloz_vyjadreni(radky: list, text: str) -> int:
+        """Zapíše vyjádření do daných řádků (DB + audit + paměť). Vrací počet."""
+        cile = [r for r in radky if _smi_psat(r)
+                and (r.get('vyjadreni') or '') != (text or '')]
+        if not cile:
+            return 0
+        kdy = datetime.datetime.now().strftime('%d.%m.%Y %H:%M')
+        conn = intranet_data.get_db_connection()
+        if not conn:
+            ui.notify('Není spojení s databází — vyjádření se neuložilo.', type='negative')
+            return 0
+        try:
+            cur = conn.cursor()
+            cur.executemany(
+                f'UPDATE {_NEDOD_TABULKA} SET vyjadreni=%s, vyjadreni_by=%s, '
+                f'vyjadreni_at=NOW() WHERE id=%s',
+                [(text, user_name, r.get('id')) for r in cile])
+            conn.commit(); cur.close()
+        finally:
+            conn.close()
+        for r in cile:
+            zapis_audit(_NEDOD_TABULKA, r.get('row_hash'), r.get('id'),
+                        'vyjadreni', r.get('vyjadreni'), text, user_id, user_name)
+            r['vyjadreni'] = text
+            r['vyjadreni_by'] = user_name
+            r['vyjadreni_at'] = kdy
+        return len(cile)
+
+    def _on_change(e):
+        a = e.args or {}
+        if a.get('colId') != 'vyjadreni':
+            return
+        d = a.get('data') or {}
+        rid = d.get('id')
+        nova = a.get('newValue')
+        radek = next((r for r in vsechny if r.get('id') == rid), None)
+        if radek is None:
+            return
+        if not _smi_psat(radek):
+            ui.notify('Vyjádření smí psát jen nákupčí s odpovídajícím kódem NAK.',
+                      type='warning')
+            _aplikuj()
+            return
+        if _uloz_vyjadreni([radek], nova or ''):
+            intranet_logger.log_activity(user_name, 'Sankce',
+                                         f'Vyjádření (Nedodávky) #{rid}')
+            grid.run_grid_method('applyTransaction', {'update': [radek]})
+            _aplikuj_souhrn()
+            info.set_text(_info_text())
+    grid.on('cellValueChanged', _on_change)
+
+    async def _on_change_souhrn(e):
+        """Zápis v souhrnu = vyjádření na VŠECH zobrazených řádcích dodavatele
+        (a všech označených dodavatelů, je-li jich zaškrtnuto víc)."""
+        a = e.args or {}
+        if a.get('colId') != 'vyjadreni':
+            return
+        gid = (a.get('data') or {}).get('id')
+        nova = a.get('newValue')
+        if not gid or nova == _MIX_LABEL:
+            _aplikuj_souhrn()
+            return
+        try:
+            sel_ids = await ui.run_javascript(
+                f'const c=getElement({souhrn.id});'
+                "return (c&&c.run_grid_method)?"
+                "c.run_grid_method('getSelectedRows').map(r=>r.id):[];",
+                timeout=5,
+            )
+        except Exception:
+            sel_ids = []
+        cile = {str(x) for x in (sel_ids or []) if x is not None}
+        cile = cile if (str(gid) in cile and len(cile) > 1) else {str(gid)}
+
+        data = _zobrazene()
+        radky = [r for r in data if str(r.get('ico') or '') in cile]
+        pocet = _uloz_vyjadreni(radky, nova or '')
+        if not pocet:
+            ui.notify('Nic se nezměnilo — buď je text stejný, nebo k těmto řádkům '
+                      'nemáte právo psát.', type='warning', position='top', timeout=5000)
+            _aplikuj_souhrn(data)
+            return
+        intranet_logger.log_activity(
+            user_name, 'Sankce',
+            f'Vyjádření (Nedodávky) hromadně: {len(cile)} dod. / {pocet} řádků')
+        ui.notify(f'Vyjádření zapsáno u {pocet} řádků ({len(cile)} dodavatel(ů)).',
+                  type='positive', position='top', timeout=4000)
+        grid.run_grid_method('applyTransaction', {'update': radky})
+        grid.run_grid_method('onFilterChanged')
+        _aplikuj_souhrn(data)
+        info.set_text(_info_text(data))
+    souhrn.on('cellValueChanged', _on_change_souhrn)
+
+    # ── Kliknutí: očičko (historie) v detailu, jméno dodavatele v souhrnu ──
+    def _on_click(e):
+        a = e.args or {}
+        d = a.get('data') or {}
+        if a.get('colId') != '_eye' or not d.get('row_hash'):
+            return
+        _zobraz_historii(_NEDOD_TABULKA, d['row_hash'],
+                         f"{d.get('jmeno_dodavatele','')} – {d.get('nazev_zbozi','')}")
+    grid.on('cellClicked', _on_click)
+
+    def _on_click_souhrn(e):
+        a = e.args or {}
+        if a.get('colId') != 'jmeno_dodavatele':
+            return
+        ico = (a.get('data') or {}).get('ico')
+        if not ico or ico == 'CELKEM':
+            return
+        stav['ico'] = str(ico)
+        prep.set_value('radky')
+        _aplikuj()
+    souhrn.on('cellClicked', _on_click_souhrn)
+
+
+# =========================================================
+# VSTUPNÍ OBRAZOVKA — DLAŽDICE SESTAV
 # =========================================================
 def _dlazdice(emoji, nadpis, barva_border, barva_btn, on_click):
     """Klasická čtvercová dlaždice (stejný styl jako na hlavní nástěnce)."""
@@ -5481,6 +6340,9 @@ async def vykresli_sankce(user_id, user_name, vsechna_prava):
     vidi_zamitnute = ma_vse or je_ctenar or 'sankce_nakup' in vsechna_prava or 'sankce_analytik' in vsechna_prava
     vidi_tikety = vidi_vystaveni or bool(
         {'sankce_tiket_provoz', 'sankce_tiket_kontrola', *KOD_PRAVO.values()} & set(vsechna_prava))
+    # Nedodávky: čtou všechny role modulu, píší do nich nákupčí podle kódu NAK.
+    vidi_nedodavky = vidi_zamitnute or vidi_vystaveni or bool(
+        set(KOD_PRAVO.values()) & set(vsechna_prava))
 
     pohled = app.storage.user.get('sankce_pohled')
     if pohled == 'vystaveni' and not vidi_vystaveni:
@@ -5488,6 +6350,8 @@ async def vykresli_sankce(user_id, user_name, vsechna_prava):
     if pohled == 'zamitnute' and not vidi_zamitnute:
         pohled = None
     if pohled == 'tikety' and not vidi_tikety:
+        pohled = None
+    if pohled == 'nedodavky' and not vidi_nedodavky:
         pohled = None
 
     # ── Hlavička ──
@@ -5503,7 +6367,8 @@ async def vykresli_sankce(user_id, user_name, vsechna_prava):
             ui.label('Sankce').classes('text-3xl font-extrabold text-gray-800')
             nadpis = {'zamitnute': 'Zamítnuté dodávky dodavatelem',
                       'vystaveni': 'Sankce k vystavení',
-                      'tikety': 'Tikety — rozhodnutí o sankcích'}.get(pohled,
+                      'tikety': 'Tikety — rozhodnutí o sankcích',
+                      'nedodavky': _NEDOD_NAZEV}.get(pohled,
                       'Přehled sankcí vůči dodavatelům')
             ui.label(nadpis).classes('text-sm text-gray-500')
 
@@ -5517,8 +6382,11 @@ async def vykresli_sankce(user_id, user_name, vsechna_prava):
     if pohled == 'tikety':
         await _vykresli_tikety(user_id, user_name, vsechna_prava)
         return
+    if pohled == 'nedodavky':
+        await _vykresli_nedodavky(user_id, user_name, vsechna_prava)
+        return
 
-    if not (vidi_vystaveni or vidi_zamitnute or vidi_tikety):
+    if not (vidi_vystaveni or vidi_zamitnute or vidi_tikety or vidi_nedodavky):
         with ui.column().classes('items-center py-20 gap-3 w-full'):
             ui.icon('lock', size='4rem', color='grey-4')
             ui.label('Nemáte přístup k žádné sestavě modulu Sankce.').classes('text-lg text-gray-400')
@@ -5543,3 +6411,9 @@ async def vykresli_sankce(user_id, user_name, vsechna_prava):
                 vykresli_sankce.refresh()
             _dlazdice('🎫', 'Tikety (nákup / provoz)',
                       'border-emerald-200', 'bg-emerald-600 hover:bg-emerald-700', _otevri_t)
+        if vidi_nedodavky:
+            def _otevri_n():
+                app.storage.user['sankce_pohled'] = 'nedodavky'
+                vykresli_sankce.refresh()
+            _dlazdice('📦', 'Nedodávky dod. k vyjádření',
+                      'border-sky-200', 'bg-sky-600 hover:bg-sky-700', _otevri_n)
