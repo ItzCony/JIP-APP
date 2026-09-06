@@ -481,6 +481,64 @@ def vykresli_prirazena_prava(prava_keys, zakladni_prava, varianta='osobni'):
                             chip.tooltip(popis)
 
 
+def vykresli_zastupy_sekce(cil_id, vsichni_db, log_kdo=None, log_koho=''):
+    """Zástupy: koho konkrétního smí uživatel schvalovat a koho vidí v kalendáři (nad rámec práv oddělení).
+    Ukládá se okamžitě do user_watched_users."""
+    u_akt = next((u for u in vsichni_db.values() if u['id'] == cil_id), {})
+    stav = {int(k): {'schvalovat': bool(v.get('schvalovat')), 'kalendar': bool(v.get('kalendar'))}
+            for k, v in (u_akt.get('sledovani_detail') or {}).items()}
+    jmena = {u['id']: u['jmeno_cele'] for u in vsichni_db.values() if u['aktivni'] and u['id'] != cil_id}
+
+    def uloz():
+        intranet_data.uloz_sledovane_uzivatele(cil_id, stav)
+        if log_kdo:
+            intranet_logger.log_activity(log_kdo, "Správa uživatelů", f"Zástupy ({log_koho}): {len(stav)} osob")
+        ui.notify('Uloženo.', type='positive')
+
+    @ui.refreshable
+    def seznam():
+        if not stav:
+            ui.label('Nikoho navíc – vidí a schvaluje jen podle práv oddělení.').classes('text-sm text-gray-400 italic')
+            return
+        for wid in sorted(stav, key=lambda i: jmena.get(i, '')):
+            with ui.row().classes('items-center gap-3 w-full bg-gray-50 border border-gray-200 rounded-xl px-3 py-2'):
+                ui.icon('person', size='sm', color='gray-500')
+                ui.label(jmena.get(wid, f'ID {wid}')).classes('font-medium text-gray-800 flex-1')
+                ui.checkbox('Schvalovat', value=stav[wid]['schvalovat'],
+                            on_change=lambda e, w=wid: (stav[w].update(schvalovat=e.value), uloz())).props('dense')
+                ui.checkbox('Kalendář', value=stav[wid]['kalendar'],
+                            on_change=lambda e, w=wid: (stav[w].update(kalendar=e.value), uloz())).props('dense')
+                ui.button(icon='delete',
+                          on_click=lambda w=wid: (stav.pop(w, None), uloz(), seznam.refresh())).props('flat dense color=red')
+
+    def pridat():
+        volne = {i: n for i, n in jmena.items() if i not in stav}
+        with ui.dialog() as d, ui.card().classes('p-5 rounded-2xl w-full max-w-md'):
+            ui.label('Přidat osobu').classes('text-lg font-bold text-slate-800 mb-2')
+            sel = ui.select(volne, label='Jméno', with_input=True).classes('w-full').props('outlined dense')
+            ch_s = ui.checkbox('Může schvalovat docházku', value=True)
+            ch_k = ui.checkbox('Vidí v kalendáři', value=True)
+
+            def ok():
+                if not sel.value:
+                    ui.notify('Vyberte jméno.', type='warning'); return
+                if not (ch_s.value or ch_k.value):
+                    ui.notify('Zaškrtněte alespoň jednu možnost.', type='warning'); return
+                stav[sel.value] = {'schvalovat': ch_s.value, 'kalendar': ch_k.value}
+                uloz(); seznam.refresh(); d.close()
+
+            with ui.row().classes('w-full justify-end gap-2 mt-3'):
+                ui.button('Zrušit', on_click=d.close).props('flat no-caps').classes('text-slate-600')
+                ui.button('Přidat', icon='add', on_click=ok).props('no-caps').classes('bg-blue-600 text-white font-bold')
+        d.open()
+
+    with ui.row().classes('items-center gap-2 w-full mt-2 mb-2'):
+        ui.label('Zástupy – koho smí schvalovat / vidět v kalendáři').classes('text-xs font-bold text-slate-400 uppercase tracking-wider')
+        ui.button(icon='add', on_click=pridat).props('flat dense round color=blue').tooltip('Přidat osobu')
+    with ui.column().classes('w-full gap-2'):
+        seznam()
+
+
 @refreshable_na_klienta
 def vykresli_prehled(user_id, user_name, vsechna_prava):
     nastaveni = intranet_data.nacti_nastaveni_intranetu()
@@ -1106,8 +1164,10 @@ def vykresli_dochazku(user_id, user_name, vsechna_prava):
 
     vsichni_uzivatele_komplet = intranet_data.ziskej_vsechny_uzivatele()
     muj_ucet = next((u for u in vsichni_uzivatele_komplet.values() if u['id'] == user_id), {})
-    moji_sledovani = muj_ucet.get('sledovani_uzivatele', [])
+    moji_sledovani = muj_ucet.get('sledovani_kalendar', [])          # koho vidím v kalendáři
+    moji_sledovani_schval = muj_ucet.get('sledovani_schvalovat', [])  # koho smím schvalovat
     jsem_majitel = bool(moji_sledovani)
+    jsem_majitel_schval = bool(moji_sledovani_schval)
 
     ma_pristup_vsechny_slozky = 'vse' in vsechna_prava or 'slozky_vse' in vsechna_prava
     ma_pristup_vsechny_kalendare = 'vse' in vsechna_prava or 'kalendar_vse' in vsechna_prava
@@ -1152,7 +1212,7 @@ def vykresli_dochazku(user_id, user_name, vsechna_prava):
                     prijemci.add(mail)
 
         for mail, udata in vsichni_uzivatele_komplet.items():
-            if cilovy_id in udata.get('sledovani_uzivatele', []) and udata.get('email_nova_zadost', True):
+            if cilovy_id in udata.get('sledovani_schvalovat', []) and udata.get('email_nova_zadost', True):
                 prijemci.add(mail)
 
         if not prijemci:
@@ -1513,12 +1573,14 @@ def vykresli_dochazku(user_id, user_name, vsechna_prava):
                 dostupna_oddeleni_kalendar.append(odd_nazev)
 
         filter_options = {}
-        if jsem_majitel:
-            filter_options['Sledovani'] = '👑 Moji sledovaní uživatelé (Majitel)'
-        else:
+        if dostupna_oddeleni_kalendar:
             filter_options['Všechna'] = 'Všechna oddělení'
             for o in sorted(dostupna_oddeleni_kalendar):
                 filter_options[o] = o
+        if jsem_majitel:
+            filter_options['Sledovani'] = '👑 Moji sledovaní uživatelé'
+        if not filter_options:
+            filter_options['Všechna'] = 'Všechna oddělení'
 
         aktualni_filtr = app.storage.user.get('cal_odd_filter')
         if aktualni_filtr not in filter_options:
@@ -1541,7 +1603,7 @@ def vykresli_dochazku(user_id, user_name, vsechna_prava):
             typ_barvy[_t] = (f'bg-{_fam}-200', f'bg-{_fam}-400', f'text-{_fam}-900')
 
         # Filtr oddělení má smysl jen když je z čeho vybírat (vedoucí více oddělení).
-        zobraz_odd_filtr = (not jsem_majitel) and (len(dostupna_oddeleni_kalendar) > 1)
+        zobraz_odd_filtr = len(filter_options) > 1
         # Filtr typu absence jen pro vedoucí oddělení (ne řadové členy).
         jsem_vedouci_oddeleni = jsem_majitel or ma_pristup_vsechny_kalendare or any(p.startswith('hlavni_vedouci_') for p in vsechna_prava)
         # Řadový člen vidí u kolegů jen veřejné typy; ostatní se maskují jako "Absence".
@@ -1644,7 +1706,7 @@ def vykresli_dochazku(user_id, user_name, vsechna_prava):
                         continue
                     if vybrany_filter not in ('Sledovani', 'Všechna') and odd != vybrany_filter:
                         continue
-                    if not (jsem_majitel or ma_pristup_vsechny_kalendare or f"kalendar_{odd.lower()}" in vsechna_prava):
+                    if not (ud['id'] in moji_sledovani or ma_pristup_vsechny_kalendare or f"kalendar_{odd.lower()}" in vsechna_prava):
                         continue
                     skupiny.setdefault(odd, {})[ud['id']] = {'jmeno': ud['jmeno_cele'], 'dny': {}}
 
@@ -1659,6 +1721,10 @@ def vykresli_dochazku(user_id, user_name, vsechna_prava):
                         if v['user_iduser'] not in moji_sledovani:
                             continue
                     elif vybrany_filter != 'Všechna' and odd_nazev != vybrany_filter:
+                        continue
+
+                    if not (v.get('user_iduser') in moji_sledovani or ma_pristup_vsechny_kalendare
+                            or f"kalendar_{odd_nazev.lower()}" in vsechna_prava):
                         continue
 
                     typ_zobrazeny = v['typ']
@@ -1761,7 +1827,7 @@ def vykresli_dochazku(user_id, user_name, vsechna_prava):
     vyrizene_zadosti_vse = [z for z in vsechny_zadosti if z['stav_id'] != 1]
 
     dostupne_vnitrni = []
-    if ma_pristup_zadosti or povoleny_schvalovat_oddeleni or jsem_neci_manazer or jsem_majitel: dostupne_vnitrni.append('moje')
+    if ma_pristup_zadosti or povoleny_schvalovat_oddeleni or jsem_neci_manazer or jsem_majitel_schval: dostupne_vnitrni.append('moje')
     if povoleny_sprava_oddeleni: dostupne_vnitrni.append('sprava')
 
     if not dostupne_vnitrni:
@@ -1772,7 +1838,7 @@ def vykresli_dochazku(user_id, user_name, vsechna_prava):
         app.storage.user['dochazka_vnitrni_tab'] = dostupne_vnitrni[0] if dostupne_vnitrni else None
 
     with ui.tabs(value=app.storage.user['dochazka_vnitrni_tab']).props('no-caps align=left dense active-color=red-6 indicator-color=red-6').classes('w-full justify-start border-b-2 border-gray-200 mb-4 text-gray-600') as main_tabs:
-        if ma_pristup_zadosti or povoleny_schvalovat_oddeleni or jsem_neci_manazer or jsem_majitel: ui.tab('moje', label='Moje docházka').classes('text-sm font-semibold')
+        if ma_pristup_zadosti or povoleny_schvalovat_oddeleni or jsem_neci_manazer or jsem_majitel_schval: ui.tab('moje', label='Moje docházka').classes('text-sm font-semibold')
         if povoleny_sprava_oddeleni: ui.tab('sprava', label='Záznamy oddělení').classes('text-sm font-semibold')
 
     main_tabs.on_value_change(lambda e: app.storage.user.update(dochazka_vnitrni_tab=e.value))
@@ -1782,11 +1848,11 @@ def vykresli_dochazku(user_id, user_name, vsechna_prava):
         # ==========================================================
         # TAB 1: MOJE DOCHÁZKA (Žádosti + Schvalování)
         # ==========================================================
-        if ma_pristup_zadosti or povoleny_schvalovat_oddeleni or jsem_neci_manazer or jsem_majitel:
+        if ma_pristup_zadosti or povoleny_schvalovat_oddeleni or jsem_neci_manazer or jsem_majitel_schval:
             with ui.tab_panel('moje'):
 
                 muze_zadat_za_sebe = ma_pristup_zadosti
-                muze_zadat_za_jine = bool(povoleny_schvalovat_oddeleni) or is_global_admin or jsem_neci_manazer or jsem_majitel
+                muze_zadat_za_jine = bool(povoleny_schvalovat_oddeleni) or is_global_admin or jsem_neci_manazer or jsem_majitel_schval
 
                 if muze_zadat_za_sebe:
                     @ui.refreshable
@@ -1847,7 +1913,7 @@ def vykresli_dochazku(user_id, user_name, vsechna_prava):
                         if 'admin' in udata['jmeno_cele'].lower() or 'admin' in udata.get('oddeleni', '').lower(): continue
                         odd_list = [o.strip() for o in (udata.get('oddeleni') or 'Bez oddělení').split(',')]
                         is_manager = user_id in udata.get('manager_id', [])
-                        is_watched = udata['id'] in moji_sledovani
+                        is_watched = udata['id'] in moji_sledovani_schval
                         if is_global_admin or any(o in povoleny_schvalovat_oddeleni for o in odd_list) or is_manager or is_watched:
                             podrizeni_pro_zadani[udata['id']] = f"{udata['jmeno_cele']} ({udata.get('oddeleni', 'Bez oddělení')})"
 
@@ -2143,7 +2209,7 @@ def vykresli_dochazku(user_id, user_name, vsechna_prava):
 
                                                     zadatel_data_s = next((u for u in vsichni_uzivatele_komplet.values() if u['id'] == z['user_iduser']), {})
                                                     is_manager_zadatele = user_id in zadatel_data_s.get('manager_id', [])
-                                                    is_watched_by_me = z['user_iduser'] in moji_sledovani
+                                                    is_watched_by_me = z['user_iduser'] in moji_sledovani_schval
                                                     ma_pravo_na_oddeleni = (z.get('oddeleni') and any(r.strip() in povoleny_schvalovat_oddeleni for r in z.get('oddeleni').split(',')))
                                                     muze_mazat = (z['stav'] == 'Čeká na schválení' and z['user_iduser'] == user_id) or ma_pristup_mazani or is_global_admin or ma_pravo_na_oddeleni or is_manager_zadatele or is_watched_by_me
 
@@ -2169,7 +2235,7 @@ def vykresli_dochazku(user_id, user_name, vsechna_prava):
                             vykresli_moje_seznam()
                             _sub_refreshes.append(vykresli_moje_seznam.refresh)
 
-                if povoleny_schvalovat_oddeleni or jsem_neci_manazer or jsem_majitel:
+                if povoleny_schvalovat_oddeleni or jsem_neci_manazer or jsem_majitel_schval:
                     ui.label('Záznamy ke schválení').classes('text-xs font-bold text-orange-500 uppercase tracking-widest mt-6 mb-3')
 
                     def _make_schvalit(zid, z_data):
@@ -2285,7 +2351,7 @@ def vykresli_dochazku(user_id, user_name, vsechna_prava):
                             if 'admin' in z.get('u_jmeno', '').lower() or 'admin' in z.get('u_prijmeni', '').lower(): continue
                             zd = next((u for u in vsichni_uzivatele_komplet.values() if u['id'] == z.get('user_iduser')), {})
                             is_mgr = user_id in zd.get('manager_id', [])
-                            is_wtch = z.get('user_iduser') in moji_sledovani
+                            is_wtch = z.get('user_iduser') in moji_sledovani_schval
                             ma_odd = (z.get('oddeleni') and any(r.strip() in povoleny_schvalovat_oddeleni for r in z.get('oddeleni').split(',')))
                             if (is_global_admin or ma_odd or is_mgr or is_wtch):
                                 cele_jmeno = f"{z['u_jmeno']} {z['u_prijmeni']}"
@@ -2326,7 +2392,7 @@ def vykresli_dochazku(user_id, user_name, vsechna_prava):
                             if 'admin' in z.get('u_jmeno', '').lower() or 'admin' in z.get('u_prijmeni', '').lower(): continue
                             zd_h = next((u for u in vsichni_uzivatele_komplet.values() if u['id'] == z.get('user_iduser')), {})
                             is_mgr_h = user_id in zd_h.get('manager_id', [])
-                            is_wtch_h = z.get('user_iduser') in moji_sledovani
+                            is_wtch_h = z.get('user_iduser') in moji_sledovani_schval
                             ma_odd_h = (z.get('oddeleni') and any(r.strip() in povoleny_schvalovat_oddeleni for r in z.get('oddeleni').split(',')))
                             if is_global_admin or ma_odd_h or is_mgr_h or is_wtch_h:
                                 z['_typ_zaznamu'] = 'volno'
@@ -4618,6 +4684,9 @@ def vykresli_spravu_uzivatelu(user_email, user_name, vsechna_prava=None):
                                     a_prv = [p.strip() for p in uzivatel_db[cil_mail]['prava'].split(',')] if uzivatel_db[cil_mail]['prava'] else []
                                     vybrane_prava_edit = render_prava_kategorie(zakladni_prava, a_prv)
 
+                                    vykresli_zastupy_sekce(uzivatel_db[cil_mail]['id'], uzivatel_db,
+                                                           log_kdo=user_name, log_koho=cil_mail)
+
                                     async def potvrdit_u():
                                         od_str = ",".join(n_od.value) if isinstance(n_od.value, list) else n_od.value
                                         pr_str = ",".join(vybrane_prava_edit)
@@ -4944,13 +5013,8 @@ def vykresli_spravu_uzivatelu(user_email, user_name, vsechna_prava=None):
                                                                 ui.label(jmeno).classes('font-bold text-gray-800 text-lg')
 
                                                             if odd_je_majitel:
-                                                                opts_id_name = {u_val['id']: u_val['jmeno_cele'] for u_val in db.values() if u_val['aktivni'] and u_val['id'] != u_data['id']}
-
-                                                                def save_watched(e, uid=u_data['id']):
-                                                                    intranet_data.uloz_sledovane_uzivatele(uid, e.value)
-                                                                    ui.notify(f'Uloženo.', type='positive')
-
-                                                                ui.select(opts_id_name, value=u_data.get('sledovani_uzivatele', []), multiple=True, label='Vyberte uživatele pro globální kalendář a schvalování', on_change=save_watched).classes('w-full').props('use-chips clearable')
+                                                                vykresli_zastupy_sekce(u_data['id'], db,
+                                                                                       log_kdo=user_name, log_koho=jmeno)
 
                                         ui.button('Zavřít', on_click=dlg.close).classes('w-full mt-6 bg-gray-200 hover:bg-gray-300 text-gray-800 font-bold rounded-xl h-12')
                                     dlg.open()

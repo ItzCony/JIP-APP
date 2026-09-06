@@ -987,7 +987,12 @@ def inicializace_db():
 
         cursor.execute("CREATE TABLE IF NOT EXISTS user_manager (user_id INT, manager_id INT, PRIMARY KEY (user_id, manager_id), FOREIGN KEY (user_id) REFERENCES user(iduser) ON DELETE CASCADE, FOREIGN KEY (manager_id) REFERENCES user(iduser) ON DELETE CASCADE) ENGINE=InnoDB")
         cursor.execute("CREATE TABLE IF NOT EXISTS user_spolecnost (user_id INT, spolecnost_id INT, PRIMARY KEY (user_id, spolecnost_id), FOREIGN KEY (user_id) REFERENCES user(iduser) ON DELETE CASCADE, FOREIGN KEY (spolecnost_id) REFERENCES spolecnost(id) ON DELETE CASCADE) ENGINE=InnoDB")
-        cursor.execute("CREATE TABLE IF NOT EXISTS user_watched_users (user_id INT, watched_user_id INT, PRIMARY KEY (user_id, watched_user_id), FOREIGN KEY (user_id) REFERENCES user(iduser) ON DELETE CASCADE, FOREIGN KEY (watched_user_id) REFERENCES user(iduser) ON DELETE CASCADE) ENGINE=InnoDB")
+        cursor.execute("CREATE TABLE IF NOT EXISTS user_watched_users (user_id INT, watched_user_id INT, schvalovat TINYINT(1) NOT NULL DEFAULT 1, kalendar TINYINT(1) NOT NULL DEFAULT 1, PRIMARY KEY (user_id, watched_user_id), FOREIGN KEY (user_id) REFERENCES user(iduser) ON DELETE CASCADE, FOREIGN KEY (watched_user_id) REFERENCES user(iduser) ON DELETE CASCADE) ENGINE=InnoDB")
+        # Zástupy: rozpad "sledovaného uživatele" na dvě práva. Stávající řádky = obojí (dosavadní chování).
+        try: cursor.execute("ALTER TABLE user_watched_users ADD COLUMN schvalovat TINYINT(1) NOT NULL DEFAULT 1")
+        except Exception: pass
+        try: cursor.execute("ALTER TABLE user_watched_users ADD COLUMN kalendar TINYINT(1) NOT NULL DEFAULT 1")
+        except Exception: pass
 
         cursor.execute("CREATE TABLE IF NOT EXISTS department_To_user (department_iddepartment INT, user_iduser INT, PRIMARY KEY(department_iddepartment, user_iduser), FOREIGN KEY(department_iddepartment) REFERENCES department(iddepartment) ON DELETE CASCADE, FOREIGN KEY(user_iduser) REFERENCES user(iduser) ON DELETE CASCADE) ENGINE=InnoDB")
         cursor.execute("CREATE TABLE IF NOT EXISTS jobPosition (idjobPosition INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(45) UNIQUE) ENGINE=InnoDB")
@@ -1994,15 +1999,23 @@ def ziskej_vsechny_spolecnosti():
         if conn: conn.close()
 
 def uloz_sledovane_uzivatele(user_id, watched_ids):
+    """watched_ids = seznam ID (obojí právo) nebo dict {id: {'schvalovat': bool, 'kalendar': bool}}."""
+    if isinstance(watched_ids, dict):
+        radky = [(user_id, int(wid), 1 if (v or {}).get('schvalovat') else 0, 1 if (v or {}).get('kalendar') else 0)
+                 for wid, v in watched_ids.items()]
+        radky = [r for r in radky if r[2] or r[3]]
+    else:
+        radky = [(user_id, int(wid), 1, 1) for wid in (watched_ids or [])]
     conn = get_db_connection()
     if not conn: return False
     cursor = None
     try:
         cursor = conn.cursor()
         cursor.execute("DELETE FROM user_watched_users WHERE user_id=%s", (user_id,))
-        if watched_ids:
-            cursor.executemany("INSERT INTO user_watched_users (user_id, watched_user_id) VALUES (%s, %s)", [(user_id, wid) for wid in watched_ids])
+        if radky:
+            cursor.executemany("INSERT INTO user_watched_users (user_id, watched_user_id, schvalovat, kalendar) VALUES (%s, %s, %s, %s)", radky)
         conn.commit()
+        _CACHE_UZIVATELE['ts'] = 0.0
         return True
     except Exception as e:
         print(f"Chyba uloz_sledovane_uzivatele: {e}")
@@ -2066,10 +2079,14 @@ def ziskej_vsechny_uzivatele():
         for s in cursor.fetchall():
             spolecnost_map.setdefault(s['user_id'], []).append({'id': s['spolecnost_id'], 'nazev': s['nazev']})
 
-        cursor.execute("SELECT user_id, watched_user_id FROM user_watched_users")
-        watched_map = {}
+        cursor.execute("SELECT user_id, watched_user_id, schvalovat, kalendar FROM user_watched_users")
+        watched_map, watched_schval, watched_kal, watched_detail = {}, {}, {}, {}
         for w in cursor.fetchall():
             watched_map.setdefault(w['user_id'], []).append(w['watched_user_id'])
+            if w['schvalovat']: watched_schval.setdefault(w['user_id'], []).append(w['watched_user_id'])
+            if w['kalendar']: watched_kal.setdefault(w['user_id'], []).append(w['watched_user_id'])
+            watched_detail.setdefault(w['user_id'], {})[w['watched_user_id']] = {
+                'schvalovat': bool(w['schvalovat']), 'kalendar': bool(w['kalendar'])}
 
         vysledek = {}
         for u in users:
@@ -2092,6 +2109,9 @@ def ziskej_vsechny_uzivatele():
                 "manager_id": manager_map.get(uid, []),
                 "spolecnosti": spolecnost_map.get(uid, []),
                 "sledovani_uzivatele": watched_map.get(uid, []),
+                "sledovani_schvalovat": watched_schval.get(uid, []),
+                "sledovani_kalendar": watched_kal.get(uid, []),
+                "sledovani_detail": watched_detail.get(uid, {}),
                 "email_nova_zadost": bool(u.get('email_nova_zadost', 1)),
                 "email_vyrizeni_zadosti": bool(u.get('email_vyrizeni_zadosti', 1)),
                 "email_narozeniny": bool(u.get('email_narozeniny', 1)),
