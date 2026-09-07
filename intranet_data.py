@@ -182,7 +182,10 @@ SOUBOR_NASTAVENI_INTRANETU = 'nastaveni_intranetu.json'
 
 # Veřejná URL portálu pro odkazy v e-mailech. Není tajemství, ale patří ke
 # konfiguraci prostředí (test/ostrý), ne do editovatelného nastavení portálu.
-APP_URL = os.environ.get('JIPKA_APP_URL', '').strip().rstrip('/')
+# Bez env proměnné se použije ostrý portál — jinak by odkazy z e-mailů chyběly
+# (prázdný APP_URL si každý modul vykládá jako „odkaz neznám“ a vynechá ho).
+APP_URL = (os.environ.get('JIPKA_APP_URL', '').strip()
+           or 'https://analytikasys.jip-napoje.cz').rstrip('/')
 
 # ==========================================
 # GLOBÁLNÍ PAMĚŤOVÁ CACHE (RAM)

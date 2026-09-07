@@ -807,6 +807,7 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
             'cenopripad_zadatel_nakup', 'cenopripad_zadatel_obchod',
             'cenopripad_zadatel_letaky', 'cenopripad_office_letaky',
             'cenopripad_ctenar_letaky',
+            'cenopripad_zadatel_ovozel', 'cenopripad_office_ovozel',
             'cenopripad_office_nakup', 'cenopripad_office_obchod',
             'cenopripad_spravce_nakup', 'cenopripad_spravce',
             'cenopripad_spravce_bez_emailu', 'cenopripad_vkladatel',
