@@ -257,6 +257,8 @@ _AKCE_NAZVY = {
     'obraty_nahled': 'Náhled obratů',
     'obraty_export_pdf': 'Export PDF — obraty',
     'obraty_export_xlsx': 'Export XLSX — obraty',
+    'srovnani_nahled': 'Náhled srovnání zákazníků',
+    'srovnani_export_xlsx': 'Export XLSX — srovnání zákazníků',
     'import': 'Import dat',
     'poznamka': 'Poznámka',
     'poznamka_edit': 'Úprava poznámky',
@@ -708,8 +710,11 @@ def _kc(hodnota):
     return f'{hodnota:,.0f}'.replace(',', ' ') + ' Kč'
 
 
+_UZAVRENE_PREFIX = 'lupa_uzavrene_mesice_'
+
+
 def _uzavrene_key(rok):
-    return f'lupa_uzavrene_mesice_{rok}'
+    return f'{_UZAVRENE_PREFIX}{rok}'
 
 
 def _stav_bunka_mesic(rok, mesic, uzavren, editable, user_name, refresh):
@@ -724,8 +729,8 @@ def _stav_bunka_mesic(rok, mesic, uzavren, editable, user_name, refresh):
     with box:
         ui.label(('✓ ' if uzavren else '') + f'{mesic:02d}')
     popis = ('Uzavřené období — data k dispozici' if uzavren else
-             ('Klikněte pro označení uzavřeného období' if editable
-              else 'Období zatím není uzavřené'))
+             ('Klikněte pro označení uzavřeného období — jinak zůstane vyjmuté z filtru'
+              if editable else 'Nekompletní období — ve filtru nejde zvolit'))
     box.props(f'title="{popis}"')
     if editable:
         def _toggle(_=None, m=mesic):
@@ -752,7 +757,8 @@ def _vykresli_uzavrene_mesice(user_name, editable):
                 ui.icon('event_available', color='primary')
                 ui.label(f'Nahraná data za rok {rok}') \
                     .classes('text-lg font-bold text-gray-800')
-            ui.label('🟢 zelené = uzavřené období k dispozici · 🔴 zatím nenahráno') \
+            ui.label('🟢 zelené = uzavřené období k dispozici · 🔴 nekompletní — '
+                     've filtru měsíců je šedé a nejde zvolit') \
                 .classes('text-xs text-gray-500 mb-2')
             if not editable:
                 ui.label('Označuje ten, kdo nahrává obraty.') \
@@ -902,6 +908,69 @@ def _volby_obdobi(asm):
         (asm,))]
 
 
+def _nekompletni_klice():
+    """Nekompletní měsíce jako rok*100+měsíc — vkladatel je neoznačil za uzavřené.
+
+    Čteme jen roky, ke kterým panel něco eviduje; rok bez záznamu (historie)
+    neřešíme, jinak by se po zapnutí funkce vyřadila celá minulost."""
+    ven = []
+    for klic, uzavrene in list(app.storage.general.items()):
+        if not klic.startswith(_UZAVRENE_PREFIX):
+            continue
+        rok = klic[len(_UZAVRENE_PREFIX):]
+        if not rok.isdigit():
+            continue
+        ven += [int(rok) * 100 + m for m in range(1, 13)
+                if m not in (uzavrene or [])]
+    return ven
+
+
+def _nekompletni_obdobi(obdobi):
+    """Měsíce ze seznamu voleb, které jsou nekompletní (pro šedé položky selectu)."""
+    ne = set(_nekompletni_klice())
+    return {klic for klic in obdobi if _obd_int(klic) in ne}
+
+
+class _VyberMesice(ui.select):
+    """Výběr měsíce, kde neuzavřené měsíce zůstanou v nabídce, ale šedé.
+
+    Quasar bere příznak `disable` přímo z položky options. Nestačí ho dopsat po
+    vytvoření — ChoiceElement.update() staví options pokaždé znovu, takže se
+    značka musí vracet právě tam."""
+
+    def __init__(self, label, obdobi, hodnota, nevolitelne):
+        self._nevolitelne = set(nevolitelne)
+        super().__init__(obdobi, label=label, clearable=True,
+                         value=hodnota if hodnota in obdobi
+                         and hodnota not in self._nevolitelne else None)
+        # Vlastní vykreslení položky jen kvůli tooltipu u šedého měsíce.
+        self.add_slot('option', '''
+            <q-item v-bind="props.itemProps">
+                <q-item-section>
+                    <q-item-label>{{ props.opt.label }}</q-item-label>
+                </q-item-section>
+                <q-tooltip v-if="props.opt.disable">Měsíc je nekompletní, nelze zvolit</q-tooltip>
+            </q-item>
+        ''')
+
+    def _update_options(self):
+        super()._update_options()
+        with self._props.suspend_updates():
+            for volba, klic in zip(self._props['options'], self._values):
+                if klic in self._nevolitelne:
+                    volba['disable'] = True
+
+
+def _sel_obdobi(label, obdobi, hodnota):
+    """Výběr měsíce. Neuzavřené měsíce jsou šedé a nejdou zvolit."""
+    ven = _nekompletni_obdobi(obdobi)
+    sel = _VyberMesice(label, obdobi, hodnota, ven) \
+        .props('dense outlined options-dense').style('min-width: 140px')
+    if ven:
+        sel.tooltip('Šedé měsíce nejsou uzavřené — data zatím nekompletní.')
+    return sel
+
+
 def _volby_zakazniku(asm):
     """{ičo: 'Jméno · Město · IČO'} pro ui.select. Bereme z dimenze, ne z faktů.
     IČO je v labelu schválně — with_input hledá v labelu, takže jde vyhledat i psaním IČ."""
@@ -969,8 +1038,16 @@ def _volby_oz(asm):
 
 
 def _filtr_sql(asm, filtr, produkt_uz_pripojen=False):
-    """WHERE pro `lupa_obrat o`. Vrací (sql, params, je_potreba_join_produktu)."""
+    """WHERE pro `lupa_obrat o`. Vrací (sql, params, je_potreba_join_produktu).
+
+    Nekompletní měsíce vyřazujeme tady, ne až v UI: prázdný filtr Od/Do jinak
+    pustí rozjetý měsíc do souhrnů i grafů."""
     kde, par = ['o.asm = %s'], [asm]
+    nekompletni = _nekompletni_klice()
+    if nekompletni:
+        kde.append('o.rok*100+o.mesic NOT IN (%s)'
+                   % ','.join(['%s'] * len(nekompletni)))
+        par += nekompletni
     od, do = _obd_int(filtr.get('od')), _obd_int(filtr.get('do'))
     if od:
         kde.append('o.rok*100+o.mesic >= %s')
@@ -1042,6 +1119,70 @@ def _produkty_zakaznika(asm, ico, filtr):
         ORDER BY kc DESC
         LIMIT {_STROP_NAHLED}
     """, par, slovnik=True)
+
+
+# ============================================================================
+# Záložka "Lupni srovnání" — zákazník proti zákazníkovi po produktech
+# ============================================================================
+
+def _srovnani_zakazniku(asm, ico_a, ico_b, filtr):
+    """Řádek = produkt, sloupce = obrat A vs B za zvolené období.
+
+    Jeden dotaz na obě IČ a pivot v Pythonu — dva zákazníci dají stovky řádků,
+    dvojitý dotaz ani SQL pivot se nevyplatí."""
+    f = dict(filtr, ico=[ico_a, ico_b])
+    kde, par, _ = _filtr_sql(asm, f, produkt_uz_pripojen=True)
+    syrove = _dotaz(f"""
+        SELECT o.ico, o.kod, p.nazev, p.dodavatel,
+               SUM(o.obrat_mj) AS mj, SUM(o.obrat_kc) AS kc
+        FROM lupa_obrat o
+        LEFT JOIN lupa_produkt p ON p.kod = o.kod
+        WHERE {kde}
+        GROUP BY o.ico, o.kod, p.nazev, p.dodavatel
+    """, par, slovnik=True)
+
+    radky = {}
+    for r in syrove:
+        radek = radky.setdefault(r['kod'], {
+            'kod': r['kod'], 'nazev': r['nazev'], 'dodavatel': r['dodavatel'],
+            'a_mj': 0.0, 'a_kc': 0.0, 'b_mj': 0.0, 'b_kc': 0.0})
+        strana = 'a' if r['ico'] == ico_a else 'b'
+        radek[strana + '_mj'] += float(r['mj'] or 0)
+        radek[strana + '_kc'] += float(r['kc'] or 0)
+
+    for radek in radky.values():
+        ma_a = bool(radek['a_mj'] or radek['a_kc'])
+        ma_b = bool(radek['b_mj'] or radek['b_kc'])
+        radek['rozdil_kc'] = radek['a_kc'] - radek['b_kc']
+        radek['stav'] = 'oba' if ma_a and ma_b else ('jen A' if ma_a else 'jen B')
+    return sorted(radky.values(), key=lambda r: abs(r['rozdil_kc']), reverse=True)
+
+
+def _cols_srovnani(jm_a, jm_b):
+    """Sloupce pro grid i XLSX. Jména zákazníků jdou do hlaviček, jinak by
+    v exportu nebylo poznat, kdo je A a kdo B."""
+    return [
+        ('Kód', 'kod', 'text', 16),
+        ('Produkt', 'nazev', 'text', 38),
+        ('Dodavatel', 'dodavatel', 'text', 24),
+        (f'A · {jm_a} — MJ', 'a_mj', 'num', 16),
+        (f'A · {jm_a} — Kč', 'a_kc', 'money', 20),
+        (f'B · {jm_b} — MJ', 'b_mj', 'num', 16),
+        (f'B · {jm_b} — Kč', 'b_kc', 'money', 20),
+        ('Rozdíl Kč (A−B)', 'rozdil_kc', 'money', 20),
+        ('Stav', 'stav', 'text', 10),
+    ]
+
+
+def _srovnani_total(rows):
+    return {
+        'nazev': f'CELKEM {len(rows)} produktů',
+        'a_mj': sum(r['a_mj'] for r in rows),
+        'a_kc': sum(r['a_kc'] for r in rows),
+        'b_mj': sum(r['b_mj'] for r in rows),
+        'b_kc': sum(r['b_kc'] for r in rows),
+        'rozdil_kc': sum(r['rozdil_kc'] for r in rows),
+    }
 
 
 # ============================================================================
@@ -1979,12 +2120,15 @@ def _vykresli_detail(asm, user_id, user_name, vsechna_prava):
             .classes('w-full border-b border-gray-200') as taby:
         ui.tab('odberatele', label='📄 Lupni odběratele')
         ui.tab('obraty', label='📊 Lupni obraty')
+        ui.tab('srovnani', label='⚖️ Lupni srovnání')
         ui.tab('poznamky', label='📝 Moje poznámky')
     with ui.tab_panels(taby, value='odberatele').classes('w-full pt-4'):
         with ui.tab_panel('odberatele'):
             _vykresli_odberatele(asm, user_id, user_name, vsechna_prava)
         with ui.tab_panel('obraty'):
             _vykresli_obraty(asm, user_id, user_name, vsechna_prava)
+        with ui.tab_panel('srovnani'):
+            _vykresli_srovnani(asm, user_id, user_name, vsechna_prava)
         with ui.tab_panel('poznamky'):
             _vykresli_poznamky(asm, user_id, user_name, vsechna_prava)
 
@@ -2057,12 +2201,8 @@ def _vykresli_odberatele(asm, user_id, user_name, vsechna_prava):
     _pruh_importu(asm)
 
     with ui.row().classes('w-full items-end gap-3 mb-2 flex-wrap'):
-        sel_od = ui.select(obdobi, label='Od měsíce', clearable=True,
-                           value=ulozeny.get('od') if ulozeny.get('od') in obdobi else None) \
-            .props('dense outlined options-dense').style('min-width: 140px')
-        sel_do = ui.select(obdobi, label='Do měsíce', clearable=True,
-                           value=ulozeny.get('do') if ulozeny.get('do') in obdobi else None) \
-            .props('dense outlined options-dense').style('min-width: 140px')
+        sel_od = _sel_obdobi('Od měsíce', obdobi, ulozeny.get('od'))
+        sel_do = _sel_obdobi('Do měsíce', obdobi, ulozeny.get('do'))
         sel_zak = ui.select(
             zak_volby, label='Zákazníci', multiple=True, with_input=True, clearable=True,
             value=[i for i in (ulozeny.get('ico') or []) if i in zak_volby]) \
@@ -2292,6 +2432,185 @@ def _vykresli_odberatele(asm, user_id, user_name, vsechna_prava):
     chk_rozpad.on_value_change(_bez_klienta(prepni_rozpad))
 
 
+def _kratke_jmeno(ico, zak_volby):
+    """Jméno z labelu selectu (`Jméno · Město · IČO`) do hlavičky sloupce."""
+    return (zak_volby.get(ico) or ico).split(' · ')[0][:24]
+
+
+def _vykresli_srovnani(asm, user_id, user_name, vsechna_prava):
+    filtr_klic = f'lupa_srovnani_{user_id}_{asm}'
+    ulozeny = app.storage.user.get(filtr_klic) or {}
+    obdobi = _volby_obdobi(asm)
+    zak_volby = _volby_zakazniku(asm)
+    dod_volby = _volby_dodavatelu()
+
+    stav = {'rows': [], 'filtr': {}, 'popis': '', 'jm_a': 'A', 'jm_b': 'B'}
+
+    _pruh_importu(asm)
+
+    with ui.row().classes('w-full items-end gap-3 mb-2 flex-wrap'):
+        sel_od = _sel_obdobi('Od měsíce', obdobi, ulozeny.get('od'))
+        sel_do = _sel_obdobi('Do měsíce', obdobi, ulozeny.get('do'))
+        sel_a = ui.select(
+            zak_volby, label='Zákazník A', with_input=True, clearable=True,
+            value=ulozeny.get('a') if ulozeny.get('a') in zak_volby else None) \
+            .props('dense outlined options-dense').style('min-width: 340px') \
+            .tooltip('Pište jméno nebo IČO.')
+        sel_b = ui.select(
+            zak_volby, label='Zákazník B', with_input=True, clearable=True,
+            value=ulozeny.get('b') if ulozeny.get('b') in zak_volby else None) \
+            .props('dense outlined options-dense').style('min-width: 340px') \
+            .tooltip('Pište jméno nebo IČO.')
+        sel_dod = ui.select(
+            dod_volby, label='Dodavatelé', multiple=True, with_input=True,
+            clearable=True,
+            value=[d for d in (ulozeny.get('dodavatel') or []) if d in dod_volby]) \
+            .props('dense outlined options-dense use-chips').style('min-width: 280px') \
+            .tooltip('Prázdné = všichni dodavatelé.')
+
+    with ui.row().classes('w-full items-center gap-3 mb-3 flex-wrap'):
+        btn_nacti = ui.button('Načíst', icon='compare_arrows') \
+            .props('unelevated color=indigo-7')
+        btn_xlsx = ui.button('XLSX srovnání', icon='table_view') \
+            .props('outline color=green-7')
+        prepinac = ui.toggle(['Vše', 'Bere jen A', 'Bere jen B', 'Berou oba'],
+                             value='Vše') \
+            .props('dense unelevated color=indigo-7 no-caps') \
+            .tooltip('Filtr produktů, ne zákazníků. „Bere jen B" = bílá místa '
+                     'zákazníka A — co bere B a A ne.')
+    btn_xlsx.disable()
+
+    vysledek = ui.column().classes('w-full')
+
+    with vysledek:
+        with ui.column().classes('items-center py-16 gap-3 w-full'):
+            ui.icon('compare_arrows', size='4rem', color='grey-3')
+            ui.label('Zvolte dva zákazníky a klikněte na Načíst') \
+                .classes('text-lg font-semibold text-gray-400')
+
+    def _soucasny_filtr():
+        return {'od': sel_od.value, 'do': sel_do.value,
+                'a': sel_a.value, 'b': sel_b.value,
+                'dodavatel': list(sel_dod.value or [])}
+
+    def _vybrane_radky():
+        volba = prepinac.value
+        if volba == 'Bere jen A':
+            return [r for r in stav['rows'] if r['stav'] == 'jen A']
+        if volba == 'Bere jen B':
+            return [r for r in stav['rows'] if r['stav'] == 'jen B']
+        if volba == 'Berou oba':
+            return [r for r in stav['rows'] if r['stav'] == 'oba']
+        return stav['rows']
+
+    def vykresli_vysledek():
+        rows = _vybrane_radky()
+        cols = _cols_srovnani(stav['jm_a'], stav['jm_b'])
+        vysledek.clear()
+        with vysledek:
+            if not rows:
+                with ui.column().classes('items-center py-16 gap-3 w-full'):
+                    ui.icon('search_off', size='4rem', color='grey-3')
+                    ui.label('Filtru nic neodpovídá') \
+                        .classes('text-lg font-semibold text-gray-400')
+                return
+            zobrazene = rows[:_STROP_NAHLED]
+            if len(rows) > _STROP_NAHLED:
+                ui.label(f'Náhled ukazuje prvních {_STROP_NAHLED} řádků z '
+                         f'{len(rows)} — export obsahuje vše.') \
+                    .classes('text-xs text-amber-700 mb-1')
+            _grid({
+                'columnDefs': [
+                    {'headerName': cols[0][0], 'field': 'kod', 'width': 130},
+                    {'headerName': cols[1][0], 'field': 'nazev', 'flex': 2,
+                     'minWidth': 220},
+                    {'headerName': cols[2][0], 'field': 'dodavatel', 'flex': 1,
+                     'minWidth': 170},
+                    {'headerName': cols[3][0], 'field': 'a_mj', 'width': 130,
+                     'type': 'numericColumn', ':valueFormatter': _fmt_js(1)},
+                    {'headerName': cols[4][0], 'field': 'a_kc', 'width': 160,
+                     'type': 'numericColumn', ':valueFormatter': _fmt_js(2)},
+                    {'headerName': cols[5][0], 'field': 'b_mj', 'width': 130,
+                     'type': 'numericColumn', ':valueFormatter': _fmt_js(1)},
+                    {'headerName': cols[6][0], 'field': 'b_kc', 'width': 160,
+                     'type': 'numericColumn', ':valueFormatter': _fmt_js(2)},
+                    {'headerName': cols[7][0], 'field': 'rozdil_kc', 'width': 160,
+                     'type': 'numericColumn', ':valueFormatter': _fmt_js(2),
+                     ':cellStyle': _STYL_ZMENA},
+                    {'headerName': cols[8][0], 'field': 'stav', 'width': 100},
+                ],
+                'rowData': zobrazene,
+                'pinnedBottomRowData': [dict(_srovnani_total(rows), _celkem=True)],
+                **_GRID_ZAKLAD,
+            }).classes('w-full').style('height: calc(100vh - 430px); min-height: 380px')
+            ui.label(f"A = {stav['jm_a']} · B = {stav['jm_b']} — kladný rozdíl znamená, "
+                     'že A bral víc.').classes('text-xs text-gray-400 mt-1')
+
+    async def nacti():
+        if _blokuje_import(asm):
+            return
+        filtr = _soucasny_filtr()
+        if not filtr['a'] or not filtr['b']:
+            ui.notify('Vyberte oba zákazníky.', type='warning')
+            return
+        if filtr['a'] == filtr['b']:
+            ui.notify('Zákazník A a B musí být různí.', type='warning')
+            return
+        app.storage.user[filtr_klic] = filtr
+        btn_nacti.disable()
+        pozn = ui.notification('Načítám data…', spinner=True, timeout=None)
+        try:
+            rows = await asyncio.to_thread(_srovnani_zakazniku, asm,
+                                           filtr['a'], filtr['b'], filtr)
+        finally:
+            pozn.dismiss()
+            btn_nacti.enable()
+        stav.update({
+            'rows': rows, 'filtr': filtr,
+            'jm_a': _kratke_jmeno(filtr['a'], zak_volby),
+            'jm_b': _kratke_jmeno(filtr['b'], zak_volby),
+            'popis': _popis_filtru(dict(filtr, ico=[filtr['a'], filtr['b']]),
+                                   zak_volby)})
+        btn_xlsx.set_enabled(bool(rows))
+        vykresli_vysledek()
+        await asyncio.to_thread(zapis_log, user_id, user_name, 'srovnani_nahled', asm,
+                                stav['popis'], len(rows))
+
+    async def export_xlsx():
+        rows = _vybrane_radky()
+        if not rows:
+            return
+        jmeno = _zaklad_jmena_srovnani(asm) + '.xlsx'
+        cesta = _tmp_cesta(jmeno)
+        pozn = ui.notification('Sestavuji XLSX…', spinner=True, timeout=None)
+        try:
+            cols = _cols_srovnani(stav['jm_a'], stav['jm_b'])
+            await asyncio.to_thread(_xlsx_na_disk, cesta, cols, rows,
+                                    _srovnani_total(rows), 'Srovnání')
+            _stahni_soubor(cesta, jmeno)
+            await asyncio.to_thread(zapis_log, user_id, user_name,
+                                    'srovnani_export_xlsx', asm, stav['popis'],
+                                    len(rows))
+        except Exception as e:
+            ui.notify(f'Export selhal: {e}', type='negative', multi_line=True)
+        finally:
+            pozn.dismiss()
+
+    def prepni(_=None):
+        # Filtrujeme už načtená data v paměti — žádný nový dotaz.
+        if stav['rows']:
+            vykresli_vysledek()
+
+    btn_nacti.on_click(_bez_klienta(nacti))
+    btn_xlsx.on_click(_bez_klienta(export_xlsx))
+    prepinac.on_value_change(prepni)
+
+
+def _zaklad_jmena_srovnani(asm):
+    return (f'lupa_{_bezpecne_jmeno(asm)}_srovnani_'
+            f'{datetime.datetime.now():%Y-%m-%d_%H%M}')
+
+
 def _graf_zaklad(nadpis, legenda_vpravo=False, podnadpis=''):
     # Podnadpis říká, co je na osách a co je série — bez něj se graf luští.
     posun = 18 if podnadpis else 0
@@ -2379,12 +2698,8 @@ def _vykresli_obraty(asm, user_id, user_name, vsechna_prava):
     _pruh_importu(asm)
 
     with ui.row().classes('w-full items-end gap-3 mb-2 flex-wrap'):
-        sel_od = ui.select(obdobi, label='Od měsíce', clearable=True,
-                           value=ulozeny.get('od') if ulozeny.get('od') in obdobi else None) \
-            .props('dense outlined options-dense').style('min-width: 140px')
-        sel_do = ui.select(obdobi, label='Do měsíce', clearable=True,
-                           value=ulozeny.get('do') if ulozeny.get('do') in obdobi else None) \
-            .props('dense outlined options-dense').style('min-width: 140px')
+        sel_od = _sel_obdobi('Od měsíce', obdobi, ulozeny.get('od'))
+        sel_do = _sel_obdobi('Do měsíce', obdobi, ulozeny.get('do'))
         sel_zak = ui.select(
             zak_volby, label='Zákazníci', multiple=True, with_input=True, clearable=True,
             value=[i for i in (ulozeny.get('ico') or []) if i in zak_volby]) \
