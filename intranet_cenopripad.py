@@ -716,6 +716,46 @@ def inicializace_cenopripad_db():
             ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
         """)
 
+        # ── Kontrola cen OVOZEL (samostatná dlaždice) ───────────────────────
+        # Týdenní sestava Sklad 6 = „master" pro kontrolu; poslední nahraná platí.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS ovozel_master (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                nahrano DATETIME DEFAULT CURRENT_TIMESTAMP,
+                uzivatel_id INT, uzivatel VARCHAR(255),
+                soubor_nazev VARCHAR(255),
+                pocet_radku INT DEFAULT 0,
+                hlavicka_json TEXT,                     -- pořadí sloupců ze souboru
+                data_json LONGTEXT,                     -- [{hlavička: hodnota}, …]
+                INDEX idx_nahrano (nahrano)
+            ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        """)
+        # Případ = jedna kontrola souboru „OZ změny PC od …" proti datům OVOZEL.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS ovozel_pripady (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                cislo VARCHAR(20),
+                nazev VARCHAR(255),
+                zadavatel_id INT, zadavatel_jmeno VARCHAR(255),
+                datum_zadani DATETIME DEFAULT CURRENT_TIMESTAMP,
+                stav VARCHAR(20) DEFAULT 'ok',          -- ok / chyba
+                pocet_radku INT DEFAULT 0, pocet_chyb INT DEFAULT 0,
+                soubor_nazev VARCHAR(255),
+                master_id INT,                          -- použitá sestava Sklad 6
+                vysledek_json LONGTEXT,                 -- celý výsledek kontroly
+                aktualizovano DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                INDEX idx_stav (stav), INDEX idx_zadavatel (zadavatel_id)
+            ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS ovozel_soubory (
+                pripad_id INT PRIMARY KEY,
+                nazev VARCHAR(255),
+                data LONGBLOB
+            ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        """)
+        # Historie akcí OVOZEL se nevede zde — jde do intranet_logger (kategorie „Cenopřípad“).
+
         # Případy (tikety)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS cenopripad_pripady (
@@ -2043,16 +2083,17 @@ def _emaily_spravce(oddeleni):
     return _emaily_s_pravy("cenopripad_spravce")
 
 
-def _app_url():
+def _app_url(dotaz=""):
+    """Odkaz do modulu; `dotaz` (např. „?ovozel=42") otevře rovnou konkrétní případ."""
     try:
         u = intranet_data.APP_URL
-        return f"{u}/cenopripad" if u else ""
+        return f"{u}/cenopripad{dotaz}" if u else ""
     except Exception:
         return ""
 
 
-def _posli_emaily_sync(prijemci, predmet, text):
-    odkaz = _app_url()
+def _posli_emaily_sync(prijemci, predmet, text, odkaz=None):
+    odkaz = odkaz or _app_url()
     if odkaz:
         text = f"{text}\n\nOtevřít v portálu: {odkaz}"
     for p in prijemci:
@@ -2062,14 +2103,15 @@ def _posli_emaily_sync(prijemci, predmet, text):
             print(f"[cenopripad] e-mail {p}: {e}")
 
 
-def _odesli_emaily(prijemci, predmet, text):
+def _odesli_emaily(prijemci, predmet, text, odkaz=None):
     prijemci = [p for p in dict.fromkeys(prijemci) if p and "@" in p]
     if not prijemci:
         return
     try:
-        asyncio.create_task(asyncio.to_thread(_posli_emaily_sync, prijemci, predmet, text))
+        asyncio.create_task(
+            asyncio.to_thread(_posli_emaily_sync, prijemci, predmet, text, odkaz))
     except RuntimeError:
-        _posli_emaily_sync(prijemci, predmet, text)
+        _posli_emaily_sync(prijemci, predmet, text, odkaz)
 
 
 def _email_uzivatele(uid):
@@ -5487,6 +5529,969 @@ def _letaky_detail(pid, user_id, user_name, prava):
             .classes("text-sm text-gray-400 italic mt-2")
 
 
+# ============================================================================
+# Kontrola cen OVOZEL — sestava Sklad 6 („ovozel") × soubor „OZ změny PC"
+# ----------------------------------------------------------------------------
+# Vzorová kontrolní sestava „OZ změny PC <datum>.xlsx" má dva listy:
+#   • „ceník"             = nahraný soubor „OZ změny PC od …" (Kód, Název,
+#                           PC01/PC02/PC14 s DPH) + sloupec s VLOOKUP na dodavatele
+#                           z přecenění; #N/A = položka NENÍ v budoucím přecenění.
+#   • „budoucí_přecenění" = nahraná sestava Sklad 6 („ovozel") + 4 DOPOČÍTANÉ sloupce:
+#                             nová NCK      = Nová NC × Koef.FC
+#                             priřážka PCxx = (PCxx z ceníku / (1 + DPH) − NCK) / NCK
+#                           #N/A = položka z přecenění NENÍ v ceníku.
+# Vyhodnocení případu stojí právě na těch 4 sloupcích, proto se počítají v Pythonu
+# (stav případu, filtr chyb) a do exportu se navíc zapisují jako ŽIVÉ VZORCE — sestava
+# je tak 1:1 se vzorem. Překlep „priřážka" je ve vzoru a schválně se zachovává.
+# ============================================================================
+OVOZEL_LIST_CENIK = "ceník"
+OVOZEL_LIST_MASTER = "budoucí_přecenění"
+OVOZEL_CENIK_HLAVICKA = ("Kód", "Název", "PC01 s DPH", "PC02 s DPH", "PC14 s DPH")
+OVOZEL_CENIK_POZNAMKA = "červené nejsou v budoucím přecenění za dodavatele 642"
+OVOZEL_DOPOCET = ("nová NCK", "priřážka PC01", "priřážka PC02", "priřážka PC14")
+
+# Šířky sloupců a formáty čísel podle vzorové sestavy (páruje se dle názvu hlavičky).
+_OVOZEL_SIRKY_MASTER = {"kód": 9.57, "nej,nová nc": 10.86, "zdražení v %": 12.29,
+                        "název": 28.57, "ozn.dod.": 9.0, "dodavatel": 24.71,
+                        "nová nc": 8.71, "nová dnc2": 11.0, "koef.fc": 11.0, "dph": 6.43,
+                        "nová nck": 9.86, "priřážka pc01": 12.14}
+_OVOZEL_FMT_MASTER = {"nová nc": "#,##0.00", "nová dnc2": "#,##0.00",
+                      "nová dnc5": "#,##0.00", "dph": "0%", "nová nck": "#,##0.00",
+                      "priřážka pc01": "0.00%", "priřážka pc02": "0.00%",
+                      "priřážka pc14": "0.00%"}
+_OVOZEL_SIRKY_CENIK = {0: 13.57, 1: 41.57, 2: 10.71, 5: 39.57}
+
+# Sloupce ceníku → varianty názvu v hlavičce nahraného souboru (přesná shoda, pak
+# podřetězec). Když hlavička nesedí vůbec, dopadne se na pořadí sloupců A–E.
+_OVOZEL_CENIK_MAPA = (
+    ("kod",   ("kód položky jip", "kód položky", "kód", "kod")),
+    ("nazev", ("název položky jip", "název položky", "název", "nazev")),
+    ("pc01",  ("veřejnost",)),
+    ("pc02",  ("podnikatel",)),
+    ("pc14",  ("mo prodejna",)),
+)
+
+
+# ── Práva ───────────────────────────────────────────────────────────────────
+def _ovozel_pristup(p):
+    """Smí do dlaždice „Kontrola cen OVOZEL"."""
+    return _je_spravce(p) or any(f"cenopripad_{r}_ovozel" in p
+                                 for r in ("office", "zadatel"))
+
+
+def _ovozel_office(p):
+    """Office nákup: nahrává sestavu Sklad 6, zadává kontrolu a exportuje.
+    Vidí zároveň všechny případy (žadatel jen své). Mazat smí až správce."""
+    return _je_spravce(p) or "cenopripad_office_ovozel" in p
+
+
+# ── Pomocné ─────────────────────────────────────────────────────────────────
+def _ovozel_norm_kod(v):
+    """Kód položky na text — 48510085.0 → „48510085", „48510085/" zůstává."""
+    if v is None:
+        return ""
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return str(v).strip()
+
+
+def _ovozel_odproc(v):
+    """`_nacti_rows` vrací procentně formátované buňky jako text („12%"). Do sestavy
+    patří zpět číslo (0.12), jinak by vzorec priřážky počítal s textem."""
+    if isinstance(v, str) and v.strip().endswith("%"):
+        c = cp.parse_cislo(v)
+        if c is not None:
+            return c
+    return v
+
+
+def _ovozel_hlavicka_dle(hlavicka, *varianty):
+    """Název sloupce z hlavičky sestavy dle normalizovaných variant, jinak None."""
+    for h in hlavicka:
+        if _norm(h) in varianty:
+            return h
+    return None
+
+
+def _ovozel_datum_sestavy(nazev_souboru, fallback=None):
+    """Datum do názvu exportu — z názvu nahraného souboru („… od 5.9_" → 5. 9.),
+    jinak datum případu / dnešek. Rok bere z názvu, jinak z fallbacku."""
+    zaklad = fallback or datetime.date.today()
+    m = re.search(r"(\d{1,2})\s*\.\s*(\d{1,2})\s*\.?\s*(\d{2,4})?", nazev_souboru or "")
+    if m:
+        rok = int(m.group(3)) if m.group(3) else zaklad.year
+        if rok < 100:
+            rok += 2000
+        try:
+            return datetime.date(rok, int(m.group(2)), int(m.group(1)))
+        except ValueError:
+            pass
+    return zaklad
+
+
+# ── Parsery ─────────────────────────────────────────────────────────────────
+def _ovozel_parse_master(raw_bytes, filename):
+    """Sestava Sklad 6 (list „ovozel") → (hlavicka, radky, chyba|None).
+    Řádky jsou dicty {hlavička: hodnota}; hlavička drží pořadí sloupců ze souboru,
+    aby se list „budoucí_přecenění" v exportu reprodukoval 1:1."""
+    try:
+        rows = _nacti_rows(raw_bytes, filename)
+    except Exception as e:
+        return None, None, f"Soubor nelze načíst: {e}"
+    hdr_idx = None
+    for i, row in enumerate(rows[:40]):
+        norm = {_norm(c) for c in row if c is not None and str(c).strip()}
+        if "kód" in norm and "nová nc" in norm and "koef.fc" in norm:
+            hdr_idx = i
+            break
+    if hdr_idx is None:
+        return None, None, ("Nenalezena hlavička sestavy Sklad 6 — čekám sloupce "
+                            "„Kód“, „Nová NC“ a „Koef.FC“.")
+    hlavicka = [str(c).strip() if c is not None else "" for c in rows[hdr_idx]]
+    while hlavicka and not hlavicka[-1]:
+        hlavicka.pop()
+    i_kod = next(j for j, h in enumerate(hlavicka) if _norm(h) in ("kód", "kod"))
+    out = []
+    for r in rows[hdr_idx + 1:]:
+        if r is None or all(c is None or str(c).strip() == "" for c in r):
+            continue
+        if not _ovozel_norm_kod(r[i_kod] if i_kod < len(r) else None):
+            continue
+        out.append({h: _ovozel_odproc(r[j] if j < len(r) else None)
+                    for j, h in enumerate(hlavicka) if h})
+    if not out:
+        return None, None, "Sestava neobsahuje žádný řádek s kódem položky."
+    return [h for h in hlavicka if h], out, None
+
+
+def _ovozel_parse_cenik(raw_bytes, filename):
+    """Soubor „OZ změny PC od …" → (radky, chyba|None). Sloupce se párují podle názvu
+    v hlavičce (Kód položky JIP / … veřejnost / … podnikatel / … MO prodejna); pokud
+    se název nenajde, použije se pořadí sloupců A–E jako ve vzoru."""
+    try:
+        rows = _nacti_rows(raw_bytes, filename)
+    except Exception as e:
+        return None, f"Soubor nelze načíst: {e}"
+    hdr_idx = None
+    for i, row in enumerate(rows[:40]):
+        norm = [_norm(c) for c in row if c is not None and str(c).strip()]
+        if any(n.startswith("kód") or n.startswith("kod") for n in norm) and len(norm) >= 3:
+            hdr_idx = i
+            break
+    if hdr_idx is None:
+        return None, "Nenalezena hlavička souboru — chybí sloupec „Kód položky JIP“."
+    hlavicka = [_norm(c) for c in rows[hdr_idx]]
+    idx = {}
+    for poz, (pole, varianty) in enumerate(_OVOZEL_CENIK_MAPA):
+        j = next((k for k, h in enumerate(hlavicka) if h in varianty), None)
+        if j is None:
+            j = next((k for k, h in enumerate(hlavicka)
+                      if h and any(v in h for v in varianty)), None)
+        idx[pole] = poz if j is None else j
+    if len(set(idx.values())) != len(idx):
+        return None, ("Sloupce souboru nelze jednoznačně spárovat — čekám „Kód položky "
+                      "JIP“, „Název položky JIP“ a tři prodejní ceny s DPH.")
+    out = []
+    for r in rows[hdr_idx + 1:]:
+        if r is None or all(c is None or str(c).strip() == "" for c in r):
+            continue
+
+        def _b(pole):
+            j = idx[pole]
+            return r[j] if j < len(r) else None
+        kod = _ovozel_norm_kod(_b("kod"))
+        if not kod:
+            continue
+        out.append({"kod": kod,
+                    "nazev": "" if _b("nazev") is None else str(_b("nazev")),
+                    "pc01": cp.parse_cena_kc(_b("pc01")),
+                    "pc02": cp.parse_cena_kc(_b("pc02")),
+                    "pc14": cp.parse_cena_kc(_b("pc14"))})
+    if not out:
+        return None, "Soubor neobsahuje žádný řádek s kódem položky."
+    return out, None
+
+
+# ── Vyhodnocení (poslední 4 sloupce sestavy) ────────────────────────────────
+def _ovozel_kontrola(hlavicka, master_radky, cenik_radky):
+    """Kontrola ceníku proti přecenění „ovozel". Vrací kompletní výsledek k uložení,
+    zobrazení i exportu.
+
+    Dopočet (shodně se vzorci ve vzorové sestavě):
+        nová NCK      = Nová NC × Koef.FC                       (list přecenění, sl. N)
+        priřážka PCxx = (PCxx z ceníku / (1 + DPH) − NCK) / NCK  (sl. O/P/Q)
+
+    Chyba případu = položka ceníku není v přecenění (VLOOKUP → #N/A), položka
+    přecenění není v ceníku (#N/A v priřážkách), chybí NCK, nebo duplicitní kód
+    v ceníku (ve vzoru hlídá podmíněné formátování)."""
+    h_kod = _ovozel_hlavicka_dle(hlavicka, "kód", "kod")
+    h_nc = _ovozel_hlavicka_dle(hlavicka, "nová nc", "nova nc")
+    h_koef = _ovozel_hlavicka_dle(hlavicka, "koef.fc", "koef fc", "koef.fc.")
+    h_dph = _ovozel_hlavicka_dle(hlavicka, "dph")
+    h_dod = _ovozel_hlavicka_dle(hlavicka, "dodavatel")
+    _num = cp.parse_cislo
+
+    # VLOOKUP bere první výskyt kódu → stejná sémantika i tady.
+    m_index = {}
+    for r in master_radky:
+        m_index.setdefault(_ovozel_norm_kod(r.get(h_kod)), r)
+    c_index, duplicitni = {}, set()
+    for r in cenik_radky:
+        if r["kod"] in c_index:
+            duplicitni.add(r["kod"])
+        else:
+            c_index[r["kod"]] = r
+
+    cenik = []
+    for r in cenik_radky:
+        m = m_index.get(r["kod"])
+        duplicita = r["kod"] in duplicitni
+        duvody = []
+        if m is None:
+            duvody.append("Není v budoucím přecenění (dodavatel 642)")
+        if duplicita:
+            duvody.append("Duplicitní kód v ceníku")
+        cenik.append(dict(r, dodavatel=(m.get(h_dod) if m else None),
+                          duplicita=duplicita, chyba=bool(duvody),
+                          duvod="; ".join(duvody)))
+
+    master = []
+    for r in master_radky:
+        kod = _ovozel_norm_kod(r.get(h_kod))
+        nck = None
+        nc, koef = _num(r.get(h_nc)), _num(r.get(h_koef))
+        if nc is not None and koef is not None:
+            nck = nc * koef
+        dph = _num(r.get(h_dph)) or 0.0
+        c = c_index.get(kod)
+        prir, duvody = {}, []
+        for pole, zdroj in (("p01", "pc01"), ("p02", "pc02"), ("p14", "pc14")):
+            pc = c.get(zdroj) if c else None
+            prir[pole] = (None if (pc is None or not nck)
+                          else ((pc / (1.0 + dph)) - nck) / nck)
+        if c is None:
+            duvody.append("Není v ceníku — priřážky nelze spočítat")
+        elif not nck:
+            duvody.append("Chybí nová NCK (Nová NC × Koef.FC) — nelze spočítat priřážku")
+        elif any(prir[p] is None for p in ("p01", "p02", "p14")):
+            duvody.append("Chybí prodejní cena v ceníku")
+        master.append({"kod": kod, "data": r, "nck": nck,
+                       "chyba": bool(duvody), "duvod": "; ".join(duvody), **prir})
+
+    chyb = sum(1 for r in cenik if r["chyba"]) + sum(1 for r in master if r["chyba"])
+    return {"hlavicka": list(hlavicka), "cenik": cenik, "master": master,
+            "pocet_chyb": chyb,
+            "pocet_radku": len(cenik) + len(master),
+            "chyb_cenik": sum(1 for r in cenik if r["chyba"]),
+            "chyb_master": sum(1 for r in master if r["chyba"])}
+
+
+# ── Export do vzorové podoby ────────────────────────────────────────────────
+def _ovozel_sestav_xlsx(vysledek, nazev_listu_ceniku=None):
+    """Výsledek kontroly → .xlsx přesně ve tvaru vzoru „OZ změny PC <datum>":
+    dva listy, poslední 4 sloupce jako živé vzorce, formáty a červené podmíněné
+    formátování na #N/A i na duplicitní kódy."""
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill
+    from openpyxl.formatting.rule import Rule
+    from openpyxl.styles.differential import DifferentialStyle
+
+    hlavicka = list(vysledek["hlavicka"])
+    cenik, master = vysledek["cenik"], vysledek["master"]
+    wb = openpyxl.Workbook()
+
+    # ── list „ceník" ────────────────────────────────────────────────────────
+    ws = wb.active
+    ws.title = nazev_listu_ceniku or OVOZEL_LIST_CENIK
+    for j, h in enumerate(OVOZEL_CENIK_HLAVICKA, 1):
+        ws.cell(row=1, column=j, value=h)
+    pozn = ws.cell(row=1, column=6, value=OVOZEL_CENIK_POZNAMKA)
+    pozn.font = Font(color="FFFF0000")
+    for j, s in _OVOZEL_SIRKY_CENIK.items():
+        ws.column_dimensions[_excel_sloupec(j)].width = s
+
+    # VLOOKUP na dodavatele — sloupec „Dodavatel" v listu přecenění (jako ve vzoru).
+    h_dod = _ovozel_hlavicka_dle(hlavicka, "dodavatel")
+    i_dod = (hlavicka.index(h_dod) + 1) if h_dod else 8
+    rozsah_dod = f"{OVOZEL_LIST_MASTER}!$A:${_excel_sloupec(i_dod - 1)}"
+    for i, r in enumerate(cenik, start=2):
+        ws.cell(row=i, column=1, value=r["kod"])
+        ws.cell(row=i, column=2, value=r["nazev"])
+        for j, pole in ((3, "pc01"), (4, "pc02"), (5, "pc14")):
+            c = ws.cell(row=i, column=j, value=r.get(pole))
+            if j > 3:
+                c.number_format = "0.00"
+        ws.cell(row=i, column=6, value=f"=VLOOKUP(A{i},{rozsah_dod},{i_dod},0)")
+    posl = max(ws.max_row, 2)
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:F{posl}"
+    cerveny = DifferentialStyle(fill=PatternFill(bgColor="FFFF0000"))
+    chybny = DifferentialStyle(font=Font(color="FF9C0006"),
+                               fill=PatternFill(bgColor="FFFFC7CE"))
+    ws.conditional_formatting.add(f"A2:A{posl}",
+                                  Rule(type="duplicateValues", dxf=cerveny, priority=2))
+    ws.conditional_formatting.add(f"F2:F{posl}",
+                                  Rule(type="containsErrors", dxf=chybny, priority=1,
+                                       formula=["ISERROR(F2)"]))
+
+    # ── list „budoucí_přecenění" ────────────────────────────────────────────
+    wm = wb.create_sheet(OVOZEL_LIST_MASTER)
+    vsechny = hlavicka + list(OVOZEL_DOPOCET)
+    zluta = PatternFill("solid", fgColor="FFFFFF00")
+    for j, h in enumerate(vsechny, 1):
+        c = wm.cell(row=1, column=j, value=h)
+        c.font = Font(bold=True)
+        if h in OVOZEL_DOPOCET:
+            c.fill = zluta
+        sirka = _OVOZEL_SIRKY_MASTER.get(_norm(h))
+        if sirka:
+            wm.column_dimensions[_excel_sloupec(j - 1)].width = sirka
+
+    def _sl(*varianty):
+        h = _ovozel_hlavicka_dle(vsechny, *varianty)
+        return _excel_sloupec(vsechny.index(h)) if h else None
+    s_kod = _sl("kód", "kod") or "A"
+    s_nc, s_koef, s_dph = _sl("nová nc", "nova nc"), _sl("koef.fc", "koef fc"), _sl("dph")
+    s_nck = _excel_sloupec(len(hlavicka))       # první dopočítaný sloupec (nová NCK)
+    # Rozsah ceníku pro VLOOKUP priřážek (A:E = Kód … PC14 s DPH).
+    rozsah_cen = f"{ws.title}!$A:$E"
+
+    for i, r in enumerate(master, start=2):
+        d = r.get("data") or {}
+        for j, h in enumerate(hlavicka, 1):
+            c = wm.cell(row=i, column=j, value=d.get(h))
+            fmt = _OVOZEL_FMT_MASTER.get(_norm(h))
+            if fmt:
+                c.number_format = fmt
+        c_nck = wm.cell(row=i, column=len(hlavicka) + 1)
+        c_nck.value = (f"={s_nc}{i}*{s_koef}{i}" if s_nc and s_koef else r.get("nck"))
+        c_nck.number_format = "#,##0.00"
+        for off, sloupec in enumerate(("3", "4", "5")):
+            c = wm.cell(row=i, column=len(hlavicka) + 2 + off)
+            if s_dph and s_nck:
+                c.value = (f"=((VLOOKUP({s_kod}{i},{rozsah_cen},{sloupec},0)"
+                           f"/(1+((100*{s_dph}{i}))/100))-{s_nck}{i})/{s_nck}{i}")
+            else:
+                c.value = r.get(("p01", "p02", "p14")[off])
+            c.number_format = "0.00%"
+    posl_m = max(wm.max_row, 2)
+    posl_sl = _excel_sloupec(len(vsechny) - 1)
+    wm.freeze_panes = "A2"
+    wm.auto_filter.ref = f"A1:{posl_sl}{posl_m}"
+    prvni_dopocet = _excel_sloupec(len(hlavicka) + 1)
+    wm.conditional_formatting.add(
+        f"{prvni_dopocet}2:{posl_sl}{posl_m}",
+        Rule(type="containsErrors", dxf=DifferentialStyle(fill=PatternFill(bgColor="FFFF0000")),
+             priority=1, formula=[f"ISERROR({prvni_dopocet}2)"]))
+
+    # Vzorce se zapisují bez uložené hodnoty → Excel/LibreOffice je musí při otevření
+    # přepočítat, jinak by uživatel viděl prázdné buňky.
+    wb.calculation.fullCalcOnLoad = True
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def _ovozel_export(pripad):
+    """(data, nazev) pro stažení kontrolní sestavy případu."""
+    try:
+        vysledek = json.loads(pripad.get("vysledek_json") or "{}")
+    except Exception as e:
+        return None, f"Výsledek kontroly nelze načíst: {e}"
+    if not vysledek.get("cenik") and not vysledek.get("master"):
+        return None, "Případ nemá data kontroly."
+    zaklad = pripad.get("datum_zadani")
+    zaklad = zaklad.date() if hasattr(zaklad, "date") else None
+    d = _ovozel_datum_sestavy(pripad.get("soubor_nazev"), zaklad)
+    return _ovozel_sestav_xlsx(vysledek), f"OZ změny PC {d.isoformat()}.xlsx"
+
+
+# ── Databáze ────────────────────────────────────────────────────────────────
+def _ovozel_uloz_master(hlavicka, radky, nazev, user_id, user_name):
+    """Nová sestava Sklad 6. Vrací (id, chyba|None); poslední nahraná = platná."""
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return None, "Není připojení k databázi."
+    try:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO ovozel_master (uzivatel_id, uzivatel, soubor_nazev, "
+                    "pocet_radku, hlavicka_json, data_json) VALUES (%s,%s,%s,%s,%s,%s)",
+                    (user_id, _str(user_name, 255), _str(nazev, 255), len(radky),
+                     json.dumps(hlavicka, ensure_ascii=False),
+                     json.dumps(radky, ensure_ascii=False, default=str)))
+        conn.commit()
+        mid = cur.lastrowid
+        cur.close()
+        return mid, None
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return None, f"Chyba zápisu do databáze: {e}"
+    finally:
+        conn.close()
+
+
+def _ovozel_master_aktualni():
+    """Poslední nahraná sestava Sklad 6 (dict s rozbalenými `hlavicka`/`radky`), nebo None."""
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return None
+    try:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT * FROM ovozel_master ORDER BY id DESC LIMIT 1")
+        m = cur.fetchone()
+        cur.close()
+        if not m:
+            return None
+        m["hlavicka"] = json.loads(m.get("hlavicka_json") or "[]")
+        m["radky"] = json.loads(m.get("data_json") or "[]")
+        return m
+    except Exception as e:
+        print(f"[ovozel] _ovozel_master_aktualni: {e}")
+        return None
+    finally:
+        conn.close()
+
+
+def _ovozel_master_seznam(limit=20):
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return []
+    try:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT id, nahrano, uzivatel, soubor_nazev, pocet_radku "
+                    "FROM ovozel_master ORDER BY id DESC LIMIT %s", (int(limit),))
+        r = cur.fetchall()
+        cur.close()
+        return r
+    except Exception as e:
+        print(f"[ovozel] _ovozel_master_seznam: {e}")
+        return []
+    finally:
+        conn.close()
+
+
+def _ovozel_uloz_pripad(nazev, vysledek, raw, soubor_nazev, master_id,
+                        user_id, user_name):
+    """Uloží případ i s výsledkem kontroly. Vrací (id, cislo) nebo (None, chyba)."""
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return None, "Není připojení k databázi."
+    try:
+        cur = conn.cursor()
+        stav = "chyba" if vysledek["pocet_chyb"] else "ok"
+        cur.execute("INSERT INTO ovozel_pripady (nazev, zadavatel_id, zadavatel_jmeno, "
+                    "stav, pocet_radku, pocet_chyb, soubor_nazev, master_id, vysledek_json) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (_str(nazev, 255), user_id, _str(user_name, 255), stav,
+                     vysledek["pocet_radku"], vysledek["pocet_chyb"],
+                     _str(soubor_nazev, 255), master_id,
+                     json.dumps(vysledek, ensure_ascii=False, default=str)))
+        pid = cur.lastrowid
+        cislo = f"O{pid:05d}"
+        cur.execute("UPDATE ovozel_pripady SET cislo=%s WHERE id=%s", (cislo, pid))
+        if raw:
+            cur.execute("INSERT INTO ovozel_soubory (pripad_id, nazev, data) "
+                        "VALUES (%s,%s,%s)", (pid, _str(soubor_nazev, 255), raw))
+        conn.commit()
+        cur.close()
+        return pid, cislo
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return None, f"Chyba zápisu do databáze: {e}"
+    finally:
+        conn.close()
+
+
+def _ovozel_seznam(user_id, prava):
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return []
+    try:
+        cur = conn.cursor(dictionary=True)
+        sql = ("SELECT id, cislo, nazev, zadavatel_id, zadavatel_jmeno, datum_zadani, "
+               "stav, pocet_radku, pocet_chyb, soubor_nazev FROM ovozel_pripady ")
+        if _ovozel_office(prava):
+            cur.execute(sql + "ORDER BY id DESC")
+        else:
+            cur.execute(sql + "WHERE zadavatel_id=%s ORDER BY id DESC", (user_id,))
+        r = cur.fetchall()
+        cur.close()
+        return r
+    except Exception as e:
+        print(f"[ovozel] _ovozel_seznam: {e}")
+        return []
+    finally:
+        conn.close()
+
+
+def _ovozel_pripad(pid):
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return None
+    try:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT * FROM ovozel_pripady WHERE id=%s", (pid,))
+        p = cur.fetchone()
+        cur.close()
+        return p
+    except Exception as e:
+        print(f"[ovozel] _ovozel_pripad: {e}")
+        return None
+    finally:
+        conn.close()
+
+
+def _ovozel_smaz(pid):
+    """Nevratně smaže případ vč. řádků a souboru. Vrací (ok, chyba|None)."""
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return False, "Není připojení k databázi."
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM ovozel_soubory WHERE pripad_id=%s", (pid,))
+        cur.execute("DELETE FROM ovozel_pripady WHERE id=%s", (pid,))
+        conn.commit()
+        cur.close()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+    finally:
+        conn.close()
+
+
+def _ovozel_notifikuj(pid, cislo, nazev, soubor, vysledek, zadavatel_jmeno, zadavatel_id):
+    """Zvoneček + e-mail všem v Office nákup (OVOZEL) a správcům — výsledek kontroly.
+    E-mail odkazuje rovnou na případ (`/cenopripad?ovozel=<id>`)."""
+    try:
+        chyb = vysledek["pocet_chyb"]
+        shrnuti = (f"✅ Bez chyb ({vysledek['pocet_radku']} řádků)" if not chyb
+                   else f"⚠️ {chyb} chyb z {vysledek['pocet_radku']} řádků")
+        text = (f"🥦 Kontrola cen OVOZEL {cislo}"
+                + (f" — {nazev}" if nazev else "")
+                + f" od {zadavatel_jmeno}: {shrnuti}.")
+        ukazky = [f"• {r['kod']} {r.get('nazev') or ''} — {r['duvod']}"
+                  for r in vysledek["cenik"] if r["chyba"]]
+        ukazky += [f"• {r['kod']} — {r['duvod']}" for r in vysledek["master"] if r["chyba"]]
+        telo = text + (f"\nSoubor: {soubor}" if soubor else "")
+        if ukazky:
+            telo += "\n\nChyby:\n" + "\n".join(ukazky[:20])
+            if len(ukazky) > 20:
+                telo += f"\n… a dalších {len(ukazky) - 20}."
+        prava = ("cenopripad_office_ovozel", "cenopripad_spravce", "vse")
+        for uid in (intranet_data.ziskej_uzivatele_s_pravem(*prava) or {}):
+            try:
+                if uid is None or int(uid) == int(zadavatel_id):
+                    continue
+            except (TypeError, ValueError):
+                continue
+            intranet_notifikace.pridej(uid, text, "warning" if chyb else "info")
+        _odesli_emaily(_emaily_s_pravy("cenopripad_office_ovozel", "cenopripad_spravce"),
+                       f"Kontrola cen OVOZEL {cislo} — " + ("chyby" if chyb else "bez chyb"),
+                       telo, _app_url(f"?ovozel={pid}"))
+    except Exception as e:
+        print(f"[ovozel] _ovozel_notifikuj: {e}")
+
+
+# ── UI ──────────────────────────────────────────────────────────────────────
+def _ovozel_otevri(pid):
+    app.storage.user["ovozel_detail"] = pid
+    _refresh()
+
+
+def _ovozel_upload_panel(popis, akce, klic_nazev=None):
+    """Sdílený upload box obou sekcí: skrytý QUploader + tlačítko „+" + stavový řádek.
+    `akce(raw, name, nazev_pripadu)` je async a běží po kliknutí na potvrzovací tlačítko."""
+    drzeny = {"raw": None, "name": ""}
+    ui.label(popis).classes("text-sm text-gray-500 mb-2")
+    nazev_in = None
+    if klic_nazev:
+        nazev_in = ui.input(klic_nazev).props("outlined dense").classes("w-full max-w-md mb-2")
+
+    async def _on_up(e):
+        up_spin.set_visibility(False)
+        raw, name = await _precti_upload(e, up)
+        if raw is not None:
+            drzeny["raw"], drzeny["name"] = raw, name
+            stav.text = f"✅ Nahráno, připraveno: {name}"
+            stav.classes(replace="text-sm text-emerald-700 font-medium break-words")
+            btn.set_enabled(True)
+        else:
+            stav.text = "❌ Nahrání souboru selhalo, zkuste to znovu."
+            stav.classes(replace="text-sm text-red-600 font-medium break-words")
+            btn.set_enabled(False)
+
+    def _pick():
+        return ui.run_javascript(
+            f"const c = getElement({up.id});"
+            f" const i = c && c.$el && c.$el.querySelector('input[type=file]');"
+            f" if (i) i.click();")
+
+    with ui.row().classes("w-full items-center gap-3"):
+        up = ui.upload(on_upload=_on_up, auto_upload=True, max_file_size=40_000_000) \
+            .props("accept=.xls,.xlsx,.xlsm,.xlsb").style("display:none")
+        ui.button(icon="add", on_click=_pick) \
+            .props("round unelevated color=green dense").classes("shadow-sm") \
+            .style("transform:scale(0.75);transform-origin:center") \
+            .tooltip("Vybrat soubor")
+        with ui.column().classes("gap-0"):
+            ui.label("Nahrát soubor").classes("text-sm font-medium text-gray-700")
+            with ui.row().classes("items-center gap-2"):
+                up_spin = ui.spinner(size="sm").classes("text-emerald-600")
+                up_spin.set_visibility(False)
+                stav = ui.label("").classes("text-sm text-gray-500 break-words")
+
+    def _zacatek():
+        drzeny["raw"] = None
+        btn.set_enabled(False)
+        up_spin.set_visibility(True)
+        stav.text = "⏳ Nahrávám soubor na server…"
+        stav.classes(replace="text-sm text-amber-700 font-medium break-words")
+
+    def _odmitnut():
+        up_spin.set_visibility(False)
+        stav.text = "❌ Soubor odmítnut (nepovolený typ nebo větší než 40 MB)."
+        stav.classes(replace="text-sm text-red-600 font-medium break-words")
+
+    up.on("added", lambda e: _zacatek(), [])
+    up.on("rejected", lambda e: _odmitnut(), [])
+    spin = ui.spinner(size="lg").classes("text-emerald-600")
+    spin.set_visibility(False)
+
+    async def _spust():
+        if not drzeny["raw"]:
+            ui.notify("Vyberte soubor.", type="warning")
+            return
+        btn.set_enabled(False)
+        spin.set_visibility(True)
+        try:
+            await akce(drzeny["raw"], drzeny["name"],
+                       (nazev_in.value or "").strip() if nazev_in else "")
+        except Exception as e:
+            ui.notify(f"Zpracování selhalo: {e}", type="negative", timeout=9000)
+        finally:
+            # Akce mohla mezitím překreslit modul (_refresh) — prvky pak už neexistují.
+            try:
+                spin.set_visibility(False)
+                btn.set_enabled(True)
+            except Exception:
+                pass
+
+    with ui.row().classes("w-full justify-end mt-2"):
+        btn = ui.button("Provést" if klic_nazev else "Nahrát", icon="cloud_upload",
+                        on_click=_spust).props("unelevated no-caps") \
+            .classes("bg-emerald-600 text-white font-semibold rounded-lg px-5")
+        btn.set_enabled(False)
+    return btn
+
+
+def _ovozel_sekce_master(user_id, user_name, prava):
+    """Sekce „Sestava Sklad 6" — nahrání týdenních dat OVOZEL + přehled nahrání."""
+    if _ovozel_office(prava):
+        with ui.card().classes("w-full max-w-3xl p-5 rounded-2xl shadow-lg mb-4"):
+            ui.label("Nahrát sestavu Sklad 6 (data „ovozel“)") \
+                .classes("text-lg font-bold text-gray-800")
+
+            async def _akce(raw, name, _nazev):
+                hlavicka, radky, err = await run.cpu_bound(_ovozel_parse_master, raw, name)
+                if err:
+                    ui.notify(f"Nahrání selhalo: {err}", type="negative", timeout=9000)
+                    return
+                mid, err = _ovozel_uloz_master(hlavicka, radky, name, user_id, user_name)
+                if not mid:
+                    ui.notify(f"Uložení selhalo: {err}", type="negative")
+                    return
+                intranet_logger.log_activity(
+                    user_name, "Cenopřípad",
+                    f"OVOZEL: nahrána sestava Sklad 6 ({name}, {len(radky)} položek)")
+                ui.notify(f"Sestava nahrána — {len(radky)} položek.", type="positive",
+                          position="top")
+                _refresh()
+
+            _ovozel_upload_panel(
+                "Sestava se stahuje každý pátek. Poslední nahraná sestava je ta, "
+                "proti které se kontrolují nové požadavky.", _akce)
+
+    m = _ovozel_master_aktualni()
+    if not m:
+        ui.label("Zatím nejsou nahraná žádná data OVOZEL — kontrolu nelze spustit.") \
+            .classes("text-red-600 font-medium p-4")
+        return
+    with ui.card().classes("w-full p-4 rounded-xl shadow-sm mb-4 border-l-4 border-emerald-300"):
+        with ui.row().classes("items-center gap-4 flex-wrap"):
+            ui.label("Platná data OVOZEL").classes("font-bold text-gray-800")
+            ui.label(f"{m.get('pocet_radku', 0)} položek").classes("text-sm text-gray-600")
+            ui.label(_bez_pripony(m.get("soubor_nazev") or "—")).classes("text-sm text-gray-600")
+            ui.space()
+            ui.label(f"{m.get('uzivatel') or ''} · {_dt_cz(m.get('nahrano'))}") \
+                .classes("text-xs text-gray-400")
+
+    historie = _ovozel_master_seznam()
+    if len(historie) > 1:
+        with ui.expansion("Historie nahrání", icon="history").classes("w-full"):
+            for h in historie:
+                with ui.row().classes("w-full items-center gap-3 text-sm py-1"):
+                    ui.label(_dt_cz(h.get("nahrano"))).classes("text-gray-500 w-40")
+                    ui.label(h.get("uzivatel") or "—").classes("text-gray-700 w-56")
+                    ui.label(_bez_pripony(h.get("soubor_nazev") or "—")).classes("text-gray-600 flex-1")
+                    ui.label(f"{h.get('pocet_radku', 0)} položek").classes("text-gray-500")
+
+
+def _ovozel_sekce_kontrola(user_id, user_name, prava):
+    """Sekce „Kontrola" — zadání kontroly + fronta případů."""
+    m = _ovozel_master_aktualni()
+    with ui.card().classes("w-full max-w-3xl p-5 rounded-2xl shadow-lg mb-4"):
+        ui.label("Provést kontrolu").classes("text-lg font-bold text-gray-800")
+        if not m:
+            ui.label("Nejsou nahraná data OVOZEL (sestava Sklad 6) — kontrolu nelze "
+                     "spustit. Požádejte Office nákup o nahrání sestavy.") \
+                .classes("text-sm text-red-600 font-medium")
+        else:
+            async def _akce(raw, name, nazev_pripadu):
+                radky, err = await run.cpu_bound(_ovozel_parse_cenik, raw, name)
+                if err:
+                    ui.notify(f"Kontrola selhala: {err}", type="negative", timeout=9000)
+                    return
+                vysledek = await run.cpu_bound(_ovozel_kontrola, m["hlavicka"],
+                                               m["radky"], radky)
+                pid, cislo = _ovozel_uloz_pripad(nazev_pripadu or _bez_pripony(name),
+                                                 vysledek, raw, name, m["id"],
+                                                 user_id, user_name)
+                if not pid:
+                    ui.notify(f"Uložení selhalo: {cislo}", type="negative")
+                    return
+                intranet_logger.log_activity(
+                    user_name, "Cenopřípad",
+                    f"OVOZEL: kontrola {cislo} ({name}) — {vysledek['pocet_chyb']} chyb")
+                _ovozel_notifikuj(pid, cislo, nazev_pripadu, name, vysledek,
+                                  user_name, user_id)
+                ui.notify(f"Kontrola {cislo} hotová — {vysledek['pocet_chyb']} chyb.",
+                          type="warning" if vysledek["pocet_chyb"] else "positive",
+                          position="top")
+                _ovozel_otevri(pid)
+
+            _ovozel_upload_panel(
+                f"Nahrajte soubor „OZ změny PC od …“ (.xlsx). Zkontroluje se proti "
+                f"datům OVOZEL z {_dt_cz(m.get('nahrano'))} "
+                f"({m.get('pocet_radku', 0)} položek) a výsledek se rozešle e-mailem.",
+                _akce, klic_nazev="Název případu (nepovinné)")
+
+    pripady = _ovozel_seznam(user_id, prava)
+    if not pripady:
+        ui.label("Zatím žádné kontroly.").classes("text-gray-400 italic p-4")
+        return
+    with ui.column().classes("w-full gap-2"):
+        for p in pripady:
+            chyb = p.get("pocet_chyb") or 0
+            barva = "border-red-300" if chyb else "border-green-300"
+            with ui.card().classes(f"w-full p-3 rounded-xl shadow-sm hover:shadow-md "
+                                   f"transition-shadow cursor-pointer border-l-4 {barva}") \
+                    .on("click", lambda pid=p["id"]: _ovozel_otevri(pid)):
+                with ui.row().classes("w-full items-center gap-3 flex-wrap"):
+                    ui.label(p.get("cislo") or "—").classes("font-bold text-gray-800")
+                    if p.get("nazev"):
+                        ui.label(p.get("nazev")).classes("font-medium text-gray-700")
+                    ui.label("⚠️ Vyhodnoceno s chybou" if chyb else "✅ Vyhodnoceno") \
+                        .classes("text-sm font-medium "
+                                 + ("text-red-600" if chyb else "text-green-700"))
+                    ui.space()
+                    ui.label(f"{p.get('pocet_radku', 0)} řádků").classes("text-sm text-gray-500")
+                    ui.label(f"{chyb} chyb").classes(
+                        "text-sm font-medium " + ("text-red-600" if chyb else "text-green-600"))
+                    ui.label(f"{p.get('zadavatel_jmeno') or ''} · {_dt_cz(p.get('datum_zadani'))}") \
+                        .classes("text-xs text-gray-400")
+
+
+def _ovozel_view(user_id, user_name, prava):
+    det = app.storage.user.get("ovozel_detail")
+    if det:
+        _ovozel_detail(det, user_id, user_name, prava)
+        return
+    # Sekci „Sestava Sklad 6" vidí jen Office nákup / správce; žadatel jen kontrolu.
+    sekce = app.storage.user.get("ovozel_sekce") or "kontrola"
+    if not _ovozel_office(prava):
+        sekce = "kontrola"
+    else:
+        def _prepni(v):
+            app.storage.user["ovozel_sekce"] = v
+            _refresh()
+        with ui.row().classes("w-full mb-4"):
+            ui.toggle({"sklad6": "Sestava Sklad 6", "kontrola": "Kontrola cen"},
+                      value=sekce, on_change=lambda e: _prepni(e.value)) \
+                .props("unelevated no-caps toggle-color=green-6")
+    if sekce == "sklad6":
+        _ovozel_sekce_master(user_id, user_name, prava)
+    else:
+        _ovozel_sekce_kontrola(user_id, user_name, prava)
+
+
+def _ovozel_detail(pid, user_id, user_name, prava):
+    p = _ovozel_pripad(pid)
+    if not p or (not _ovozel_office(prava) and p.get("zadavatel_id") != user_id):
+        app.storage.user["ovozel_detail"] = None
+        if p:
+            ui.notify("K tomuto případu nemáte oprávnění.", type="warning")
+        _refresh()
+        return
+    try:
+        vysledek = json.loads(p.get("vysledek_json") or "{}")
+    except Exception:
+        vysledek = {}
+    cenik = vysledek.get("cenik") or []
+    master = vysledek.get("master") or []
+    hlavicka = vysledek.get("hlavicka") or []
+    chyb = p.get("pocet_chyb") or 0
+
+    with ui.row().classes("w-full items-center gap-3 mb-2 flex-wrap"):
+        ui.button(icon="arrow_back", on_click=lambda: _ovozel_otevri(None)) \
+            .props("flat round color=grey-7").tooltip("Zpět na seznam")
+        ui.label(f"{p.get('cislo')}" + (f" · {p.get('nazev')}" if p.get("nazev") else "")) \
+            .classes("text-xl font-bold text-gray-800")
+        ui.label("⚠️ Vyhodnoceno s chybou" if chyb else "✅ Vyhodnoceno") \
+            .classes("text-sm font-medium px-2 py-0.5 rounded "
+                     + ("bg-red-100 text-red-700" if chyb else "bg-green-100 text-green-700"))
+        ui.space()
+        ui.label(f"{p.get('pocet_radku', 0)} řádků · {chyb} chyb").classes("text-sm text-gray-500")
+
+        if _ovozel_office(prava):
+            async def _exp():
+                data, nazev = await run.cpu_bound(_ovozel_export, p)
+                if not data:
+                    ui.notify(f"Export selhal: {nazev}", type="negative")
+                    return
+                intranet_logger.log_activity(
+                    user_name, "Cenopřípad",
+                    f"OVOZEL: export kontroly {p.get('cislo')} — sestava „{nazev}“")
+                ui.download(data, nazev)
+            ui.button("Export kontrolní sestavy", icon="file_download", on_click=_exp) \
+                .props("outline no-caps").classes("text-emerald-700 font-semibold rounded-lg")
+
+        if _je_spravce(prava):
+            def _smaz_dialog():
+                with ui.dialog() as dlg, ui.card().classes("p-4"):
+                    ui.label(f"Nevratně smazat kontrolu {p.get('cislo')}?") \
+                        .classes("font-medium")
+                    ui.label("Smaže se případ i nahraný soubor.") \
+                        .classes("text-sm text-gray-500")
+
+                    def _potvrd():
+                        ok, err = _ovozel_smaz(pid)
+                        dlg.close()
+                        if ok:
+                            intranet_logger.log_activity(
+                                user_name, "Cenopřípad",
+                                f"OVOZEL: smazána kontrola {p.get('cislo')}")
+                            ui.notify(f"Kontrola {p.get('cislo')} smazána.", type="warning")
+                            _ovozel_otevri(None)
+                        else:
+                            ui.notify(err or "Smazání selhalo.", type="negative")
+                    with ui.row().classes("w-full justify-end gap-2 mt-2"):
+                        ui.button("Zrušit", on_click=dlg.close).props("flat no-caps")
+                        ui.button("Smazat", icon="delete_forever", on_click=_potvrd) \
+                            .props("unelevated no-caps").classes("bg-red-600 text-white")
+                dlg.open()
+            ui.button("Smazat", icon="delete", on_click=_smaz_dialog) \
+                .props("flat no-caps").classes("text-red-600")
+
+    if not cenik and not master:
+        ui.label("Případ nemá data kontroly.").classes("text-gray-400 italic p-4")
+        return
+
+    # ── Řádky obou listů + filtr „jen chyby" ────────────────────────────────
+    _CS = ("(p) => p.data && p.data._chyba ? "
+           "{backgroundColor:'#fee2e2',color:'#b91c1c',fontWeight:'700'} : null")
+    cen_rows = [{"kod": r["kod"], "nazev": r.get("nazev") or "",
+                 "pc01": _castka(r.get("pc01")), "pc02": _castka(r.get("pc02")),
+                 "pc14": _castka(r.get("pc14")),
+                 "dodavatel": r.get("dodavatel") or "#N/A",
+                 "duvod": r.get("duvod") or "", "_chyba": bool(r.get("chyba"))}
+                for r in cenik]
+    mas_rows = []
+    for r in master:
+        d = r.get("data") or {}
+        row = {f"d_{i}": ("" if d.get(h) is None else d.get(h))
+               for i, h in enumerate(hlavicka)}
+        row["nck"] = _castka(r.get("nck"))
+        for pole in ("p01", "p02", "p14"):
+            row[pole] = _pct(r.get(pole)) if r.get(pole) is not None else "#N/A"
+        row["duvod"] = r.get("duvod") or ""
+        row["_chyba"] = bool(r.get("chyba"))
+        mas_rows.append(row)
+
+    filtr = {"jen_chyby": False}
+    grids = {}
+
+    def _aplikuj():
+        for klic, (grid, data, lbl) in grids.items():
+            vidno = [d for d in data if d["_chyba"]] if filtr["jen_chyby"] else data
+            grid.options["rowData"] = vidno
+            grid.update()
+            lbl.text = f"Zobrazeno {len(vidno)} z {len(data)} řádků."
+
+    with ui.row().classes("items-center gap-3 mb-2 flex-wrap"):
+        ui.switch("Zobrazit jen chyby",
+                  on_change=lambda e: (filtr.update(jen_chyby=bool(e.value)), _aplikuj())) \
+            .classes("text-sm")
+        ui.label(f"Ceník: {vysledek.get('chyb_cenik', 0)} chyb · "
+                 f"Přecenění: {vysledek.get('chyb_master', 0)} chyb") \
+            .classes("text-sm text-gray-600")
+
+    _DEF = {"resizable": True, "sortable": True, "filter": True,
+            "wrapHeaderText": True, "autoHeaderHeight": True, "cellDataType": False}
+
+    ui.label(f"{OVOZEL_LIST_CENIK} — {len(cenik)} položek z nahraného souboru") \
+        .classes("text-base font-bold text-gray-800 mt-2")
+    cen_lbl = ui.label("").classes("text-xs text-gray-500 mb-1")
+    # POZOR: `flex` na sloupci NELZE kombinovat s `autoSizeStrategy` — AG Grid to hlásí
+    # („colDef.flex is not supported with gridOptions.autoSizeStrategy“) a tabulku schová
+    # (třída .ag-delay-render = visibility:hidden na buňkách, kterou už neodkryje).
+    # Ceník má málo sloupců, takže se roztáhne na šířku mřížky přes „fitGridWidth"
+    # (`width` = poměr, `minWidth` = mez, pod kterou se místo mačkání zapne posuvník).
+    cen_cols = [{"headerName": "Kód", "field": "kod", "width": 110, "minWidth": 90,
+                 ":cellStyle": _CS},
+                {"headerName": "Název", "field": "nazev", "width": 320, "minWidth": 180},
+                {"headerName": "PC01 s DPH", "field": "pc01", "width": 120, "minWidth": 100,
+                 "type": "rightAligned"},
+                {"headerName": "PC02 s DPH", "field": "pc02", "width": 120, "minWidth": 100,
+                 "type": "rightAligned"},
+                {"headerName": "PC14 s DPH", "field": "pc14", "width": 120, "minWidth": 100,
+                 "type": "rightAligned"},
+                {"headerName": "Dodavatel (přecenění)", "field": "dodavatel",
+                 "width": 240, "minWidth": 160, ":cellStyle": _CS},
+                {"headerName": "Chyba", "field": "duvod", "width": 320, "minWidth": 200,
+                 ":cellStyle": _CS}]
+    grids["cenik"] = (ui.aggrid({"columnDefs": cen_cols, "rowData": cen_rows,
+                                 "defaultColDef": _DEF, "rowHeight": 28,
+                                 "autoSizeStrategy": {"type": "fitGridWidth"}})
+                      .classes("w-full").style("height: 34vh"), cen_rows, cen_lbl)
+
+    ui.label(f"{OVOZEL_LIST_MASTER} — {len(master)} položek z dat OVOZEL "
+             f"(poslední 4 sloupce = vyhodnocení)") \
+        .classes("text-base font-bold text-gray-800 mt-4")
+    mas_lbl = ui.label("").classes("text-xs text-gray-500 mb-1")
+    mas_cols = [{"headerName": h, "field": f"d_{i}", "minWidth": 90} for i, h in enumerate(hlavicka)]
+    mas_cols += [{"headerName": OVOZEL_DOPOCET[0], "field": "nck", "type": "rightAligned"},
+                 {"headerName": OVOZEL_DOPOCET[1], "field": "p01", "type": "rightAligned",
+                  ":cellStyle": _CS},
+                 {"headerName": OVOZEL_DOPOCET[2], "field": "p02", "type": "rightAligned",
+                  ":cellStyle": _CS},
+                 {"headerName": OVOZEL_DOPOCET[3], "field": "p14", "type": "rightAligned",
+                  ":cellStyle": _CS},
+                 {"headerName": "Chyba", "field": "duvod", "minWidth": 260, ":cellStyle": _CS}]
+    # Přecenění má 17+ sloupců — širší než okno, takže bílé místo vpravo nevzniká a
+    # šířky dle obsahu jsou čitelnější než mačkání všech sloupců do mřížky.
+    grids["master"] = (ui.aggrid({"columnDefs": mas_cols, "rowData": mas_rows,
+                                  "defaultColDef": _DEF, "rowHeight": 28,
+                                  "autoSizeStrategy": {"type": "fitCellContents"}})
+                       .classes("w-full").style("height: 40vh"), mas_rows, mas_lbl)
+    _aplikuj()
+
+
 def vykresli_cenopripad(user_id, user_name, vsechna_prava):
     """Vstupní bod modulu — vytvoří per-klient refreshable a vykreslí ho.
 
@@ -5496,6 +6501,16 @@ def vykresli_cenopripad(user_id, user_name, vsechna_prava):
     `@ui.refreshable` zde dělal chybu: `refresh()` re-renderoval všechny připojené
     klienty v kontextu jednoho uživatele → všem přepínal sekci (sdílený stav přes
     `app.storage.user` + request_contextvar)."""
+    # Odkaz z e-mailu „…/cenopripad?ovozel=<id>" otevře rovnou daný případ. Čte se jen
+    # tady (ne v `_vykresli_cenopripad`), aby návrat na seznam po `_refresh()` držel.
+    try:
+        z_emailu = context.client.request.query_params.get("ovozel")
+    except Exception:
+        z_emailu = None
+    if z_emailu and str(z_emailu).isdigit():
+        app.storage.user["cenopripad_pohled"] = "ovozel"
+        app.storage.user["ovozel_detail"] = int(z_emailu)
+
     @ui.refreshable
     def _obsah():
         _vykresli_cenopripad(user_id, user_name, vsechna_prava)
@@ -5508,11 +6523,13 @@ def _vykresli_cenopripad(user_id, user_name, vsechna_prava):
     inicializace_cenopripad_db()
     typy = _viditelne_typy(vsechna_prava)
     pohled = app.storage.user.get("cenopripad_pohled")
-    if pohled not in typy and pohled not in ("import", "letaky"):
+    if pohled not in typy and pohled not in ("import", "letaky", "ovozel"):
         pohled = None
     if pohled == "import" and not _vidi_import(vsechna_prava):
         pohled = None
     if pohled == "letaky" and not _letaky_pristup(vsechna_prava):
+        pohled = None
+    if pohled == "ovozel" and not _ovozel_pristup(vsechna_prava):
         pohled = None
 
     with ui.row().classes("w-full items-center gap-3 mb-6"):
@@ -5529,6 +6546,8 @@ def _vykresli_cenopripad(user_id, user_name, vsechna_prava):
                 podtitul = "Import dat"
             elif pohled == "letaky":
                 podtitul = "Kontrolní data letáků"
+            elif pohled == "ovozel":
+                podtitul = "Kontrola cen OVOZEL"
             ui.label(podtitul).classes("text-sm text-gray-500")
         ui.space()
         if pohled == "porovnani":   # IND ceny — vzorový formulář ke stažení
@@ -5538,7 +6557,7 @@ def _vykresli_cenopripad(user_id, user_name, vsechna_prava):
                 .tooltip("Stáhne vzorový formulář pro individuální ceny (.xlsx).")
         # Generický manuál Cenopřípadu (ind. ceny aj.) — NE v „Kontrolní data letáků"
         # (ta má vlastní obsah; ind. ceny a letáky tak nesdílí stejný manuál).
-        if pohled != "letaky":
+        if pohled not in ("letaky", "ovozel"):
             ui.button("Manuál", icon="menu_book", on_click=_dialog_manual) \
                 .props("outline no-caps") \
                 .classes("text-emerald-700 font-semibold rounded-lg") \
@@ -5550,11 +6569,15 @@ def _vykresli_cenopripad(user_id, user_name, vsechna_prava):
     if pohled == "letaky":
         _letaky_view(user_id, user_name, vsechna_prava)
         return
+    if pohled == "ovozel":
+        _ovozel_view(user_id, user_name, vsechna_prava)
+        return
     if pohled in typy:
         _sub_view_typ(pohled, user_id, user_name, vsechna_prava)
         return
 
-    if not typy and not _vidi_import(vsechna_prava):
+    if not typy and not _vidi_import(vsechna_prava) \
+            and not _letaky_pristup(vsechna_prava) and not _ovozel_pristup(vsechna_prava):
         with ui.column().classes("items-center py-20 gap-3 w-full"):
             ui.icon("lock", size="4rem", color="grey-4")
             ui.label("Nemáte přístup k žádné dlaždici modulu Cenopřípad.") \
@@ -5570,6 +6593,12 @@ def _vykresli_cenopripad(user_id, user_name, vsechna_prava):
                 app.storage.user["letaky_detail"] = None
                 _nav("letaky")
             _tile("📰", "Kontrolní data letáků", "letáková kontrola", "border-rose-200", _otevri_letaky)
+        if _ovozel_pristup(vsechna_prava):
+            def _otevri_ovozel():
+                app.storage.user["ovozel_detail"] = None
+                _nav("ovozel")
+            _tile("🥦", "Kontrola cen OVOZEL", "ovoce a zelenina", "border-lime-300",
+                  _otevri_ovozel)
         for klic in typy:
             c = TYPY[klic]
             _tile(c["emoji"], c["nazev"], "nákup" if c["oddeleni"] == "nakup" else "obchod",
