@@ -39,6 +39,12 @@ VZOR_IND_SOUBOR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                "cenopripad_vzor_ind_ceny.xlsx")
 VZOR_IND_NAZEV = "Vzorovy_formular_individualni_ceny.xlsx"
 
+# Vzorový formulář dlaždice „Oprava cen". Kopie originálu — vzorce ve sloupcích
+# J/K jsou v souboru a servíruje se beze změny, aby zůstaly zachovány.
+VZOR_OPRAVA_SOUBOR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "cenopripad_vzor_oprava_ceny.xlsx")
+VZOR_OPRAVA_NAZEV = "Oprava_ceny_2026.xlsx"
+
 
 # ============================================================================
 # Konfigurace typů případů (dlaždic)
@@ -755,6 +761,65 @@ def inicializace_cenopripad_db():
             ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
         """)
         # Historie akcí OVOZEL se nevede zde — jde do intranet_logger (kategorie „Cenopřípad“).
+
+        # ── Oprava cen ──────────────────────────────────────────────────────
+        # Žádost = jeden vyplněný formulář „Oprava_ceny_2026.xlsx" + důvod.
+        # Fronta žadatel → Office obchod → (volitelně) Správce, stejná jako Formuláře ASM.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS oprava_pripady (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                cislo VARCHAR(20),
+                nazev VARCHAR(255),
+                zadavatel_id INT, zadavatel_jmeno VARCHAR(255),
+                datum_zadani DATETIME DEFAULT CURRENT_TIMESTAMP,
+                stav VARCHAR(30) DEFAULT 'odeslano',
+                duvod TEXT,                             -- důvod žádosti od žadatele
+                pocet_radku INT DEFAULT 0,
+                suma_abs DOUBLE DEFAULT 0,              -- součet absolutní odchylky (K)
+                soubor_nazev VARCHAR(255),
+                poznamka VARCHAR(1000),                 -- co má žadatel opravit
+                spravce_pozn VARCHAR(1000),             -- Office → Správce (žadatel nevidí)
+                zamitnuti_duvod VARCHAR(1000),
+                storno_duvod VARCHAR(1000),
+                aktualizovano DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                INDEX idx_stav (stav), INDEX idx_zadavatel (zadavatel_id)
+            ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        """)
+        # Řádky formuláře. J/K se NEberou z buněk (vzorec nemusí mít uloženou hodnotu),
+        # ale dopočítávají se ze sloupců E/G/H stejným předpisem — viz `_oprava_dopocet`.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS oprava_radky (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                pripad_id INT, poradi INT,
+                ico VARCHAR(40), doklad VARCHAR(60),
+                kod VARCHAR(40), nazev VARCHAR(255),
+                ks DOUBLE, nc DOUBLE, pc_std DOUBLE, pc_pozad DOUBLE,
+                odchylka_pct DOUBLE, odchylka_abs DOUBLE,
+                duvod VARCHAR(500),
+                INDEX idx_pripad (pripad_id)
+            ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        """)
+        # Originál nahraného souboru — vzorce ve sloupcích J/K zůstávají netknuté.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS oprava_soubory (
+                pripad_id INT PRIMARY KEY,
+                nazev VARCHAR(255),
+                data LONGBLOB
+            ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        """)
+        # Vlastní historie — `cenopripad_historie.pripad_id` patří `cenopripad_pripady`,
+        # sdílení by míchalo průběh dvou různých případů se stejným id.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS oprava_historie (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                pripad_id INT,
+                akce VARCHAR(80),
+                detail VARCHAR(1000),
+                kdo VARCHAR(255),
+                kdy DATETIME DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_pripad (pripad_id)
+            ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        """)
 
         # Případy (tikety)
         cur.execute("""
@@ -5575,18 +5640,19 @@ _OVOZEL_CENIK_MAPA = (
 # ── Práva ───────────────────────────────────────────────────────────────────
 def _ovozel_pristup(p):
     """Smí do dlaždice „Kontrola cen OVOZEL"."""
-    return _je_spravce(p) or any(f"cenopripad_{r}_ovozel" in p
-                                 for r in ("office", "zadatel"))
+    return _ovozel_office(p) or "cenopripad_zadatel_nakup" in p
 
 
 def _ovozel_office(p):
     """Office nákup: nahrává sestavu Sklad 6, zadává kontrolu a exportuje.
-    Vidí zároveň všechny případy (žadatel jen své). Mazat smí až správce."""
-    return _je_spravce(p) or "cenopripad_office_ovozel" in p
+    Vidí zároveň všechny případy (žadatel jen své). Mazat smí až správce.
+    Role sedí na existujícím právu „Office nákup" — samostatné právo pro OVOZEL
+    se nezavádí, aby se jedna a tatáž role nespravovala na dvou místech."""
+    return _je_spravce(p) or "cenopripad_office_nakup" in p
 
 
 # ── Pomocné ─────────────────────────────────────────────────────────────────
-def _ovozel_norm_kod(v):
+def _norm_kod(v):
     """Kód položky na text — 48510085.0 → „48510085", „48510085/" zůstává."""
     if v is None:
         return ""
@@ -5655,7 +5721,7 @@ def _ovozel_parse_master(raw_bytes, filename):
     for r in rows[hdr_idx + 1:]:
         if r is None or all(c is None or str(c).strip() == "" for c in r):
             continue
-        if not _ovozel_norm_kod(r[i_kod] if i_kod < len(r) else None):
+        if not _norm_kod(r[i_kod] if i_kod < len(r) else None):
             continue
         out.append({h: _ovozel_odproc(r[j] if j < len(r) else None)
                     for j, h in enumerate(hlavicka) if h})
@@ -5699,7 +5765,7 @@ def _ovozel_parse_cenik(raw_bytes, filename):
         def _b(pole):
             j = idx[pole]
             return r[j] if j < len(r) else None
-        kod = _ovozel_norm_kod(_b("kod"))
+        kod = _norm_kod(_b("kod"))
         if not kod:
             continue
         out.append({"kod": kod,
@@ -5734,7 +5800,7 @@ def _ovozel_kontrola(hlavicka, master_radky, cenik_radky):
     # VLOOKUP bere první výskyt kódu → stejná sémantika i tady.
     m_index = {}
     for r in master_radky:
-        m_index.setdefault(_ovozel_norm_kod(r.get(h_kod)), r)
+        m_index.setdefault(_norm_kod(r.get(h_kod)), r)
     c_index, duplicitni = {}, set()
     for r in cenik_radky:
         if r["kod"] in c_index:
@@ -5757,7 +5823,7 @@ def _ovozel_kontrola(hlavicka, master_radky, cenik_radky):
 
     master = []
     for r in master_radky:
-        kod = _ovozel_norm_kod(r.get(h_kod))
+        kod = _norm_kod(r.get(h_kod))
         nck = None
         nc, koef = _num(r.get(h_nc)), _num(r.get(h_koef))
         if nc is not None and koef is not None:
@@ -6083,7 +6149,7 @@ def _ovozel_notifikuj(pid, cislo, nazev, soubor, vysledek, zadavatel_jmeno, zada
             telo += "\n\nChyby:\n" + "\n".join(ukazky[:20])
             if len(ukazky) > 20:
                 telo += f"\n… a dalších {len(ukazky) - 20}."
-        prava = ("cenopripad_office_ovozel", "cenopripad_spravce", "vse")
+        prava = ("cenopripad_office_nakup", "cenopripad_spravce", "vse")
         for uid in (intranet_data.ziskej_uzivatele_s_pravem(*prava) or {}):
             try:
                 if uid is None or int(uid) == int(zadavatel_id):
@@ -6091,7 +6157,7 @@ def _ovozel_notifikuj(pid, cislo, nazev, soubor, vysledek, zadavatel_jmeno, zada
             except (TypeError, ValueError):
                 continue
             intranet_notifikace.pridej(uid, text, "warning" if chyb else "info")
-        _odesli_emaily(_emaily_s_pravy("cenopripad_office_ovozel", "cenopripad_spravce"),
+        _odesli_emaily(_emaily_s_pravy("cenopripad_office_nakup", "cenopripad_spravce"),
                        f"Kontrola cen OVOZEL {cislo} — " + ("chyby" if chyb else "bez chyb"),
                        telo, _app_url(f"?ovozel={pid}"))
     except Exception as e:
@@ -6104,9 +6170,10 @@ def _ovozel_otevri(pid):
     _refresh()
 
 
-def _ovozel_upload_panel(popis, akce, klic_nazev=None):
-    """Sdílený upload box obou sekcí: skrytý QUploader + tlačítko „+" + stavový řádek.
-    `akce(raw, name, nazev_pripadu)` je async a běží po kliknutí na potvrzovací tlačítko."""
+def _upload_panel(popis, akce, klic_nazev=None):
+    """Sdílený upload box (OVOZEL i Oprava cen): skrytý QUploader + tlačítko „+"
+    + stavový řádek. `akce(raw, name, nazev_pripadu)` je async a běží po kliknutí
+    na potvrzovací tlačítko."""
     drzeny = {"raw": None, "name": ""}
     ui.label(popis).classes("text-sm text-gray-500 mb-2")
     nazev_in = None
@@ -6213,7 +6280,7 @@ def _ovozel_sekce_master(user_id, user_name, prava):
                           position="top")
                 _refresh()
 
-            _ovozel_upload_panel(
+            _upload_panel(
                 "Sestava se stahuje každý pátek. Poslední nahraná sestava je ta, "
                 "proti které se kontrolují nové požadavky.", _akce)
 
@@ -6275,7 +6342,7 @@ def _ovozel_sekce_kontrola(user_id, user_name, prava):
                           position="top")
                 _ovozel_otevri(pid)
 
-            _ovozel_upload_panel(
+            _upload_panel(
                 f"Nahrajte soubor „OZ změny PC od …“ (.xlsx). Zkontroluje se proti "
                 f"datům OVOZEL z {_dt_cz(m.get('nahrano'))} "
                 f"({m.get('pocet_radku', 0)} položek) a výsledek se rozešle e-mailem.",
@@ -6492,6 +6559,904 @@ def _ovozel_detail(pid, user_id, user_name, prava):
     _aplikuj()
 
 
+# ============================================================================
+# Dlaždice „Oprava cen" — žádost o opravu ceny (formulář Oprava_ceny_2026.xlsx)
+#
+# Fronta je záměrně stejná jako u Formulářů ASM (splatnosti):
+#   žadatel → Office obchod → buď zpracuje, nebo postoupí Správci k odsouhlasení.
+# ============================================================================
+_OPRAVA_STAV_BADGE = {
+    "odeslano":         ("Odesláno / ve frontě", "blue"),
+    "vraceno_oprava":   ("Vráceno k opravě", "orange"),
+    "vraceno_zpet":     ("Vráceno zpět na Office", "purple"),
+    "u_spravce":        ("U správce", "indigo"),
+    "spravce_schvalil": ("Správce schválil", "teal"),
+    "zpracovano":       ("Zpracováno", "green"),
+    "uzavreno":         ("Uzavřeno", "grey-8"),
+    "zamitnuto":        ("Zamítnuto", "red"),
+    "stornovano":       ("Stornováno", "grey"),
+}
+_OPRAVA_STAVY_KONCOVE = {"uzavreno", "zamitnuto", "stornovano"}
+
+# Sloupce formuláře → (klíč, typ, varianty hlavičky). Hlavička se hledá podle
+# textu, ne podle pozice, aby drobná úprava šablony import nerozbila.
+_OPRAVA_SLOUPCE = (
+    ("ico",      "text",  ("ičo", "ico")),
+    ("doklad",   "text",  ("číslo dokladu", "cislo dokladu")),
+    ("kod",      "text",  ("kód karty", "kod karty")),
+    ("nazev",    "text",  ("název karty", "nazev karty")),
+    ("ks",       "cislo", ("počet ks", "pocet ks")),
+    ("nc",       "cislo", ("nákupní cena", "nakupni cena")),
+    ("pc_std",   "cislo", ("standartní prodejní cena", "standardní prodejní cena",
+                           "standartni prodejni cena", "standardni prodejni cena")),
+    ("pc_pozad", "cislo", ("požadovaná prodejní cena", "pozadovana prodejni cena")),
+    ("duvod",    "text",  ("důvod opravy", "duvod opravy")),
+)
+_OPRAVA_POVINNE = ("kod", "ks", "pc_std", "pc_pozad")
+
+
+# ── Práva ───────────────────────────────────────────────────────────────────
+def _oprava_pristup(p):
+    """Smí do dlaždice „Oprava cen"."""
+    return _je_spravce(p) or "cenopripad_zadatel_obchod" in p \
+        or "cenopripad_office_obchod" in p
+
+
+def _oprava_office(p):
+    """Office obchod: vidí všechny žádosti, zpracuje je nebo postoupí správci."""
+    return _je_spravce(p) or "cenopripad_office_obchod" in p
+
+
+# ── Výpočet ─────────────────────────────────────────────────────────────────
+def _oprava_dopocet(ks, pc_std, pc_pozad):
+    """Sloupce J a K ze šablony, dopočítané ze vstupů E/G/H.
+
+    Excel:  J = (100-H/(G*0.01))*-1/100   ==  H/G - 1        (podíl, formát 0,00 %)
+            K = ((G*E)-(H*E))*-1          ==  E*(H-G)        (Kč)
+
+    Bere se hodnota, ne buňka: vzorec v nahraném souboru nemusí mít uloženou
+    cached hodnotu (soubor vytvořený programem, nikdy neotevřený v Excelu), takže
+    `data_only=True` by vrátilo None. Vzorce v souboru samotném zůstávají netknuté.
+    """
+    pct = None
+    if pc_std not in (None, 0) and pc_pozad is not None:
+        pct = pc_pozad / pc_std - 1
+    abs_ = None
+    if None not in (ks, pc_std, pc_pozad):
+        abs_ = ks * (pc_pozad - pc_std)
+    return pct, abs_
+
+
+def _oprava_parse(raw_bytes, filename):
+    """Nahraný formulář → (radky, chyba|None). Řádky bez povinných polí se
+    přeskočí (prázdné patičky šablony), vadné se vrátí s popisem chyby."""
+    try:
+        rows = _nacti_rows(raw_bytes, filename)
+    except Exception as e:
+        return None, f"Soubor se nepodařilo načíst: {e}"
+    if not rows:
+        return None, "Soubor je prázdný."
+
+    # 1) Řádek hlavičky — první do 20. řádku, kde sedí IČO i Kód karty.
+    idx_hdr, mapa = None, {}
+    for i, r in enumerate(rows[:20]):
+        m = {}
+        for j, bunka in enumerate(r):
+            h = _norm(bunka)
+            if not h:
+                continue
+            for klic, _typ, varianty in _OPRAVA_SLOUPCE:
+                if klic not in m and any(h.startswith(v) for v in varianty):
+                    m[klic] = j
+                    break
+        if "ico" in m and "kod" in m:
+            idx_hdr, mapa = i, m
+            break
+    if idx_hdr is None:
+        return None, ("V souboru chybí hlavička formuláře (sloupce „IČO“ a „Kód karty“). "
+                      "Použijte vzorový formulář z tlačítka „Vzorový formulář“.")
+    chybi = [k for k in _OPRAVA_POVINNE if k not in mapa]
+    if chybi:
+        popisky = {s[0]: s[2][0] for s in _OPRAVA_SLOUPCE}
+        return None, ("Ve formuláři chybí sloupce: "
+                      + ", ".join(popisky.get(k, k) for k in chybi) + ".")
+
+    typy = {k: t for k, t, _ in _OPRAVA_SLOUPCE}
+    radky, poradi = [], 0
+    for r in rows[idx_hdr + 1:]:
+        hodnoty = {}
+        for klic, j in mapa.items():
+            v = r[j] if j < len(r) else None
+            if typy[klic] == "cislo":
+                # `parse_cena_kc`, ne `parse_cislo`: v cenových sloupcích nesmí projít
+                # procento („5%" → 0,05 by tiše zkreslilo cenu i dopad opravy).
+                v = cp.parse_cena_kc(v) if v not in (None, "") else None
+            elif klic in ("ico", "doklad", "kod"):
+                # Identifikátory ať jsou vždy text: Excel vrací 48510085 i jako
+                # float, „48510085.0" by pak nesedělo s kódem v systému.
+                v = _norm_kod(v)
+            else:
+                v = " ".join(str(v).split()) if v not in (None, "") else ""
+            hodnoty[klic] = v
+        # Prázdný řádek šablony (i „mezerový" text ve sloupci F) → přeskoč.
+        if not hodnoty.get("kod") and not hodnoty.get("nazev") \
+                and hodnoty.get("pc_pozad") is None:
+            continue
+        poradi += 1
+        chyby = []
+        if not hodnoty.get("kod"):
+            chyby.append("chybí kód karty")
+        for klic, popis in (("ks", "počet ks"), ("pc_std", "standardní PC"),
+                            ("pc_pozad", "požadovaná PC")):
+            if hodnoty.get(klic) is None:
+                chyby.append(f"chybí {popis}")
+        if hodnoty.get("pc_std") == 0:
+            chyby.append("standardní PC je 0 (nelze spočítat % odchylku)")
+        pct, abs_ = _oprava_dopocet(hodnoty.get("ks"), hodnoty.get("pc_std"),
+                                    hodnoty.get("pc_pozad"))
+        hodnoty.update(poradi=poradi, odchylka_pct=pct, odchylka_abs=abs_,
+                       chyba="; ".join(chyby))
+        radky.append(hodnoty)
+
+    if not radky:
+        return None, "Formulář neobsahuje žádný vyplněný řádek."
+    vadne = [r for r in radky if r["chyba"]]
+    if vadne:
+        ukazka = "; ".join(f"řádek {r['poradi']}: {r['chyba']}" for r in vadne[:5])
+        return None, (f"Vadných řádků: {len(vadne)} — opravte je a nahrajte znovu. "
+                      f"{ukazka}" + (" …" if len(vadne) > 5 else ""))
+    return radky, None
+
+
+# ── DB ──────────────────────────────────────────────────────────────────────
+def _oprava_zapis_radky(cur, pid, radky):
+    cur.execute("DELETE FROM oprava_radky WHERE pripad_id=%s", (pid,))
+    cur.executemany(
+        "INSERT INTO oprava_radky (pripad_id, poradi, ico, doklad, kod, nazev, ks, nc, "
+        "pc_std, pc_pozad, odchylka_pct, odchylka_abs, duvod) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+        [(pid, r["poradi"], _str(r.get("ico"), 40), _str(r.get("doklad"), 60),
+          _str(r.get("kod"), 40), _str(r.get("nazev"), 255), r.get("ks"), r.get("nc"),
+          r.get("pc_std"), r.get("pc_pozad"), r.get("odchylka_pct"),
+          r.get("odchylka_abs"), _str(r.get("duvod"), 500)) for r in radky])
+
+
+def _oprava_uloz(nazev, duvod, radky, raw, soubor_nazev, user_id, user_name):
+    """Nová žádost. Vrací (id, cislo) nebo (None, chyba)."""
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return None, "Není připojení k databázi."
+    try:
+        cur = conn.cursor()
+        suma = sum(r.get("odchylka_abs") or 0 for r in radky)
+        cur.execute("INSERT INTO oprava_pripady (nazev, zadavatel_id, zadavatel_jmeno, "
+                    "stav, duvod, pocet_radku, suma_abs, soubor_nazev) "
+                    "VALUES (%s,%s,%s,'odeslano',%s,%s,%s,%s)",
+                    (_str(nazev, 255), user_id, _str(user_name, 255), duvod,
+                     len(radky), suma, _str(soubor_nazev, 255)))
+        pid = cur.lastrowid
+        cislo = f"OC{pid:05d}"
+        cur.execute("UPDATE oprava_pripady SET cislo=%s WHERE id=%s", (cislo, pid))
+        _oprava_zapis_radky(cur, pid, radky)
+        if raw:
+            cur.execute("INSERT INTO oprava_soubory (pripad_id, nazev, data) "
+                        "VALUES (%s,%s,%s)", (pid, _str(soubor_nazev, 255), raw))
+        conn.commit()
+        cur.close()
+        return pid, cislo
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return None, f"Chyba zápisu do databáze: {e}"
+    finally:
+        conn.close()
+
+
+def _oprava_prepis(pid, duvod, radky, raw, soubor_nazev):
+    """Oprava existující žádosti žadatelem (stav „vráceno k opravě").
+    Soubor je nepovinný — beze změny se zachová ten původní."""
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return False, "Není připojení k databázi."
+    try:
+        cur = conn.cursor()
+        if radky is not None:
+            suma = sum(r.get("odchylka_abs") or 0 for r in radky)
+            cur.execute("UPDATE oprava_pripady SET duvod=%s, pocet_radku=%s, suma_abs=%s, "
+                        "soubor_nazev=%s WHERE id=%s",
+                        (duvod, len(radky), suma, _str(soubor_nazev, 255), pid))
+            _oprava_zapis_radky(cur, pid, radky)
+            cur.execute("DELETE FROM oprava_soubory WHERE pripad_id=%s", (pid,))
+            cur.execute("INSERT INTO oprava_soubory (pripad_id, nazev, data) "
+                        "VALUES (%s,%s,%s)", (pid, _str(soubor_nazev, 255), raw))
+        else:
+            cur.execute("UPDATE oprava_pripady SET duvod=%s WHERE id=%s", (duvod, pid))
+        conn.commit()
+        cur.close()
+        return True, None
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False, str(e)
+    finally:
+        conn.close()
+
+
+def _oprava_stav(pid, novy_stav, **pole):
+    """Změna stavu + volitelně poznamka/spravce_pozn/zamitnuti_duvod/storno_duvod."""
+    povolene = ("poznamka", "spravce_pozn", "zamitnuti_duvod", "storno_duvod")
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return False
+    try:
+        cur = conn.cursor()
+        sety, params = ["stav=%s"], [novy_stav]
+        for k in povolene:
+            if pole.get(k) is not None:
+                sety.append(f"{k}=%s")
+                params.append(_str(pole[k], 1000))
+        params.append(pid)
+        cur.execute(f"UPDATE oprava_pripady SET {','.join(sety)} WHERE id=%s", params)
+        conn.commit()
+        cur.close()
+        return True
+    except Exception as e:
+        print(f"[oprava] _oprava_stav: {e}")
+        return False
+    finally:
+        conn.close()
+
+
+def _oprava_seznam(user_id, prava):
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return []
+    try:
+        cur = conn.cursor(dictionary=True)
+        sql = ("SELECT id, cislo, nazev, zadavatel_id, zadavatel_jmeno, datum_zadani, "
+               "stav, pocet_radku, suma_abs, soubor_nazev FROM oprava_pripady ")
+        if _oprava_office(prava):
+            cur.execute(sql + "ORDER BY id DESC")
+        else:
+            cur.execute(sql + "WHERE zadavatel_id=%s ORDER BY id DESC", (user_id,))
+        r = cur.fetchall()
+        cur.close()
+        return r
+    except Exception as e:
+        print(f"[oprava] _oprava_seznam: {e}")
+        return []
+    finally:
+        conn.close()
+
+
+def _oprava_pripad(pid):
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return None
+    try:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT * FROM oprava_pripady WHERE id=%s", (pid,))
+        p = cur.fetchone()
+        cur.close()
+        return p
+    except Exception as e:
+        print(f"[oprava] _oprava_pripad: {e}")
+        return None
+    finally:
+        conn.close()
+
+
+def _oprava_nacti_radky(pid):
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return []
+    try:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT * FROM oprava_radky WHERE pripad_id=%s ORDER BY poradi", (pid,))
+        r = cur.fetchall()
+        cur.close()
+        return r
+    except Exception as e:
+        print(f"[oprava] _oprava_nacti_radky: {e}")
+        return []
+    finally:
+        conn.close()
+
+
+def _oprava_soubor(pid):
+    """(nazev, data) originálu nahraného formuláře, nebo (None, None)."""
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return None, None
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT nazev, data FROM oprava_soubory WHERE pripad_id=%s", (pid,))
+        r = cur.fetchone()
+        cur.close()
+        return (r[0], r[1]) if r else (None, None)
+    except Exception as e:
+        print(f"[oprava] _oprava_soubor: {e}")
+        return None, None
+    finally:
+        conn.close()
+
+
+def _oprava_smaz(pid):
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return False, "Není připojení k databázi."
+    try:
+        cur = conn.cursor()
+        for t in ("oprava_soubory", "oprava_radky", "oprava_historie"):
+            cur.execute(f"DELETE FROM {t} WHERE pripad_id=%s", (pid,))
+        cur.execute("DELETE FROM oprava_pripady WHERE id=%s", (pid,))
+        conn.commit()
+        cur.close()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+    finally:
+        conn.close()
+
+
+def _oprava_zapis_historie(pid, akce, kdo, detail=None):
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return
+    try:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO oprava_historie (pripad_id, akce, detail, kdo) "
+                    "VALUES (%s,%s,%s,%s)",
+                    (pid, _str(akce, 80), _str(detail, 1000), _str(kdo, 255) or ""))
+        conn.commit()
+        cur.close()
+    except Exception as e:
+        print(f"[oprava] _oprava_zapis_historie: {e}")
+    finally:
+        conn.close()
+
+
+def _oprava_historie(pid):
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return []
+    try:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT akce, detail, kdo, kdy FROM oprava_historie "
+                    "WHERE pripad_id=%s ORDER BY id", (pid,))
+        r = cur.fetchall()
+        cur.close()
+        return r
+    except Exception as e:
+        print(f"[oprava] _oprava_historie: {e}")
+        return []
+    finally:
+        conn.close()
+
+
+# ── Notifikace ──────────────────────────────────────────────────────────────
+def _oprava_zvonecek(text, typ, *prava_klice, krome_uid=None):
+    try:
+        for uid in (intranet_data.ziskej_uzivatele_s_pravem(*prava_klice) or {}):
+            try:
+                if uid is None or (krome_uid is not None and int(uid) == int(krome_uid)):
+                    continue
+            except (TypeError, ValueError):
+                continue
+            intranet_notifikace.pridej(uid, text, typ)
+    except Exception as e:
+        print(f"[oprava] _oprava_zvonecek: {e}")
+
+
+def _oprava_mail_office(pid, predmet, text):
+    _odesli_emaily(_emaily_office("obchod"), predmet, text, _app_url(f"?oprava={pid}"))
+
+
+def _oprava_mail_zadateli(p, predmet, text):
+    em = _email_uzivatele(p.get("zadavatel_id"))
+    if em:
+        _odesli_emaily([em], predmet, text, _app_url(f"?oprava={p.get('id')}"))
+
+
+# ── UI ──────────────────────────────────────────────────────────────────────
+def _oprava_otevri(pid):
+    app.storage.user["oprava_detail"] = pid
+    _refresh()
+
+
+def _oprava_stahni_vzor():
+    """Servíruje originál šablony — vzorce ve sloupcích J a K zůstávají zachovány."""
+    if not os.path.exists(VZOR_OPRAVA_SOUBOR):
+        ui.notify("Vzorový formulář není k dispozici.", type="negative")
+        return
+    ui.download.file(VZOR_OPRAVA_SOUBOR, VZOR_OPRAVA_NAZEV)
+
+
+def _oprava_badge(stav):
+    popis, barva = _OPRAVA_STAV_BADGE.get(stav, (stav, "grey"))
+    ui.badge(popis, color=barva).props("rounded").classes("px-2 py-1 text-xs")
+
+
+def _oprava_view(user_id, user_name, prava):
+    det = app.storage.user.get("oprava_detail")
+    if det:
+        _oprava_detail(det, user_id, user_name, prava)
+        return
+    _oprava_sekce_nova(user_id, user_name, prava)
+    _oprava_sekce_seznam(user_id, prava)
+
+
+def _oprava_sekce_nova(user_id, user_name, prava):
+    """Panel „Nová žádost o opravu ceny" — vzor ke stažení, důvod, upload."""
+    with ui.card().classes("w-full max-w-3xl p-5 rounded-2xl shadow-lg mb-4"):
+        with ui.row().classes("w-full items-center gap-3"):
+            ui.label("Nová žádost o opravu ceny") \
+                .classes("text-lg font-bold text-gray-800")
+            ui.space()
+            ui.button("Vzorový formulář", icon="file_download",
+                      on_click=_oprava_stahni_vzor).props("outline no-caps") \
+                .classes("text-emerald-700 font-semibold rounded-lg") \
+                .tooltip("Stáhne formulář Oprava_ceny_2026.xlsx včetně vzorců ve "
+                         "sloupcích J a K.")
+        duvod_in = ui.textarea("Důvod opravy / žádost *") \
+            .props("outlined autogrow").classes("w-full mb-2")
+
+        async def _akce(raw, name, nazev_zadosti):
+            duvod = (duvod_in.value or "").strip()
+            if not duvod:
+                ui.notify("Vyplňte důvod opravy.", type="warning")
+                return
+            radky, err = await run.cpu_bound(_oprava_parse, raw, name)
+            if err:
+                ui.notify(err, type="negative", timeout=12000)
+                return
+            pid, cislo = _oprava_uloz(nazev_zadosti or _bez_pripony(name), duvod,
+                                      radky, raw, name, user_id, user_name)
+            if not pid:
+                ui.notify(f"Uložení selhalo: {cislo}", type="negative")
+                return
+            suma = sum(r.get("odchylka_abs") or 0 for r in radky)
+            _oprava_zapis_historie(pid, "Odesláno žadatelem", user_name,
+                                   f"{len(radky)} řádků, dopad {_castka(suma)} Kč")
+            intranet_logger.log_activity(
+                user_name, "Cenopřípad",
+                f"Oprava cen: nová žádost {cislo} ({name}) — {len(radky)} řádků")
+            _oprava_zvonecek(f"🧾 Oprava cen {cislo} od {user_name}: {len(radky)} řádků, "
+                             f"dopad {_castka(suma)} Kč.", "info",
+                             "cenopripad_office_obchod", "cenopripad_spravce", "vse",
+                             krome_uid=user_id)
+            _oprava_mail_office(
+                pid, f"Oprava cen — nová žádost {cislo}",
+                f"Žadatel {user_name} podal žádost o opravu ceny {cislo}.\n"
+                f"Řádků: {len(radky)} · dopad: {_castka(suma)} Kč\n"
+                f"Soubor: {name}\n\nDůvod:\n{duvod}")
+            ui.notify(f"Žádost {cislo} odeslána Office obchod.", type="positive",
+                      position="top")
+            _oprava_otevri(pid)
+
+        _upload_panel(
+            "Nahrajte vyplněný formulář „Oprava_ceny_2026.xlsx“. Sloupce J a K "
+            "(% a absolutní odchylka) se dopočítají podle vzorců ze šablony — "
+            "nemusíte je vyplňovat a v souboru zůstanou zachovány.",
+            _akce, klic_nazev="Název žádosti (nepovinné)")
+
+
+def _oprava_sekce_seznam(user_id, prava):
+    zadosti = _oprava_seznam(user_id, prava)
+    if not zadosti:
+        ui.label("Zatím žádné žádosti o opravu ceny.").classes("text-gray-400 italic p-4")
+        return
+    with ui.column().classes("w-full gap-2"):
+        for p in zadosti:
+            stav = p.get("stav")
+            barva = ("border-gray-300" if stav in _OPRAVA_STAVY_KONCOVE
+                     else "border-orange-300" if stav == "vraceno_oprava"
+                     else "border-indigo-300" if stav == "u_spravce"
+                     else "border-green-300" if stav in ("zpracovano", "spravce_schvalil")
+                     else "border-blue-300")
+            with ui.card().classes(f"w-full p-3 rounded-xl shadow-sm hover:shadow-md "
+                                   f"transition-shadow cursor-pointer border-l-4 {barva}") \
+                    .on("click", lambda pid=p["id"]: _oprava_otevri(pid)):
+                with ui.row().classes("w-full items-center gap-3 flex-wrap"):
+                    ui.label(p.get("cislo") or "—").classes("font-bold text-gray-800")
+                    if p.get("nazev"):
+                        ui.label(p.get("nazev")).classes("font-medium text-gray-700")
+                    _oprava_badge(stav)
+                    ui.space()
+                    ui.label(f"{p.get('pocet_radku', 0)} řádků") \
+                        .classes("text-sm text-gray-500")
+                    ui.label(f"{_castka(p.get('suma_abs'))} Kč") \
+                        .classes("text-sm font-medium text-red-600")
+                    ui.label(f"{p.get('zadavatel_jmeno') or ''} · "
+                             f"{_dt_cz(p.get('datum_zadani'))}") \
+                        .classes("text-xs text-gray-400")
+
+
+def _oprava_detail(pid, user_id, user_name, prava):
+    p = _oprava_pripad(pid)
+    je_office = _oprava_office(prava)
+    if not p or (not je_office and p.get("zadavatel_id") != user_id):
+        app.storage.user["oprava_detail"] = None
+        if p:
+            ui.notify("K této žádosti nemáte oprávnění.", type="warning")
+        _refresh()
+        return
+    je_spravce = _je_spravce(prava)
+    je_vlastnik = p.get("zadavatel_id") == user_id
+    stav = p.get("stav")
+    radky = _oprava_nacti_radky(pid)
+
+    # ── Hlavička ────────────────────────────────────────────────────────────
+    with ui.row().classes("w-full items-center gap-3 mb-2 flex-wrap"):
+        ui.button(icon="arrow_back", on_click=lambda: _oprava_otevri(None)) \
+            .props("flat round color=grey-7").tooltip("Zpět na seznam")
+        ui.label(f"{p.get('cislo')}" + (f" · {p.get('nazev')}" if p.get("nazev") else "")) \
+            .classes("text-xl font-bold text-gray-800")
+        _oprava_badge(stav)
+        ui.space()
+        ui.label(f"{p.get('pocet_radku', 0)} řádků · dopad {_castka(p.get('suma_abs'))} Kč") \
+            .classes("text-sm text-gray-500")
+
+        def _stahni():
+            nazev, data = _oprava_soubor(pid)
+            if not data:
+                ui.notify("Nahraný soubor není k dispozici.", type="warning")
+                return
+            ui.download(bytes(data), nazev or f"oprava_{p.get('cislo')}.xlsx")
+        ui.button("Stáhnout formulář", icon="file_download", on_click=_stahni) \
+            .props("outline no-caps").classes("text-emerald-700 font-semibold rounded-lg") \
+            .tooltip("Originál nahraného souboru — vzorce ve sloupcích J a K beze změny.")
+
+        if je_spravce:
+            def _smaz_dialog():
+                with ui.dialog() as dlg, ui.card().classes("p-4"):
+                    ui.label(f"Nevratně smazat žádost {p.get('cislo')}?") \
+                        .classes("font-medium")
+                    ui.label("Smaže se žádost, řádky, historie i nahraný soubor.") \
+                        .classes("text-sm text-gray-500")
+
+                    def _potvrd():
+                        ok, err = _oprava_smaz(pid)
+                        dlg.close()
+                        if ok:
+                            intranet_logger.log_activity(
+                                user_name, "Cenopřípad",
+                                f"Oprava cen: smazána žádost {p.get('cislo')}")
+                            ui.notify(f"Žádost {p.get('cislo')} smazána.", type="warning")
+                            _oprava_otevri(None)
+                        else:
+                            ui.notify(err or "Smazání selhalo.", type="negative")
+                    with ui.row().classes("w-full justify-end gap-2 mt-2"):
+                        ui.button("Zrušit", on_click=dlg.close).props("flat no-caps")
+                        ui.button("Smazat", icon="delete_forever", on_click=_potvrd) \
+                            .props("unelevated no-caps").classes("bg-red-600 text-white")
+                dlg.open()
+            ui.button("Smazat", icon="delete", on_click=_smaz_dialog) \
+                .props("flat no-caps").classes("text-red-600")
+
+    # ── Důvod + poznámky ────────────────────────────────────────────────────
+    with ui.card().classes("w-full p-4 rounded-xl shadow-sm mb-3 gap-1"):
+        ui.label("Důvod opravy / žádost").classes("text-sm font-bold text-gray-700")
+        ui.label(p.get("duvod") or "—").classes("text-sm text-gray-800 whitespace-pre-wrap")
+        ui.label(f"Podal: {p.get('zadavatel_jmeno') or '—'} · "
+                 f"{_dt_cz(p.get('datum_zadani'))} · soubor: {p.get('soubor_nazev') or '—'}") \
+            .classes("text-xs text-gray-400 mt-1")
+        if p.get("poznamka"):
+            ui.label(f"↩︎ Vráceno k opravě: {p['poznamka']}") \
+                .classes("text-sm text-orange-700 font-medium mt-2 whitespace-pre-wrap")
+        # Poznámka pro správce je interní — žadatel ji nevidí (stejně jako u ASM).
+        if p.get("spravce_pozn") and (je_office or je_spravce):
+            ui.label(f"→ Poznámka správci: {p['spravce_pozn']}") \
+                .classes("text-sm text-indigo-700 font-medium mt-2 whitespace-pre-wrap")
+        if p.get("zamitnuti_duvod"):
+            ui.label(f"✖ Zamítnuto: {p['zamitnuti_duvod']}") \
+                .classes("text-sm text-red-700 font-medium mt-2 whitespace-pre-wrap")
+        if p.get("storno_duvod"):
+            ui.label(f"⃠ Stornováno: {p['storno_duvod']}") \
+                .classes("text-sm text-gray-600 font-medium mt-2 whitespace-pre-wrap")
+
+    # ── Řádky formuláře ─────────────────────────────────────────────────────
+    _ZAP = "(p) => p.value && p.value.startsWith('-') ? {color:'#b91c1c'} : null"
+    grid_rows = [{"poradi": r.get("poradi"), "ico": r.get("ico") or "",
+                  "doklad": r.get("doklad") or "", "kod": r.get("kod") or "",
+                  "nazev": r.get("nazev") or "",
+                  "ks": _castka(r.get("ks")), "nc": _castka(r.get("nc")),
+                  "pc_std": _castka(r.get("pc_std")), "pc_pozad": _castka(r.get("pc_pozad")),
+                  "pct": _pct(r.get("odchylka_pct")), "abs": _castka(r.get("odchylka_abs")),
+                  "duvod": r.get("duvod") or ""} for r in radky]
+    ui.label(f"Řádky formuláře — {len(radky)} položek").classes(
+        "text-base font-bold text-gray-800 mt-1 mb-1")
+    ui.aggrid({
+        "columnDefs": [
+            {"headerName": "#", "field": "poradi", "width": 70, "minWidth": 55},
+            {"headerName": "IČO", "field": "ico", "width": 110, "minWidth": 90},
+            {"headerName": "Číslo dokladu", "field": "doklad", "width": 130, "minWidth": 100},
+            {"headerName": "Kód karty", "field": "kod", "width": 120, "minWidth": 90},
+            {"headerName": "Název karty", "field": "nazev", "width": 300, "minWidth": 160},
+            {"headerName": "Počet ks", "field": "ks", "width": 100, "minWidth": 80,
+             "type": "rightAligned"},
+            {"headerName": "Nákupní cena", "field": "nc", "width": 120, "minWidth": 95,
+             "type": "rightAligned"},
+            {"headerName": "Standardní PC bez DPH", "field": "pc_std", "width": 140,
+             "minWidth": 105, "type": "rightAligned"},
+            {"headerName": "Požadovaná PC bez DPH", "field": "pc_pozad", "width": 140,
+             "minWidth": 105, "type": "rightAligned"},
+            # J a K ze šablony — dopočítané, ne čtené z buněk (viz `_oprava_dopocet`).
+            {"headerName": "% odchylka oproti std. PC", "field": "pct", "width": 140,
+             "minWidth": 105, "type": "rightAligned", ":cellStyle": _ZAP},
+            {"headerName": "Absolutní odchylka", "field": "abs", "width": 140,
+             "minWidth": 105, "type": "rightAligned", ":cellStyle": _ZAP},
+            {"headerName": "Důvod opravy", "field": "duvod", "width": 260, "minWidth": 160},
+        ],
+        "rowData": grid_rows,
+        "defaultColDef": {"resizable": True, "sortable": True, "filter": True,
+                          "wrapHeaderText": True, "autoHeaderHeight": True,
+                          "cellDataType": False},
+        "rowHeight": 28,
+        "autoSizeStrategy": {"type": "fitCellContents"},
+    }).classes("w-full").style("height: 42vh")
+
+    _oprava_workflow(p, pid, stav, je_vlastnik, je_office, je_spravce, user_name)
+
+    # ── Průběh ──────────────────────────────────────────────────────────────
+    kroky = _oprava_historie(pid)
+    if kroky:
+        with ui.expansion("Průběh žádosti", icon="history") \
+                .classes("w-full mt-3 border rounded-xl"):
+            for k in kroky:
+                with ui.row().classes("w-full items-start gap-3 py-1 flex-wrap"):
+                    ui.label(_dt_cz(k.get("kdy"))).classes("text-xs text-gray-400 w-36")
+                    ui.label(k.get("akce") or "").classes("text-sm font-medium text-gray-800")
+                    ui.label(k.get("kdo") or "").classes("text-sm text-gray-500")
+                    if k.get("detail"):
+                        ui.label(k["detail"]).classes("text-sm text-gray-600 italic")
+
+
+def _oprava_workflow(p, pid, stav, je_vlastnik, je_office, je_spravce, user_name):
+    """Akční tlačítka fronty — 1:1 stavový automat Formulářů ASM (splatnosti)."""
+    cislo = p.get("cislo")
+
+    def _hotovo(zprava):
+        ui.notify(zprava, type="positive")
+        _refresh()
+
+    with ui.row().classes("w-full gap-2 flex-wrap mt-3"):
+        # ── Žadatel — případ vrácen k opravě ────────────────────────────────
+        if je_vlastnik and stav == "vraceno_oprava":
+            def _dialog_oprava():
+                with ui.dialog() as d, ui.card().classes("p-4 gap-3") \
+                        .style("min-width:560px; max-width:94vw"):
+                    ui.label("Opravit a odeslat zpět").classes("text-lg font-bold")
+                    ui.label(f"Co má být opraveno: {p.get('poznamka') or '—'}") \
+                        .classes("text-sm text-orange-700 whitespace-pre-wrap")
+                    duvod_in = ui.textarea("Důvod opravy / žádost *",
+                                           value=p.get("duvod") or "") \
+                        .props("outlined autogrow").classes("w-full")
+                    ui.label("Nahrajte opravený formulář, nebo nechte prázdné a "
+                             "odešlete jen upravený důvod.").classes("text-sm text-gray-500")
+                    drzeny = {"radky": None, "raw": None, "name": ""}
+
+                    async def _prijmi(raw, name, _nazev):
+                        radky, err = await run.cpu_bound(_oprava_parse, raw, name)
+                        if err:
+                            ui.notify(err, type="negative", timeout=12000)
+                            return
+                        drzeny.update(radky=radky, raw=raw, name=name)
+                        ui.notify(f"Soubor v pořádku — {len(radky)} řádků. "
+                                  f"Potvrďte tlačítkem „Odeslat zpět“.", type="positive")
+                    _upload_panel("Opravený formulář (.xlsx) — nepovinné.", _prijmi)
+
+                    def _odeslat():
+                        duvod = (duvod_in.value or "").strip()
+                        if not duvod:
+                            ui.notify("Vyplňte důvod opravy.", type="warning")
+                            return
+                        ok, err = _oprava_prepis(pid, duvod, drzeny["radky"],
+                                                 drzeny["raw"], drzeny["name"])
+                        if not ok:
+                            ui.notify(f"Uložení opravy selhalo: {err}", type="negative")
+                            return
+                        _oprava_stav(pid, "odeslano")
+                        _oprava_zapis_historie(
+                            pid, "Opraveno žadatelem", user_name,
+                            "Nahrán opravený formulář" if drzeny["radky"]
+                            else "Upraven pouze důvod")
+                        _oprava_mail_office(
+                            pid, f"Oprava cen — žádost {cislo} opravena",
+                            f"Žadatel {user_name} opravil žádost {cislo} a odeslal ji "
+                            f"zpět ke zpracování.\n\nDůvod:\n{duvod}")
+                        d.close()
+                        _hotovo("Oprava odeslána Office obchod.")
+                    with ui.row().classes("w-full justify-end gap-2"):
+                        ui.button("Zrušit", on_click=d.close).props("flat no-caps")
+                        ui.button("Odeslat zpět", icon="send", on_click=_odeslat) \
+                            .props("unelevated no-caps color=green")
+                d.open()
+
+            def _trvam():
+                _oprava_stav(pid, "vraceno_zpet")
+                _oprava_zapis_historie(pid, "Vráceno zpět na Office", user_name,
+                                       "Žadatel trvá na svém")
+                _oprava_mail_office(
+                    pid, f"Oprava cen — žádost {cislo} vrácena zpět",
+                    f"Žadatel {user_name} vrátil žádost {cislo} zpět na Office "
+                    f"(trvá na svém).")
+                _hotovo("Odesláno zpět na Office.")
+
+            ui.button("Opravit a odeslat", icon="save", on_click=_dialog_oprava) \
+                .props("unelevated no-caps").classes("bg-emerald-600 text-white rounded-lg")
+            ui.button("Trvám na svém – vrátit Office", icon="reply", on_click=_trvam) \
+                .props("outline no-caps color=purple")
+
+        # ── Office obchod ───────────────────────────────────────────────────
+        if je_office and stav in ("odeslano", "vraceno_zpet", "spravce_schvalil"):
+            def _zpracovano():
+                _oprava_stav(pid, "zpracovano")
+                _oprava_zapis_historie(pid, "Zpracováno", user_name)
+                _oprava_mail_zadateli(p, f"Oprava cen — žádost {cislo} zpracována",
+                                      f"Vaše žádost o opravu ceny {cislo} byla zpracována.")
+                intranet_logger.log_activity(user_name, "Cenopřípad",
+                                             f"Oprava cen: zpracováno {cislo}")
+                _hotovo("Označeno jako zpracováno.")
+
+            def _vratit():
+                with ui.dialog() as d, ui.card().classes("p-4 gap-3").style("min-width:420px"):
+                    ui.label("Vrátit k opravě").classes("text-lg font-bold")
+                    pozn = ui.textarea("Co má žadatel opravit *") \
+                        .props("outlined autogrow").classes("w-full")
+
+                    def _ok():
+                        txt = (pozn.value or "").strip()
+                        if not txt:
+                            ui.notify("Vyplňte poznámku.", type="warning")
+                            return
+                        _oprava_stav(pid, "vraceno_oprava", poznamka=txt)
+                        _oprava_zapis_historie(pid, "Vráceno k opravě", user_name, txt)
+                        _oprava_mail_zadateli(
+                            p, f"Oprava cen — žádost {cislo} vrácena k opravě",
+                            f"Vaše žádost {cislo} byla vrácena k opravě.\n\nPoznámka: {txt}")
+                        d.close()
+                        _hotovo("Vráceno žadateli.")
+                    with ui.row().classes("w-full justify-end gap-2"):
+                        ui.button("Zrušit", on_click=d.close).props("flat no-caps")
+                        ui.button("Vrátit", on_click=_ok) \
+                            .props("unelevated no-caps color=orange")
+                d.open()
+
+            def _postoupit():
+                with ui.dialog() as d, ui.card().classes("p-4 gap-3").style("min-width:460px"):
+                    ui.label("Postoupit správci k odsouhlasení").classes("text-lg font-bold")
+                    ui.label("Napište, proč má opravu schválit správce. Poznámku vidí "
+                             "jen Office a správce, žadateli se nezobrazuje.") \
+                        .classes("text-sm text-gray-500")
+                    pozn = ui.textarea("Poznámka správci *") \
+                        .props("outlined autogrow").classes("w-full")
+
+                    def _ok():
+                        txt = (pozn.value or "").strip()
+                        if not txt:
+                            ui.notify("Vyplňte poznámku správci.", type="warning")
+                            return
+                        _oprava_stav(pid, "u_spravce", spravce_pozn=txt)
+                        _oprava_zapis_historie(pid, "Postoupeno správci", user_name, txt)
+                        _oprava_zvonecek(f"🧾 Oprava cen {cislo} čeká na odsouhlasení "
+                                         f"správcem.", "warning",
+                                         "cenopripad_spravce", "vse")
+                        _odesli_emaily(
+                            _emaily_spravce("obchod"),
+                            f"Oprava cen — žádost {cislo} ke schválení",
+                            f"Office ({user_name}) postoupil žádost {cislo} k rozhodnutí.\n"
+                            f"Řádků: {p.get('pocet_radku', 0)} · dopad: "
+                            f"{_castka(p.get('suma_abs'))} Kč\n\n"
+                            f"Poznámka správci:\n{txt}", _app_url(f"?oprava={pid}"))
+                        d.close()
+                        _hotovo("Postoupeno správci.")
+                    with ui.row().classes("w-full justify-end gap-2"):
+                        ui.button("Zrušit", on_click=d.close).props("flat no-caps")
+                        ui.button("Postoupit", on_click=_ok) \
+                            .props("unelevated no-caps color=indigo")
+                d.open()
+
+            ui.button("Zpracováno", icon="task_alt", on_click=_zpracovano) \
+                .props("unelevated no-caps").classes("bg-green-600 text-white rounded-lg")
+            ui.button("Vrátit k opravě", icon="undo", on_click=_vratit) \
+                .props("outline no-caps color=orange")
+            ui.button("Postoupit správci", icon="arrow_upward", on_click=_postoupit) \
+                .props("outline no-caps color=indigo")
+
+        if je_office and stav == "zpracovano":
+            def _uzavrit():
+                _oprava_stav(pid, "uzavreno")
+                _oprava_zapis_historie(pid, "Uzavřeno", user_name)
+                _hotovo("Žádost uzavřena.")
+            ui.button("Uzavřít", icon="lock", on_click=_uzavrit) \
+                .props("unelevated no-caps").classes("bg-gray-700 text-white rounded-lg")
+
+        # ── Správce ─────────────────────────────────────────────────────────
+        if je_spravce and stav == "u_spravce":
+            def _schvalit():
+                _oprava_stav(pid, "spravce_schvalil")
+                _oprava_zapis_historie(pid, "Správce schválil", user_name)
+                _oprava_mail_zadateli(p, f"Oprava cen — žádost {cislo} schválena",
+                                      f"Vaše žádost {cislo} byla správcem schválena.")
+                _oprava_mail_office(
+                    pid, f"Oprava cen — správce schválil žádost {cislo}",
+                    f"Správce schválil žádost {cislo}. Proveďte realizaci.")
+                intranet_logger.log_activity(user_name, "Cenopřípad",
+                                             f"Oprava cen: správce schválil {cislo}")
+                _hotovo("Schváleno, vráceno na Office.")
+
+            def _zamitnout():
+                with ui.dialog() as d, ui.card().classes("p-4 gap-3").style("min-width:420px"):
+                    ui.label("Zamítnout žádost").classes("text-lg font-bold")
+                    duv = ui.textarea("Důvod zamítnutí *") \
+                        .props("outlined autogrow").classes("w-full")
+
+                    def _ok():
+                        txt = (duv.value or "").strip()
+                        if not txt:
+                            ui.notify("Vyplňte důvod.", type="warning")
+                            return
+                        _oprava_stav(pid, "zamitnuto", zamitnuti_duvod=txt)
+                        _oprava_zapis_historie(pid, "Zamítnuto", user_name, txt)
+                        _oprava_mail_zadateli(
+                            p, f"Oprava cen — žádost {cislo} zamítnuta",
+                            f"Vaše žádost {cislo} byla zamítnuta.\n\nDůvod: {txt}")
+                        intranet_logger.log_activity(user_name, "Cenopřípad",
+                                                     f"Oprava cen: zamítnuto {cislo}")
+                        d.close()
+                        _hotovo("Žádost zamítnuta.")
+                    with ui.row().classes("w-full justify-end gap-2"):
+                        ui.button("Zrušit", on_click=d.close).props("flat no-caps")
+                        ui.button("Zamítnout", on_click=_ok) \
+                            .props("unelevated no-caps color=red")
+                d.open()
+
+            ui.button("Schválit", icon="thumb_up", on_click=_schvalit) \
+                .props("unelevated no-caps").classes("bg-teal-600 text-white rounded-lg")
+            ui.button("Zamítnout", icon="thumb_down", on_click=_zamitnout) \
+                .props("outline no-caps color=red")
+
+        # ── Storno — vlastník / Office / Správce, dokud není koncový stav ───
+        if stav not in _OPRAVA_STAVY_KONCOVE and (je_vlastnik or je_office or je_spravce):
+            def _storno():
+                with ui.dialog() as d, ui.card().classes("p-4 gap-3").style("min-width:420px"):
+                    ui.label("Stornovat žádost").classes("text-lg font-bold")
+                    ui.label("Žádost se uzavře jako stornovaná a nebude dál zpracována.") \
+                        .classes("text-sm text-gray-500")
+                    duv = ui.textarea("Důvod storna *") \
+                        .props("outlined autogrow").classes("w-full")
+
+                    def _ok():
+                        txt = (duv.value or "").strip()
+                        if not txt:
+                            ui.notify("Vyplňte důvod.", type="warning")
+                            return
+                        _oprava_stav(pid, "stornovano", storno_duvod=txt)
+                        _oprava_zapis_historie(pid, "Stornováno", user_name, txt)
+                        _oprava_mail_zadateli(
+                            p, f"Oprava cen — žádost {cislo} stornována",
+                            f"Žádost {cislo} byla stornována.\n\nDůvod: {txt}")
+                        if je_vlastnik:
+                            _oprava_mail_office(
+                                pid, f"Oprava cen — žádost {cislo} stornována žadatelem",
+                                f"Žadatel {user_name} stornoval žádost {cislo}.\n\n"
+                                f"Důvod: {txt}")
+                        d.close()
+                        _hotovo("Žádost stornována.")
+                    with ui.row().classes("w-full justify-end gap-2"):
+                        ui.button("Zrušit", on_click=d.close).props("flat no-caps")
+                        ui.button("Stornovat", on_click=_ok) \
+                            .props("unelevated no-caps color=grey-7")
+                d.open()
+            ui.button("Stornovat", icon="block", on_click=_storno) \
+                .props("flat no-caps").classes("text-gray-600")
+
+
 def vykresli_cenopripad(user_id, user_name, vsechna_prava):
     """Vstupní bod modulu — vytvoří per-klient refreshable a vykreslí ho.
 
@@ -6501,15 +7466,18 @@ def vykresli_cenopripad(user_id, user_name, vsechna_prava):
     `@ui.refreshable` zde dělal chybu: `refresh()` re-renderoval všechny připojené
     klienty v kontextu jednoho uživatele → všem přepínal sekci (sdílený stav přes
     `app.storage.user` + request_contextvar)."""
-    # Odkaz z e-mailu „…/cenopripad?ovozel=<id>" otevře rovnou daný případ. Čte se jen
-    # tady (ne v `_vykresli_cenopripad`), aby návrat na seznam po `_refresh()` držel.
-    try:
-        z_emailu = context.client.request.query_params.get("ovozel")
-    except Exception:
-        z_emailu = None
-    if z_emailu and str(z_emailu).isdigit():
-        app.storage.user["cenopripad_pohled"] = "ovozel"
-        app.storage.user["ovozel_detail"] = int(z_emailu)
+    # Odkaz z e-mailu „…/cenopripad?ovozel=<id>" / „?oprava=<id>" otevře rovnou daný
+    # případ. Čte se jen tady (ne v `_vykresli_cenopripad`), aby návrat na seznam po
+    # `_refresh()` držel.
+    for klic in ("ovozel", "oprava"):
+        try:
+            z_emailu = context.client.request.query_params.get(klic)
+        except Exception:
+            z_emailu = None
+        if z_emailu and str(z_emailu).isdigit():
+            app.storage.user["cenopripad_pohled"] = klic
+            app.storage.user[f"{klic}_detail"] = int(z_emailu)
+            break
 
     @ui.refreshable
     def _obsah():
@@ -6523,13 +7491,15 @@ def _vykresli_cenopripad(user_id, user_name, vsechna_prava):
     inicializace_cenopripad_db()
     typy = _viditelne_typy(vsechna_prava)
     pohled = app.storage.user.get("cenopripad_pohled")
-    if pohled not in typy and pohled not in ("import", "letaky", "ovozel"):
+    if pohled not in typy and pohled not in ("import", "letaky", "ovozel", "oprava"):
         pohled = None
     if pohled == "import" and not _vidi_import(vsechna_prava):
         pohled = None
     if pohled == "letaky" and not _letaky_pristup(vsechna_prava):
         pohled = None
     if pohled == "ovozel" and not _ovozel_pristup(vsechna_prava):
+        pohled = None
+    if pohled == "oprava" and not _oprava_pristup(vsechna_prava):
         pohled = None
 
     with ui.row().classes("w-full items-center gap-3 mb-6"):
@@ -6548,6 +7518,8 @@ def _vykresli_cenopripad(user_id, user_name, vsechna_prava):
                 podtitul = "Kontrolní data letáků"
             elif pohled == "ovozel":
                 podtitul = "Kontrola cen OVOZEL"
+            elif pohled == "oprava":
+                podtitul = "Oprava cen"
             ui.label(podtitul).classes("text-sm text-gray-500")
         ui.space()
         if pohled == "porovnani":   # IND ceny — vzorový formulář ke stažení
@@ -6557,7 +7529,7 @@ def _vykresli_cenopripad(user_id, user_name, vsechna_prava):
                 .tooltip("Stáhne vzorový formulář pro individuální ceny (.xlsx).")
         # Generický manuál Cenopřípadu (ind. ceny aj.) — NE v „Kontrolní data letáků"
         # (ta má vlastní obsah; ind. ceny a letáky tak nesdílí stejný manuál).
-        if pohled not in ("letaky", "ovozel"):
+        if pohled not in ("letaky", "ovozel", "oprava"):
             ui.button("Manuál", icon="menu_book", on_click=_dialog_manual) \
                 .props("outline no-caps") \
                 .classes("text-emerald-700 font-semibold rounded-lg") \
@@ -6572,12 +7544,16 @@ def _vykresli_cenopripad(user_id, user_name, vsechna_prava):
     if pohled == "ovozel":
         _ovozel_view(user_id, user_name, vsechna_prava)
         return
+    if pohled == "oprava":
+        _oprava_view(user_id, user_name, vsechna_prava)
+        return
     if pohled in typy:
         _sub_view_typ(pohled, user_id, user_name, vsechna_prava)
         return
 
     if not typy and not _vidi_import(vsechna_prava) \
-            and not _letaky_pristup(vsechna_prava) and not _ovozel_pristup(vsechna_prava):
+            and not _letaky_pristup(vsechna_prava) and not _ovozel_pristup(vsechna_prava) \
+            and not _oprava_pristup(vsechna_prava):
         with ui.column().classes("items-center py-20 gap-3 w-full"):
             ui.icon("lock", size="4rem", color="grey-4")
             ui.label("Nemáte přístup k žádné dlaždici modulu Cenopřípad.") \
@@ -6599,6 +7575,12 @@ def _vykresli_cenopripad(user_id, user_name, vsechna_prava):
                 _nav("ovozel")
             _tile("🥦", "Kontrola cen OVOZEL", "ovoce a zelenina", "border-lime-300",
                   _otevri_ovozel)
+        if _oprava_pristup(vsechna_prava):
+            def _otevri_oprava():
+                app.storage.user["oprava_detail"] = None
+                _nav("oprava")
+            _tile("🧾", "Oprava cen", "formulář + fronta", "border-orange-300",
+                  _otevri_oprava)
         for klic in typy:
             c = TYPY[klic]
             _tile(c["emoji"], c["nazev"], "nákup" if c["oddeleni"] == "nakup" else "obchod",

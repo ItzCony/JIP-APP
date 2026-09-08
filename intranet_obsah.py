@@ -595,7 +595,8 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
         'sankce_analytik' in vsechna_prava or
         'sankce_ucetni' in vsechna_prava or
         'sankce_nakup' in vsechna_prava or
-        'sankce_ctenar' in vsechna_prava
+        'sankce_ctenar' in vsechna_prava or
+        any(p.startswith('sankce_tiket_') for p in vsechna_prava)
     ) and nastaveni.get('sankce_zapnuty', True)
     ma_pristup_spolvecer = (
         'vse' in vsechna_prava or
@@ -732,7 +733,7 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
         _d('finance', ma_pristup_finance, '💼', nazev_finance, '#3b82f6', _akce('finance')),
         _d('znacky', ma_pristup_znacky, '🏷️', 'Privátní značky JIP', '#f59e0b', _akce('znacky')),
         _d('znacky_provoz', ma_pristup_znacky_provoz, '🏭', 'Hlas Provozu', '#14b8a6', _akce('znacky_provoz')),
-        _d('prod_akt', ma_pristup_prod_akt, '📋', 'Prodejní aktivity', '#10b981', _akce('prod_akt')),
+        _d('prod_akt', ma_pristup_prod_akt, '📈', 'Prodejní aktivity', '#10b981', _akce('prod_akt')),
         _d('narozeniny', ma_pristup_narozeniny, '🎂', nazev_narozeniny, '#ec4899',
            _akce('narozeniny'), _narozeniny_dnes),
         _d('smeny', _ma_smeny, '⌨️', 'Plánování směn', '#6366f1', _akce('smeny')),
