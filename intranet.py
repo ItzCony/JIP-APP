@@ -807,7 +807,6 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
             'cenopripad_zadatel_nakup', 'cenopripad_zadatel_obchod',
             'cenopripad_zadatel_letaky', 'cenopripad_office_letaky',
             'cenopripad_ctenar_letaky',
-            'cenopripad_zadatel_ovozel', 'cenopripad_office_ovozel',
             'cenopripad_office_nakup', 'cenopripad_office_obchod',
             'cenopripad_spravce_nakup', 'cenopripad_spravce',
             'cenopripad_spravce_bez_emailu', 'cenopripad_vkladatel',
@@ -1432,7 +1431,7 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
                     if (ma_vse or "znacky_provoz_uzivatel" in vsechna_prava or "znacky_provoz_spravce" in vsechna_prava) and nastaveni.get('znacky_provoz_zapnuty', True):
                         tab_znacky_provoz = ui.tab('znacky_provoz', label='🏭  Hlas Provozu').classes('justify-start text-lg text-gray-800')
                     if 'prod_akt' in dostupne_taby:
-                        tab_prod_akt = ui.tab('prod_akt', label='📋  Prodejní aktivity').classes('justify-start text-lg text-gray-800')
+                        tab_prod_akt = ui.tab('prod_akt', label='📈  Prodejní aktivity').classes('justify-start text-lg text-gray-800')
                     if ma_narozeniny:
                         tab_narozeniny = ui.tab('narozeniny', label='🎂  Narozeniny').classes('justify-start text-lg text-gray-800')
                     if 'smeny' in dostupne_taby:

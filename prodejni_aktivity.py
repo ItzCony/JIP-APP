@@ -937,7 +937,7 @@ def vykresli(user_id: int, user_name: str, vsechna_prava: list):
 
     # ── Záhlaví ───────────────────────────────────────────────────────────
     with ui.row().classes('w-full items-center gap-4 mb-2'):
-        ui.label('📋 Prodejní aktivity').classes('text-3xl font-extrabold text-gray-800')
+        ui.label('📈 Prodejní aktivity').classes('text-3xl font-extrabold text-gray-800')
 
     ui.label('Nastavení a vyhodnocení prodejních aktivit') \
       .classes('text-sm text-gray-500 mb-4')

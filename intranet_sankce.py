@@ -25,6 +25,8 @@ Role (intranet_prava.py):
   • sankce_tiket_provoz   – tikety předané na provoz.
   • sankce_tiket_kontrola – druhotná kontrola: schvaluje storno i abnormalitu.
   • sankce_tiket_tvrde_storno – storno bez kontroly a bez mailu (rovnou Nevyfakturovat).
+  • sankce_tiket_unibrands – POUZE dlaždice „Nedodávky dod. k vyjádření" a zápis
+    do sloupce „Vyjádření nákupčího" u dodavatele UNIBRANDS. Nic jiného v modulu.
   • 'vse'           – vše.
 """
 
@@ -4825,6 +4827,9 @@ ROZ_LABEL_REV = {v: k for k, v in ROZ_LABEL.items()}
 KODY_NAKUPCI = ['DR', 'SK', 'CK', 'VI', 'LT', 'NP', 'RD', 'HV', 'UP', 'KO', 'ML', 'MR',
                 'OZ', 'VN']
 KOD_PRAVO = {k: 'sankce_tiket_' + k.lower() for k in KODY_NAKUPCI}
+# Unibrands: jediné, co smí — vidět dlaždici Nedodávky a psát tam Vyjádření
+# nákupčího – jen řádky dodavatele UNIBRANDS. Žádné tikety.
+PRAVO_UNIBRANDS = 'sankce_tiket_unibrands'
 
 _SANKCE_URL = 'https://analytikasys.jip-napoje.cz/sankce'
 
@@ -5951,11 +5956,19 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
     je_analytik = ma_vse or 'sankce_analytik' in vsechna_prava
     # Nákupčí vidí a edituje jen řádky se svým kódem NAK; ostatní role čtou vše.
     moje_kody = {k for k, p in KOD_PRAVO.items() if p in vsechna_prava}
-    vidi_vse = je_analytik or bool({'sankce_ucetni', 'sankce_ctenar', 'sankce_nakup'}
-                                   & set(vsechna_prava))
+    # Unibrands píše do všech řádků, ale jinak v modulu nic nemá.
+    psat_vse = je_analytik or PRAVO_UNIBRANDS in vsechna_prava
+    vidi_vse = psat_vse or bool({'sankce_ucetni', 'sankce_ctenar', 'sankce_nakup'}
+                                & set(vsechna_prava))
+
+    # Unibrands vidí jen řádky dodavatele UNIBRANDS.
+    jen_unibrands = not je_analytik and PRAVO_UNIBRANDS in vsechna_prava
 
     vsechny = await asyncio.to_thread(_nacti, _NEDOD_TABULKA)
-    if not vidi_vse:
+    if jen_unibrands:
+        vsechny = [r for r in vsechny
+                   if 'UNIBRANDS' in (r.get('jmeno_dodavatele') or '').upper()]
+    elif not vidi_vse:
         vsechny = [r for r in vsechny if (r.get('nak') or '') in moje_kody]
 
     if not vsechny:
@@ -5984,10 +5997,12 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
     stav = {'obdobi': obdobi_list[0] if obdobi_list else None,
             'jen_bez': False, 'ico': None}
 
-    edit_js = _nedod_edit_js(moje_kody, je_analytik)
+    edit_js = _nedod_edit_js(moje_kody, psat_vse)
 
     def _smi_psat(r) -> bool:
-        return je_analytik or (r.get('nak') or '') in moje_kody
+        if jen_unibrands:
+            return 'UNIBRANDS' in (r.get('jmeno_dodavatele') or '').upper()
+        return psat_vse or (r.get('nak') or '') in moje_kody
 
     def _zobrazene():
         data = vsechny
@@ -6130,11 +6145,11 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
             _smazat_button(_NEDOD_TABULKA, _NEDOD_NAZEV,
                            user_name, _vykresli_nedodavky.refresh)
 
-    if not je_analytik and moje_kody:
+    if not psat_vse and moje_kody:
         ui.label(f'✍ Vidíte a vyplňujete nedodávky svého nákupu ({", ".join(sorted(moje_kody))}). '
                  'V souhrnu se zápis propíše do všech zobrazených řádků dodavatele.') \
             .classes('text-xs text-gray-500 mb-1')
-    elif not je_analytik:
+    elif not psat_vse:
         ui.label('👁 Sestavu vidíte jen pro čtení — filtrovat, řadit a exportovat můžete, '
                  'vyjádření píší nákupčí podle kódu NAK.').classes('text-xs text-gray-500 mb-1')
 
@@ -6342,7 +6357,7 @@ async def vykresli_sankce(user_id, user_name, vsechna_prava):
         {'sankce_tiket_provoz', 'sankce_tiket_kontrola', *KOD_PRAVO.values()} & set(vsechna_prava))
     # Nedodávky: čtou všechny role modulu, píší do nich nákupčí podle kódu NAK.
     vidi_nedodavky = vidi_zamitnute or vidi_vystaveni or bool(
-        set(KOD_PRAVO.values()) & set(vsechna_prava))
+        {PRAVO_UNIBRANDS, *KOD_PRAVO.values()} & set(vsechna_prava))
 
     pohled = app.storage.user.get('sankce_pohled')
     if pohled == 'vystaveni' and not vidi_vystaveni:
