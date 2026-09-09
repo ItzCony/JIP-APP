@@ -806,8 +806,9 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
         any(p in vsechna_prava for p in (
             'cenopripad_zadatel_nakup', 'cenopripad_zadatel_obchod',
             'cenopripad_zadatel_letaky', 'cenopripad_office_letaky',
-            'cenopripad_ctenar_letaky',
+            'cenopripad_ctenar_letaky', 'cenopripad_ctenar_nc',
             'cenopripad_office_nakup', 'cenopripad_office_obchod',
+            'cenopripad_office_obchod_ovozel',
             'cenopripad_spravce_nakup', 'cenopripad_spravce',
             'cenopripad_spravce_bez_emailu', 'cenopripad_vkladatel',
             'cenopripad_zobrazeni_oddeleni')) or

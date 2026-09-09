@@ -613,6 +613,7 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
             'cenopripad_zadatel_letaky', 'cenopripad_office_letaky',
             'cenopripad_ctenar_letaky',
             'cenopripad_office_nakup', 'cenopripad_office_obchod',
+            'cenopripad_office_obchod_ovozel',
             'cenopripad_spravce_nakup', 'cenopripad_spravce',
             'cenopripad_spravce_bez_emailu', 'cenopripad_vkladatel'))
     ) and nastaveni.get('cenopripad_zapnuty', True)

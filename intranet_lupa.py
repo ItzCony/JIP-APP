@@ -72,6 +72,11 @@ _SLOUPCE = {
 
 _POVINNE = ('asm', 'mesic', 'ico', 'kod', 'obrat_mj', 'obrat_kc')
 
+# Karty zboží (.xlsb) — hlavička na 5. řádku, data od 6.
+_KARTY_SLOUPCE = {'kod9': 'kod', 'skupina2 popis': 'skupina'}
+
+_KARTY_KLIC = '#KARTY'   # pseudo-ASM pro zámek a protokol; slug() ho nevyrobí
+
 _MESIC_RE = re.compile(r'^\s*(\d{4})\s*M\s*(\d{1,2})\s*$', re.I)
 
 
@@ -189,6 +194,15 @@ def inicializace_db():
                 INDEX idx_dod (dodavatel)
             ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci ENGINE=InnoDB
         """)
+        # Katalog karet zboží (samostatný import .xlsb). Vlastní tabulka, ne
+        # sloupec v lupa_produkt: katalog má ~123 tis. karet proti ~18 tis.
+        # prodaných produktů a plnit jím dimenzi by rozbilo volby dodavatelů.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS lupa_karta (
+                kod     VARCHAR(40) PRIMARY KEY,
+                skupina VARCHAR(255)
+            ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci ENGINE=InnoDB
+        """)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS lupa_dealer (
                 dealer VARCHAR(40) PRIMARY KEY,
@@ -260,6 +274,7 @@ _AKCE_NAZVY = {
     'srovnani_nahled': 'Náhled srovnání zákazníků',
     'srovnani_export_xlsx': 'Export XLSX — srovnání zákazníků',
     'import': 'Import dat',
+    'import_karty': 'Import karet zboží',
     'poznamka': 'Poznámka',
     'poznamka_edit': 'Úprava poznámky',
     'poznamka_smaz': 'Smazání poznámky',
@@ -385,6 +400,109 @@ def _najdi_hlavicku(radek):
         if klic and klic not in mapa:
             mapa[klic] = i
     return mapa if all(k in mapa for k in _POVINNE) else None
+
+
+def _radky_xlsb(raw_bytes, stav=None):
+    """Řádky prvního listu .xlsb. pyxlsb streamuje stejně jako openpyxl read_only."""
+    from pyxlsb import open_workbook
+    with open_workbook(io.BytesIO(raw_bytes)) as wb:
+        with wb.get_sheet(1) as ws:
+            if stav is not None:
+                stav['celkem'] = ws.dimension.h or None
+            for radek in ws.rows():
+                yield [b.v for b in radek]
+
+
+def _kod_karty(hodnota):
+    """'40207992!' → '40207992'. Vykřičník má jen katalog, prodeje ho nemají."""
+    if isinstance(hodnota, float) and hodnota.is_integer():
+        hodnota = int(hodnota)
+    return str(hodnota if hodnota is not None else '').strip().rstrip('!')
+
+
+def _uloz_karty(cur, davka):
+    cur.executemany(
+        'INSERT INTO lupa_karta (kod, skupina) VALUES (%s,%s) '
+        'ON DUPLICATE KEY UPDATE skupina=VALUES(skupina)', davka)
+
+
+def importuj_karty(raw_bytes, nazev_souboru, stav=None):
+    """Katalog karet zboží (.xlsb) → lupa_karta. Vrací dict jako importuj_soubor.
+
+    Jen upsert, nic nemaže: zrušená karta navíc v číselníku nevadí, kdežto
+    výpadek skupiny u prodané položky by v rozpadu zel prázdnem.
+    """
+    stav = stav if stav is not None else {}
+    stav.update(faze='otevírám soubor', hotovo=0, celkem=None)
+    vysledek = {'soubor': nazev_souboru, 'asm': _KARTY_KLIC, 'radku': 0,
+                'preskoceno': 0, 'cizi': 0, 'obdobi': [], 'chyba': None}
+    inicializace_db()
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        vysledek['chyba'] = 'Není spojení s databází.'
+        return vysledek
+
+    davka = []
+    od_commitu = 0
+    cur = None
+    try:
+        cur = conn.cursor()
+        mapa = None
+        stav['faze'] = 'načítám řádky'
+        for i, radek in enumerate(_radky_xlsb(raw_bytes, stav), 1):
+            stav['hotovo'] = i
+            if mapa is None:
+                najdene = {}
+                for j, bunka in enumerate(radek):
+                    klic = _KARTY_SLOUPCE.get(_norm_hlavicka(bunka))
+                    if klic and klic not in najdene:
+                        najdene[klic] = j
+                mapa = najdene if len(najdene) == len(_KARTY_SLOUPCE) else None
+                continue
+
+            def bunka(klic):
+                j = mapa[klic]
+                return radek[j] if j < len(radek) else None
+
+            kod = _kod_karty(bunka('kod'))
+            if not kod:
+                vysledek['preskoceno'] += 1   # součtové řádky, prázdné patičky
+                continue
+            davka.append((kod[:40], str(bunka('skupina') or '').strip()[:255]))
+            if len(davka) >= _DAVKA:
+                _uloz_karty(cur, davka)
+                vysledek['radku'] += len(davka)
+                od_commitu += len(davka)
+                davka = []
+                if od_commitu >= _COMMIT_PO:
+                    conn.commit()
+                    od_commitu = 0
+
+        if mapa is None:
+            vysledek['chyba'] = ('Nenalezena hlavička. Očekávám sloupce Kód9 '
+                                 'a Skupina2-popis (5. řádek souboru).')
+            return vysledek
+        if davka:
+            _uloz_karty(cur, davka)
+            vysledek['radku'] += len(davka)
+        conn.commit()
+        if not vysledek['radku']:
+            vysledek['chyba'] = 'Soubor neobsahuje žádné karty zboží.'
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        vysledek['chyba'] = str(e)
+        print(f'[lupa] import karet {nazev_souboru}: {e}')
+    finally:
+        if cur:
+            try:
+                cur.close()
+            except Exception:
+                pass
+        conn.close()
+    return vysledek
 
 
 def importuj_soubor(raw_bytes, nazev_souboru, stav=None):
@@ -1263,10 +1381,12 @@ def _top_produkty(asm, filtr, limit=_TOP_POLOZEK):
     kde, par, _ = _filtr_sql(asm, filtr, produkt_uz_pripojen=True)
     return _dotaz(f"""
         SELECT o.kod, p.nazev, p.dodavatel,
+               MAX(k.skupina) AS skupina,
                COUNT(DISTINCT o.ico) AS zakazniku,
                SUM(o.obrat_mj) AS mj, SUM(o.obrat_kc) AS kc
         FROM lupa_obrat o
         LEFT JOIN lupa_produkt p ON p.kod = o.kod
+        LEFT JOIN lupa_karta k ON k.kod = o.kod
         WHERE {kde}
         GROUP BY o.kod, p.nazev, p.dodavatel
         ORDER BY kc DESC
@@ -1490,6 +1610,16 @@ _COLS_POLOZKY = [
     ('Obrat v MJ', 'mj', 'num', 14),
     ('Obrat v Kč bez DPH', 'kc', 'money', 20),
 ]
+
+
+def _cols_polozky(rozpad):
+    """Sloupce TOP položek do exportu — skupina zboží jen v rozpadu, ať papír
+    odpovídá tomu, co měl uživatel na obrazovce."""
+    if not rozpad:
+        return _COLS_POLOZKY
+    return (_COLS_POLOZKY[:2] + [('Skupina zboží', 'skupina', 'text', 28)]
+            + _COLS_POLOZKY[2:])
+
 
 _XLSX_FMT = {'text': '@', 'int': '#,##0', 'num': '#,##0.###', 'money': '#,##0.00'}
 
@@ -1931,7 +2061,7 @@ def _serie_yoy(radky_mesice):
             for rok in sorted({k // 100 for k in kc})]
 
 
-def _pdf_obraty_html(asm, data, popis_filtru, uzivatel):
+def _pdf_obraty_html(asm, data, popis_filtru, uzivatel, rozpad=False):
     e = html.escape
     k = data['kpi']
     zmena = lambda v: '—' if v is None else f'{v:+.1f} %'.replace('.', ',')
@@ -1954,10 +2084,13 @@ def _pdf_obraty_html(asm, data, popis_filtru, uzivatel):
         + _pdf_tabulka('Obrat po měsících', _COLS_MESICE, data['radky_mesice'], 40)
         + _pdf_tabulka('Výsledky OZ', _COLS_OZ, data['oz'], 40)
         + _pdf_tabulka('Propady zákazníků', _COLS_PROPADY, data['propady'])
-        + _pdf_tabulka('TOP odebrané položky', _COLS_POLOZKY, data['produkty'])
+        + _pdf_tabulka('TOP odebrané položky', _cols_polozky(rozpad),
+                        data['produkty'])
         + _pdf_grafy(data)
         + '<div class="pozn">Obraty bez DPH. Poslední měsíc může být neúplný, '
-        'pokud import proběhl v jeho průběhu. Zdrojem pravdy zůstává GIST.</div>'
+        'pokud import proběhl v jeho průběhu. Zdrojem pravdy zůstává GIST. '
+        'PDF ukazuje celý zvolený výběr — filtr TOP položek nastavený v aplikaci '
+        'se do něj nepromítá, na filtrovaný výběr použijte XLSX.</div>'
         '</div></body></html>'
     )
 
@@ -2162,10 +2295,26 @@ _GRID_ZAKLAD = {
 }
 
 
-def _grid(opts):
+def _filtry(cols):
+    """Doplní filtr sloupce — AG Grid Community umí text i čísla, jen je nevybírá
+    sám. Volá se i mimo _grid(), protože přepínač rozpadu mění columnDefs za běhu."""
+    for c in cols:
+        c.setdefault('filter', 'agNumberColumnFilter'
+                     if c.get('type') == 'numericColumn' else 'agTextColumnFilter')
+    return cols
+
+
+def _grid(opts, filtry=False):
     """AG Grid 34 odmítá colDef.flex spolu s gridOptions.autoSizeStrategy, kterou
     NiceGUI přidává při auto_size_columns=True (default) — grid se pak nevykreslí.
-    Šířky řešíme přes flex/minWidth, takže strategii vypínáme."""
+    Šířky řešíme přes flex/minWidth, takže strategii vypínáme.
+
+    `filtry` zapíná řádek filtrů pod hlavičkou. Jen tam, kde je grid pracovní
+    tabulka bez součtového řádku — pod součtem celé sady by filtr lhal."""
+    if filtry:
+        _filtry(opts.get('columnDefs') or [])
+        opts['defaultColDef'] = {**(opts.get('defaultColDef') or {}),
+                                 'floatingFilter': True}
     return ui.aggrid(opts, auto_size_columns=False)
 
 
@@ -2677,6 +2826,23 @@ def _graf_polozky_option(produkty, n=15):
     return opt
 
 
+def _cols_polozky_grid(rozpad):
+    """Sloupce TOP položek; v rozpadu přibude skupina zboží z karet (lupa_karta)."""
+    return _filtry([
+        {'headerName': 'Kód', 'field': 'kod', 'width': 130},
+        {'headerName': 'Produkt', 'field': 'nazev', 'flex': 2, 'minWidth': 240},
+    ] + ([{'headerName': 'Skupina zboží', 'field': 'skupina', 'flex': 1,
+           'minWidth': 200}] if rozpad else []) + [
+        {'headerName': 'Dodavatel', 'field': 'dodavatel', 'flex': 1, 'minWidth': 180},
+        {'headerName': 'Zákazníků', 'field': 'zakazniku', 'width': 120,
+         'type': 'numericColumn', ':valueFormatter': _fmt_js(0)},
+        {'headerName': 'Obrat MJ', 'field': 'mj', 'width': 130,
+         'type': 'numericColumn', ':valueFormatter': _fmt_js(1)},
+        {'headerName': 'Obrat Kč', 'field': 'kc', 'width': 150,
+         'type': 'numericColumn', ':valueFormatter': _fmt_js(2)},
+    ])
+
+
 def _vykresli_obraty(asm, user_id, user_name, vsechna_prava):
     # Filtr sdílíme s odběrateli — je to týž pohled na táž data, jen jinak
     # vykreslený; dvě sady filtrů by uživatel jen držel v synchronizaci ručně.
@@ -2689,7 +2855,7 @@ def _vykresli_obraty(asm, user_id, user_name, vsechna_prava):
     dod_volby = _volby_dodavatelu()
     oz_volby = _volby_oz(asm)
 
-    stav = {'data': None, 'filtr': {}, 'popis': ''}
+    stav = {'data': None, 'filtr': {}, 'popis': '', 'grid_polozky': None}
 
     def _zaklad_jmena(co):
         return (f'lupa_{_bezpecne_jmeno(asm)}_{co}_'
@@ -2733,10 +2899,13 @@ def _vykresli_obraty(asm, user_id, user_name, vsechna_prava):
     with ui.row().classes('w-full items-center gap-3 mb-3 flex-wrap'):
         btn_nacti = ui.button('Načíst', icon='insights').props('unelevated color=indigo-7')
         btn_pdf = ui.button('PDF přehled', icon='picture_as_pdf') \
-            .props('outline color=indigo-7')
+            .props('outline color=indigo-7') \
+            .tooltip('Celý zvolený výběr včetně KPI a grafů — filtr TOP položek '
+                     'se do PDF nepromítá.')
         btn_xlsx = ui.button('XLSX (4 listy)', icon='table_view') \
             .props('outline color=green-7') \
-            .tooltip('Měsíce, OZ, propady, TOP položky — každý na vlastním listu.')
+            .tooltip('Měsíce, OZ, propady, TOP položky — každý na vlastním listu. '
+                     'Filtry a řazení v TOP položkách se do listu promítnou.')
         info = ui.label('').classes('text-sm text-gray-500')
 
     for b in (btn_pdf, btn_xlsx):
@@ -2768,6 +2937,7 @@ def _vykresli_obraty(asm, user_id, user_name, vsechna_prava):
 
     def vykresli_vysledek():
         data = stav['data']
+        stav['grid_polozky'] = None   # grid z minulého vykreslení už neexistuje
         vysledek.clear()
         with vysledek:
             if not data or not data['mesice']:
@@ -2886,23 +3056,30 @@ def _vykresli_obraty(asm, user_id, user_name, vsechna_prava):
             with ui.card().classes('w-full shadow-sm rounded-xl'):
                 ui.echart(_graf_polozky_option(data['produkty'])) \
                     .classes('w-full').style('height: 420px')
-                _grid({
-                    'columnDefs': [
-                        {'headerName': 'Kód', 'field': 'kod', 'width': 130},
-                        {'headerName': 'Produkt', 'field': 'nazev', 'flex': 2,
-                         'minWidth': 240},
-                        {'headerName': 'Dodavatel', 'field': 'dodavatel', 'flex': 1,
-                         'minWidth': 180},
-                        {'headerName': 'Zákazníků', 'field': 'zakazniku', 'width': 120,
-                         'type': 'numericColumn', ':valueFormatter': _fmt_js(0)},
-                        {'headerName': 'Obrat MJ', 'field': 'mj', 'width': 130,
-                         'type': 'numericColumn', ':valueFormatter': _fmt_js(1)},
-                        {'headerName': 'Obrat Kč', 'field': 'kc', 'width': 150,
-                         'type': 'numericColumn', ':valueFormatter': _fmt_js(2)},
-                    ],
+                with ui.row().classes('w-full justify-end mt-2'):
+                    btn_rozpad = ui.button(on_click=lambda: _prepni_rozpad()) \
+                        .props('outline dense color=indigo-7')
+                grid_polozky = _grid({
+                    'columnDefs': _cols_polozky_grid(False),
                     'rowData': data['produkty'],
                     **_GRID_ZAKLAD,
-                }).classes('w-full mt-2').style('height: 320px')
+                }, filtry=True).classes('w-full mt-2').style('height: 320px')
+                stav['grid_polozky'] = grid_polozky
+
+                def _prepni_rozpad():
+                    stav['rozpad'] = not stav.get('rozpad')
+                    grid_polozky.options['columnDefs'] = \
+                        _cols_polozky_grid(stav['rozpad'])
+                    grid_polozky.update()
+                    _popis_rozpadu()
+
+                def _popis_rozpadu():
+                    zap = bool(stav.get('rozpad'))
+                    btn_rozpad.text = ('Skrýt skupiny zboží' if zap
+                                       else 'Rozpad na skupiny zboží')
+                    btn_rozpad.props(f'icon={"visibility_off" if zap else "category"}')
+
+                _popis_rozpadu()
 
     async def nacti():
         if _blokuje_import(asm):
@@ -2935,12 +3112,25 @@ def _vykresli_obraty(asm, user_id, user_name, vsechna_prava):
         await asyncio.to_thread(zapis_log, user_id, user_name, 'obraty_nahled', asm,
                                 stav['popis'], len(data['mesice']))
 
+    async def _polozky_k_exportu():
+        """TOP položky tak, jak je uživatel vidí — s filtry i řazením z gridu.
+        Klient neodpoví (odešel, grid se nevykreslil) → plná sada; export kvůli
+        tomu padat nesmí."""
+        grid = stav.get('grid_polozky')
+        if grid is None:
+            return stav['data']['produkty']
+        try:
+            return await grid.get_client_data(timeout=5, method='filtered_sorted')
+        except Exception:
+            return stav['data']['produkty']
+
     async def export_pdf():
         data = stav['data']
         jmeno = _zaklad_jmena('obraty') + '.pdf'
         pozn = ui.notification('Připravuji PDF…', spinner=True, timeout=None)
         try:
-            html_text = _pdf_obraty_html(asm, data, stav['popis'], user_name)
+            html_text = _pdf_obraty_html(asm, data, stav['popis'], user_name,
+                                         bool(stav.get('rozpad')))
             bajty = await _render_pdf(html_text, jmeno, pozn)
             _stahni_bajty(bajty, jmeno)
             await asyncio.to_thread(zapis_log, user_id, user_name, 'obraty_export_pdf',
@@ -2968,7 +3158,8 @@ def _vykresli_obraty(asm, user_id, user_name, vsechna_prava):
                 ('Propady', _COLS_PROPADY, data['propady'],
                  {'jmeno': f"CELKEM {len(data['propady'])} zákazníků",
                   'rozdil': sum(p['rozdil'] for p in data['propady'])}),
-                ('TOP položky', _COLS_POLOZKY, data['produkty'], None),
+                ('TOP položky', _cols_polozky(stav.get('rozpad')),
+                 await _polozky_k_exportu(), None),
             ]
             await asyncio.to_thread(_xlsx_listy_na_disk, cesta, listy)
             _stahni_soubor(cesta, jmeno)
@@ -3136,6 +3327,50 @@ def _vykresli_import(user_id, user_name, vsechna_prava):
     up = ui.upload(on_upload=zpracuj, on_rejected=odmitnuto, auto_upload=True, multiple=True,
                    max_file_size=120_000_000, label='Vybrat .xlsx (lze více najednou)') \
         .props('accept=.xlsx multiple').classes('w-full max-w-2xl')
+
+    ui.separator().classes('my-6 max-w-2xl')
+    ui.label('Karty zboží (číselník skupin)').classes('font-bold text-gray-700')
+    ui.label('Soubor „Karty k DD.MM.RRRR.xlsb" — hlavička na 5. řádku, data od 6. '
+             'Naplní skupiny zboží pro rozpad v Lupni obraty. '
+             'Nový soubor karty přepíše, nic nemaže.') \
+        .classes('text-xs text-gray-400 mb-2')
+
+    async def zpracuj_karty(e):
+        raw, nazev = await intranet_asm._precti_upload(e, up_karty, reset=False)
+        if raw is None:
+            return
+        stav = {'faze': 've frontě', 'hotovo': 0, 'celkem': None,
+                'nazev': nazev, 'asm': _KARTY_KLIC}
+        _BEZICI_IMPORTY[id(stav)] = stav
+        radek_ui, timer = slot_prubehu(stav)
+        try:
+            async with _IMPORT_SEM, _zamek_asm(_KARTY_KLIC):
+                vysledek = await asyncio.to_thread(importuj_karty, raw, nazev, stav)
+        finally:
+            _BEZICI_IMPORTY.pop(id(stav), None)
+            _tise(timer.cancel)
+            _tise(radek_ui.clear)
+
+        if vysledek['chyba']:
+            def selhalo():
+                with radek_ui:
+                    ui.label(f"❌ {nazev}: {vysledek['chyba']}") \
+                        .classes('text-sm text-red-600')
+                ui.notify(f"{nazev}: {vysledek['chyba']}", type='negative')
+            _tise(selhalo)
+            return
+        zapis_log(user_id, user_name, 'import_karty', '', nazev, vysledek['radku'])
+
+        def hotovo():
+            with radek_ui:
+                ui.label(f"✅ {nazev} → {vysledek['radku']:,} karet zboží"
+                         .replace(',', ' ')).classes('text-sm text-green-700')
+        _tise(hotovo)
+
+    up_karty = ui.upload(on_upload=zpracuj_karty, on_rejected=odmitnuto,
+                         auto_upload=True, max_file_size=120_000_000,
+                         label='Vybrat .xlsb s kartami zboží') \
+        .props('accept=.xlsb').classes('w-full max-w-2xl')
 
     @ui.refreshable
     def karta_nesparovane():

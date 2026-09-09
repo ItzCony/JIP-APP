@@ -1659,8 +1659,9 @@ def _smaz_chat(tabulka, row_hash, msg_id, user_id, muze_mazat_vse=False) -> bool
 
 # Práva, kterým „cinkne" zvoneček při novém komentáři — podle sestavy.
 _KOMENTAR_PRAVA = {
-    'sankce_vystaveni': ('vse', 'sankce_analytik', 'sankce_ucetni', 'sankce_ctenar'),
-    'sankce_zamitnute': ('vse', 'sankce_analytik', 'sankce_nakup', 'sankce_ctenar'),
+    # Analytik data jen importuje, případy neřeší — žádná upozornění.
+    'sankce_vystaveni': ('vse', 'sankce_ucetni', 'sankce_ctenar'),
+    'sankce_zamitnute': ('vse', 'sankce_nakup', 'sankce_ctenar'),
     # U tiketu jen účtárna (vlastník fronty) + řešitel přes `prava_navic`.
     # Analytik tikety neřeší, jen importuje data — komentáře mu necinkají.
     'sankce_tikety':    ('sankce_ucetni',),
@@ -5329,7 +5330,7 @@ def _palec_kontrola(tiket: dict, radky: list, schvaleno: bool, user_id, user_nam
         _zapis_audit_bulk([('sankce_tikety', rh, tid, 'tiket_stav',
                             TIKET_STAV_LABEL.get(tiket.get('stav')),
                             TIKET_STAV_LABEL['abnormalita'], user_id, user_name)])
-        _notifikuj_tiket(('vse', 'sankce_ucetni', 'sankce_analytik'),
+        _notifikuj_tiket(('vse', 'sankce_ucetni'),
                          f'Sankce – {cislo} označen jako abnormalita ({dod})',
                          f'{user_name} schválil(a) abnormalitu u dodavatele {dod}. '
                          f'Data se nezměnila, důvod najdete v diskuzi tiketu.')
