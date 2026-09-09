@@ -39,8 +39,9 @@ VZOR_IND_SOUBOR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                "cenopripad_vzor_ind_ceny.xlsx")
 VZOR_IND_NAZEV = "Vzorovy_formular_individualni_ceny.xlsx"
 
-# Vzorový formulář dlaždice „Oprava cen". Kopie originálu — vzorce ve sloupcích
-# J/K jsou v souboru a servíruje se beze změny, aby zůstaly zachovány.
+# Vzorový formulář dlaždice „Oprava cen". Kopie originálu, servíruje se beze změny.
+# Odchylky (dřív sloupce J/K) se ve formuláři nevyplňují — počítá je aplikace
+# stejnými vzorci, viz `_oprava_dopocet`.
 VZOR_OPRAVA_SOUBOR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   "cenopripad_vzor_oprava_ceny.xlsx")
 VZOR_OPRAVA_NAZEV = "Oprava_ceny_2026.xlsx"
@@ -785,8 +786,8 @@ def inicializace_cenopripad_db():
                 INDEX idx_stav (stav), INDEX idx_zadavatel (zadavatel_id)
             ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
         """)
-        # Řádky formuláře. J/K se NEberou z buněk (vzorec nemusí mít uloženou hodnotu),
-        # ale dopočítávají se ze sloupců E/G/H stejným předpisem — viz `_oprava_dopocet`.
+        # Řádky formuláře. Odchylky nejsou ve formuláři — dopočítávají se ze sloupců
+        # počet ks / standardní PC / požadovaná PC — viz `_oprava_dopocet`.
         cur.execute("""
             CREATE TABLE IF NOT EXISTS oprava_radky (
                 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -795,11 +796,10 @@ def inicializace_cenopripad_db():
                 kod VARCHAR(40), nazev VARCHAR(255),
                 ks DOUBLE, nc DOUBLE, pc_std DOUBLE, pc_pozad DOUBLE,
                 odchylka_pct DOUBLE, odchylka_abs DOUBLE,
-                duvod VARCHAR(500),
                 INDEX idx_pripad (pripad_id)
             ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
         """)
-        # Originál nahraného souboru — vzorce ve sloupcích J/K zůstávají netknuté.
+        # Originál nahraného souboru — servíruje se zpět beze změny.
         cur.execute("""
             CREATE TABLE IF NOT EXISTS oprava_soubory (
                 pripad_id INT PRIMARY KEY,
@@ -811,6 +811,58 @@ def inicializace_cenopripad_db():
         # sdílení by míchalo průběh dvou různých případů se stejným id.
         cur.execute("""
             CREATE TABLE IF NOT EXISTS oprava_historie (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                pripad_id INT,
+                akce VARCHAR(80),
+                detail VARCHAR(1000),
+                kdo VARCHAR(255),
+                kdy DATETIME DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_pripad (pripad_id)
+            ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        """)
+
+        # ── NC OVOZEL ───────────────────────────────────────────────────────
+        # Žádost o změnu nákupní ceny = jedna nahraná tabulka (list „IC") + důvod.
+        # Fronta bez kontroly: nákup → Office nákup zpracuje, nebo vrátí k opravě.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS nc_pripady (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                cislo VARCHAR(20),
+                druh VARCHAR(10) DEFAULT 'import',      -- import (cen) / delist
+                nazev VARCHAR(255),
+                zadavatel_id INT, zadavatel_jmeno VARCHAR(255),
+                datum_zadani DATETIME DEFAULT CURRENT_TIMESTAMP,
+                stav VARCHAR(30) DEFAULT 'odeslano',
+                duvod TEXT,                             -- důvod žádosti od žadatele
+                pocet_radku INT DEFAULT 0,
+                soubor_nazev VARCHAR(255),
+                poznamka VARCHAR(1000),                 -- proč Office vrátil k opravě
+                aktualizovano DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                INDEX idx_stav (stav), INDEX idx_druh (druh),
+                INDEX idx_zadavatel (zadavatel_id)
+            ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        """)
+        # Řádky nahrané tabulky. Termíny se ukládají jako sériové číslo Excelu —
+        # přesně v té podobě, v jaké je čeká import do skladu (viz `_nc_datum`).
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS nc_radky (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                pripad_id INT, poradi INT,
+                skupina VARCHAR(60), klic VARCHAR(40),
+                datumod INT, datumdo INT,
+                slevakc DOUBLE, poznamka VARCHAR(255),
+                INDEX idx_pripad (pripad_id)
+            ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS nc_soubory (
+                pripad_id INT PRIMARY KEY,
+                nazev VARCHAR(255),
+                data LONGBLOB
+            ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS nc_historie (
                 id INT AUTO_INCREMENT PRIMARY KEY,
                 pripad_id INT,
                 akce VARCHAR(80),
@@ -1355,14 +1407,133 @@ async def _potvrd_nove_karty(nove):
         d.delete()
 
 
+def _sylk_pole(telo):
+    """Rozdělí tělo SYLK záznamu na pole. „;;" je escapovaný středník UVNITŘ pole,
+    ne oddělovač — bez toho by se poznámka s ';' rozpadla na dvě pole."""
+    pole, buf, i = [], [], 0
+    while i < len(telo):
+        if telo[i] == ";":
+            if telo[i + 1:i + 2] == ";":
+                buf.append(";")
+                i += 2
+                continue
+            pole.append("".join(buf))
+            buf = []
+            i += 1
+            continue
+        buf.append(telo[i])
+        i += 1
+    pole.append("".join(buf))
+    return pole
+
+
+def _sylk_hodnota(k):
+    """Obsah pole K SYLK záznamu → text / číslo / bool."""
+    if k.startswith('"'):
+        return k[1:-1].replace('""', '"') if k.endswith('"') else k[1:]
+    if k in ("TRUE", "FALSE"):
+        return k == "TRUE"
+    try:
+        cislo = float(k)
+    except ValueError:
+        return k
+    return int(cislo) if cislo.is_integer() else cislo
+
+
+def _sylk_rows(raw_bytes):
+    """SYLK (.slk) → řádky prvního listu. Excel tenhle textový formát pořád nabízí
+    v „Uložit jako" a starší skladové systémy ho posílají místo .xls. Buňky jsou
+    v záznamech „C;Y<řádek>;X<sloupec>;K<hodnota>"; X i Y drží poslední hodnotu,
+    dokud je další záznam nepřepíše."""
+    try:
+        text = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        # SYLK z Excelu je v ANSI kódování Windows — pro češtinu cp1250.
+        text = raw_bytes.decode("cp1250", errors="replace")
+    bunky, y, x = {}, 1, 1
+    for radek in text.splitlines():
+        if not radek.startswith("C;"):
+            continue
+        hodnota, ma_hodnotu = None, False
+        for pole in _sylk_pole(radek[2:]):
+            typ, telo = pole[:1], pole[1:]
+            if typ == "Y" and telo.isdigit():
+                y = int(telo)
+            elif typ == "X" and telo.isdigit():
+                x = int(telo)
+            elif typ == "K":
+                hodnota, ma_hodnotu = _sylk_hodnota(telo), True
+        if ma_hodnotu:
+            bunky[(y, x)] = hodnota
+    if not bunky:
+        return []
+    max_y = max(k[0] for k in bunky)
+    max_x = max(k[1] for k in bunky)
+    return [[bunky.get((ry, rx)) for rx in range(1, max_x + 1)]
+            for ry in range(1, max_y + 1)]
+
+
+def _xml_ss_rows(raw_bytes):
+    """Excel 2003 XML Spreadsheet → řádky prvního listu. Formát se ukládá i pod
+    příponou .xls (uvnitř je text, ne binárka), takže ho nesmí dostat xlrd.
+    `ss:Index` u Row i Cell znamená přeskočené (prázdné) řádky/sloupce."""
+    import xml.etree.ElementTree as ET
+    ns = "{urn:schemas-microsoft-com:office:spreadsheet}"
+    try:
+        root = ET.fromstring(raw_bytes)
+    except ET.ParseError as e:
+        raise RuntimeError(f"XML tabulku se nepodařilo přečíst: {e}")
+    table = root.find(f"{ns}Worksheet/{ns}Table")
+    if table is None:
+        return []
+    out = []
+    for row in table.findall(f"{ns}Row"):
+        idx_row = row.get(f"{ns}Index")
+        if idx_row and idx_row.isdigit():
+            while len(out) < int(idx_row) - 1:
+                out.append([])
+        radek = []
+        for cell in row.findall(f"{ns}Cell"):
+            idx = cell.get(f"{ns}Index")
+            if idx and idx.isdigit():
+                while len(radek) < int(idx) - 1:
+                    radek.append(None)
+            data = cell.find(f"{ns}Data")
+            if data is None:
+                radek.append(None)
+                continue
+            v, typ = data.text, data.get(f"{ns}Type")
+            if typ == "Number":
+                try:
+                    cislo = float(v)
+                    v = int(cislo) if cislo.is_integer() else cislo
+                except (TypeError, ValueError):
+                    pass
+            elif typ == "DateTime":
+                v = _xlsx_datum((v or "").replace("T", " ")) or v
+            radek.append(v)
+        out.append(radek)
+    return out
+
+
 def _nacti_rows(raw_bytes, filename):
-    """Načte 1. list libovolného formátu (.xls / .xlsx / .xlsm / .xlsb) jako seznam
-    řádků (každý = seznam buněk). Formát se pozná především z OBSAHU (magic bytes),
-    aby fungoval i když se z uploadu nepředá název/přípona."""
+    """Načte 1. list libovolného formátu (.xls / .xlsx / .xlsm / .xlsb / .slk /
+    XML tabulka 2003) jako seznam řádků (každý = seznam buněk). Formát se pozná
+    především z OBSAHU (magic bytes), aby fungoval i když se z uploadu nepředá
+    název/přípona."""
     name = (filename or "").lower()
-    head = raw_bytes[:8] if raw_bytes else b""
+    head = raw_bytes[:16] if raw_bytes else b""
     je_ole2 = head[:4] == b"\xd0\xcf\x11\xe0"   # starý binární .xls (OLE2)
     je_zip = head[:4] == b"PK\x03\x04"           # .xlsx/.xlsm/.xlsb (ZIP kontejner)
+
+    # Textové formáty z Excelu „Uložit jako" (SYLK, XML tabulka 2003). Poznají se
+    # z obsahu — obojí se běžně ukládá i s příponou .xls, takže test podle přípony
+    # by je omylem poslal do xlrd.
+    zacatek = head.lstrip(b"\xef\xbb\xbf \t\r\n")
+    if zacatek[:3] == b"ID;" or name.endswith(".slk"):
+        return _sylk_rows(raw_bytes)
+    if zacatek[:5] == b"<?xml" or zacatek[:9] == b"<Workbook":
+        return _xml_ss_rows(raw_bytes)
 
     if je_ole2 or (name.endswith(".xls") and not je_zip):
         try:
@@ -5638,6 +5809,12 @@ _OVOZEL_CENIK_MAPA = (
 
 
 # ── Práva ───────────────────────────────────────────────────────────────────
+# Role „Office" pro OBĚ dlaždice OVOZEL (Kontrola cen OVOZEL i NC OVOZEL) — stejná
+# množina i pro adresáty e-mailů a zvonečku, aby se držitel mimořádného práva
+# nedostal do UI bez notifikací.
+OVOZEL_OFFICE_PRAVA = ("cenopripad_office_nakup", "cenopripad_office_obchod_ovozel")
+
+
 def _ovozel_pristup(p):
     """Smí do dlaždice „Kontrola cen OVOZEL"."""
     return _ovozel_office(p) or "cenopripad_zadatel_nakup" in p
@@ -5647,8 +5824,10 @@ def _ovozel_office(p):
     """Office nákup: nahrává sestavu Sklad 6, zadává kontrolu a exportuje.
     Vidí zároveň všechny případy (žadatel jen své). Mazat smí až správce.
     Role sedí na existujícím právu „Office nákup" — samostatné právo pro OVOZEL
-    se nezavádí, aby se jedna a tatáž role nespravovala na dvou místech."""
-    return _je_spravce(p) or "cenopripad_office_nakup" in p
+    se nezavádí, aby se jedna a tatáž role nespravovala na dvou místech.
+    Výjimka: „Office obchod – OVOZEL" je mimořádné právo, které pouští Office obchod
+    do obou dlaždic OVOZEL ve stejném rozsahu, aniž by odemklo zbytek nákupu."""
+    return _je_spravce(p) or any(x in p for x in OVOZEL_OFFICE_PRAVA)
 
 
 # ── Pomocné ─────────────────────────────────────────────────────────────────
@@ -6149,7 +6328,7 @@ def _ovozel_notifikuj(pid, cislo, nazev, soubor, vysledek, zadavatel_jmeno, zada
             telo += "\n\nChyby:\n" + "\n".join(ukazky[:20])
             if len(ukazky) > 20:
                 telo += f"\n… a dalších {len(ukazky) - 20}."
-        prava = ("cenopripad_office_nakup", "cenopripad_spravce", "vse")
+        prava = OVOZEL_OFFICE_PRAVA + ("cenopripad_spravce", "vse")
         for uid in (intranet_data.ziskej_uzivatele_s_pravem(*prava) or {}):
             try:
                 if uid is None or int(uid) == int(zadavatel_id):
@@ -6157,7 +6336,7 @@ def _ovozel_notifikuj(pid, cislo, nazev, soubor, vysledek, zadavatel_jmeno, zada
             except (TypeError, ValueError):
                 continue
             intranet_notifikace.pridej(uid, text, "warning" if chyb else "info")
-        _odesli_emaily(_emaily_s_pravy("cenopripad_office_nakup", "cenopripad_spravce"),
+        _odesli_emaily(_emaily_s_pravy(*OVOZEL_OFFICE_PRAVA, "cenopripad_spravce"),
                        f"Kontrola cen OVOZEL {cislo} — " + ("chyby" if chyb else "bez chyb"),
                        telo, _app_url(f"?ovozel={pid}"))
     except Exception as e:
@@ -6170,11 +6349,16 @@ def _ovozel_otevri(pid):
     _refresh()
 
 
-def _upload_panel(popis, akce, klic_nazev=None):
-    """Sdílený upload box (OVOZEL i Oprava cen): skrytý QUploader + tlačítko „+"
-    + stavový řádek. `akce(raw, name, nazev_pripadu)` je async a běží po kliknutí
-    na potvrzovací tlačítko."""
+def _upload_panel(popis, akce, klic_nazev=None, tlacitka=None):
+    """Sdílený upload box (OVOZEL, Oprava cen, NC OVOZEL): skrytý QUploader
+    + tlačítko „+" + stavový řádek. `akce(raw, name, nazev_pripadu)` je async
+    a běží po kliknutí na potvrzovací tlačítko.
+
+    `tlacitka` = [(popisek, ikona, css, vlastní_akce)] pro víc voleb nad jedním
+    souborem (NC OVOZEL: „import cen" vs. „delist" — žadatel volí až po nahrání).
+    Bez něj se vykreslí jedno tlačítko volající `akce`."""
     drzeny = {"raw": None, "name": ""}
+    btny = []
     ui.label(popis).classes("text-sm text-gray-500 mb-2")
     nazev_in = None
     if klic_nazev:
@@ -6187,11 +6371,11 @@ def _upload_panel(popis, akce, klic_nazev=None):
             drzeny["raw"], drzeny["name"] = raw, name
             stav.text = f"✅ Nahráno, připraveno: {name}"
             stav.classes(replace="text-sm text-emerald-700 font-medium break-words")
-            btn.set_enabled(True)
+            _povol(True)
         else:
             stav.text = "❌ Nahrání souboru selhalo, zkuste to znovu."
             stav.classes(replace="text-sm text-red-600 font-medium break-words")
-            btn.set_enabled(False)
+            _povol(False)
 
     def _pick():
         return ui.run_javascript(
@@ -6201,7 +6385,7 @@ def _upload_panel(popis, akce, klic_nazev=None):
 
     with ui.row().classes("w-full items-center gap-3"):
         up = ui.upload(on_upload=_on_up, auto_upload=True, max_file_size=40_000_000) \
-            .props("accept=.xls,.xlsx,.xlsm,.xlsb").style("display:none")
+            .props("accept=.xls,.xlsx,.xlsm,.xlsb,.slk,.xml").style("display:none")
         ui.button(icon="add", on_click=_pick) \
             .props("round unelevated color=green dense").classes("shadow-sm") \
             .style("transform:scale(0.75);transform-origin:center") \
@@ -6213,9 +6397,13 @@ def _upload_panel(popis, akce, klic_nazev=None):
                 up_spin.set_visibility(False)
                 stav = ui.label("").classes("text-sm text-gray-500 break-words")
 
+    def _povol(zapnout):
+        for b in btny:
+            b.set_enabled(zapnout)
+
     def _zacatek():
         drzeny["raw"] = None
-        btn.set_enabled(False)
+        _povol(False)
         up_spin.set_visibility(True)
         stav.text = "⏳ Nahrávám soubor na server…"
         stav.classes(replace="text-sm text-amber-700 font-medium break-words")
@@ -6230,31 +6418,35 @@ def _upload_panel(popis, akce, klic_nazev=None):
     spin = ui.spinner(size="lg").classes("text-emerald-600")
     spin.set_visibility(False)
 
-    async def _spust():
+    async def _spust(fn):
         if not drzeny["raw"]:
             ui.notify("Vyberte soubor.", type="warning")
             return
-        btn.set_enabled(False)
+        _povol(False)
         spin.set_visibility(True)
         try:
-            await akce(drzeny["raw"], drzeny["name"],
-                       (nazev_in.value or "").strip() if nazev_in else "")
+            await fn(drzeny["raw"], drzeny["name"],
+                     (nazev_in.value or "").strip() if nazev_in else "")
         except Exception as e:
             ui.notify(f"Zpracování selhalo: {e}", type="negative", timeout=9000)
         finally:
             # Akce mohla mezitím překreslit modul (_refresh) — prvky pak už neexistují.
             try:
                 spin.set_visibility(False)
-                btn.set_enabled(True)
+                _povol(True)
             except Exception:
                 pass
 
-    with ui.row().classes("w-full justify-end mt-2"):
-        btn = ui.button("Provést" if klic_nazev else "Nahrát", icon="cloud_upload",
-                        on_click=_spust).props("unelevated no-caps") \
-            .classes("bg-emerald-600 text-white font-semibold rounded-lg px-5")
-        btn.set_enabled(False)
-    return btn
+    volby = tlacitka or [("Provést" if klic_nazev else "Nahrát", "cloud_upload",
+                          "bg-emerald-600 text-white font-semibold rounded-lg px-5", akce)]
+    with ui.row().classes("w-full justify-end mt-2 gap-2 flex-wrap"):
+        for popisek, ikona, css, fn in volby:
+            b = ui.button(popisek, icon=ikona,
+                          on_click=lambda _e=None, f=fn: _spust(f)) \
+                .props("unelevated no-caps").classes(css)
+            b.set_enabled(False)
+            btny.append(b)
+    return btny
 
 
 def _ovozel_sekce_master(user_id, user_name, prava):
@@ -6590,7 +6782,6 @@ _OPRAVA_SLOUPCE = (
     ("pc_std",   "cislo", ("standartní prodejní cena", "standardní prodejní cena",
                            "standartni prodejni cena", "standardni prodejni cena")),
     ("pc_pozad", "cislo", ("požadovaná prodejní cena", "pozadovana prodejni cena")),
-    ("duvod",    "text",  ("důvod opravy", "duvod opravy")),
 )
 _OPRAVA_POVINNE = ("kod", "ks", "pc_std", "pc_pozad")
 
@@ -6598,25 +6789,23 @@ _OPRAVA_POVINNE = ("kod", "ks", "pc_std", "pc_pozad")
 # ── Práva ───────────────────────────────────────────────────────────────────
 def _oprava_pristup(p):
     """Smí do dlaždice „Oprava cen"."""
-    return _je_spravce(p) or "cenopripad_zadatel_obchod" in p \
-        or "cenopripad_office_obchod" in p
+    return _je_spravce(p) or "cenopripad_zadatel_oprava" in p \
+        or _oprava_office(p)
 
 
 def _oprava_office(p):
-    """Office obchod: vidí všechny žádosti, zpracuje je nebo postoupí správci."""
-    return _je_spravce(p) or "cenopripad_office_obchod" in p
+    """Office oprava cen: vidí všechny žádosti, zpracuje je nebo postoupí správci."""
+    return _je_spravce(p) or "cenopripad_office_oprava" in p
 
 
 # ── Výpočet ─────────────────────────────────────────────────────────────────
 def _oprava_dopocet(ks, pc_std, pc_pozad):
-    """Sloupce J a K ze šablony, dopočítané ze vstupů E/G/H.
+    """Odchylky — ve formuláři se nevyplňují, drží se ale původní vzorce šablony:
 
-    Excel:  J = (100-H/(G*0.01))*-1/100   ==  H/G - 1        (podíl, formát 0,00 %)
-            K = ((G*E)-(H*E))*-1          ==  E*(H-G)        (Kč)
+        % odchylka  = (100-H/(G*0.01))*-1/100   ==  H/G - 1     (podíl, formát 0,00 %)
+        absolutní   = ((G*E)-(H*E))*-1          ==  E*(H-G)     (Kč)
 
-    Bere se hodnota, ne buňka: vzorec v nahraném souboru nemusí mít uloženou
-    cached hodnotu (soubor vytvořený programem, nikdy neotevřený v Excelu), takže
-    `data_only=True` by vrátilo None. Vzorce v souboru samotném zůstávají netknuté.
+    (E = počet ks, G = standardní PC, H = požadovaná PC.)
     """
     pct = None
     if pc_std not in (None, 0) and pc_pozad is not None:
@@ -6713,12 +6902,12 @@ def _oprava_zapis_radky(cur, pid, radky):
     cur.execute("DELETE FROM oprava_radky WHERE pripad_id=%s", (pid,))
     cur.executemany(
         "INSERT INTO oprava_radky (pripad_id, poradi, ico, doklad, kod, nazev, ks, nc, "
-        "pc_std, pc_pozad, odchylka_pct, odchylka_abs, duvod) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+        "pc_std, pc_pozad, odchylka_pct, odchylka_abs) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
         [(pid, r["poradi"], _str(r.get("ico"), 40), _str(r.get("doklad"), 60),
           _str(r.get("kod"), 40), _str(r.get("nazev"), 255), r.get("ks"), r.get("nc"),
           r.get("pc_std"), r.get("pc_pozad"), r.get("odchylka_pct"),
-          r.get("odchylka_abs"), _str(r.get("duvod"), 500)) for r in radky])
+          r.get("odchylka_abs")) for r in radky])
 
 
 def _oprava_uloz(nazev, duvod, radky, raw, soubor_nazev, user_id, user_name):
@@ -6939,7 +7128,9 @@ def _oprava_historie(pid):
 
 
 # ── Notifikace ──────────────────────────────────────────────────────────────
-def _oprava_zvonecek(text, typ, *prava_klice, krome_uid=None):
+def _cp_zvonecek(text, typ, *prava_klice, krome_uid=None):
+    """Zvoneček všem držitelům daných práv (kromě `krome_uid`). Sdílí ho víc
+    dlaždic — Oprava cen i NC OVOZEL."""
     try:
         for uid in (intranet_data.ziskej_uzivatele_s_pravem(*prava_klice) or {}):
             try:
@@ -6949,11 +7140,12 @@ def _oprava_zvonecek(text, typ, *prava_klice, krome_uid=None):
                 continue
             intranet_notifikace.pridej(uid, text, typ)
     except Exception as e:
-        print(f"[oprava] _oprava_zvonecek: {e}")
+        print(f"[cenopripad] _cp_zvonecek: {e}")
 
 
 def _oprava_mail_office(pid, predmet, text):
-    _odesli_emaily(_emaily_office("obchod"), predmet, text, _app_url(f"?oprava={pid}"))
+    _odesli_emaily(_emaily_s_pravy("cenopripad_office_oprava"), predmet, text,
+                   _app_url(f"?oprava={pid}"))
 
 
 def _oprava_mail_zadateli(p, predmet, text):
@@ -6969,7 +7161,7 @@ def _oprava_otevri(pid):
 
 
 def _oprava_stahni_vzor():
-    """Servíruje originál šablony — vzorce ve sloupcích J a K zůstávají zachovány."""
+    """Servíruje originál šablony beze změny."""
     if not os.path.exists(VZOR_OPRAVA_SOUBOR):
         ui.notify("Vzorový formulář není k dispozici.", type="negative")
         return
@@ -7000,8 +7192,7 @@ def _oprava_sekce_nova(user_id, user_name, prava):
             ui.button("Vzorový formulář", icon="file_download",
                       on_click=_oprava_stahni_vzor).props("outline no-caps") \
                 .classes("text-emerald-700 font-semibold rounded-lg") \
-                .tooltip("Stáhne formulář Oprava_ceny_2026.xlsx včetně vzorců ve "
-                         "sloupcích J a K.")
+                .tooltip("Stáhne formulář Oprava_ceny_2026.xlsx.")
         duvod_in = ui.textarea("Důvod opravy / žádost *") \
             .props("outlined autogrow").classes("w-full mb-2")
 
@@ -7025,9 +7216,9 @@ def _oprava_sekce_nova(user_id, user_name, prava):
             intranet_logger.log_activity(
                 user_name, "Cenopřípad",
                 f"Oprava cen: nová žádost {cislo} ({name}) — {len(radky)} řádků")
-            _oprava_zvonecek(f"🧾 Oprava cen {cislo} od {user_name}: {len(radky)} řádků, "
+            _cp_zvonecek(f"🧾 Oprava cen {cislo} od {user_name}: {len(radky)} řádků, "
                              f"dopad {_castka(suma)} Kč.", "info",
-                             "cenopripad_office_obchod", "cenopripad_spravce", "vse",
+                             "cenopripad_office_oprava", "cenopripad_spravce", "vse",
                              krome_uid=user_id)
             _oprava_mail_office(
                 pid, f"Oprava cen — nová žádost {cislo}",
@@ -7039,9 +7230,8 @@ def _oprava_sekce_nova(user_id, user_name, prava):
             _oprava_otevri(pid)
 
         _upload_panel(
-            "Nahrajte vyplněný formulář „Oprava_ceny_2026.xlsx“. Sloupce J a K "
-            "(% a absolutní odchylka) se dopočítají podle vzorců ze šablony — "
-            "nemusíte je vyplňovat a v souboru zůstanou zachovány.",
+            "Nahrajte vyplněný formulář „Oprava_ceny_2026.xlsx“. Odchylky "
+            "(% i absolutní) dopočítá aplikace, ve formuláři je nevyplňujete.",
             _akce, klic_nazev="Název žádosti (nepovinné)")
 
 
@@ -7109,7 +7299,7 @@ def _oprava_detail(pid, user_id, user_name, prava):
             ui.download(bytes(data), nazev or f"oprava_{p.get('cislo')}.xlsx")
         ui.button("Stáhnout formulář", icon="file_download", on_click=_stahni) \
             .props("outline no-caps").classes("text-emerald-700 font-semibold rounded-lg") \
-            .tooltip("Originál nahraného souboru — vzorce ve sloupcích J a K beze změny.")
+            .tooltip("Originál nahraného souboru beze změny.")
 
         if je_spravce:
             def _smaz_dialog():
@@ -7166,8 +7356,8 @@ def _oprava_detail(pid, user_id, user_name, prava):
                   "nazev": r.get("nazev") or "",
                   "ks": _castka(r.get("ks")), "nc": _castka(r.get("nc")),
                   "pc_std": _castka(r.get("pc_std")), "pc_pozad": _castka(r.get("pc_pozad")),
-                  "pct": _pct(r.get("odchylka_pct")), "abs": _castka(r.get("odchylka_abs")),
-                  "duvod": r.get("duvod") or ""} for r in radky]
+                  "pct": _pct(r.get("odchylka_pct")),
+                  "abs": _castka(r.get("odchylka_abs"))} for r in radky]
     ui.label(f"Řádky formuláře — {len(radky)} položek").classes(
         "text-base font-bold text-gray-800 mt-1 mb-1")
     ui.aggrid({
@@ -7185,20 +7375,19 @@ def _oprava_detail(pid, user_id, user_name, prava):
              "minWidth": 105, "type": "rightAligned"},
             {"headerName": "Požadovaná PC bez DPH", "field": "pc_pozad", "width": 140,
              "minWidth": 105, "type": "rightAligned"},
-            # J a K ze šablony — dopočítané, ne čtené z buněk (viz `_oprava_dopocet`).
+            # Odchylky nejsou ve formuláři — dopočítané (viz `_oprava_dopocet`).
             {"headerName": "% odchylka oproti std. PC", "field": "pct", "width": 140,
              "minWidth": 105, "type": "rightAligned", ":cellStyle": _ZAP},
             {"headerName": "Absolutní odchylka", "field": "abs", "width": 140,
              "minWidth": 105, "type": "rightAligned", ":cellStyle": _ZAP},
-            {"headerName": "Důvod opravy", "field": "duvod", "width": 260, "minWidth": 160},
         ],
         "rowData": grid_rows,
         "defaultColDef": {"resizable": True, "sortable": True, "filter": True,
                           "wrapHeaderText": True, "autoHeaderHeight": True,
                           "cellDataType": False},
         "rowHeight": 28,
-        "autoSizeStrategy": {"type": "fitCellContents"},
-    }).classes("w-full").style("height: 42vh")
+        "autoSizeStrategy": {"type": "fitGridWidth"},
+    }).classes("w-full").style(f"height: min(42vh, {60 + len(grid_rows) * 28}px)")
 
     _oprava_workflow(p, pid, stav, je_vlastnik, je_office, je_spravce, user_name)
 
@@ -7343,7 +7532,7 @@ def _oprava_workflow(p, pid, stav, je_vlastnik, je_office, je_spravce, user_name
                             return
                         _oprava_stav(pid, "u_spravce", spravce_pozn=txt)
                         _oprava_zapis_historie(pid, "Postoupeno správci", user_name, txt)
-                        _oprava_zvonecek(f"🧾 Oprava cen {cislo} čeká na odsouhlasení "
+                        _cp_zvonecek(f"🧾 Oprava cen {cislo} čeká na odsouhlasení "
                                          f"správcem.", "warning",
                                          "cenopripad_spravce", "vse")
                         _odesli_emaily(
@@ -7457,6 +7646,851 @@ def _oprava_workflow(p, pid, stav, je_vlastnik, je_office, je_spravce, user_name
                 .props("flat no-caps").classes("text-gray-600")
 
 
+# ============================================================================
+# Dlaždice „NC OVOZEL" — žádost o změnu nákupní ceny (import cen / delist)
+#
+# Tiketová fronta ZÁMĚRNĚ bez jakékoli kontroly cen: nákupčí nahraje tabulku
+# (vzor „TEST DODAVATEL – nahraje", list „IC", 6 sloupců) a zvolí, jestli žádá
+# o import cen, nebo o delist. Office nákup žádost zpracuje, nebo ji vrátí
+# k opravě s důvodem; exportuje soubor pro import do skladu 6 ve stejném tvaru
+# jako u IND cen (vzor „TEST DODAVATEL – Office stáhne", 15 sloupců).
+#
+# Rozdíl obou vzorů = 9 sloupců, které jsou vždy stejné (konstanty dohodnuté se
+# skladem). Zbývajících 6 se bere vždy z aktuálně nahrané tabulky.
+# ============================================================================
+NC_HLAVICKA = ("SKUPINA", "KLIC", "DATUMOD", "DATUMDO", "SLEVAKC", "POZNAMKA")
+
+# Sloupec → jak se čte hodnota. „kod" drží vodicí nuly, „datum" převádí na
+# sériové číslo Excelu, „cislo" nepustí dál procenta (viz `cp.parse_cena_kc`).
+_NC_TYPY = {"SKUPINA": "text", "KLIC": "kod", "DATUMOD": "datum",
+            "DATUMDO": "datum", "SLEVAKC": "cislo", "POZNAMKA": "text"}
+
+# U delistu nemusí být vyplněné všechny sloupce — bez klíče ale není co odlistovat.
+_NC_POVINNE_DELIST = ("KLIC",)
+
+# Druh žádosti musí být vidět na první pohled — proto emoji, barva i vlastní badge.
+NC_DRUHY = {
+    "import": ("📥 Import cen", "blue", "border-blue-400"),
+    "delist": ("🚫 Delist", "deep-orange", "border-deep-orange-400"),
+}
+
+_NC_STAV_BADGE = {
+    "odeslano":       ("Odesláno / ve frontě", "blue"),
+    "vraceno_oprava": ("Vráceno k opravě", "orange"),
+    "zpracovano":     ("Zpracováno", "green"),
+}
+
+_EXCEL_EPOCH = datetime.date(1899, 12, 30)   # den 0 Excelu (Windows)
+
+
+# ── Práva ───────────────────────────────────────────────────────────────────
+def _nc_office(p):
+    """Office nákup (a správce): vidí všechny žádosti, zpracuje je, vrací
+    k opravě s důvodem a exportuje soubor pro sklad. Stejně tak držitel
+    mimořádného práva „Office obchod – OVOZEL" (viz `OVOZEL_OFFICE_PRAVA`)."""
+    return _je_spravce(p) or any(x in p for x in OVOZEL_OFFICE_PRAVA)
+
+
+def _nc_ctenar(p):
+    """Čtenář: vidí všechny žádosti, ale nesmí nic — ani zakládat, ani exportovat."""
+    return "cenopripad_ctenar_nc" in p
+
+
+def _nc_zadatel(p):
+    """Nákup: zakládá žádosti a vidí jen ty svoje."""
+    return "cenopripad_zadatel_nakup" in p
+
+
+def _nc_pristup(p):
+    """Smí do dlaždice „NC OVOZEL"."""
+    return _nc_office(p) or _nc_ctenar(p) or _nc_zadatel(p)
+
+
+def _nc_vidi_vse(p):
+    return _nc_office(p) or _nc_ctenar(p)
+
+
+# ── Čtení hodnot ────────────────────────────────────────────────────────────
+def _nc_datum(v):
+    """Termín do DATUMOD/DATUMDO jako SÉRIOVÉ ČÍSLO Excelu — přesně v podobě,
+    v jaké ho čeká import do skladu (vzor „Office stáhne" má v obou sloupcích
+    čísla ve formátu „General", ne formátovaná data). Bere číslo, datum
+    i textové datum (ISO nebo CZ). Vrací int, nebo None když to datum není."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return int(v) if 1 <= v <= 200000 else None
+    if isinstance(v, datetime.datetime):
+        v = v.date()
+    if isinstance(v, datetime.date):
+        return (v - _EXCEL_EPOCH).days
+    s = " ".join(str(v or "").split())
+    if not s:
+        return None
+    d = _xlsx_datum(s)
+    if d is None:
+        for fmt in ("%d.%m.%Y", "%d.%m.%y", "%d/%m/%Y"):
+            try:
+                d = datetime.datetime.strptime(s, fmt)
+                break
+            except ValueError:
+                continue
+    if d is not None:
+        return (d.date() - _EXCEL_EPOCH).days
+    try:                                  # sériové číslo uložené jako text
+        cislo = float(s.replace(",", "."))
+    except ValueError:
+        return None
+    return int(cislo) if 1 <= cislo <= 200000 else None
+
+
+def _nc_datum_cz(serial):
+    """Sériové číslo → „dd.mm.rrrr" pro náhled. Prázdné → „—"."""
+    if serial in (None, ""):
+        return "—"
+    try:
+        return (_EXCEL_EPOCH + datetime.timedelta(days=int(serial))).strftime("%d.%m.%Y")
+    except (ValueError, OverflowError, TypeError):
+        return str(serial)
+
+
+def _nc_parse(raw_bytes, filename, druh):
+    """Nahraná tabulka („TEST DODAVATEL – nahraje") → (radky, chyba|None).
+
+    Hlídá se hlavička (všech 6 sloupců vzoru) i formát hodnot. U žádosti
+    o import cen musí být vyplněné všechny sloupce, u delistu stačí KLIC —
+    jinak se vrátí hláška „chybný formát" s tím, co konkrétně nesedí."""
+    if druh not in NC_DRUHY:
+        return None, "Neznámý druh žádosti."
+    try:
+        rows = _nacti_rows(raw_bytes, filename)
+    except Exception as e:
+        return None, f"Chybný formát – soubor se nepodařilo načíst: {e}"
+    if not rows:
+        return None, "Chybný formát – soubor je prázdný."
+
+    # 1) Hlavička = první řádek (max. do 20.), kde sedí všech 6 sloupců vzoru.
+    idx_hdr, mapa = None, {}
+    for i, r in enumerate(rows[:20]):
+        m = {}
+        for j, bunka in enumerate(r):
+            h = _norm(bunka).upper()
+            if h in NC_HLAVICKA and h not in m:
+                m[h] = j
+        if len(m) == len(NC_HLAVICKA):
+            idx_hdr, mapa = i, m
+            break
+    if idx_hdr is None:
+        nalezene = {_norm(b).upper() for r in rows[:20] for b in r}
+        chybi = [h for h in NC_HLAVICKA if h not in nalezene] or list(NC_HLAVICKA)
+        return None, ("Chybný formát – v tabulce chybí sloupce: " + ", ".join(chybi)
+                      + ". Hlavička musí obsahovat: " + ", ".join(NC_HLAVICKA) + ".")
+
+    # 2) Řádky. Povinnost sloupců se liší podle druhu žádosti.
+    povinne = NC_HLAVICKA if druh == "import" else _NC_POVINNE_DELIST
+    radky, chyby, poradi = [], [], 0
+    for r in rows[idx_hdr + 1:]:
+        syrove = {h: (r[j] if j < len(r) else None) for h, j in mapa.items()}
+        if all(v is None or str(v).strip() == "" for v in syrove.values()):
+            continue                       # prázdná patička tabulky
+        poradi += 1
+        # Klíče = názvy sloupců v `nc_radky`, aby řádek z parseru i z DB vypadal
+        # stejně (náhled i export pak jedou nad jedním tvarem).
+        hodnoty, vadne = {"poradi": poradi}, []
+        for h in NC_HLAVICKA:
+            v, typ, pole = syrove[h], _NC_TYPY[h], h.lower()
+            prazdno = v is None or str(v).strip() == ""
+            if typ == "kod":
+                hodnoty[pole] = _norm_kod(v) or ""
+                prazdno = not hodnoty[pole]
+            elif typ == "datum":
+                hodnoty[pole] = None if prazdno else _nc_datum(v)
+                if not prazdno and hodnoty[pole] is None:
+                    vadne.append(f"{h} není datum")
+            elif typ == "cislo":
+                hodnoty[pole] = None if prazdno else cp.parse_cena_kc(v)
+                if not prazdno and hodnoty[pole] is None:
+                    vadne.append(f"{h} není částka v Kč")
+            else:
+                # ŽÁDNÁ normalizace mezer: názvy ve sloupci POZNAMKA jsou doplněné
+                # mezerami do pevné šířky a sklad je tak i očekává — „Tyč Twix
+                # 50g" a „Tyč Twix          50g" pro něj nejsou totéž.
+                hodnoty[pole] = "" if prazdno else (v if isinstance(v, str) else str(v))
+            if prazdno and h in povinne:
+                vadne.append(f"chybí {h}")
+        if vadne:
+            chyby.append(f"řádek {poradi}: " + ", ".join(vadne))
+        radky.append(hodnoty)
+
+    if not radky:
+        return None, "Chybný formát – tabulka neobsahuje žádný vyplněný řádek."
+    if chyby:
+        ukazka = "; ".join(chyby[:5]) + (" …" if len(chyby) > 5 else "")
+        return None, f"Chybný formát – vadných řádků: {len(chyby)}. {ukazka}"
+    return radky, None
+
+
+# ── Export do skladu 6 ──────────────────────────────────────────────────────
+def _nc_sklad_radky(radky):
+    """Řádky žádosti → řádky vzoru „Office stáhne" (list „IC", `_SKLAD_HLAVICKA`).
+    Z nahrané tabulky se berou SKUPINA/KLIC/DATUMOD/DATUMDO/SLEVAKC/POZNAMKA,
+    zbylých 9 sloupců jsou konstanty dohodnuté se skladem — pro import cen
+    i delist stejné, aby se sklad choval pořád stejně."""
+    return [[
+        r.get("skupina") or "",
+        "kód",                                            # TYPKLICE
+        _export_kod(r.get("klic")),                       # KLIC — text, vodicí nuly
+        "" if r.get("datumod") is None else r["datumod"],
+        "" if r.get("datumdo") is None else r["datumdo"],
+        0,                                                # SLEVAPROC
+        "" if r.get("slevakc") is None else r["slevakc"],
+        "cena Kč",                                        # TYPSLEVY
+        r.get("poznamka") or "",
+        9, 0, 0, 17152, 0, 0,   # TYPZAOKR/PORADI/ODCASTKY/PREPINACE/TYPOD/TYPDO
+    ] for r in radky]
+
+
+def _nc_export_soubor(radky, format="xlsx"):
+    """Soubor pro import do skladu 6 — stejná hlavička, list i formáty jako
+    u IND cen. Vrací (bytes, přípona, MIME); `format` = klíč ze `SKLAD_FORMATY`."""
+    _popis, pripona, mime, zapis = SKLAD_FORMATY.get(format) or SKLAD_FORMATY["xlsx"]
+    data = zapis(_SKLAD_HLAVICKA, _nc_sklad_radky(radky), [2], nazev_listu="IC")
+    return data, pripona, mime
+
+
+# ── DB ──────────────────────────────────────────────────────────────────────
+def _nc_zapis_radky(cur, pid, radky):
+    cur.execute("DELETE FROM nc_radky WHERE pripad_id=%s", (pid,))
+    cur.executemany(
+        "INSERT INTO nc_radky (pripad_id, poradi, skupina, klic, datumod, datumdo, "
+        "slevakc, poznamka) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+        [(pid, r["poradi"], _str(r.get("skupina"), 60), _str(r.get("klic"), 40),
+          r.get("datumod"), r.get("datumdo"), r.get("slevakc"),
+          _str(r.get("poznamka"), 255)) for r in radky])
+
+
+def _nc_uloz(druh, nazev, duvod, radky, raw, soubor_nazev, user_id, user_name):
+    """Nová žádost. Vrací (id, cislo) nebo (None, chyba)."""
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return None, "Není připojení k databázi."
+    try:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO nc_pripady (druh, nazev, zadavatel_id, zadavatel_jmeno, "
+                    "stav, duvod, pocet_radku, soubor_nazev) "
+                    "VALUES (%s,%s,%s,%s,'odeslano',%s,%s,%s)",
+                    (druh, _str(nazev, 255), user_id, _str(user_name, 255), duvod,
+                     len(radky), _str(soubor_nazev, 255)))
+        pid = cur.lastrowid
+        cislo = f"NC{pid:05d}"
+        cur.execute("UPDATE nc_pripady SET cislo=%s WHERE id=%s", (cislo, pid))
+        _nc_zapis_radky(cur, pid, radky)
+        if raw:
+            cur.execute("INSERT INTO nc_soubory (pripad_id, nazev, data) "
+                        "VALUES (%s,%s,%s)", (pid, _str(soubor_nazev, 255), raw))
+        conn.commit()
+        cur.close()
+        return pid, cislo
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return None, f"Chyba zápisu do databáze: {e}"
+    finally:
+        conn.close()
+
+
+def _nc_prepis(pid, duvod, radky, raw, soubor_nazev):
+    """Oprava žádosti žadatelem (stav „vráceno k opravě").
+    Soubor je nepovinný — beze změny se zachová ten původní."""
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return False, "Není připojení k databázi."
+    try:
+        cur = conn.cursor()
+        if radky is not None:
+            cur.execute("UPDATE nc_pripady SET duvod=%s, pocet_radku=%s, soubor_nazev=%s "
+                        "WHERE id=%s", (duvod, len(radky), _str(soubor_nazev, 255), pid))
+            _nc_zapis_radky(cur, pid, radky)
+            cur.execute("DELETE FROM nc_soubory WHERE pripad_id=%s", (pid,))
+            cur.execute("INSERT INTO nc_soubory (pripad_id, nazev, data) "
+                        "VALUES (%s,%s,%s)", (pid, _str(soubor_nazev, 255), raw))
+        else:
+            cur.execute("UPDATE nc_pripady SET duvod=%s WHERE id=%s", (duvod, pid))
+        conn.commit()
+        cur.close()
+        return True, None
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False, str(e)
+    finally:
+        conn.close()
+
+
+def _nc_stav(pid, novy_stav, poznamka=None):
+    """Změna stavu + volitelně důvod vrácení k opravě."""
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return False
+    try:
+        cur = conn.cursor()
+        if poznamka is None:
+            cur.execute("UPDATE nc_pripady SET stav=%s WHERE id=%s", (novy_stav, pid))
+        else:
+            cur.execute("UPDATE nc_pripady SET stav=%s, poznamka=%s WHERE id=%s",
+                        (novy_stav, _str(poznamka, 1000), pid))
+        conn.commit()
+        cur.close()
+        return True
+    except Exception as e:
+        print(f"[nc] _nc_stav: {e}")
+        return False
+    finally:
+        conn.close()
+
+
+def _nc_seznam(user_id, prava):
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return []
+    try:
+        cur = conn.cursor(dictionary=True)
+        sql = ("SELECT id, cislo, druh, nazev, zadavatel_id, zadavatel_jmeno, "
+               "datum_zadani, stav, pocet_radku, soubor_nazev FROM nc_pripady ")
+        if _nc_vidi_vse(prava):
+            cur.execute(sql + "ORDER BY id DESC")
+        else:
+            cur.execute(sql + "WHERE zadavatel_id=%s ORDER BY id DESC", (user_id,))
+        r = cur.fetchall()
+        cur.close()
+        return r
+    except Exception as e:
+        print(f"[nc] _nc_seznam: {e}")
+        return []
+    finally:
+        conn.close()
+
+
+def _nc_pripad(pid):
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return None
+    try:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT * FROM nc_pripady WHERE id=%s", (pid,))
+        p = cur.fetchone()
+        cur.close()
+        return p
+    except Exception as e:
+        print(f"[nc] _nc_pripad: {e}")
+        return None
+    finally:
+        conn.close()
+
+
+def _nc_nacti_radky(pid):
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return []
+    try:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT * FROM nc_radky WHERE pripad_id=%s ORDER BY poradi", (pid,))
+        r = cur.fetchall()
+        cur.close()
+        return r
+    except Exception as e:
+        print(f"[nc] _nc_nacti_radky: {e}")
+        return []
+    finally:
+        conn.close()
+
+
+def _nc_original(pid):
+    """(nazev, data) původně nahraného souboru, nebo (None, None)."""
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return None, None
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT nazev, data FROM nc_soubory WHERE pripad_id=%s", (pid,))
+        r = cur.fetchone()
+        cur.close()
+        return (r[0], r[1]) if r else (None, None)
+    except Exception as e:
+        print(f"[nc] _nc_original: {e}")
+        return None, None
+    finally:
+        conn.close()
+
+
+def _nc_smaz(pid):
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return False, "Není připojení k databázi."
+    try:
+        cur = conn.cursor()
+        for t in ("nc_soubory", "nc_radky", "nc_historie"):
+            cur.execute(f"DELETE FROM {t} WHERE pripad_id=%s", (pid,))
+        cur.execute("DELETE FROM nc_pripady WHERE id=%s", (pid,))
+        conn.commit()
+        cur.close()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+    finally:
+        conn.close()
+
+
+def _nc_zapis_historie(pid, akce, kdo, detail=None):
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return
+    try:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO nc_historie (pripad_id, akce, detail, kdo) "
+                    "VALUES (%s,%s,%s,%s)",
+                    (pid, _str(akce, 80), _str(detail, 1000), _str(kdo, 255) or ""))
+        conn.commit()
+        cur.close()
+    except Exception as e:
+        print(f"[nc] _nc_zapis_historie: {e}")
+    finally:
+        conn.close()
+
+
+def _nc_historie(pid):
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return []
+    try:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT akce, detail, kdo, kdy FROM nc_historie "
+                    "WHERE pripad_id=%s ORDER BY id", (pid,))
+        r = cur.fetchall()
+        cur.close()
+        return r
+    except Exception as e:
+        print(f"[nc] _nc_historie: {e}")
+        return []
+    finally:
+        conn.close()
+
+
+# ── Notifikace ──────────────────────────────────────────────────────────────
+def _nc_mail_office(pid, predmet, text):
+    _odesli_emaily(_emaily_s_pravy(*OVOZEL_OFFICE_PRAVA), predmet, text,
+                   _app_url(f"?ncovozel={pid}"))
+
+
+def _nc_mail_zadateli(p, predmet, text):
+    em = _email_uzivatele(p.get("zadavatel_id"))
+    if em:
+        _odesli_emaily([em], predmet, text, _app_url(f"?ncovozel={p.get('id')}"))
+
+
+# ── UI ──────────────────────────────────────────────────────────────────────
+def _nc_otevri(pid):
+    app.storage.user["ncovozel_detail"] = pid
+    _refresh()
+
+
+def _nc_badge_druh(druh):
+    popis, barva, _ = NC_DRUHY.get(druh, (druh or "—", "grey", "border-gray-300"))
+    ui.badge(popis, color=barva).props("rounded").classes("px-2 py-1 text-xs font-bold")
+
+
+def _nc_badge_stav(stav):
+    popis, barva = _NC_STAV_BADGE.get(stav, (stav, "grey"))
+    ui.badge(popis, color=barva).props("rounded").classes("px-2 py-1 text-xs")
+
+
+def _nc_view(user_id, user_name, prava):
+    det = app.storage.user.get("ncovozel_detail")
+    if det:
+        _nc_detail(det, user_id, user_name, prava)
+        return
+    # Čtenář žádosti nezakládá; žadatel, Office (nákup i mimořádné OVOZEL) a správce ano.
+    if _nc_zadatel(prava) or _nc_office(prava):
+        _nc_sekce_nova(user_id, user_name, prava)
+    _nc_sekce_seznam(user_id, prava)
+
+
+def _nc_sekce_nova(user_id, user_name, prava):
+    """Panel „Vytvořit žádost o změnu NC" — důvod, nahrání tabulky a volba,
+    jestli jde o import cen, nebo delist."""
+    with ui.card().classes("w-full max-w-3xl p-5 rounded-2xl shadow-lg mb-4"):
+        ui.label("Vytvořit žádost o změnu NC").classes("text-lg font-bold text-gray-800")
+        duvod_in = ui.textarea("Důvod žádosti *") \
+            .props("outlined autogrow").classes("w-full mb-2")
+
+        def _podej(druh):
+            async def _akce(raw, name, nazev_zadosti):
+                duvod = (duvod_in.value or "").strip()
+                if not duvod:
+                    ui.notify("Vyplňte důvod žádosti.", type="warning")
+                    return
+                radky, err = await run.cpu_bound(_nc_parse, raw, name, druh)
+                if err:
+                    ui.notify(err, type="negative", timeout=15000)
+                    return
+                pid, cislo = _nc_uloz(druh, nazev_zadosti or _bez_pripony(name), duvod,
+                                      radky, raw, name, user_id, user_name)
+                if not pid:
+                    ui.notify(f"Uložení selhalo: {cislo}", type="negative")
+                    return
+                popis = NC_DRUHY[druh][0]
+                _nc_zapis_historie(pid, "Odesláno žadatelem", user_name,
+                                   f"{popis} · {len(radky)} řádků · soubor {name}")
+                intranet_logger.log_activity(
+                    user_name, "Cenopřípad",
+                    f"NC OVOZEL: nová žádost {cislo} ({popis}, {name}) — {len(radky)} řádků")
+                _cp_zvonecek(f"🥬 NC OVOZEL {cislo} od {user_name}: {popis}, "
+                                 f"{len(radky)} řádků.", "info",
+                                 *OVOZEL_OFFICE_PRAVA, "cenopripad_spravce", "vse",
+                                 krome_uid=user_id)
+                _nc_mail_office(
+                    pid, f"NC OVOZEL — nová žádost {cislo} ({popis})",
+                    f"Žadatel {user_name} podal žádost {cislo}.\n"
+                    f"Druh: {popis} · řádků: {len(radky)}\nSoubor: {name}\n\n"
+                    f"Důvod:\n{duvod}")
+                ui.notify(f"Žádost {cislo} odeslána Office nákup.", type="positive",
+                          position="top")
+                _nc_otevri(pid)
+            return _akce
+
+        _upload_panel(
+            "Nahrajte tabulku se sloupci SKUPINA, KLIC, DATUMOD, DATUMDO, SLEVAKC "
+            "a POZNAMKA (vzor „TEST DODAVATEL – nahraje“, list „IC“). Přijímá se "
+            ".xlsx, .xlsm, .xlsb, starý .xls, SYLK (.slk) i XML tabulka 2003. "
+            "Po nahrání zvolte, jestli žádáte o import cen (musí být vyplněné "
+            "všechny sloupce), nebo o delist (stačí KLIC).",
+            None, klic_nazev="Název žádosti (nepovinné)",
+            tlacitka=[
+                ("Zažádat o import cen", "upload_file",
+                 "bg-blue-600 text-white font-semibold rounded-lg px-5", _podej("import")),
+                ("Zažádat o delist", "block",
+                 "bg-deep-orange-600 text-white font-semibold rounded-lg px-5",
+                 _podej("delist")),
+            ])
+
+
+def _nc_sekce_seznam(user_id, prava):
+    zadosti = _nc_seznam(user_id, prava)
+    if not zadosti:
+        ui.label("Zatím žádné žádosti o změnu NC.").classes("text-gray-400 italic p-4")
+        return
+    with ui.column().classes("w-full gap-2"):
+        for p in zadosti:
+            # Barva pruhu = DRUH žádosti (import cen / delist) — ať je vidět hned.
+            _, _, barva = NC_DRUHY.get(p.get("druh"), ("", "grey", "border-gray-300"))
+            with ui.card().classes(f"w-full p-3 rounded-xl shadow-sm hover:shadow-md "
+                                   f"transition-shadow cursor-pointer border-l-8 {barva}") \
+                    .on("click", lambda pid=p["id"]: _nc_otevri(pid)):
+                with ui.row().classes("w-full items-center gap-3 flex-wrap"):
+                    ui.label(p.get("cislo") or "—").classes("font-bold text-gray-800")
+                    _nc_badge_druh(p.get("druh"))
+                    if p.get("nazev"):
+                        ui.label(p.get("nazev")).classes("font-medium text-gray-700")
+                    _nc_badge_stav(p.get("stav"))
+                    ui.space()
+                    ui.label(f"{p.get('pocet_radku', 0)} řádků") \
+                        .classes("text-sm text-gray-500")
+                    ui.label(f"{p.get('zadavatel_jmeno') or ''} · "
+                             f"{_dt_cz(p.get('datum_zadani'))}") \
+                        .classes("text-xs text-gray-400")
+
+
+def _nc_detail(pid, user_id, user_name, prava):
+    p = _nc_pripad(pid)
+    if not p or (not _nc_vidi_vse(prava) and p.get("zadavatel_id") != user_id):
+        app.storage.user["ncovozel_detail"] = None
+        if p:
+            ui.notify("K této žádosti nemáte oprávnění.", type="warning")
+        _refresh()
+        return
+    je_office = _nc_office(prava)
+    je_spravce = _je_spravce(prava)
+    je_ctenar = _nc_ctenar(prava) and not je_office
+    je_vlastnik = p.get("zadavatel_id") == user_id and not je_ctenar
+    stav = p.get("stav")
+    radky = _nc_nacti_radky(pid)
+    popis_druhu = NC_DRUHY.get(p.get("druh"), ("—",))[0]
+
+    # ── Hlavička ────────────────────────────────────────────────────────────
+    with ui.row().classes("w-full items-center gap-3 mb-2 flex-wrap"):
+        ui.button(icon="arrow_back", on_click=lambda: _nc_otevri(None)) \
+            .props("flat round color=grey-7").tooltip("Zpět na seznam")
+        ui.label(f"{p.get('cislo')}" + (f" · {p.get('nazev')}" if p.get("nazev") else "")) \
+            .classes("text-xl font-bold text-gray-800")
+        _nc_badge_druh(p.get("druh"))
+        _nc_badge_stav(stav)
+        ui.space()
+        ui.label(f"{p.get('pocet_radku', 0)} řádků").classes("text-sm text-gray-500")
+
+        def _stahni_original():
+            nazev, data = _nc_original(pid)
+            if not data:
+                ui.notify("Nahraný soubor není k dispozici.", type="warning")
+                return
+            ui.download(bytes(data), nazev or f"nc_{p.get('cislo')}.xlsx")
+        ui.button("Nahraný soubor", icon="file_download", on_click=_stahni_original) \
+            .props("outline no-caps").classes("text-emerald-700 font-semibold rounded-lg") \
+            .tooltip("Originál tabulky, kterou nahrál žadatel — beze změny.")
+
+        # Export do skladu 6 — jen Office nákup a správce (čtenář nesmí nic).
+        if je_office:
+            def _export():
+                dlg = ui.dialog()
+                with dlg, ui.card().classes("w-96"):
+                    ui.label("Export pro nahrání do skladu 6") \
+                        .classes("text-lg font-semibold")
+                    ui.label("Vyexportuje se tabulka žádosti ve tvaru vzoru „Office "
+                             "stáhne“ (list „IC“, 15 sloupců).") \
+                        .classes("text-sm text-gray-600")
+                    sel_fmt = ui.select({k: v[0] for k, v in SKLAD_FORMATY.items()},
+                                        value="xlsx", label="Formát souboru") \
+                        .props("outlined dense").classes("w-full") \
+                        .tooltip("Starší importy (skladový systém na Excelu 2003) "
+                                 "neumí .xlsx — pak zvolte některou .xls variantu.")
+
+                    def _stahni():
+                        try:
+                            data, pripona, mime = _nc_export_soubor(
+                                radky, sel_fmt.value or "xlsx")
+                        except Exception as e:
+                            # nejčastěji chybějící xlwt na serveru nebo limit řádků
+                            ui.notify(f"Export selhal: {e}", type="negative", timeout=10000)
+                            return
+                        dlg.close()
+                        _nc_zapis_historie(pid, "Export do skladu", user_name,
+                                           f"formát {sel_fmt.value or 'xlsx'}")
+                        intranet_logger.log_activity(
+                            user_name, "Cenopřípad",
+                            f"NC OVOZEL: export {p.get('cislo')} do skladu "
+                            f"({sel_fmt.value or 'xlsx'}, {len(radky)} řádků)")
+                        ui.download.content(
+                            data, f"NC_OVOZEL_{p.get('cislo')}_do_skladu.{pripona}", mime)
+
+                    with ui.row().classes("justify-end w-full"):
+                        ui.button("Zrušit", on_click=dlg.close).props("flat no-caps")
+                        ui.button("Stáhnout", on_click=_stahni).props("no-caps")
+                dlg.open()
+            ui.button("Export do skladu", icon="warehouse", on_click=_export) \
+                .props("outline no-caps").classes("text-teal-700 font-semibold rounded-lg") \
+                .tooltip("Soubor pro import do skladu 6 — stejný formát jako u IND cen.")
+
+        if je_spravce:
+            def _smaz_dialog():
+                with ui.dialog() as dlg, ui.card().classes("p-4"):
+                    ui.label(f"Nevratně smazat žádost {p.get('cislo')}?") \
+                        .classes("font-medium")
+                    ui.label("Smaže se žádost, řádky, historie i nahraný soubor.") \
+                        .classes("text-sm text-gray-500")
+
+                    def _potvrd():
+                        ok, err = _nc_smaz(pid)
+                        dlg.close()
+                        if ok:
+                            intranet_logger.log_activity(
+                                user_name, "Cenopřípad",
+                                f"NC OVOZEL: smazána žádost {p.get('cislo')}")
+                            ui.notify(f"Žádost {p.get('cislo')} smazána.", type="warning")
+                            _nc_otevri(None)
+                        else:
+                            ui.notify(err or "Smazání selhalo.", type="negative")
+                    with ui.row().classes("w-full justify-end gap-2 mt-2"):
+                        ui.button("Zrušit", on_click=dlg.close).props("flat no-caps")
+                        ui.button("Smazat", icon="delete_forever", on_click=_potvrd) \
+                            .props("unelevated no-caps").classes("bg-red-600 text-white")
+                dlg.open()
+            ui.button("Smazat", icon="delete", on_click=_smaz_dialog) \
+                .props("flat no-caps").classes("text-red-600")
+
+    # ── Důvod + vrácení k opravě ────────────────────────────────────────────
+    with ui.card().classes("w-full p-4 rounded-xl shadow-sm mb-3 gap-1"):
+        ui.label(f"Důvod žádosti · {popis_druhu}") \
+            .classes("text-sm font-bold text-gray-700")
+        ui.label(p.get("duvod") or "—").classes("text-sm text-gray-800 whitespace-pre-wrap")
+        ui.label(f"Podal: {p.get('zadavatel_jmeno') or '—'} · "
+                 f"{_dt_cz(p.get('datum_zadani'))} · soubor: {p.get('soubor_nazev') or '—'}") \
+            .classes("text-xs text-gray-400 mt-1")
+        if p.get("poznamka"):
+            ui.label(f"↩︎ Vráceno k opravě: {p['poznamka']}") \
+                .classes("text-sm text-orange-700 font-medium mt-2 whitespace-pre-wrap")
+
+    # ── Řádky tabulky ───────────────────────────────────────────────────────
+    grid_rows = [{"poradi": r.get("poradi"), "skupina": r.get("skupina") or "",
+                  "klic": r.get("klic") or "",
+                  "datumod": _nc_datum_cz(r.get("datumod")),
+                  "datumdo": _nc_datum_cz(r.get("datumdo")),
+                  "slevakc": _castka(r.get("slevakc")),
+                  "poznamka": r.get("poznamka") or ""} for r in radky]
+    ui.label(f"Nahraná tabulka — {len(radky)} řádků").classes(
+        "text-base font-bold text-gray-800 mt-1 mb-1")
+    ui.aggrid({
+        "columnDefs": [
+            {"headerName": "#", "field": "poradi", "width": 70, "minWidth": 55},
+            {"headerName": "SKUPINA", "field": "skupina", "width": 150, "minWidth": 110},
+            {"headerName": "KLIC", "field": "klic", "width": 120, "minWidth": 90},
+            {"headerName": "DATUMOD", "field": "datumod", "width": 120, "minWidth": 95},
+            {"headerName": "DATUMDO", "field": "datumdo", "width": 120, "minWidth": 95},
+            {"headerName": "SLEVAKC", "field": "slevakc", "width": 110, "minWidth": 90,
+             "type": "rightAligned"},
+            {"headerName": "POZNAMKA", "field": "poznamka", "width": 300, "minWidth": 160},
+        ],
+        "rowData": grid_rows,
+        "defaultColDef": {"resizable": True, "sortable": True, "filter": True,
+                          "wrapHeaderText": True, "autoHeaderHeight": True,
+                          "cellDataType": False},
+        "rowHeight": 28,
+        "autoSizeStrategy": {"type": "fitGridWidth"},
+    }).classes("w-full").style(f"height: min(42vh, {60 + len(grid_rows) * 28}px)")
+
+    if not je_ctenar:
+        _nc_workflow(p, pid, stav, je_vlastnik, je_office, user_name)
+
+    # ── Průběh (cesta log) ──────────────────────────────────────────────────
+    kroky = _nc_historie(pid)
+    if kroky:
+        with ui.expansion("Průběh žádosti", icon="history") \
+                .classes("w-full mt-3 border rounded-xl"):
+            for k in kroky:
+                with ui.row().classes("w-full items-start gap-3 py-1 flex-wrap"):
+                    ui.label(_dt_cz(k.get("kdy"))).classes("text-xs text-gray-400 w-36")
+                    ui.label(k.get("akce") or "").classes("text-sm font-medium text-gray-800")
+                    ui.label(k.get("kdo") or "").classes("text-sm text-gray-500")
+                    if k.get("detail"):
+                        ui.label(k["detail"]).classes("text-sm text-gray-600 italic")
+
+
+def _nc_workflow(p, pid, stav, je_vlastnik, je_office, user_name):
+    """Akční tlačítka fronty. Bez kontroly cen a bez schvalování správcem —
+    Office buď zpracuje, nebo vrátí k opravě s důvodem; žadatel opraví a pošle zpět."""
+    cislo = p.get("cislo")
+    druh = p.get("druh")
+
+    def _hotovo(zprava):
+        ui.notify(zprava, type="positive")
+        _refresh()
+
+    with ui.row().classes("w-full gap-2 flex-wrap mt-3"):
+        # ── Žadatel — žádost vrácena k opravě ───────────────────────────────
+        if je_vlastnik and stav == "vraceno_oprava":
+            def _dialog_oprava():
+                with ui.dialog() as d, ui.card().classes("p-4 gap-3") \
+                        .style("min-width:560px; max-width:94vw"):
+                    ui.label("Opravit a odeslat zpět").classes("text-lg font-bold")
+                    ui.label(f"Co má být opraveno: {p.get('poznamka') or '—'}") \
+                        .classes("text-sm text-orange-700 whitespace-pre-wrap")
+                    duvod_in = ui.textarea("Důvod žádosti *", value=p.get("duvod") or "") \
+                        .props("outlined autogrow").classes("w-full")
+                    ui.label("Nahrajte opravenou tabulku, nebo nechte prázdné a "
+                             "odešlete jen upravený důvod.").classes("text-sm text-gray-500")
+                    drzeny = {"radky": None, "raw": None, "name": ""}
+
+                    async def _prijmi(raw, name, _nazev):
+                        radky, err = await run.cpu_bound(_nc_parse, raw, name, druh)
+                        if err:
+                            ui.notify(err, type="negative", timeout=15000)
+                            return
+                        drzeny.update(radky=radky, raw=raw, name=name)
+                        ui.notify(f"Tabulka v pořádku — {len(radky)} řádků. "
+                                  f"Potvrďte tlačítkem „Odeslat zpět“.", type="positive")
+                    _upload_panel("Opravená tabulka — nepovinné.", _prijmi)
+
+                    def _odeslat():
+                        duvod = (duvod_in.value or "").strip()
+                        if not duvod:
+                            ui.notify("Vyplňte důvod žádosti.", type="warning")
+                            return
+                        ok, err = _nc_prepis(pid, duvod, drzeny["radky"],
+                                             drzeny["raw"], drzeny["name"])
+                        if not ok:
+                            ui.notify(f"Uložení opravy selhalo: {err}", type="negative")
+                            return
+                        _nc_stav(pid, "odeslano")
+                        _nc_zapis_historie(
+                            pid, "Opraveno žadatelem", user_name,
+                            f"Nahrána opravená tabulka ({drzeny['name']})"
+                            if drzeny["radky"] else "Upraven pouze důvod")
+                        intranet_logger.log_activity(
+                            user_name, "Cenopřípad",
+                            f"NC OVOZEL: žádost {cislo} opravena a vrácena Office")
+                        _nc_mail_office(
+                            pid, f"NC OVOZEL — žádost {cislo} opravena",
+                            f"Žadatel {user_name} opravil žádost {cislo} a odeslal ji "
+                            f"zpět ke zpracování.\n\nDůvod:\n{duvod}")
+                        d.close()
+                        _hotovo("Oprava odeslána Office nákup.")
+                    with ui.row().classes("w-full justify-end gap-2"):
+                        ui.button("Zrušit", on_click=d.close).props("flat no-caps")
+                        ui.button("Odeslat zpět", icon="send", on_click=_odeslat) \
+                            .props("unelevated no-caps color=green")
+                d.open()
+
+            ui.button("Opravit a odeslat", icon="save", on_click=_dialog_oprava) \
+                .props("unelevated no-caps").classes("bg-emerald-600 text-white rounded-lg")
+
+        # ── Office nákup ────────────────────────────────────────────────────
+        if je_office and stav in ("odeslano", "vraceno_oprava"):
+            def _zpracovano():
+                _nc_stav(pid, "zpracovano")
+                _nc_zapis_historie(pid, "Zpracováno", user_name)
+                intranet_logger.log_activity(user_name, "Cenopřípad",
+                                             f"NC OVOZEL: zpracováno {cislo}")
+                _nc_mail_zadateli(p, f"NC OVOZEL — žádost {cislo} zpracována",
+                                  f"Vaše žádost o změnu NC {cislo} byla zpracována.")
+                _hotovo("Označeno jako zpracováno.")
+
+            def _vratit():
+                with ui.dialog() as d, ui.card().classes("p-4 gap-3").style("min-width:420px"):
+                    ui.label("Vrátit k opravě").classes("text-lg font-bold")
+                    pozn = ui.textarea("Důvod vrácení — co má žadatel opravit *") \
+                        .props("outlined autogrow").classes("w-full")
+
+                    def _ok():
+                        txt = (pozn.value or "").strip()
+                        if not txt:
+                            ui.notify("Vyplňte důvod vrácení.", type="warning")
+                            return
+                        _nc_stav(pid, "vraceno_oprava", poznamka=txt)
+                        _nc_zapis_historie(pid, "Vráceno k opravě", user_name, txt)
+                        intranet_logger.log_activity(
+                            user_name, "Cenopřípad",
+                            f"NC OVOZEL: {cislo} vráceno k opravě — {txt}")
+                        _nc_mail_zadateli(
+                            p, f"NC OVOZEL — žádost {cislo} vrácena k opravě",
+                            f"Vaše žádost {cislo} byla vrácena k opravě.\n\n"
+                            f"Důvod: {txt}")
+                        d.close()
+                        _hotovo("Vráceno žadateli.")
+                    with ui.row().classes("w-full justify-end gap-2"):
+                        ui.button("Zrušit", on_click=d.close).props("flat no-caps")
+                        ui.button("Vrátit", on_click=_ok) \
+                            .props("unelevated no-caps color=orange")
+                d.open()
+
+            ui.button("Zpracováno", icon="task_alt", on_click=_zpracovano) \
+                .props("unelevated no-caps").classes("bg-green-600 text-white rounded-lg")
+            ui.button("Vrátit k opravě", icon="undo", on_click=_vratit) \
+                .props("outline no-caps color=orange")
+
+        # Zpracovanou žádost může Office vrátit zpět do fronty (překlep, doplnění).
+        if je_office and stav == "zpracovano":
+            def _znovu():
+                _nc_stav(pid, "odeslano")
+                _nc_zapis_historie(pid, "Vráceno do fronty", user_name)
+                intranet_logger.log_activity(user_name, "Cenopřípad",
+                                             f"NC OVOZEL: {cislo} vráceno do fronty")
+                _hotovo("Žádost je zpět ve frontě.")
+            ui.button("Vrátit do fronty", icon="restart_alt", on_click=_znovu) \
+                .props("outline no-caps color=blue")
+
+
 def vykresli_cenopripad(user_id, user_name, vsechna_prava):
     """Vstupní bod modulu — vytvoří per-klient refreshable a vykreslí ho.
 
@@ -7469,7 +8503,7 @@ def vykresli_cenopripad(user_id, user_name, vsechna_prava):
     # Odkaz z e-mailu „…/cenopripad?ovozel=<id>" / „?oprava=<id>" otevře rovnou daný
     # případ. Čte se jen tady (ne v `_vykresli_cenopripad`), aby návrat na seznam po
     # `_refresh()` držel.
-    for klic in ("ovozel", "oprava"):
+    for klic in ("ovozel", "oprava", "ncovozel"):
         try:
             z_emailu = context.client.request.query_params.get(klic)
         except Exception:
@@ -7491,7 +8525,8 @@ def _vykresli_cenopripad(user_id, user_name, vsechna_prava):
     inicializace_cenopripad_db()
     typy = _viditelne_typy(vsechna_prava)
     pohled = app.storage.user.get("cenopripad_pohled")
-    if pohled not in typy and pohled not in ("import", "letaky", "ovozel", "oprava"):
+    if pohled not in typy and pohled not in ("import", "letaky", "ovozel", "oprava",
+                                            "ncovozel"):
         pohled = None
     if pohled == "import" and not _vidi_import(vsechna_prava):
         pohled = None
@@ -7500,6 +8535,8 @@ def _vykresli_cenopripad(user_id, user_name, vsechna_prava):
     if pohled == "ovozel" and not _ovozel_pristup(vsechna_prava):
         pohled = None
     if pohled == "oprava" and not _oprava_pristup(vsechna_prava):
+        pohled = None
+    if pohled == "ncovozel" and not _nc_pristup(vsechna_prava):
         pohled = None
 
     with ui.row().classes("w-full items-center gap-3 mb-6"):
@@ -7520,6 +8557,8 @@ def _vykresli_cenopripad(user_id, user_name, vsechna_prava):
                 podtitul = "Kontrola cen OVOZEL"
             elif pohled == "oprava":
                 podtitul = "Oprava cen"
+            elif pohled == "ncovozel":
+                podtitul = "NC OVOZEL — žádosti o změnu nákupní ceny"
             ui.label(podtitul).classes("text-sm text-gray-500")
         ui.space()
         if pohled == "porovnani":   # IND ceny — vzorový formulář ke stažení
@@ -7529,7 +8568,7 @@ def _vykresli_cenopripad(user_id, user_name, vsechna_prava):
                 .tooltip("Stáhne vzorový formulář pro individuální ceny (.xlsx).")
         # Generický manuál Cenopřípadu (ind. ceny aj.) — NE v „Kontrolní data letáků"
         # (ta má vlastní obsah; ind. ceny a letáky tak nesdílí stejný manuál).
-        if pohled not in ("letaky", "ovozel", "oprava"):
+        if pohled not in ("letaky", "ovozel", "oprava", "ncovozel"):
             ui.button("Manuál", icon="menu_book", on_click=_dialog_manual) \
                 .props("outline no-caps") \
                 .classes("text-emerald-700 font-semibold rounded-lg") \
@@ -7547,13 +8586,17 @@ def _vykresli_cenopripad(user_id, user_name, vsechna_prava):
     if pohled == "oprava":
         _oprava_view(user_id, user_name, vsechna_prava)
         return
+    if pohled == "ncovozel":
+        _nc_view(user_id, user_name, vsechna_prava)
+        return
     if pohled in typy:
         _sub_view_typ(pohled, user_id, user_name, vsechna_prava)
         return
 
     if not typy and not _vidi_import(vsechna_prava) \
             and not _letaky_pristup(vsechna_prava) and not _ovozel_pristup(vsechna_prava) \
-            and not _oprava_pristup(vsechna_prava):
+            and not _oprava_pristup(vsechna_prava) \
+            and not _nc_pristup(vsechna_prava):
         with ui.column().classes("items-center py-20 gap-3 w-full"):
             ui.icon("lock", size="4rem", color="grey-4")
             ui.label("Nemáte přístup k žádné dlaždici modulu Cenopřípad.") \
@@ -7581,6 +8624,12 @@ def _vykresli_cenopripad(user_id, user_name, vsechna_prava):
                 _nav("oprava")
             _tile("🧾", "Oprava cen", "formulář + fronta", "border-orange-300",
                   _otevri_oprava)
+        if _nc_pristup(vsechna_prava):
+            def _otevri_nc():
+                app.storage.user["ncovozel_detail"] = None
+                _nav("ncovozel")
+            _tile("🥬", "NC OVOZEL", "import cen / delist", "border-green-400",
+                  _otevri_nc)
         for klic in typy:
             c = TYPY[klic]
             _tile(c["emoji"], c["nazev"], "nákup" if c["oddeleni"] == "nakup" else "obchod",
