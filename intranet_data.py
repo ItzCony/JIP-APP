@@ -468,6 +468,7 @@ MODULY = {
     'cenopripad_zapnuty':    ('🏷️ Modul Cenopřípad',             'Cenopřípad'),
     'asm_zapnuty':           ('📝 Modul Formuláře ASM',          'Formuláře ASM'),
     'lupa_zapnuty':          ('🔍 Modul Lupou na obchod',        'Lupou na obchod'),
+    'bonusy_ao_zapnuty':     ('💰 Modul Bonusy AO',              'Bonusy AO'),
     'schuzky_zapnuty':       ('🗓️ Modul Schůzky s vedoucími',    'Schůzky s vedoucími'),
     # Má i vlastní přepínač na záložce Narozeniny v Nastavení portálu.
     'narozeniny_zapnuty':    ('Modul Narozeniny',               'Narozeniny'),

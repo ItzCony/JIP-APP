@@ -637,6 +637,11 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
         and intranet_lupa.ma_pristup(user_id, vsechna_prava)
     )
 
+    # Bonusy AO: zatím jen superadmin.
+    ma_pristup_bonusy_ao = (
+        'vse' in vsechna_prava and nastaveni.get('bonusy_ao_zapnuty', True)
+    )
+
     nazev_kviz       = "Zkouškový Kvíz"
     nazev_dochazka   = "Docházka a Volno"
     nazev_veletrh    = "Plán Veletrh 2027"
@@ -754,6 +759,8 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
         _d('asm', ma_pristup_asm, '📝', 'Formuláře ASM', '#6366f1', _akce('asm', 'asm_pohled')),
         _d('lupa', ma_pristup_lupa, '🔍', 'Lupou na obchod', '#a855f7',
            _akce('lupa', f'lupa_pohled_{user_id}')),
+        _d('bonusy_ao', ma_pristup_bonusy_ao, '💰', 'Bonusy AO', '#eab308',
+           _akce('bonusy_ao')),
     ) if d]
 
     podle_klice = {d['klic']: d for d in dlazdice}

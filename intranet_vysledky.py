@@ -1141,9 +1141,18 @@ def nacti_porovnani(pobocka: str, aktualni_rok: int) -> list[dict]:
     return _porovnani_z_klicu(klice, aktualni_rok)
 
 
-def _porovnani_z_klicu(klice: list[str], aktualni_rok: int) -> list[dict]:
+def _mesice_db(mesice: list[int] | None) -> list[str]:
+    """Čísla měsíců (1-12) → DB sloupce; prázdné/None = celý rok."""
+    if not mesice:
+        return list(MESICE_DB)
+    return [db for i, db in enumerate(MESICE_DB, 1) if i in mesice]
+
+
+def _porovnani_z_klicu(klice: list[str], aktualni_rok: int,
+                       mesice: list[int] | None = None) -> list[dict]:
     """Sestaví meziroční porovnání podrobných nákladů sečtených přes ``klice``
-    (datové klíče poboček). Spojuje aktuální a minulý rok podle (předpis, název)."""
+    (datové klíče poboček). Spojuje aktuální a minulý rok podle (předpis, název).
+    ``mesice`` (1-12) zúží součty „Celkem" jen na vybrané období; prázdné = celý rok."""
     minuly_rok = aktualni_rok - 1
     akt  = _slouc_naklady_vice_pobocek(klice, aktualni_rok)
     prev = _slouc_naklady_vice_pobocek(klice, minuly_rok)
@@ -1165,8 +1174,9 @@ def _porovnani_z_klicu(klice: list[str], aktualni_rok: int) -> list[dict]:
             row[f'akt_{m}']  = av
             row[f'min_{m}']  = pv
             row[f'diff_{m}'] = av - pv
-        row['akt_celkem']  = sum(row[f'akt_{m}']  for m in MESICE_DB)
-        row['min_celkem']  = sum(row[f'min_{m}']  for m in MESICE_DB)
+        vyb = _mesice_db(mesice)
+        row['akt_celkem']  = sum(row[f'akt_{m}']  for m in vyb)
+        row['min_celkem']  = sum(row[f'min_{m}']  for m in vyb)
         row['diff_celkem'] = row['akt_celkem'] - row['min_celkem']
         result.append(row)
     return result
@@ -2040,8 +2050,10 @@ _KOMENTAR_TOOLTIP = (
 )
 
 
-def _col_defs_porovnani(aktualni_rok: int) -> list[dict]:
+def _col_defs_porovnani(aktualni_rok: int, mesice: list[int] | None = None) -> list[dict]:
+    """``mesice`` (1-12) = zobrazit jen vybrané měsíce; prázdné = celý rok."""
     minuly_rok = aktualni_rok - 1
+    vyb_db = _mesice_db(mesice)
     cols: list[dict] = [
         {'headerName': 'Předpis', 'field': 'ucetni_predpis', 'pinned': 'left', 'width': 120, 'minWidth': _tn_minw('Předpis'),
          'cellStyle': {'fontFamily': 'monospace', 'fontSize': '12px'},
@@ -2051,6 +2063,8 @@ def _col_defs_porovnani(aktualni_rok: int) -> list[dict]:
          'sortable': True},
     ]
     for nazev, db in zip(MESICE_NAZVY, MESICE_DB):
+        if db not in vyb_db:
+            continue
         cols.append({
             'headerName': nazev,
             'children': [
@@ -3995,11 +4009,16 @@ def _vykresli_prehled(user_id: int, user_name: str, pristupne_pobocky: list[str]
                 if _ddm is not None:
                     app.storage.user[fk_ao_m] = list(_ddm)
 
+            def _ao_filtr() -> tuple[list[str], list[int]]:
+                vyb = app.storage.user.get(fk_ao_p) or []
+                return (
+                    [p for p in pristupne_pobocky if p in vyb] if vyb else pristupne_pobocky,
+                    sorted(m for m in (app.storage.user.get(fk_ao_m) or []) if 1 <= m <= 12),
+                )
+
             @ui.refreshable
             def _ao_grid():
-                vyb = app.storage.user.get(fk_ao_p) or []
-                pob = [p for p in pristupne_pobocky if p in vyb] if vyb else pristupne_pobocky
-                sel_m = sorted(m for m in (app.storage.user.get(fk_ao_m) or []) if 1 <= m <= 12)
+                pob, sel_m = _ao_filtr()
                 ao_rows, ao_total, r_old, r_new = nacti_prehled_ao(roky, pob, sel_m)
                 ui.label(
                     f'Porovnání: {r_new} × {r_old} · Měsíce: '
@@ -4097,6 +4116,18 @@ def _vykresli_prehled(user_id: int, user_name: str, pristupne_pobocky: list[str]
                     _ao_grid.refresh()
                 w_ao_p.on_value_change(_zm_ao_p)
 
+                def _exp_ao(_):
+                    pob, sel_m = _ao_filtr()
+                    return _exp_stahni(
+                        _export_prehled_ao_xlsx, (roky, pob, sel_m),
+                        f'Prehled_AO_{datetime.date.today():%Y-%m-%d}.xlsx', user_name,
+                        'Export KT „Přehled AO" do XLSX'
+                        + (f' (měsíce {", ".join(str(m) for m in sel_m)})' if sel_m else ''),
+                    )
+                ui.button('Export XLSX', icon='download', on_click=_exp_ao) \
+                    .props('flat dense color=green no-caps').classes('text-xs') \
+                    .tooltip('Stáhne tabulku 1:1 vč. formátů a barev (dle nastaveného filtru)')
+
                 if je_ao:
                     _ao_default_ovladani()
             _ao_grid()
@@ -4108,6 +4139,7 @@ def _vykresli_prehled(user_id: int, user_name: str, pristupne_pobocky: list[str]
         with ui.tab_panel('podrobne'):
             fk_pn_p = f'prehled_podrobne_pobocky_{user_id}'
             fk_pn_r = f'prehled_podrobne_rok_{user_id}'
+            fk_pn_m = f'prehled_podrobne_mesice_{user_id}'
 
             pn_roky = nacti_vysledky_roky()
             _akt_rok_pn = datetime.datetime.now().year
@@ -4137,8 +4169,10 @@ def _vykresli_prehled(user_id: int, user_name: str, pristupne_pobocky: list[str]
                 rok = app.storage.user.get(fk_pn_r)
                 if rok not in pn_roky:
                     rok = pn_rok_default
+                mes = sorted(m for m in (app.storage.user.get(fk_pn_m) or [])
+                             if 1 <= m <= 12)
                 minuly = rok - 1
-                rows = _porovnani_z_klicu(pob, rok)
+                rows = _porovnani_z_klicu(pob, rok, mes)
                 vsechny = (not vyb) or len(pob) == len(vsechny_klice_pn)
                 pob_txt = ('všechny pobočky' if vsechny else ', '.join(
                     labely_pn.get(k, k).lstrip('↳ ') for k in pob))
@@ -4146,6 +4180,9 @@ def _vykresli_prehled(user_id: int, user_name: str, pristupne_pobocky: list[str]
                     ui.icon('compare_arrows', color='teal', size='sm')
                     ui.label(f'Porovnání {rok} vs {minuly}') \
                         .classes('text-sm font-semibold text-gray-700')
+                    ui.label('Období: ' + ('celý rok' if not mes
+                                           else ', '.join(MESICE_NAZVY[m - 1] for m in mes))) \
+                        .classes('text-xs text-gray-500')
                     ui.label(f'Pobočky: {pob_txt}').classes('text-xs text-gray-400 italic')
                     ui.label('Δ = Aktuální − Minulý · 🔴 nárůst  🟢 pokles') \
                         .classes('text-xs text-gray-500')
@@ -4155,7 +4192,7 @@ def _vykresli_prehled(user_id: int, user_name: str, pristupne_pobocky: list[str]
                         .classes('text-gray-400 italic py-4')
                     return
                 grid = ui.aggrid({
-                    'columnDefs': _col_defs_porovnani(rok),
+                    'columnDefs': _col_defs_porovnani(rok, mes),
                     'rowData': rows,
                     'pinnedBottomRowData': [_soucet_porovnani(rows)],
                     'defaultColDef': {'resizable': True, 'sortable': False,
@@ -4167,8 +4204,24 @@ def _vykresli_prehled(user_id: int, user_name: str, pristupne_pobocky: list[str]
                     ':onGridSizeChanged': _AUTOSIZE_FIT,
                 }).classes('w-full').style(_GRID_STYLE)
                 with filtr_slot:
-                    _pridej_filtr_nazvu(rows, grid, _soucet_porovnani,
-                                        f'podrobne_naklady_vse_{rok}', s_exportem=False)
+                    zobrazene = _pridej_filtr_nazvu(rows, grid, _soucet_porovnani,
+                                                    f'podrobne_naklady_vse_{rok}',
+                                                    s_exportem=False)
+
+                    def _exp_pn(_):
+                        return _exp_stahni(
+                            _export_podrobne_xlsx, (zobrazene(), rok, mes),
+                            f'Podrobne_naklady_{rok}_{datetime.date.today():%Y-%m-%d}.xlsx',
+                            user_name,
+                            f'Export podrobných nákladů {rok} vs {rok - 1} do XLSX '
+                            f'({pob_txt}'
+                            + ('' if not mes
+                               else ', měsíce ' + ', '.join(str(m) for m in mes)) + ')',
+                        )
+                    ui.button('Export XLSX', icon='download', on_click=_exp_pn) \
+                        .props('flat dense color=green no-caps').classes('text-xs') \
+                        .tooltip('Stáhne tabulku 1:1 vč. formátů a barev '
+                                 '(respektuje vybraný rok, období, pobočky i filtr názvu)')
 
             pob_opts_pn = {k: labely_pn[k] for k in vsechny_klice_pn}
             rok_opts_pn = {r: str(r) for r in pn_roky}
@@ -4180,6 +4233,12 @@ def _vykresli_prehled(user_id: int, user_name: str, pristupne_pobocky: list[str]
                     label='Rok',
                 ).props('dense outlined options-dense').style('min-width: 120px') \
                  .tooltip('Porovnává se vybraný rok proti předchozímu')
+                w_pn_m = ui.select(
+                    {i: MESICE_NAZVY[i - 1] for i in range(1, 13)},
+                    value=list(app.storage.user.get(fk_pn_m) or []),
+                    label='Období', multiple=True,
+                ).props('dense outlined options-dense use-chips').style('min-width: 200px') \
+                 .tooltip('Prázdné = celý rok; vybrané měsíce platí i pro export XLSX')
                 # Bez `use-chips` – při výběru všech poboček by se vypsal dlouhý
                 # seznam chipsů. Místo toho kompaktní `display-value` (viz _pn_stav).
                 w_pn_p = ui.select(
@@ -4219,6 +4278,11 @@ def _vykresli_prehled(user_id: int, user_name: str, pristupne_pobocky: list[str]
                     app.storage.user[fk_pn_r] = e.value
                     _podrobne_grid.refresh()
                 w_pn_r.on_value_change(_zm_pn_r)
+
+                def _zm_pn_m(e):
+                    app.storage.user[fk_pn_m] = list(e.value) if e.value else []
+                    _podrobne_grid.refresh()
+                w_pn_m.on_value_change(_zm_pn_m)
 
                 def _zm_pn_p(e):
                     app.storage.user[fk_pn_p] = list(e.value) if e.value else []
@@ -4786,8 +4850,13 @@ def vykresli_vysledky(user_id: int, user_name: str, vsechna_prava: list):
                         prijemci = _email_ref.get('prijemci') or []
                         if not prijemci:
                             return
-                        ui.notify('Odesílám e-maily…', type='ongoing', position='top-right')
-                        sent, fail = await asyncio.to_thread(_rozesli_aktualizace_sync, prijemci)
+                        pozn = ui.notification('Odesílám e-maily…', spinner=True,
+                                               timeout=None, position='top-right')
+                        try:
+                            sent, fail = await asyncio.to_thread(
+                                _rozesli_aktualizace_sync, prijemci)
+                        finally:
+                            pozn.dismiss()
                         intranet_logger.log_activity(
                             user_name, 'Výsledky poboček',
                             f'Rozeslány e-maily o aktualizaci: {sent} odesláno, {fail} chyb')
@@ -5340,7 +5409,7 @@ def _vykresli_podrobne_naklady(
                 with ui.tab_panel(t):
                     tbl()
             with ui.tab_panel('por'):
-                _tabulka_porovnani(pobocka, aktualni_rok, je_ucetni)
+                _tabulka_porovnani(pobocka, aktualni_rok, je_ucetni, user_name)
             for i, (_, klic) in enumerate(vsechny):
                 t = 'min' if i == 0 else f'min_{i}'
                 with ui.tab_panel(t):
@@ -5363,7 +5432,7 @@ def _vykresli_podrobne_naklady(
                 _tabulka_aktualni(pobocka, minuly_rok, user_id, user_name, je_ucetni,
                                   zamky_aktivni=False, povolit_pridat=False)
             with ui.tab_panel('por'):
-                _tabulka_porovnani(pobocka, aktualni_rok, je_ucetni)
+                _tabulka_porovnani(pobocka, aktualni_rok, je_ucetni, user_name)
 
 
 def _hist_field_label(pole: str) -> str:
@@ -5785,10 +5854,11 @@ def _tabulka_aktualni(pobocka: str, rok: int, user_id: int, user_name: str, je_u
             ui.label('Pouze pro čtení.').classes('text-xs text-gray-400 italic')
 
 
-@refreshable_na_klienta
-def _tabulka_porovnani(pobocka: str, aktualni_rok: int, je_ucetni: bool = False):
-    rows       = nacti_porovnani(pobocka, aktualni_rok)
-    minuly_rok = aktualni_rok - 1
+def _porovnani_rows(pobocka: str, aktualni_rok: int, je_ucetni: bool = False,
+                    mesice: list[int] | None = None) -> list[dict]:
+    """Řádky porovnání let pro pobočku – se zohledněním zámků (jako v gridu).
+    ``mesice`` (1-12) zúží součty „Celkem" na vybrané období; prázdné = celý rok."""
+    rows = nacti_porovnani(pobocka, aktualni_rok)
     if not je_ucetni:
         # Zámky se uplatňují jen na aktuální rok; minulý rok (historická data)
         # je bez zámků a zobrazuje se celý.
@@ -5802,27 +5872,79 @@ def _tabulka_porovnani(pobocka: str, aktualni_rok: int, je_ucetni: bool = False)
                 r['akt_celkem']  = sum(r.get(f'akt_{m}', 0) for m in MESICE_DB)
                 r['min_celkem']  = sum(r.get(f'min_{m}', 0) for m in MESICE_DB)
                 r['diff_celkem'] = r['akt_celkem'] - r['min_celkem']
+    if mesice:
+        vyb = _mesice_db(mesice)
+        for r in rows:
+            r['akt_celkem']  = sum(_s(r.get(f'akt_{m}', 0)) for m in vyb)
+            r['min_celkem']  = sum(_s(r.get(f'min_{m}', 0)) for m in vyb)
+            r['diff_celkem'] = r['akt_celkem'] - r['min_celkem']
+    return rows
+
+
+@refreshable_na_klienta
+def _tabulka_porovnani(pobocka: str, aktualni_rok: int, je_ucetni: bool = False,
+                       user_name: str = ''):
+    minuly_rok = aktualni_rok - 1
+    fk_mes     = f'podrobne_por_mesice_{pobocka}'
+    pob_txt    = _POBOCKY_EXCEL_REVERSE.get(pobocka, pobocka)
     with ui.column().classes('w-full gap-2'):
+
+        @ui.refreshable
+        def _por_blok():
+            mes = sorted(m for m in (app.storage.user.get(fk_mes) or [])
+                         if 1 <= m <= 12)
+            rows = _porovnani_rows(pobocka, aktualni_rok, je_ucetni, mes)
+            with ui.row().classes('items-center gap-3 mb-1 flex-wrap'):
+                ui.icon('compare_arrows', color='teal', size='sm')
+                ui.label(f'Porovnání {aktualni_rok} vs {minuly_rok}').classes('text-sm font-semibold text-gray-700')
+                ui.label('Období: ' + ('celý rok' if not mes
+                                       else ', '.join(MESICE_NAZVY[m - 1] for m in mes))) \
+                    .classes('text-xs text-gray-500')
+                ui.label('Δ = Aktuální rok − Minulý rok').classes('text-xs text-gray-500')
+                ui.label('🔴 nárůst nákladů  🟢 pokles nákladů').classes('text-xs text-gray-500')
+                filtr_slot = ui.row().classes('items-center gap-1 ml-auto')
+            grid = ui.aggrid({
+                'columnDefs': _col_defs_porovnani(aktualni_rok, mes),
+                'rowData': rows,
+                'pinnedBottomRowData': [_soucet_porovnani(rows)],
+                'defaultColDef': {'resizable': True, 'sortable': False, 'wrapHeaderText': True, 'autoHeaderHeight': True},
+                'rowHeight': 34,
+                'suppressMovableColumns': True,
+                ':getRowStyle': _PINNED_BOTTOM_STYLE,
+                ':onFirstDataRendered': _AUTOSIZE_FIT,
+                ':onGridSizeChanged': _AUTOSIZE_FIT,
+            }).classes('w-full').style(_GRID_STYLE)
+            with filtr_slot:
+                zobrazene = _pridej_filtr_nazvu(rows, grid, _soucet_porovnani,
+                                                f'naklady_porovnani_{pobocka}_{aktualni_rok}',
+                                                s_exportem=False)
+
+                def _exp_pn(_):
+                    return _exp_stahni(
+                        _export_podrobne_xlsx, (zobrazene(), aktualni_rok, mes),
+                        f'Podrobne_naklady_{_exp_slug(pob_txt)}_{aktualni_rok}'
+                        f'_{datetime.date.today():%Y-%m-%d}.xlsx',
+                        user_name,
+                        f'Export podrobných nákladů {aktualni_rok} vs {minuly_rok} '
+                        f'do XLSX ({pob_txt}'
+                        + ('' if not mes
+                           else ', měsíce ' + ', '.join(str(m) for m in mes)) + ')',
+                    )
+                ui.button('Export XLSX', icon='download', on_click=_exp_pn) \
+                    .props('flat dense color=green no-caps').classes('text-xs') \
+                    .tooltip('Stáhne tabulku 1:1 vč. formátů a barev '
+                             '(respektuje období i filtr názvu)')
+
         with ui.row().classes('items-center gap-3 mb-1 flex-wrap'):
-            ui.icon('compare_arrows', color='teal', size='sm')
-            ui.label(f'Porovnání {aktualni_rok} vs {minuly_rok}').classes('text-sm font-semibold text-gray-700')
-            ui.label('Δ = Aktuální rok − Minulý rok').classes('text-xs text-gray-500')
-            ui.label('🔴 nárůst nákladů  🟢 pokles nákladů').classes('text-xs text-gray-500')
-            filtr_slot = ui.row().classes('items-center gap-1 ml-auto')
-        grid = ui.aggrid({
-            'columnDefs': _col_defs_porovnani(aktualni_rok),
-            'rowData': rows,
-            'pinnedBottomRowData': [_soucet_porovnani(rows)],
-            'defaultColDef': {'resizable': True, 'sortable': False, 'wrapHeaderText': True, 'autoHeaderHeight': True},
-            'rowHeight': 34,
-            'suppressMovableColumns': True,
-            ':getRowStyle': _PINNED_BOTTOM_STYLE,
-            ':onFirstDataRendered': _AUTOSIZE_FIT,
-            ':onGridSizeChanged': _AUTOSIZE_FIT,
-        }).classes('w-full').style(_GRID_STYLE)
-        with filtr_slot:
-            _pridej_filtr_nazvu(rows, grid, _soucet_porovnani,
-                                f'naklady_porovnani_{pobocka}_{aktualni_rok}')
+            def _zm_mes(e):
+                app.storage.user[fk_mes] = list(e.value) if e.value else []
+                _por_blok.refresh()
+            ui.select({i: MESICE_NAZVY[i - 1] for i in range(1, 13)},
+                      value=list(app.storage.user.get(fk_mes) or []),
+                      label='Období', multiple=True, on_change=_zm_mes) \
+                .props('dense outlined options-dense use-chips').style('min-width: 280px') \
+                .tooltip('Prázdné = celý rok. Výběr zúží sloupce, součty Celkem i export.')
+        _por_blok()
 
 
 # ─── Obraty / Zisk – UI ───────────────────────────────────────────────────────
@@ -6912,6 +7034,206 @@ def _export_zr_xlsx(pobocky: list[str], roky: list[int]) -> bytes:
     return buf.getvalue()
 
 
+# ── Export KT „Přehled AO" 1:1 (formáty, barvy, podbarvení dle gridu) ────────
+# Sloupce, formáty i podmíněné formátování se odvozují přímo z `_col_defs_prehled_ao`,
+# takže export zůstane shodný s gridem i po změně definic sloupců.
+
+def _ao_x_fmt(field: str) -> str:
+    """Číselný formát 1:1 s gridem (nula i prázdno se vykreslí jako „—")."""
+    if field.endswith('_diff_pct'):
+        return '0.0%;-0.0%;"—"'
+    if field.startswith('naklad_kg_'):
+        return '#,##0.00;-#,##0.00;"—"'
+    return '#,##0;-#,##0;"—"'
+
+
+def _ao_x_cf(js: str) -> tuple | None:
+    """Z JS cellStyle sloupce odvodí CF barvy: ((bg,fg) pro >0, (bg,fg) pro <0)."""
+    good = (_AO_CF_GOOD_BG.lstrip('#'), _AO_CF_GOOD_FG.lstrip('#'))
+    bad = (_AO_CF_BAD_BG.lstrip('#'), _AO_CF_BAD_FG.lstrip('#'))
+    if f"if(v>0)return{{backgroundColor:'{_AO_CF_GOOD_BG}'" in js:
+        return good, bad
+    if f"if(v>0)return{{backgroundColor:'{_AO_CF_BAD_BG}'" in js:
+        return bad, good
+    return None
+
+
+def _x_hlavicka(ws, coldefs: list[dict], font, ram=None, vypln=None) -> list[tuple]:
+    """Zapíše 2řádkovou hlavičku dle grid columnDefs: skupina se sloučí přes své
+    podsloupce, sloupec bez skupiny přes oba řádky. Nastaví šířky (px/7) a vrátí
+    [(field, cellStyle, šířka px)] v pořadí gridu."""
+    from openpyxl.styles import Alignment
+    from openpyxl.utils import get_column_letter
+    stred = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    sloupce: list[tuple] = []
+    ci = 1
+    for cd in coldefs:
+        deti = cd.get('children')
+        for ch in (deti or [cd]):
+            ws.cell(2 if deti else 1, ci, ch['headerName'])
+            sloupce.append((ch.get('field'), ch.get(':cellStyle') or ch.get('cellStyle'),
+                            ch.get('width', 160)))
+            ci += 1
+        zac = ci - len(deti or [cd])
+        if deti:
+            ws.merge_cells(start_row=1, start_column=zac, end_row=1, end_column=ci - 1)
+            ws.cell(1, zac, cd['headerName'])
+        else:
+            ws.merge_cells(start_row=1, start_column=zac, end_row=2, end_column=zac)
+    for i, (_f, _cs, sirka) in enumerate(sloupce, start=1):
+        for r in (1, 2):
+            c = ws.cell(r, i)
+            c.font = font
+            c.alignment = stred
+            if vypln:
+                c.fill = vypln
+            if r == 2 and ram:
+                c.border = ram
+        ws.column_dimensions[get_column_letter(i)].width = max(10, round(sirka / 7))
+    ws.row_dimensions[1].height = 20
+    ws.row_dimensions[2].height = 28
+    return sloupce
+
+
+def _export_prehled_ao_xlsx(roky: list[int], pobocky: list[str],
+                            mesice: list[int] | None) -> bytes:
+    """Sešit s jediným listem = KT „Přehled AO" 1:1 s gridem (vč. filtru měsíců)."""
+    import io
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    rows, total, r_old, r_new = nacti_prehled_ao(roky, pobocky, mesice)
+    if not rows:
+        return b''
+
+    accent = _AO_ACCENT.lstrip('#')
+    ram_dole = Border(bottom=Side(style='medium', color=accent))
+    ram_vpravo = Border(right=Side(style='medium', color=accent))
+    ram_nahore = Border(top=Side(style='medium', color=accent))
+    ram_roh = Border(top=Side(style='medium', color=accent),
+                     right=Side(style='medium', color=accent))
+    vypln_total = PatternFill('solid', fgColor=_AO_ACCENT_LIGHT.lstrip('#'))
+    f_hlav = Font(name='Calibri', size=11, bold=True)
+    f_data = Font(name='Calibri', size=11)
+    f_bold = Font(name='Calibri', size=11, bold=True)
+
+    wb = _exp_wb()
+    ws = wb.create_sheet('Přehled AO')
+
+    sloupce = _x_hlavicka(ws, _col_defs_prehled_ao(r_old, r_new), f_hlav, ram_dole)
+
+    r = 2
+    for row in list(rows) + ([total] if total else []):
+        r += 1
+        je_total = bool(row.get('_je_celkem'))
+        for i, (field, js, _w) in enumerate(sloupce, start=1):
+            v = row.get(field)
+            if i == 1:
+                c = ws.cell(r, i, '' if v is None else str(v))
+                c.font = f_bold
+                c.border = ram_roh if je_total else ram_vpravo
+                if je_total:
+                    c.fill = vypln_total
+                continue
+            try:
+                v = None if v in (None, '') else float(v)
+            except (TypeError, ValueError):
+                v = None
+            c = ws.cell(r, i, v)
+            c.number_format = _ao_x_fmt(field)
+            c.alignment = Alignment(horizontal='right')
+            if je_total:
+                c.font = f_bold
+                c.fill = vypln_total
+                c.border = ram_nahore
+                continue
+            c.font = f_data
+            cf = _ao_x_cf(js or '')
+            if cf and isinstance(v, float) and v != 0:
+                bg, fg = cf[0] if v > 0 else cf[1]
+                c.fill = PatternFill('solid', fgColor=bg)
+                c.font = Font(name='Calibri', size=11, color=fg)
+
+    ws.freeze_panes = 'B3'
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+# ── Export „Podrobné náklady" (porovnání let) 1:1 s gridem ───────────────────
+_PN_X_HLAV_BG = 'F8F8F8'      # šedá hlavička ag-Gridu (theme alpine)
+_PN_X_HLAV_RAM = 'BABFC7'
+_PN_X_SOUCET_BG = 'F1F5F9'    # připnutý součtový řádek (_PINNED_BOTTOM_STYLE)
+_PN_X_SOUCET_RAM = '94A3B8'
+_PN_X_RUST = 'DC2626'         # Δ > 0 – nárůst (červená, _DIFF_STYLE)
+_PN_X_POKLES = '16A34A'       # Δ < 0 – pokles (zelená)
+
+
+def _pn_x_list(wb, nazev: str, rows: list[dict], rok: int,
+               mesice: list[int] | None = None, pouzite: set | None = None):
+    """Jeden list KT „Podrobné náklady" 1:1 s gridem."""
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    f_hlav = Font(name='Arial', size=10, bold=True)
+    f_data = Font(name='Arial', size=10)
+    f_bold = Font(name='Arial', size=10, bold=True)
+    f_mono = Font(name='Consolas', size=10)
+    f_rust = Font(name='Arial', size=10, bold=True, color=_PN_X_RUST)
+    f_pokles = Font(name='Arial', size=10, bold=True, color=_PN_X_POKLES)
+    ram_hlav = Border(bottom=Side(style='thin', color=_PN_X_HLAV_RAM))
+    ram_soucet = Border(top=Side(style='medium', color=_PN_X_SOUCET_RAM))
+    vypln_hlav = PatternFill('solid', fgColor=_PN_X_HLAV_BG)
+    vypln_soucet = PatternFill('solid', fgColor=_PN_X_SOUCET_BG)
+    vpravo = Alignment(horizontal='right')
+
+    ws = (_exp_list(wb, nazev, pouzite) if pouzite is not None
+          else wb.create_sheet(nazev))
+    sloupce = _x_hlavicka(ws, _col_defs_porovnani(rok, mesice), f_hlav, ram_hlav, vypln_hlav)
+
+    r = 2
+    for row in list(rows) + [_soucet_porovnani(rows)]:
+        r += 1
+        je_soucet = bool(row.get('_soucet'))
+        for i, (field, cs, _w) in enumerate(sloupce, start=1):
+            v = row.get(field)
+            if i <= 2:                      # Předpis / Název = text
+                c = ws.cell(r, i, '' if v is None else str(v))
+                c.font = f_bold if je_soucet else (f_mono if i == 1 else f_data)
+            else:
+                try:
+                    v = None if v in (None, '') else float(v)
+                except (TypeError, ValueError):
+                    v = None
+                c = ws.cell(r, i, v)
+                c.number_format = '#,##0.00;-#,##0.00;"—"'
+                c.alignment = vpravo
+                if je_soucet:
+                    c.font = f_bold
+                elif cs == _DIFF_STYLE and isinstance(v, float) and v != 0:
+                    c.font = f_rust if v > 0 else f_pokles
+                elif isinstance(cs, dict) and cs.get('fontWeight') == 'bold':
+                    c.font = f_bold
+                else:
+                    c.font = f_data
+            if je_soucet:
+                c.fill = vypln_soucet
+                c.border = ram_soucet
+
+    ws.freeze_panes = 'C3'
+    return ws
+
+
+def _export_podrobne_xlsx(rows: list[dict], rok: int,
+                          mesice: list[int] | None = None) -> bytes:
+    """Sešit s KT „Podrobné náklady" 1:1 s gridem (`rows` = už vyfiltrované
+    řádky gridu, tj. respektuje výběr poboček, roku i filtr názvu)."""
+    import io
+    if not rows:
+        return b''
+    wb = _exp_wb()
+    _pn_x_list(wb, f'Podrobné náklady {rok}', rows, rok, mesice)
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
 # ── Tlačítka ─────────────────────────────────────────────────────────────────
 
 async def _exp_stahni(builder, args: tuple, soubor: str, user_name: str, zprava: str):
@@ -6919,13 +7241,15 @@ async def _exp_stahni(builder, args: tuple, soubor: str, user_name: str, zprava:
     – ui.download.content by u velkých sešitů narazil na limit WebSocketu."""
     import asyncio
     from intranet_sankce import _stahni_pres_http
-    ui.notify('Připravuji export…', type='ongoing')
+    pozn = ui.notification('Připravuji export…', spinner=True, timeout=None)
     try:
         data = await asyncio.to_thread(builder, *args)
     except Exception as exc:
         print(f'[vysledky] export error: {exc}')
         ui.notify(f'Export se nezdařil: {exc}', type='negative')
         return
+    finally:
+        pozn.dismiss()
     if not data:
         ui.notify('Není co exportovat.', type='warning')
         return
@@ -6936,7 +7260,7 @@ async def _exp_stahni(builder, args: tuple, soubor: str, user_name: str, zprava:
 def _exp_tlacitko_pobocka(pobocka: str, sekce: list[str], user_name: str):
     nazev = _POBOCKY_EXCEL_REVERSE.get(pobocka, pobocka)
     dnes = datetime.date.today().strftime('%Y-%m-%d')
-    ui.button('Export do XLSX', icon='download',
+    ui.button('Kompletní Export', icon='download',
               on_click=lambda: _exp_stahni(
                   _export_pobocka_xlsx, (pobocka, sekce),
                   f'{_exp_slug(nazev)}_vysledky_{dnes}.xlsx', user_name,
