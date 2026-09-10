@@ -935,6 +935,22 @@ def vykresli(user_id: int, user_name: str, vsechna_prava: list):
     # Stav filtrů — sdílený v closure (nevytváříme třídu)
     filtr: dict = {k: '' for k in ('aktivita', 'nakupci', 'dodavatel', 'nazev_akce', 'od', 'do')}
 
+    # Živá reference na tabulku — obnova řádků na místě, aby se
+    # nezničilo DOM a neresetoval se scroll (a řazení) při každé změně.
+    _ziva: dict = {'tbl': None, 'pocet': None}
+
+    def _obnov():
+        tbl = _ziva['tbl']
+        if tbl is None:
+            _tabulka.refresh()          # tabulka neexistuje (prázdný stav) → plné překreslení
+            return
+        radky = _nacti_radky(filtr, vsechna_prava)
+        if not radky:
+            _tabulka.refresh()          # přepnutí na prázdný stav
+            return
+        tbl.update_rows(radky)
+        _ziva['pocet'].text = f'Celkem záznamů: {len(radky)}'
+
     # ── Záhlaví ───────────────────────────────────────────────────────────
     with ui.row().classes('w-full items-center gap-4 mb-2'):
         ui.label('📈 Prodejní aktivity').classes('text-3xl font-extrabold text-gray-800')
@@ -953,7 +969,7 @@ def vykresli(user_id: int, user_name: str, vsechna_prava: list):
                 filtr['nazev_akce'] = f_nazev.value or ''
                 filtr['od']         = f_od.value or ''
                 filtr['do']         = f_do.value or ''
-                _tabulka.refresh()
+                _obnov()
 
             f_aktivita = ui.select(
                 options=[''] + AKTIVITA_VOLBY,
@@ -984,7 +1000,7 @@ def vykresli(user_id: int, user_name: str, vsechna_prava: list):
                 f_do.set_value('')
                 for k in filtr:
                     filtr[k] = ''
-                _tabulka.refresh()
+                _obnov()
 
             ui.button(icon='clear', on_click=reset_filtr) \
               .props('flat round').classes('text-gray-400 hover:text-gray-700 self-end').tooltip('Resetovat filtry')
@@ -995,13 +1011,13 @@ def vykresli(user_id: int, user_name: str, vsechna_prava: list):
             ui.button(
                 'Nová aktivita', icon='add',
                 on_click=lambda: _dialog_formular(
-                    vsechna_prava, user_name, None, _tabulka.refresh),
+                    vsechna_prava, user_name, None, _obnov),
             ).classes('bg-green-600 hover:bg-green-700 text-white font-bold')
 
             ui.button(
                 'Import z Excelu', icon='upload_file',
                 on_click=lambda: _dialog_import_excel(
-                    vsechna_prava, user_name, _tabulka.refresh),
+                    vsechna_prava, user_name, _obnov),
             ).classes('bg-teal-600 hover:bg-teal-700 text-white font-bold')
 
         ui.button(
@@ -1048,6 +1064,7 @@ def vykresli(user_id: int, user_name: str, vsechna_prava: list):
         ]
 
         if not radky:
+            _ziva['tbl'] = None
             with ui.column().classes('w-full items-center py-16 gap-3'):
                 ui.icon('inbox', size='3rem', color='grey-4')
                 ui.label('Žádné záznamy neodpovídají filtru.') \
@@ -1109,7 +1126,7 @@ def vykresli(user_id: int, user_name: str, vsechna_prava: list):
             # ── Event handlery ────────────────────────────────────────────
 
             def _evt_uprav(e):
-                _dialog_formular(vsechna_prava, user_name, e.args, _tabulka.refresh)
+                _dialog_formular(vsechna_prava, user_name, e.args, _obnov)
 
             def _evt_historie(e):
                 r = e.args
@@ -1146,7 +1163,7 @@ def vykresli(user_id: int, user_name: str, vsechna_prava: list):
                                     f'Smazána aktivita #{r_id}: {r_nazev}')
                                 ui.notify(f'Aktivita #{r_id} smazána.', type='warning')
                                 d.close()
-                                _tabulka.refresh()
+                                _obnov()
                             except Exception as ex:
                                 ui.notify(f'Chyba: {ex}', type='negative')
                             finally:
@@ -1162,7 +1179,8 @@ def vykresli(user_id: int, user_name: str, vsechna_prava: list):
             tbl.on('historie', _evt_historie)
             tbl.on('smaz',     _evt_smaz)
 
-        ui.label(f'Celkem záznamů: {len(radky)}') \
+        _ziva['tbl'] = tbl
+        _ziva['pocet'] = ui.label(f'Celkem záznamů: {len(radky)}') \
           .classes('text-xs text-gray-400 mt-2 text-right')
 
     _tabulka()

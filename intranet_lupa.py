@@ -1623,6 +1623,14 @@ def _cols_polozky(rozpad):
 
 _XLSX_FMT = {'text': '@', 'int': '#,##0', 'num': '#,##0.###', 'money': '#,##0.00'}
 
+
+def _xlsx_format(typ, val):
+    """Formát buňky. U „num" (#,##0.###) Excel vykreslí desetinný oddělovač i u
+    celého čísla („42,"), proto celá čísla dostanou formát bez desetin."""
+    if typ == 'num' and isinstance(val, (int, float)) and float(val).is_integer():
+        return _XLSX_FMT['int']
+    return _XLSX_FMT.get(typ, 'General')
+
 _TMP_DIR = os.path.join(tempfile.gettempdir(), 'jip_lupa')
 
 
@@ -1661,8 +1669,9 @@ def _xlsx_list(wb, sheet, cols, radky, total=None):
     for r in radky:
         bunky = []
         for _n, field, typ, _w in cols:
-            c = WriteOnlyCell(ws, value=_xlsx_hodnota(r.get(field), typ))
-            c.number_format = _XLSX_FMT.get(typ, 'General')
+            v = _xlsx_hodnota(r.get(field), typ)
+            c = WriteOnlyCell(ws, value=v)
+            c.number_format = _xlsx_format(typ, v)
             bunky.append(c)
         ws.append(bunky)
         pocet += 1
@@ -1675,8 +1684,9 @@ def _xlsx_list(wb, sheet, cols, radky, total=None):
         ws.append([])
         radek = []
         for _n, field, typ, _w in cols:
-            c = WriteOnlyCell(ws, value=_xlsx_hodnota(total.get(field), typ))
-            c.number_format = _XLSX_FMT.get(typ, 'General')
+            v = _xlsx_hodnota(total.get(field), typ)
+            c = WriteOnlyCell(ws, value=v)
+            c.number_format = _xlsx_format(typ, v)
             c.font = Font(bold=True)
             radek.append(c)
         ws.append(radek)
