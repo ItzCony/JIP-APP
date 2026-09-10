@@ -4831,6 +4831,8 @@ KOD_PRAVO = {k: 'sankce_tiket_' + k.lower() for k in KODY_NAKUPCI}
 # Unibrands: jediné, co smí — vidět dlaždici Nedodávky a psát tam Vyjádření
 # nákupčího – jen řádky dodavatele UNIBRANDS. Žádné tikety.
 PRAVO_UNIBRANDS = 'sankce_tiket_unibrands'
+# VN nefiguruje v datech jako kód NAK — vedoucí nákupu píše vyjádření všude.
+PRAVO_VEDOUCI_NAKUPU = KOD_PRAVO['VN']
 
 _SANKCE_URL = 'https://analytikasys.jip-napoje.cz/sankce'
 
@@ -5958,7 +5960,9 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
     # Nákupčí vidí a edituje jen řádky se svým kódem NAK; ostatní role čtou vše.
     moje_kody = {k for k, p in KOD_PRAVO.items() if p in vsechna_prava}
     # Unibrands píše do všech řádků, ale jinak v modulu nic nemá.
-    psat_vse = je_analytik or PRAVO_UNIBRANDS in vsechna_prava
+    # VN = vedoucí nákupu: nemá vlastní kód NAK v datech, píše za všechny nákupčí.
+    psat_vse = (je_analytik or PRAVO_UNIBRANDS in vsechna_prava
+                or PRAVO_VEDOUCI_NAKUPU in vsechna_prava)
     vidi_vse = psat_vse or bool({'sankce_ucetni', 'sankce_ctenar', 'sankce_nakup'}
                                 & set(vsechna_prava))
 
