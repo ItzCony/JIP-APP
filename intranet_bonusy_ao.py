@@ -367,6 +367,13 @@ def parsuj_excel(raw: bytes, list_nazev: str, pobocka: str) -> tuple[list[dict],
 # Chování gridu 1:1 jako tabulky v modulu Sankce: výška do patičky okna a
 # sloupce nejdřív roztažené na obsah, pak dorovnané na plnou šířku tabulky.
 _GRID_STYLE = 'height: calc(100vh - 360px); min-height: 420px'
+_BEZ_TYPU = '(bez typu)'
+
+
+def _typ_bonusu(radek: dict) -> str:
+    return str(radek.get('typ_bonusu') or '').strip() or _BEZ_TYPU
+
+
 _AUTOSIZE_FIT = (
     "function(p){var api=p.api;if(!api||!api.autoSizeAllColumns||!api.sizeColumnsToFit)return;"
     "requestAnimationFrame(function(){api.autoSizeAllColumns();"
@@ -408,25 +415,15 @@ def _col_defs() -> list[dict]:
 
 
 def _podkladova_tabulka(pobocka: str, user_name: str) -> None:
-    stav = {'radky': nacti_radky(pobocka)}
+    stav = {'radky': nacti_radky(pobocka), 'grids': {}, 'tab': None}
 
     @ui.refreshable
     def _grid_box():
-        grid = ui.aggrid({
-            'columnDefs': _col_defs(),
-            'rowData': stav['radky'],
-            'defaultColDef': {'resizable': True, 'sortable': True, 'filter': True},
-            'rowHeight': 32,
-            'rowSelection': 'multiple',
-            'suppressRowClickSelection': True,
-            'suppressMovableColumns': True,
-            'singleClickEdit': True,
-            'stopEditingWhenCellsLoseFocus': True,
-            ':onFirstDataRendered': _AUTOSIZE_FIT,
-            ':onGridSizeChanged': _AUTOSIZE_FIT,
-            ':getRowId': 'function(p){return String(p.data.id);}',
-        }).classes('w-full').style(_GRID_STYLE)
-        stav['grid'] = grid
+        stav['grids'] = {}
+        skupiny: dict[str, list[dict]] = {}
+        for r in stav['radky']:
+            skupiny.setdefault(_typ_bonusu(r), []).append(r)
+        poradi = sorted(skupiny, key=lambda t: (t == _BEZ_TYPU, t.lower()))
 
         def _on_change(e):
             a = e.args or {}
@@ -441,32 +438,76 @@ def _podkladova_tabulka(pobocka: str, user_name: str) -> None:
                 if r['id'] == rid:
                     r[pole] = a.get('newValue')
                     break
+            if pole == 'typ_bonusu':      # řádek patří do jiné podsekce
+                _grid_box.refresh()
 
-        grid.on('cellValueChanged', _on_change)
+        def _panel(typ: str, radky: list[dict]):
+            # grid se staví až pro aktivní záložku – jinak má nulovou šířku
+            # a autosize sloupců na obsah se spočítá špatně
+            grid = ui.aggrid({
+                'columnDefs': _col_defs(),
+                'rowData': radky,
+                'defaultColDef': {'resizable': True, 'sortable': True, 'filter': True},
+                'rowHeight': 32,
+                'rowSelection': 'multiple',
+                'suppressRowClickSelection': True,
+                'suppressMovableColumns': True,
+                'singleClickEdit': True,
+                'stopEditingWhenCellsLoseFocus': True,
+                ':onFirstDataRendered': _AUTOSIZE_FIT,
+                ':onGridSizeChanged': _AUTOSIZE_FIT,
+                ':getRowId': 'function(p){return String(p.data.id);}',
+            }).classes('w-full').style(_GRID_STYLE)
+            stav['grids'][typ] = grid
+            grid.on('cellValueChanged', _on_change)
 
-        async def _smaz():
-            vybrane = await grid.get_selected_rows()
-            ids = [int(r['id']) for r in vybrane if r.get('id')]
-            if not ids:
-                ui.notify('Nejsou označené žádné řádky.', type='warning')
-                return
-            pocet = smaz_radky(ids)
-            stav['radky'] = nacti_radky(pobocka)
-            _grid_box.refresh()
-            ui.notify(f'Smazáno řádků: {pocet}', type='positive')
-            intranet_logger.log_activity(
-                user_name, 'Bonusy AO', f'{pobocka}: smazáno {pocet} řádků podkladové tabulky')
+            async def _smaz(g=grid):
+                vybrane = await g.get_selected_rows()
+                ids = [int(r['id']) for r in vybrane if r.get('id')]
+                if not ids:
+                    ui.notify('Nejsou označené žádné řádky.', type='warning')
+                    return
+                pocet = smaz_radky(ids)
+                stav['radky'] = nacti_radky(pobocka)
+                _grid_box.refresh()
+                ui.notify(f'Smazáno řádků: {pocet}', type='positive')
+                intranet_logger.log_activity(
+                    user_name, 'Bonusy AO',
+                    f'{pobocka}: smazáno {pocet} řádků podkladové tabulky')
 
-        with ui.row().classes('w-full justify-between items-center mt-2'):
-            ui.label(f'Řádků: {len(stav["radky"])}').classes('text-sm text-gray-500')
-            ui.button('Smazat označené', icon='delete', on_click=_smaz) \
-                .props('color=negative outline no-caps dense')
+            with ui.row().classes('w-full justify-between items-center mt-2'):
+                ui.label(f'Řádků: {len(radky)}').classes('text-sm text-gray-500')
+                ui.button('Smazat označené', icon='delete', on_click=_smaz) \
+                    .props('color=negative outline no-caps dense')
+
+        if not poradi:
+            ui.label('Žádné řádky.').classes('text-sm text-gray-500')
+            return
+
+        if stav.get('tab') not in poradi:
+            stav['tab'] = poradi[0]
+
+        def _prepni(e):
+            if e.value and e.value != stav['tab']:
+                stav['tab'] = e.value
+                _grid_box.refresh()
+
+        with ui.tabs(value=stav['tab'], on_change=_prepni) \
+                .props('align=left active-color=primary indicator-color=primary') \
+                .classes('w-full border-b border-gray-200'):
+            for typ in poradi:
+                ui.tab(typ, label=f'📋 {typ.upper()}')
+
+        with ui.column().classes('w-full pt-2 gap-0'):
+            _panel(stav['tab'], skupiny[stav['tab']])
 
     def _skoc_na_konec():
-        grid = stav.get('grid')
-        if grid is None or not stav['radky']:
+        typ = _BEZ_TYPU
+        grid = stav['grids'].get(typ)
+        radky = [r for r in stav['radky'] if _typ_bonusu(r) == typ]
+        if grid is None or not radky:
             return
-        idx = len(stav['radky']) - 1
+        idx = len(radky) - 1
         grid.run_grid_method('ensureIndexVisible', idx, 'bottom')
         grid.run_grid_method('startEditingCell', {'rowIndex': idx, 'colKey': POLE[0]})
 
@@ -475,6 +516,7 @@ def _podkladova_tabulka(pobocka: str, user_name: str) -> None:
             ui.notify('Řádek se nepodařilo přidat.', type='negative')
             return
         stav['radky'] = nacti_radky(pobocka)
+        stav['tab'] = _BEZ_TYPU          # nový řádek je prázdný → záložka bez typu
         _grid_box.refresh()
         # grid se po refreshi staví znovu – skok až je na klientovi
         ui.timer(0.3, _skoc_na_konec, once=True)
@@ -624,11 +666,18 @@ def _cislo_hodnota(hodnota):
 _SLK_BUNKA = re.compile(r'C;(?:Y(\d+);)?(?:X(\d+);)?K(.*)')
 
 
-def _radky_slk(cesta: str):
+def _radky_slk(cesta: str, pokrok=None):
     y = x = 0
     radek: dict = {}
+    velikost = max(os.path.getsize(cesta), 1)       # postup podle přečtených znaků
+    nacteno = i_line = 0
     with io.open(cesta, 'r', encoding='cp1250', errors='replace') as f:
         for line in f:
+            if pokrok:
+                nacteno += len(line)
+                i_line += 1
+                if i_line % 2000 == 0:
+                    pokrok(min(nacteno / velikost, 1.0))
             if not line.startswith('C;'):
                 continue
             m = _SLK_BUNKA.match(line.rstrip('\r\n'))
@@ -645,28 +694,37 @@ def _radky_slk(cesta: str):
             v = k.strip()
             if v.startswith('"'):
                 v = v[1:-1] if v.endswith('"') else v[1:]
-            radek[x] = v.strip()
+            # SLK: středník v textu je escapovaný zdvojením
+            radek[x] = v.replace(';;', ';').strip()
     if radek:
         yield y, radek
 
 
-def _radky_xlsx(cesta: str):
+def _radky_xlsx(cesta: str, pokrok=None):
     import openpyxl
     wb = openpyxl.load_workbook(cesta, read_only=True, data_only=True)
     try:
         ws = wb[wb.sheetnames[0]]
+        celkem = ws.max_row or 0
         for y, radek in enumerate(ws.iter_rows(values_only=True), 1):
+            if pokrok and celkem and y % 500 == 0:
+                pokrok(min(y / celkem, 1.0))
             yield y, {i: v for i, v in enumerate(radek, 1) if v is not None}
     finally:
         wb.close()
 
 
-def zdrojove_radky(cesta: str):
-    """Datové řádky zdroje – prvních 5 řádků (4 hlavičkové + názvy sloupců) pryč."""
+def zdrojove_radky(cesta: str, pokrok=None):
+    """Datové řádky zdroje – prvních 5 řádků (4 hlavičkové + názvy sloupců) pryč.
+
+    pokrok: volitelný callback(0.0–1.0) s podílem načteného zdroje.
+    """
     fn = _radky_slk if cesta.lower().endswith('.slk') else _radky_xlsx
-    for y, radek in fn(cesta):
+    for y, radek in fn(cesta, pokrok):
         if y >= PRVNI_DATOVY_RADEK:
             yield radek
+    if pokrok:
+        pokrok(1.0)
 
 
 def uprav_radek(zdroj: dict, kontakty: dict) -> list | None:
@@ -822,11 +880,18 @@ def inicializace_bonusy_data_db():
         conn.close()
 
 
-def zpracuj_soubor(pobocka: str, nazev: str) -> tuple[int, str]:
-    """Načte soubor z Edit, aplikuje pravidla, uloží do DB a do Zpracovano."""
+def zpracuj_soubor(pobocka: str, nazev: str, pokrok=None) -> tuple[int, str, str]:
+    """Načte soubor z Edit, aplikuje pravidla, uloží do DB a do Zpracovano.
+
+    Období řádku = měsíc data zdanitelného plnění; bez data → z názvu souboru.
+    Vrací (pocet, cil, prevazujici_obdobi).
+    """
     import openpyxl
+    from openpyxl.cell import WriteOnlyCell
     zdroj = os.path.join(_slozka(pobocka, 'Edit'), nazev)
-    obdobi = _obdobi_z_nazvu(nazev)
+    zaloha_obdobi = _obdobi_z_nazvu(nazev)
+    pocty_obdobi: dict[str, int] = {}
+    smazana: set[str] = set()
     kontakty = nacti_kontakty()
     conn = intranet_data.get_db_connection()
     if not conn:
@@ -837,16 +902,33 @@ def zpracuj_soubor(pobocka: str, nazev: str) -> tuple[int, str]:
     sql = (f'INSERT INTO {TABULKA_DATA} (pobocka_klic, obdobi, {DATA_POLE_SQL}) '
            f'VALUES ({", ".join(["%s"] * (len(DATA_POLE) + 2))})')
     davka, pocet = [], 0
+    i_datum = DATA_POLE.index('datum')
     try:
         cur = conn.cursor()
-        cur.execute(f'DELETE FROM {TABULKA_DATA} WHERE pobocka_klic=%s AND obdobi=%s',
-                    (pobocka, obdobi))
-        conn.commit()
-        for zdrojovy in zdrojove_radky(zdroj):
+        for zdrojovy in zdrojove_radky(zdroj, pokrok):
             radek = uprav_radek(zdrojovy, kontakty)
             if radek is None:
                 continue
-            ws.append(radek)
+            bunky = list(radek)
+            datum = bunky[i_datum]
+            if isinstance(datum, (datetime.date, datetime.datetime)):
+                obdobi = datum.strftime('%Y-%m')
+                b = WriteOnlyCell(ws, value=datum)
+                b.number_format = 'DD.MM.YYYY'
+                bunky[i_datum] = b
+            else:
+                obdobi = zaloha_obdobi
+            if obdobi not in smazana:      # staré řádky období pryč před importem
+                cur.executemany(sql, davka)
+                conn.commit()
+                davka = []
+                cur.execute(
+                    f'DELETE FROM {TABULKA_DATA} WHERE pobocka_klic=%s AND obdobi=%s',
+                    (pobocka, obdobi))
+                conn.commit()
+                smazana.add(obdobi)
+            pocty_obdobi[obdobi] = pocty_obdobi.get(obdobi, 0) + 1
+            ws.append(bunky)
             davka.append((pobocka, obdobi, *radek))
             pocet += 1
             if len(davka) >= 5000:
@@ -862,20 +944,24 @@ def zpracuj_soubor(pobocka: str, nazev: str) -> tuple[int, str]:
     cil = os.path.join(_slozka(pobocka, 'Zpracovano'),
                        f'{os.path.splitext(nazev)[0]}_zpracovano.xlsx')
     wb.save(cil)
-    return pocet, cil
+    if zdroj.lower().endswith('.slk'):   # zdrojový SLK po zpracování pryč
+        os.remove(zdroj)
+    hlavni = max(pocty_obdobi, key=pocty_obdobi.get) if pocty_obdobi else zaloha_obdobi
+    return pocet, cil, hlavni
 
 
-def nacti_obdobi(pobocka: str) -> list[tuple[str, int]]:
-    """Období pobočky v DB, nejnovější první: [(obdobi, pocet_radku)]."""
+def nacti_obdobi(pobocka: str) -> list[str]:
+    """Období pobočky v DB, nejnovější první. DISTINCT přes prefix indexu –
+    COUNT(*) by skenoval miliony řádků a zablokoval UI."""
     conn = intranet_data.get_db_connection()
     if not conn:
         return []
     try:
         cur = conn.cursor()
         cur.execute(
-            f'SELECT obdobi, COUNT(*) FROM {TABULKA_DATA} WHERE pobocka_klic=%s '
-            f'GROUP BY obdobi ORDER BY obdobi DESC', (pobocka,))
-        out = [(r[0], r[1]) for r in cur.fetchall()]
+            f'SELECT DISTINCT pobocka_klic, obdobi FROM {TABULKA_DATA} '
+            f'WHERE pobocka_klic=%s', (pobocka,))
+        out = sorted((r[1] for r in cur.fetchall()), reverse=True)
         cur.close()
         return out
     finally:
@@ -924,6 +1010,532 @@ def nacti_data_nahled(pobocka: str, obdobi: str | None = None,
         conn.close()
 
 
+# ─── Výpočet bonusů (port logiky z App.java) ──────────────────────────────────
+
+# klíč, popisek, předpona typu bonusu v podkladu (normalizovaná: „fakturačně“ i
+# „fakturační“). Ostatní typy (zboží, odd + zápočet…) se nepočítají – jako v Javě.
+BONUS_TYPY = [
+    ('fakturacni', 'Fakturační', 'fakturac'),
+    ('konto_o',    'Konto O',    'konto o'),
+    ('konto_r',    'Konto R',    'konto r'),
+]
+
+
+def _bonus_typ_klic(hodnota) -> str | None:
+    t = _norm(hodnota)
+    for klic, _lbl, predpona in BONUS_TYPY:
+        if t.startswith(predpona):
+            return klic
+    return None
+
+# výstupní sloupce = data + 4 dopočtené
+BONUS_SLOUPCE = DATA_SLOUPCE + [
+    ('bonus_proc', 'bonus v %',           'procento',      100),
+    ('bonus_kc',   'bonus v Kč bez DPH',  'DECIMAL(15,2)', 150),
+    ('skupina',    'skupina',             'text',          120),
+    ('min_odber',  'minimální odběr',     'DECIMAL(15,2)', 130),
+]
+
+# indexy v datovém řádku (pořadí DATA_POLE)
+_I_ICO, _I_TYP_DOKL, _I_DATUM = 0, 4, 6
+_I_NADR_POPIS, _I_DOD_POPIS, _I_POUZITA_IC, _I_CASTKA = 13, 14, 16, 17
+
+_BONUS_CACHE: dict[str, dict] = {}      # náhled posledního výpočtu (per pobočka|okno|režim)
+
+_MAX_RADKU_LIST = 1_000_000             # limit XLSX je 1 048 576 vč. hlavičky
+
+# režimy okna výpočtu (klíč, popisek, délka v měsících)
+BONUS_REZIMY = [
+    ('mesic',    'Měsíc',        1),
+    ('kvartal',  'Kvartál',      3),
+    ('pololeti', 'Pololetí',     6),
+    ('rok',      'Rok',         12),
+    ('podklad',  'Dle podkladu', 0),
+]
+_REZIM_DELKA = {k: n for k, _l, n in BONUS_REZIMY if n}
+_REZIM_LBL = {k: lbl for k, lbl, _n in BONUS_REZIMY}
+# sloupec Interval v podkladu -> režim okna
+_IVL_REZIM = {'mesicni': 'mesic', 'kvartalni': 'kvartal',
+              'pololetni': 'pololeti', 'rocni': 'rok'}
+
+
+def _ivl_rezim(hodnota) -> str:
+    return _IVL_REZIM.get(_norm(hodnota), 'mesic')
+
+
+def _okno_mesice(obdobi: str, rezim: str) -> tuple[str, list[str]]:
+    """Kalendářní okno kolem období 'YYYY-MM'. Vrací (popisek, [měsíce])."""
+    rok, mes = int(obdobi[:4]), int(obdobi[5:7])
+    delka = _REZIM_DELKA.get(rezim, 1)
+    if delka == 1:
+        return obdobi, [obdobi]
+    zac = ((mes - 1) // delka) * delka + 1
+    mesice = [f'{rok}-{m:02d}' for m in range(zac, zac + delka)]
+    if delka == 3:
+        popis = f'{rok}-Q{(zac - 1) // 3 + 1}'
+    elif delka == 6:
+        popis = f'{rok}-H{(zac - 1) // 6 + 1}'
+    else:
+        popis = str(rok)
+    return popis, mesice
+
+
+def _bonus_datum(txt) -> datetime.date | None:
+    txt = str(txt or '').strip()
+    if not txt:
+        return None
+    try:
+        return datetime.datetime.strptime(txt, '%d.%m.%Y').date()
+    except ValueError:
+        return None
+
+
+def _bonus_mapy(pobocka: str) -> dict[str, dict]:
+    """{typ bonusu: {IČO: [řádky podkladu]}} – jedno IČO může mít víc období
+    platnosti (Od–Do). Seřazeno od nejnovějšího Od, aby při překryvu vyhrál
+    novější řádek. Do řádku dopočte _od, _do (platnost) a _rezim (z Intervalu)."""
+    mapy: dict[str, dict] = {k: {} for k, _l, _n in BONUS_TYPY}
+    for r in nacti_radky(pobocka):
+        klic = _bonus_typ_klic(r.get('typ_bonusu'))
+        ico = str(r.get('ico_zadane') or '').strip()
+        if klic and ico:
+            r['_od'] = _bonus_datum(r.get('datum_od'))
+            r['_do'] = _bonus_datum(r.get('datum_do'))
+            r['_rezim'] = _ivl_rezim(r.get('interval'))
+            mapy[klic].setdefault(ico, []).append(r)
+    for mapa in mapy.values():
+        for radky in mapa.values():
+            radky.sort(key=lambda p: p['_od'] or datetime.date.min, reverse=True)
+    return mapy
+
+
+def _mapy_pro_rezim(mapy: dict[str, dict], rezim: str) -> dict[str, dict]:
+    """Pevný režim počítá jen řádky podkladu s odpovídajícím Intervalem.
+    Režim 'podklad' bere vše, každý řádek ve svém okně."""
+    if rezim == 'podklad':
+        return mapy
+    out: dict[str, dict] = {}
+    for k, mapa in mapy.items():
+        out[k] = {i: [p for p in radky if p['_rezim'] == rezim]
+                  for i, radky in mapa.items()}
+        out[k] = {i: radky for i, radky in out[k].items() if radky}
+    return out
+
+
+def _podklad_pro(mapa: dict, ico: str, datum):
+    """Řádek podkladu IČO platný k datu zdanitelného plnění; jinak None."""
+    for p in mapa.get(ico, ()):
+        if not _mimo_platnost(p, datum):
+            return p
+    return None
+
+
+def _mimo_platnost(p: dict, datum) -> bool:
+    """Datum zdanitelného plnění mimo Od–Do podkladu (obě hranice včetně)."""
+    if isinstance(datum, datetime.datetime):
+        datum = datum.date()
+    if p['_od'] and datum < p['_od']:
+        return True
+    if p['_do'] and datum > p['_do']:
+        return True
+    return False
+
+
+def _okno_pro_vypocet(pobocka: str, obdobi: str, rezim: str) -> tuple[str, list[str]]:
+    """Okno pevného režimu; u 'podklad' sjednocení oken všech intervalů v podkladu."""
+    if rezim != 'podklad':
+        return _okno_mesice(obdobi, rezim)
+    mesice: set[str] = set()
+    for r in nacti_radky(pobocka):
+        if _bonus_typ_klic(r.get('typ_bonusu')):
+            mesice.update(_okno_mesice(obdobi, _ivl_rezim(r.get('interval')))[1])
+    return f'{obdobi}-podklad', sorted(mesice or [obdobi])
+
+
+def bonus_predkontrola(pobocka: str, obdobi: str, rezim: str) -> dict:
+    """Kontroly před výpočtem: uzavřenost okna, data bez datumu, podklad bez platnosti."""
+    popis, mesice = _okno_pro_vypocet(pobocka, obdobi, rezim)
+    v_db = set(nacti_obdobi(pobocka))
+    chybi = [m for m in mesice if m not in v_db]
+    bez_data = 0
+    if not chybi:
+        conn = intranet_data.get_db_connection()
+        if not conn:
+            raise RuntimeError('Databáze není dostupná.')
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                f'SELECT COUNT(*) FROM {TABULKA_DATA} WHERE pobocka_klic=%s '
+                f'AND obdobi IN ({", ".join(["%s"] * len(mesice))}) AND datum IS NULL',
+                (pobocka, *mesice))
+            bez_data = cur.fetchone()[0] or 0
+            cur.close()
+        finally:
+            conn.close()
+    mapy = _mapy_pro_rezim(_bonus_mapy(pobocka), rezim)
+    podklad = [p for mapa in mapy.values() for radky in mapa.values() for p in radky]
+    bez_platnosti = sum(1 for p in podklad if not p['_od'] and not p['_do'])
+    return {'popis': popis, 'mesice': mesice, 'chybi_obdobi': chybi,
+            'bez_data': bez_data, 'bez_platnosti': bez_platnosti,
+            'podklad': len(podklad)}
+
+
+def _bonus_vyhodit(p: dict, d: tuple) -> bool:
+    """A/N příznaky podkladu, které řádek z výstupu úplně odstraní."""
+    typ_dokl = str(d[_I_TYP_DOKL] or '').strip()
+    nadr = str(d[_I_NADR_POPIS] or '')
+    dod = str(d[_I_DOD_POPIS] or '')
+    ic = str(d[_I_POUZITA_IC] or '')
+    return bool(
+        (p['obrat_dp'] == 'N' and typ_dokl == 'Dr.prodej')
+        or (p['obrat_akce'] == 'N' and 'PC' in ic)
+        or (p['tabak'] == 'N' and 'tabák' in nadr)
+        or (p['pivo'] == 'N' and 'pivo' in nadr)
+        or (p['ceniny'] == 'N' and 'provize' in nadr)
+        or (p['nektar_natura'] == 'N' and 'Nektar' in dod)
+        or (p['eso'] == 'N' and dod.startswith('ESO'))
+        or (p['premier_wines'] == 'N' and 'Premier Wines' in dod)
+    )
+
+
+def _bonus_nulovat(p: dict, d: tuple) -> bool:
+    """Řádek zůstává, ale bonus je nulový."""
+    return bool(
+        (p['bonus_dp'] == 'N' and str(d[_I_TYP_DOKL] or '').strip() == 'Dr.prodej')
+        or (p['bonus_akce'] == 'N' and 'PC' in str(d[_I_POUZITA_IC] or ''))
+    )
+
+
+def _bonus_data_radky(conn, pobocka: str, mesice: list[str]):
+    """Streamuje datové řádky okna po dávkách (ať se 150k řádků nevejde naráz)."""
+    cur = conn.cursor()
+    cur.execute(f'SELECT {DATA_POLE_SQL} FROM {TABULKA_DATA} '
+                f'WHERE pobocka_klic=%s AND obdobi IN '
+                f'({", ".join(["%s"] * len(mesice))}) ORDER BY obdobi, id',
+                (pobocka, *mesice))
+    try:
+        while True:
+            davka = cur.fetchmany(5000)
+            if not davka:
+                return
+            yield from davka
+    finally:
+        cur.close()
+
+
+def _bonus_nazev(klic: str, popis: str) -> str:
+    return f'bonusy_{klic}_{popis}.xlsx'
+
+
+def _bonus_mesic(datum) -> str:
+    return datum.strftime('%Y-%m')
+
+
+def _novy_list(wb, hlavicka: list):
+    """Nový list s hlavičkou – kvůli limitu 1 048 576 řádků na list."""
+    poradi = len(wb.worksheets) + 1
+    w = wb.create_sheet(title='bonusy' if poradi == 1 else f'bonusy_{poradi}')
+    w.append(hlavicka)
+    return w
+
+
+def spocitej_bonusy(pobocka: str, obdobi: str, rezim: str = 'mesic', pokrok=None) -> dict:
+    """Dopočte bonusy pro 3 typy za zvolené okno, zapíše XLSX do Zpracovano.
+    Vrací {'pocty': {...}, 'radky': {...náhled}, 'soubory': {...}}."""
+    import openpyxl
+    from openpyxl.cell import WriteOnlyCell
+
+    mapy = _mapy_pro_rezim(_bonus_mapy(pobocka), rezim)
+    popis, mesice = _okno_pro_vypocet(pobocka, obdobi, rezim)
+    # okno pro součet min. odběru: pevné pro všechny, nebo per řádek podkladu
+    okna: dict[int, set[str]] = {}
+    okno_pevne = set(mesice)
+
+    def _okno_radku(p: dict) -> set[str]:
+        if rezim != 'podklad':
+            return okno_pevne
+        ms = okna.get(id(p))
+        if ms is None:
+            ms = set(_okno_mesice(obdobi, p['_rezim'])[1])
+            okna[id(p)] = ms
+        return ms
+
+    hotovo = _slozka(pobocka, 'Zpracovano')
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        raise RuntimeError('Databáze není dostupná.')
+    try:
+        cur = conn.cursor()
+        cur.execute(f'SELECT COUNT(*) FROM {TABULKA_DATA} WHERE pobocka_klic=%s '
+                    f'AND obdobi IN ({", ".join(["%s"] * len(mesice))})',
+                    (pobocka, *mesice))
+        celkem = cur.fetchone()[0] or 0
+        cur.close()
+
+        # 1. průchod – obrat za klíč (skupina, jinak IČO) a měsíc, pro min. odběr
+        soucty = {k: {} for k, _l, _n in BONUS_TYPY}
+        for i, d in enumerate(_bonus_data_radky(conn, pobocka, mesice)):
+            ico = str(d[_I_ICO] or '').strip()
+            mes = _bonus_mesic(d[_I_DATUM])
+            for klic, mapa in mapy.items():
+                p = _podklad_pro(mapa, ico, d[_I_DATUM])
+                if p is None or _bonus_vyhodit(p, d):
+                    continue
+                if mes not in _okno_radku(p):
+                    continue
+                kl = str(p['skupina'] or '').strip() or ico
+                po_mesicich = soucty[klic].setdefault(kl, {})
+                po_mesicich[mes] = po_mesicich.get(mes, 0.0) + float(d[_I_CASTKA] or 0)
+            if pokrok and celkem and i % 2000 == 0:
+                pokrok(i / (2 * celkem))
+
+        # 2. průchod – výstupní řádky + zápis
+        hlavicka = [h for _f, h, _t, _w in BONUS_SLOUPCE]
+        wb = {k: openpyxl.Workbook(write_only=True) for k, _l, _n in BONUS_TYPY}
+        ws = {k: _novy_list(wb[k], hlavicka) for k, _l, _n in BONUS_TYPY}
+        na_listu = {k: 0 for k, _l, _n in BONUS_TYPY}
+        pocty = {k: 0 for k, _l, _n in BONUS_TYPY}
+        nahled = {k: [] for k, _l, _n in BONUS_TYPY}
+
+        for i, d in enumerate(_bonus_data_radky(conn, pobocka, mesice)):
+            ico = str(d[_I_ICO] or '').strip()
+            mes = _bonus_mesic(d[_I_DATUM])
+            for klic, mapa in mapy.items():
+                p = _podklad_pro(mapa, ico, d[_I_DATUM])
+                if p is None or _bonus_vyhodit(p, d):
+                    continue
+                okno = _okno_radku(p)
+                if mes not in okno:
+                    continue
+                castka = float(d[_I_CASTKA] or 0)
+                proc = p['procento_bonusu'] or 0.0
+                if _bonus_nulovat(p, d):
+                    proc = 0.0
+                kc = round(castka * proc, 2)
+                skupina = str(p['skupina'] or '').strip()
+                min_odber = p['minimalni_odber']
+                if min_odber is not None:
+                    po_mesicich = soucty[klic].get(skupina or ico, {})
+                    if sum(po_mesicich.get(m, 0.0) for m in okno) < min_odber:
+                        kc = 0.0
+                radek = list(d) + [proc, kc, skupina, min_odber]
+
+                if na_listu[klic] >= _MAX_RADKU_LIST:   # limit XLSX -> další list
+                    ws[klic] = _novy_list(wb[klic], hlavicka)
+                    na_listu[klic] = 0
+                bunky = list(radek)
+                datum = bunky[_I_DATUM]
+                if isinstance(datum, (datetime.date, datetime.datetime)):
+                    b = WriteOnlyCell(ws[klic], value=datum)
+                    b.number_format = 'DD.MM.YYYY'
+                    bunky[_I_DATUM] = b
+                b = WriteOnlyCell(ws[klic], value=proc)
+                b.number_format = '0.00%'
+                bunky[len(DATA_POLE)] = b
+                ws[klic].append(bunky)
+                na_listu[klic] += 1
+                pocty[klic] += 1
+                if len(nahled[klic]) < 500:
+                    n = dict(zip(DATA_POLE, d))
+                    if isinstance(n.get('datum'), (datetime.date, datetime.datetime)):
+                        n['datum'] = n['datum'].strftime('%d.%m.%Y')
+                    n['celk_bez_dph'] = castka
+                    n.update(bonus_proc=proc, bonus_kc=kc,
+                             skupina=skupina, min_odber=min_odber)
+                    nahled[klic].append(n)
+            if pokrok and celkem and i % 2000 == 0:
+                pokrok(0.5 + i / (2 * celkem))
+    finally:
+        conn.close()
+
+    soubory = {}
+    for klic, _lbl, _n in BONUS_TYPY:
+        cil = os.path.join(hotovo, _bonus_nazev(klic, popis))
+        wb[klic].save(cil)
+        soubory[klic] = cil
+    if pokrok:
+        pokrok(1.0)
+    return {'pocty': pocty, 'radky': nahled, 'soubory': soubory,
+            'popis': popis, 'mesice': mesice, 'rezim': rezim,
+            'cas': datetime.datetime.now()}
+
+
+def _bonus_col_defs() -> list[dict]:
+    cols = []
+    for f, h, typ, sirka in BONUS_SLOUPCE:
+        col = {'headerName': h, 'field': f, 'width': sirka,
+               'sortable': True, 'filter': True, 'headerTooltip': h}
+        if typ.startswith('DECIMAL'):
+            col['type'] = 'numericColumn'
+            col['valueFormatter'] = _FMT_CISLO
+        elif typ == 'procento':
+            col['type'] = 'numericColumn'
+            col['valueFormatter'] = _FMT_PROCENTO
+        cols.append(col)
+    return cols
+
+
+@refreshable_na_klienta
+def _bonusy_sekce(pobocka: str, user_name: str) -> None:
+    inicializace_bonusy_data_db()
+    hotovo = _slozka(pobocka, 'Zpracovano')
+    obdobi_klice = nacti_obdobi(pobocka)
+    stav_klic = f'bonusy_ao_bonus_obdobi_{pobocka}'
+    obdobi_sel = app.storage.user.get(stav_klic)
+    if obdobi_sel not in obdobi_klice:
+        obdobi_sel = obdobi_klice[0] if obdobi_klice else None
+        app.storage.user[stav_klic] = obdobi_sel
+    rezim_klic = f'bonusy_ao_bonus_rezim_{pobocka}'
+    rezim_sel = app.storage.user.get(rezim_klic)
+    if rezim_sel not in [k for k, _l, _n in BONUS_REZIMY]:
+        rezim_sel = 'mesic'
+        app.storage.user[rezim_klic] = rezim_sel
+    okno_popis, okno_mesice = (
+        _okno_pro_vypocet(pobocka, obdobi_sel, rezim_sel) if obdobi_sel else ('', []))
+    vysledek = _BONUS_CACHE.get(f'{pobocka}|{okno_popis}|{rezim_sel}')
+
+    async def _spocitej():
+        if not obdobi_sel:
+            return
+        try:
+            kontrola = await asyncio.to_thread(
+                bonus_predkontrola, pobocka, obdobi_sel, rezim_sel)
+        except Exception as exc:
+            ui.notify(f'Chyba kontroly: {exc}', type='negative', timeout=10000)
+            return
+        if kontrola['chybi_obdobi']:
+            ui.notify(f'Okno {kontrola["popis"]} není uzavřené – nejdřív zpracujte '
+                      f'období: {", ".join(kontrola["chybi_obdobi"])}',
+                      type='negative', timeout=15000)
+            return
+        if not kontrola['podklad']:
+            ui.notify(f'Podkladová tabulka nemá žádný řádek s intervalem '
+                      f'{_REZIM_LBL.get(rezim_sel, rezim_sel)}.',
+                      type='negative', timeout=10000)
+            return
+        if kontrola['bez_data']:
+            ui.notify(f'{kontrola["bez_data"]} řádků dat nemá Datum zdanitelného '
+                      f'plnění – nelze ověřit platnost bonusu, výpočet zastaven.',
+                      type='negative', timeout=15000)
+            return
+        if kontrola['bez_platnosti']:
+            with ui.dialog() as dlg_upoz, ui.card().classes('w-[460px]'):
+                ui.label('Podklad bez platnosti').classes('text-lg font-bold')
+                ui.label(f'{kontrola["bez_platnosti"]} řádků podkladové tabulky nemá '
+                         f'vyplněno Od ani Do. Počítají se bez omezení platnosti.') \
+                    .classes('text-sm text-gray-600')
+                with ui.row().classes('w-full justify-end gap-2'):
+                    ui.button('Zrušit', on_click=lambda: dlg_upoz.submit(False)) \
+                        .props('flat no-caps')
+                    ui.button('Pokračovat', on_click=lambda: dlg_upoz.submit(True)) \
+                        .props('color=primary no-caps')
+            if not await dlg_upoz:
+                return
+        stav_pokrok = {'f': 0.0}
+        dlg, kruh, popisek = _prekryv_kolecko(f'Počítám bonusy {okno_popis}…')
+
+        def _tik():
+            proc = stav_pokrok['f'] * 100
+            kruh.set_value(proc)
+            popisek.set_text(f'{proc:.0f} %')
+
+        dlg.open()
+        casovac = ui.timer(0.2, _tik)
+        try:
+            out = await asyncio.to_thread(
+                spocitej_bonusy, pobocka, obdobi_sel, rezim_sel,
+                lambda f: stav_pokrok.update(f=f))
+        except Exception as exc:
+            ui.notify(f'Chyba výpočtu: {exc}', type='negative', timeout=10000)
+            return
+        finally:
+            casovac.cancel()
+            dlg.close()
+        _BONUS_CACHE[f'{pobocka}|{out["popis"]}|{rezim_sel}'] = out
+        ui.notify(f'Bonusy {out["popis"]} spočteny: ' + ', '.join(
+            f'{lbl} {out["pocty"][k]}' for k, lbl, _n in BONUS_TYPY), type='positive')
+        intranet_logger.log_activity(
+            user_name, 'Bonusy AO',
+            f'{pobocka}: spočteny bonusy za {out["popis"]} '
+            f'({sum(out["pocty"].values())} řádků)')
+        _bonusy_sekce.refresh()
+
+    def _zmen_obdobi(e):
+        app.storage.user[stav_klic] = e.value
+        _bonusy_sekce.refresh()
+
+    def _zmen_rezim(e):
+        app.storage.user[rezim_klic] = e.value
+        _bonusy_sekce.refresh()
+
+    with ui.column().classes('w-full gap-2'):
+        with ui.row().classes('w-full items-center gap-3'):
+            ui.label('Bonusy').classes('text-lg font-bold text-gray-800')
+            if obdobi_klice:
+                ui.select(obdobi_klice,
+                          value=obdobi_sel, label='Období', on_change=_zmen_obdobi) \
+                    .props('dense outlined options-dense').style('min-width: 220px')
+                ui.select({k: lbl for k, lbl, _n in BONUS_REZIMY},
+                          value=rezim_sel, label='Interval', on_change=_zmen_rezim) \
+                    .props('dense outlined options-dense').style('min-width: 160px')
+                ui.button('Spočítat', icon='calculate', on_click=_spocitej) \
+                    .props('color=primary outline no-caps dense')
+            else:
+                ui.label('Nejdřív zpracujte data v sekci Data.') \
+                    .classes('text-sm text-gray-400')
+            ui.space()
+            for klic, lbl, _n in BONUS_TYPY:
+                plna = os.path.join(hotovo, _bonus_nazev(klic, okno_popis))
+                if obdobi_sel and os.path.isfile(plna):
+                    ui.button(f'Stáhnout {lbl}', icon='download',
+                              on_click=lambda _e, c=plna:
+                                  ui.download.file(c, os.path.basename(c))) \
+                        .props('color=green outline no-caps dense')
+        if obdobi_sel:
+            if rezim_sel == 'podklad':
+                info = (f'Okno {okno_mesice[0]} – {okno_mesice[-1]} • délka per řádek '
+                        f'dle sloupce Interval v podkladu')
+            else:
+                pocet_podkladu = sum(
+                    len(radky) for mapa in
+                    _mapy_pro_rezim(_bonus_mapy(pobocka), rezim_sel).values()
+                    for radky in mapa.values())
+                info = (f'Okno {okno_popis} ({okno_mesice[0]} – {okno_mesice[-1]}) • '
+                        f'podklad: {pocet_podkladu} řádků s intervalem '
+                        f'{_REZIM_LBL[rezim_sel]}')
+            ui.label(info).classes('text-xs text-gray-500')
+        if not vysledek:
+            ui.label('Zatím nespočítáno – klikněte na Spočítat.') \
+                .classes('text-sm text-gray-400')
+            return
+        ui.label(f'Spočteno {vysledek["cas"]:%d.%m.%Y %H:%M} • '
+                 f'zdroj: podkladová tabulka + data {vysledek["popis"]}') \
+            .classes('text-xs text-gray-500')
+        with ui.tabs().props(
+            'align=left active-color=primary indicator-color=primary'
+        ).classes('w-full border-b border-gray-200') as taby:
+            for klic, lbl, _n in BONUS_TYPY:
+                ui.tab(klic, label=f'{lbl} ({vysledek["pocty"][klic]})')
+        with ui.tab_panels(taby, value=BONUS_TYPY[0][0]).classes('w-full pt-2'):
+            for klic, _lbl, _n in BONUS_TYPY:
+                with ui.tab_panel(klic).classes('p-0'):
+                    ui.aggrid({
+                        'columnDefs': _bonus_col_defs(),
+                        'rowData': vysledek['radky'][klic],
+                        'defaultColDef': {'resizable': True, 'sortable': True,
+                                          'filter': True},
+                        'rowHeight': 32,
+                        'suppressMovableColumns': True,
+                        ':onFirstDataRendered': _AUTOSIZE_FIT,
+                        ':onGridSizeChanged': _AUTOSIZE_FIT,
+                    }).classes('w-full').style(_GRID_STYLE)
+                    if vysledek['pocty'][klic] > len(vysledek['radky'][klic]):
+                        ui.label(f'Náhled prvních {len(vysledek["radky"][klic])} '
+                                 f'z {vysledek["pocty"][klic]} řádků – '
+                                 f'celý výstup je v XLSX.') \
+                            .classes('text-xs text-gray-500')
+
+
 def _soubory(cesta: str) -> list[tuple]:
     out = []
     for nazev in sorted(os.listdir(cesta)):
@@ -939,6 +1551,22 @@ def _velikost(b: int) -> str:
             return f'{b:.0f} {jed}' if jed == 'B' else f'{b:.1f} {jed}'
         b /= 1024
     return f'{b:.1f} GB'
+
+
+def _prekryv_kolecko(popis: str, procenta: bool = True):
+    """Šedý překryv s kolečkem uprostřed. Vrací (dialog, kruh, popisek).
+    procenta=False → kolečko se točí (délka operace není známá)."""
+    with ui.dialog().props('persistent') as dlg, \
+            ui.card().classes('bg-transparent shadow-none items-center gap-2'):
+        kruh = ui.circular_progress(value=0, max=100, size='98px', show_value=False) \
+            .props('thickness=0.2 color=primary track-color=grey-5')
+        if not procenta:
+            kruh.props('indeterminate')
+        with kruh:
+            popisek = ui.label('0 %' if procenta else '') \
+                .classes('absolute-center text-lg font-bold')
+        ui.label(popis).classes('text-white').style('font-size: 1.25rem')
+    return dlg, kruh, popisek
 
 
 def _data_col_defs() -> list[dict]:
@@ -959,8 +1587,7 @@ def _data_sekce(pobocka: str, user_name: str) -> None:
     edit = _slozka(pobocka, 'Edit')
     hotovo = _slozka(pobocka, 'Zpracovano')
     obdobi_klic = f'bonusy_ao_obdobi_{pobocka}'
-    obdobi_list = nacti_obdobi(pobocka)
-    obdobi_klice = [o for o, _ in obdobi_list]
+    obdobi_klice = nacti_obdobi(pobocka)
     obdobi_sel = app.storage.user.get(obdobi_klic)
     if obdobi_sel not in obdobi_klice:
         obdobi_sel = obdobi_klice[0] if obdobi_klice else None
@@ -968,35 +1595,60 @@ def _data_sekce(pobocka: str, user_name: str) -> None:
     radky, celkem = nacti_data_nahled(pobocka, obdobi_sel)
 
     async def _zpracuj(nazev: str):
-        notif = ui.notification(f'Zpracovávám {nazev}…', spinner=True, timeout=None)
+        stav_pokrok = {'f': 0.0}
+        dlg, kruh, popisek = _prekryv_kolecko(f'Zpracovávám {nazev}…')
+        dlg.open()
+
+        def _tik():
+            proc = stav_pokrok['f'] * 100
+            kruh.set_value(proc)
+            popisek.set_text(f'{proc:.0f} %')
+
+        casovac = ui.timer(0.2, _tik)
         try:
-            pocet, cil = await asyncio.to_thread(zpracuj_soubor, pobocka, nazev)
+            pocet, cil, obdobi_sou = await asyncio.to_thread(
+                zpracuj_soubor, pobocka, nazev, lambda f: stav_pokrok.update(f=f))
         except Exception as exc:
-            notif.dismiss()
             ui.notify(f'Chyba zpracování: {exc}', type='negative', timeout=10000)
             return
-        notif.dismiss()
+        finally:
+            casovac.cancel()
+            dlg.close()
         ui.notify(f'{nazev}: {pocet} řádků → {os.path.basename(cil)}', type='positive')
         intranet_logger.log_activity(
             user_name, 'Bonusy AO',
             f'{pobocka}: zpracován soubor {nazev} ({pocet} řádků)')
-        app.storage.user[obdobi_klic] = _obdobi_z_nazvu(nazev)
+        app.storage.user[obdobi_klic] = obdobi_sou
         _data_sekce.refresh()
 
-    def _zmen_obdobi(e):
+    async def _zmen_obdobi(e):
         app.storage.user[obdobi_klic] = e.value
+        dlg, _kruh, _popisek = _prekryv_kolecko(f'Načítám období {e.value}…',
+                                                procenta=False)
+        dlg.open()
+        await asyncio.sleep(0.15)   # ať se překryv vykreslí před načtením z DB
+        dlg.close()
         _data_sekce.refresh()
 
     async def _smaz_obdobi():
         if not obdobi_sel:
             return
-        pocet = await asyncio.to_thread(smaz_obdobi, pobocka, obdobi_sel)
+        dlg_smaz.close()
+        dlg, _kruh, _popisek = _prekryv_kolecko(f'Mažu období {obdobi_sel}…',
+                                                procenta=False)
+        dlg.open()
+        try:
+            pocet = await asyncio.to_thread(smaz_obdobi, pobocka, obdobi_sel)
+        except Exception as exc:
+            ui.notify(f'Chyba mazání: {exc}', type='negative', timeout=10000)
+            return
+        finally:
+            dlg.close()
         ui.notify(f'Smazáno období {obdobi_sel}: {pocet} řádků.', type='positive')
         intranet_logger.log_activity(
             user_name, 'Bonusy AO',
             f'{pobocka}: smazáno období {obdobi_sel} ({pocet} řádků)')
         app.storage.user.pop(obdobi_klic, None)
-        dlg_smaz.close()
         _data_sekce.refresh()
 
     with ui.dialog() as dlg_smaz, ui.card().classes('w-[420px]'):
@@ -1062,13 +1714,19 @@ def _data_sekce(pobocka: str, user_name: str) -> None:
                 soubory = _soubory(edit)
                 if not soubory:
                     ui.label('Složka je prázdná.').classes('text-xs text-gray-400')
-                for nazev, vel in soubory:
-                    with ui.row().classes('items-center gap-2 w-full'):
-                        ui.icon('description', color='grey-6')
-                        ui.label(f'{nazev} ({_velikost(vel)})').classes('text-sm')
-                        ui.space()
-                        ui.button('Zpracovat', icon='play_arrow',
-                                  on_click=lambda _e, n=nazev: _zpracuj(n)) \
+                else:
+                    with ui.row().classes('items-center gap-2 w-full no-wrap'):
+                        vyber = ui.select(
+                            {n: f'{n} ({_velikost(v)})' for n, v in soubory},
+                            value=soubory[0][0], label='Soubor') \
+                            .props('dense outlined options-dense').classes('flex-grow')
+                        async def _klik(_e=None, v=vyber):
+                            if not v.value:
+                                ui.notify('Vyberte soubor.', type='warning')
+                                return
+                            await _zpracuj(v.value)
+
+                        ui.button('Zpracovat', icon='play_arrow', on_click=_klik) \
                             .props('color=primary outline no-caps dense')
             with ui.card().classes('flex-1 p-3 gap-2'):
                 ui.label('Hotové – složka Zpracovano') \
@@ -1088,7 +1746,7 @@ def _data_sekce(pobocka: str, user_name: str) -> None:
 
         with ui.row().classes('w-full items-center gap-3 mt-2'):
             if obdobi_klice:
-                ui.select({o: f'{o}  ({p} řádků)' for o, p in obdobi_list},
+                ui.select(obdobi_klice,
                           value=obdobi_sel, label='Období', on_change=_zmen_obdobi) \
                     .props('dense outlined options-dense').style('min-width: 220px')
                 ui.button('Smazat období', icon='delete', on_click=dlg_smaz.open) \
@@ -1145,6 +1803,8 @@ def vykresli_bonusy_ao(user_id: int, user_name: str, vsechna_prava: list):
                                 lambda: _podkladova_tabulka(sel, user_name)),
                     'data':    ('🗂️ Data',
                                 lambda: _data_sekce(sel, user_name)),
+                    'bonusy':  ('💰 Bonusy',
+                                lambda: _bonusy_sekce(sel, user_name)),
                 }
                 with ui.tabs().props(
                     'align=left active-color=primary indicator-color=primary'
