@@ -36,6 +36,7 @@ import os
 import pickle
 import signal
 import sys
+import time
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 
@@ -93,6 +94,8 @@ CPU_POOL: ProcessPoolExecutor | None = None
 _SEM: asyncio.Semaphore | None = None      # brzda souběhu těžkých úloh
 _BEZICI: int = 0                           # počet právě běžících těžkých úloh
 _FALLBACKU: int = 0                        # kolikrát se cpu() muselo vrátit k vláknu
+_GRACE_SHUTDOWN: float = 5.0               # lhůta pro dobehnutí běžící úlohy při shutdownu
+_VYPINAME: bool = False                    # appka se vypíná → pool už neobnovovat
 
 
 def _je_worker() -> bool:
@@ -111,7 +114,7 @@ def _sem() -> asyncio.Semaphore:
 def init_pool() -> None:
     """Založí proces-pool. Bezpečné volat opakovaně; v child-procesu nedělá nic."""
     global CPU_POOL
-    if _je_worker():
+    if _je_worker() or _VYPINAME:   # po vypnutí appky už pool neoživovat
         return
     _sem()  # inicializuj semafor v aktuální event-loopě
     if CPU_POOL is None:
@@ -129,14 +132,50 @@ def init_pool() -> None:
 
 
 def shutdown_pool() -> None:
-    """Korektně ukončí proces-pool. Volat z app.on_shutdown."""
-    global CPU_POOL
-    if CPU_POOL is not None:
-        try:
-            CPU_POOL.shutdown(wait=False, cancel_futures=True)
-        except Exception:
-            pass
-        CPU_POOL = None
+    """Korektně ukončí proces-pool. Volat z app.on_shutdown.
+
+    BEZ PARAMETRŮ — ani keyword-only. NiceGUI (app/app.py) volá handler jako
+    `t(self) if len(inspect.signature(t).parameters) == 1 else t()`, takže jediný
+    parametr (i defaultní keyword-only) znamená, že dostaneme navíc `app` → TypeError
+    → "Application shutdown failed" a nedoběhnou ani další on_shutdown handlery.
+    """
+    _uzavri_pool(definitivni=True)
+
+
+def _uzavri_pool(*, definitivni: bool) -> None:
+    """Zavře proces-pool a odregistruje jeho semafory.
+
+    definitivni=False použij jen pro recyklaci rozbitého poolu za běhu — pool se pak
+    smí znovu postavit a na dobehnutí úloh se nečeká (u rozbitého poolu jsou jejich
+    výsledky stejně nedoručitelné).
+
+    Semafory poolu (/dev/shm/sem.mp-*) odregistruje až dobehnutý manager-thread
+    executoru, a ten dobehne jen při shutdown(wait=True). Bez toho zůstanou jména
+    v resource_trackeru, a když je proces ukončen tvrdě (SIGKILL po TimeoutStopSec,
+    execv při restartu) nebo je soubory smaže systemd RemoveIPC, tracker při pádu
+    vypíše "leaked semaphore objects ... [Errno 2] No such file or directory".
+    Samotné wait=True ale čeká i na úlohy už rozdané do fronty (naměřeno 59 s,
+    cancel_futures je neodvolá), proto běžícím úlohám dáme jen lhůtu a pak je ukončíme.
+    """
+    global CPU_POOL, _VYPINAME
+    if definitivni:
+        _VYPINAME = True                  # ať si rozbité úlohy pool znovu nepostaví
+    pool, CPU_POOL = CPU_POOL, None       # odpojit hned: cpu() nesmí chytit umírající pool
+    if pool is None:
+        return
+    try:
+        if _BEZICI > 0:                   # něco běží → nedostaneme se k úklidu sami
+            deti = list((getattr(pool, "_processes", None) or {}).values())
+            if definitivni:               # řádné vypnutí: lhůta na dobehnutí
+                konec = time.monotonic() + _GRACE_SHUTDOWN
+                for p in deti:
+                    p.join(max(0.0, konec - time.monotonic()))
+            for p in deti:                # rozbitý pool / přetažená lhůta → ukončit
+                if p.is_alive():
+                    p.terminate()
+        pool.shutdown(wait=True, cancel_futures=True)
+    except Exception:
+        pass
 
 
 async def warmup() -> None:
@@ -208,7 +247,7 @@ async def cpu(fn, *args):
                 except BrokenProcessPool as e:
                     # Worker zemřel (OOM/crash) → obnov pool a dojeď ve vlákně
                     print(f"[jobs] Proces-pool se rozbil ({e}); restart + vlákno.")
-                    shutdown_pool()
+                    _uzavri_pool(definitivni=False)
                     init_pool()
                     _FALLBACKU += 1
                     return await asyncio.to_thread(fn, *args)
@@ -239,3 +278,19 @@ def info() -> dict:
         "fallbacku_na_vlakno": _FALLBACKU,
         "jader": os.cpu_count(),
     }
+
+
+if __name__ == "__main__":
+    # Self-check kontraktu on_startup/on_shutdown handlerů (`python3 intranet_jobs.py`).
+    # NiceGUI (app/app.py) volá handler takto:
+    #     result = t(self) if len(inspect.signature(t).parameters) == 1 else t()
+    # Handler s PRÁVĚ JEDNÍM parametrem (i keyword-only s defaultem) tedy dostane `app`;
+    # pokud ho neumí přijmout, lifespan spadne na TypeError, appka vypíše
+    # "Application shutdown failed" a nedoběhnou ani ostatní handlery za ním.
+    import inspect
+
+    for h in (shutdown_pool, warmup):
+        pocet = len(inspect.signature(h).parameters)
+        assert pocet != 1, (f"{h.__name__} má 1 parametr → NiceGUI mu předá `app`. "
+                            f"Nech ho bez parametrů a volitelné přepínače dej do privátní funkce.")
+        print(f"OK {h.__name__}: {pocet} parametrů → NiceGUI zavolá {h.__name__}()")

@@ -889,8 +889,68 @@ def _vykresli_uzavrene_mesice(user_name, editable):
     panel()
 
 
+def _kopirovaci_skript():
+    """Delegovaný posluchač pro kopírování identifikátorů z gridů (IČO, kód
+    produktu) do schránky. Jeden na stránku, v capture fázi — klik na hodnotu se
+    tak nedostane k posluchači řádku v AG Gridu a neotevře detail zákazníka.
+    Zápis přes textarea+execCommand, protože navigator.clipboard je na http
+    (intranet bez TLS) nedostupný; clipboard API je jen fallback.
+
+    Injektáž přes run_javascript, ne add_body_html: Lupa se kreslí až při
+    přepnutí tabu, tedy po odeslání stránky — NiceGUI takové HTML vkládá přes
+    insertAdjacentHTML, který <script> nikdy nespustí."""
+    ui.run_javascript('''
+    (function () {
+      if (window.__lupaKopie) return;
+      window.__lupaKopie = true;
+      const st = document.createElement('style');
+      st.textContent = '.lupa-kopie{cursor:copy;border-bottom:1px dashed #94a3b8}'
+        + '.lupa-kopie:hover{background:#e0e7ff}';
+      document.head.appendChild(st);
+      const hlaska = (txt) => {
+        const d = document.createElement('div');
+        d.textContent = 'Zkopírováno: ' + txt;
+        d.style.cssText = 'position:fixed;left:50%;bottom:32px;transform:translateX(-50%);'
+          + 'background:#1e293b;color:#fff;padding:6px 14px;border-radius:6px;'
+          + 'font-size:13px;z-index:9999;pointer-events:none;';
+        document.body.appendChild(d);
+        setTimeout(() => d.remove(), 1200);
+      };
+      document.addEventListener('click', (ev) => {
+        const el = ev.target.closest && ev.target.closest('.lupa-kopie');
+        if (!el) return;
+        const txt = (el.textContent || '').trim();
+        if (!txt) return;
+        ev.stopPropagation();
+        let ok = false;
+        const onCopy = (e) => {
+          e.clipboardData.setData('text/plain', txt);
+          e.preventDefault(); ok = true;
+        };
+        try {
+          const ta = document.createElement('textarea');
+          ta.value = txt;
+          ta.style.position = 'fixed'; ta.style.top = '0'; ta.style.opacity = '0';
+          document.body.appendChild(ta); ta.focus(); ta.select();
+          document.addEventListener('copy', onCopy, true);
+          document.execCommand('copy');
+          document.removeEventListener('copy', onCopy, true);
+          ta.remove();
+        } catch (_) {
+          document.removeEventListener('copy', onCopy, true);
+        }
+        if (!ok && navigator.clipboard) {
+          try { navigator.clipboard.writeText(txt); ok = true; } catch (e) {}
+        }
+        hlaska(ok ? txt : txt + ' — kopie selhala, označ a Ctrl+C');
+      }, true);
+    })();
+    ''')
+
+
 def vykresli_lupa(user_id, user_name, vsechna_prava):
     inicializace_db()
+    _kopirovaci_skript()
     stav_klic = f'lupa_pohled_{user_id}'
 
     @ui.refreshable
@@ -2314,6 +2374,29 @@ def _filtry(cols):
     return cols
 
 
+# Identifikátory, které se z gridu kopírují klikem (IČO do JIP, kód produktu do
+# objednávek). Renderer vrací element, ne HTML string — hodnota se tak nikdy
+# neinterpretuje jako markup. Součtový řádek (rowPinned) kopírovatelný není.
+_KOPIROVATELNE = ('ico', 'kod')
+
+_KOPIE_RENDERER = (
+    "function(p){"
+    "var v=(p.value===null||p.value===undefined)?'':String(p.value);"
+    "var e=document.createElement('span');e.textContent=v;"
+    "if(v&&!(p.node&&p.node.rowPinned)){e.className='lupa-kopie';"
+    "e.title='Kliknutím zkopírujete do schránky';}"
+    "return e;}"
+)
+
+
+def _kopirovatelne(cols):
+    """Označí sloupce s identifikátory jako kopírovatelné klikem."""
+    for c in cols:
+        if c.get('field') in _KOPIROVATELNE:
+            c.setdefault(':cellRenderer', _KOPIE_RENDERER)
+    return cols
+
+
 def _grid(opts, filtry=False):
     """AG Grid 34 odmítá colDef.flex spolu s gridOptions.autoSizeStrategy, kterou
     NiceGUI přidává při auto_size_columns=True (default) — grid se pak nevykreslí.
@@ -2321,6 +2404,7 @@ def _grid(opts, filtry=False):
 
     `filtry` zapíná řádek filtrů pod hlavičkou. Jen tam, kde je grid pracovní
     tabulka bez součtového řádku — pod součtem celé sady by filtr lhal."""
+    _kopirovatelne(opts.get('columnDefs') or [])
     if filtry:
         _filtry(opts.get('columnDefs') or [])
         opts['defaultColDef'] = {**(opts.get('defaultColDef') or {}),
@@ -2837,8 +2921,9 @@ def _graf_polozky_option(produkty, n=15):
 
 
 def _cols_polozky_grid(rozpad):
-    """Sloupce TOP položek; v rozpadu přibude skupina zboží z karet (lupa_karta)."""
-    return _filtry([
+    """Sloupce TOP položek; v rozpadu přibude skupina zboží z karet (lupa_karta).
+    Kopírování se doplňuje i tady — přepínač rozpadu mění columnDefs mimo _grid()."""
+    return _kopirovatelne(_filtry([
         {'headerName': 'Kód', 'field': 'kod', 'width': 130},
         {'headerName': 'Produkt', 'field': 'nazev', 'flex': 2, 'minWidth': 240},
     ] + ([{'headerName': 'Skupina zboží', 'field': 'skupina', 'flex': 1,
@@ -2850,7 +2935,7 @@ def _cols_polozky_grid(rozpad):
          'type': 'numericColumn', ':valueFormatter': _fmt_js(1)},
         {'headerName': 'Obrat Kč', 'field': 'kc', 'width': 150,
          'type': 'numericColumn', ':valueFormatter': _fmt_js(2)},
-    ])
+    ]))
 
 
 def _vykresli_obraty(asm, user_id, user_name, vsechna_prava):
