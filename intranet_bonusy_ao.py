@@ -10,9 +10,12 @@ import asyncio
 import datetime
 import inspect
 import io
+import math
 import os
 import re
 import unicodedata
+import zipfile
+from xml.sax.saxutils import escape
 
 from nicegui import app, ui
 
@@ -239,7 +242,8 @@ def nacti_radky(pobocka: str) -> list[dict]:
     return radky
 
 
-def pridej_radek(pobocka: str) -> int:
+def pridej_radek(pobocka: str, typ_bonusu: str | None = None) -> int:
+    """Nový prázdný řádek. `typ_bonusu` ho rovnou zařadí do sekce."""
     conn = intranet_data.get_db_connection()
     if not conn:
         return 0
@@ -248,8 +252,10 @@ def pridej_radek(pobocka: str) -> int:
         cur.execute(f'SELECT COALESCE(MAX(poradi), 0) + 1 FROM {TABULKA} '
                     f'WHERE pobocka_klic=%s', (pobocka,))
         poradi = cur.fetchone()[0]
-        cur.execute(f'INSERT INTO {TABULKA} (pobocka_klic, poradi, `pobocka`) '
-                    f'VALUES (%s, %s, %s)', (pobocka, poradi, pobocka))
+        cur.execute(f'INSERT INTO {TABULKA} '
+                    f'(pobocka_klic, poradi, `pobocka`, `typ_bonusu`) '
+                    f'VALUES (%s, %s, %s, %s)',
+                    (pobocka, poradi, pobocka, typ_bonusu or ''))
         conn.commit()
         rid = cur.lastrowid
         cur.close()
@@ -274,16 +280,40 @@ def uloz_bunku(rid: int, pole: str, hodnota) -> None:
         conn.close()
 
 
-def smaz_radky(ids: list[int]) -> int:
+def smaz_radky(ids: list[int]) -> list[dict]:
+    """Smaže řádky a vrátí jejich úplnou zálohu pro `obnov_radky` (undo)."""
     if not ids:
+        return []
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return []
+    try:
+        cur = conn.cursor(dictionary=True)
+        misto = ','.join(['%s'] * len(ids))
+        cur.execute(f'SELECT * FROM {TABULKA} WHERE id IN ({misto})', tuple(ids))
+        zaloha = cur.fetchall()
+        cur.execute(f'DELETE FROM {TABULKA} WHERE id IN ({misto})', tuple(ids))
+        conn.commit()
+        cur.close()
+        return zaloha
+    finally:
+        conn.close()
+
+
+def obnov_radky(zaloha: list[dict]) -> int:
+    """Vrátí zpět řádky smazané přes `smaz_radky` – včetně id a pořadí."""
+    if not zaloha:
         return 0
     conn = intranet_data.get_db_connection()
     if not conn:
         return 0
     try:
+        sl = list(zaloha[0])
         cur = conn.cursor()
-        cur.execute(f'DELETE FROM {TABULKA} WHERE id IN '
-                    f'({",".join(["%s"] * len(ids))})', tuple(ids))
+        cur.executemany(
+            f'INSERT INTO {TABULKA} ({", ".join(f"`{s}`" for s in sl)}) '
+            f'VALUES ({", ".join(["%s"] * len(sl))})',
+            [tuple(r[s] for s in sl) for r in zaloha])
         conn.commit()
         pocet = cur.rowcount
         cur.close()
@@ -415,7 +445,10 @@ def _col_defs() -> list[dict]:
 
 
 def _podkladova_tabulka(pobocka: str, user_name: str) -> None:
-    stav = {'radky': nacti_radky(pobocka), 'grids': {}, 'tab': None}
+    # `kos` = zásobník smazaných dávek (undo), `kotva` = element mimo _grid_box,
+    # na kterém přežije timer refresh gridu
+    stav = {'radky': nacti_radky(pobocka), 'grids': {}, 'tab': None,
+            'kos': [], 'kotva': None}
 
     @ui.refreshable
     def _grid_box():
@@ -444,44 +477,70 @@ def _podkladova_tabulka(pobocka: str, user_name: str) -> None:
         def _panel(typ: str, radky: list[dict]):
             # grid se staví až pro aktivní záložku – jinak má nulovou šířku
             # a autosize sloupců na obsah se spočítá špatně
-            grid = ui.aggrid({
-                'columnDefs': _col_defs(),
-                'rowData': radky,
-                'defaultColDef': {'resizable': True, 'sortable': True, 'filter': True},
-                'rowHeight': 32,
-                'rowSelection': 'multiple',
-                'suppressRowClickSelection': True,
-                'suppressMovableColumns': True,
-                'singleClickEdit': True,
-                'stopEditingWhenCellsLoseFocus': True,
-                ':onFirstDataRendered': _AUTOSIZE_FIT,
-                ':onGridSizeChanged': _AUTOSIZE_FIT,
-                ':getRowId': 'function(p){return String(p.data.id);}',
-            }).classes('w-full').style(_GRID_STYLE)
+            # aggrid má template `<div></div>` bez slotu → potomci se nevykreslí;
+            # kontextové menu musí viset na obalu, event z gridu k němu probublá
+            obal = ui.element('div').classes('w-full')
+            with obal:
+                grid = ui.aggrid({
+                    'columnDefs': _col_defs(),
+                    'rowData': radky,
+                    'defaultColDef': {'resizable': True, 'sortable': True, 'filter': True},
+                    'rowHeight': 32,
+                    'rowSelection': 'multiple',
+                    'suppressRowClickSelection': True,
+                    'suppressMovableColumns': True,
+                    'singleClickEdit': True,
+                    'stopEditingWhenCellsLoseFocus': True,
+                    ':onFirstDataRendered': _AUTOSIZE_FIT,
+                    ':onGridSizeChanged': _AUTOSIZE_FIT,
+                    ':getRowId': 'function(p){return String(p.data.id);}',
+                }).classes('w-full').style(_GRID_STYLE)
+                with ui.context_menu():         # pravý klik kamkoliv do dat
+                    ui.menu_item('Přidat řádek', _pridej)
             stav['grids'][typ] = grid
             grid.on('cellValueChanged', _on_change)
 
+            # Delete smaže označené řádky, jinak ten pod kurzorem (ne při editaci).
+            # Event je pojmenovaný po kotvě, ne po gridu – ui.on visí na layoutu
+            # a při každém refreshi by přibyl mrtvý listener.
+            grid._props['options'][':onCellKeyDown'] = (
+                "function(p){"
+                "var e=p.event;if(!e)return;"
+                "if(e.key!=='Delete'&&e.key!=='Del')return;"
+                "if(p.api.getEditingCells().length)return;"
+                "var s=p.api.getSelectedRows().filter(function(r){return r&&r.id;})"
+                ".map(function(r){return r.id;});"
+                "if(!s.length&&p.data&&p.data.id)s=[p.data.id];"
+                "if(!s.length)return;"
+                "e.preventDefault();"
+                f"emitEvent('bonusy_del_{stav['kotva'].id}',{{ids:s}});"
+                "}")
+
             async def _smaz(g=grid):
                 vybrane = await g.get_selected_rows()
-                ids = [int(r['id']) for r in vybrane if r.get('id')]
-                if not ids:
-                    ui.notify('Nejsou označené žádné řádky.', type='warning')
-                    return
-                pocet = smaz_radky(ids)
-                stav['radky'] = nacti_radky(pobocka)
-                _grid_box.refresh()
-                ui.notify(f'Smazáno řádků: {pocet}', type='positive')
-                intranet_logger.log_activity(
-                    user_name, 'Bonusy AO',
-                    f'{pobocka}: smazáno {pocet} řádků podkladové tabulky')
+                _smaz_ids([int(r['id']) for r in vybrane if r.get('id')])
 
             with ui.row().classes('w-full justify-between items-center mt-2'):
-                ui.label(f'Řádků: {len(radky)}').classes('text-sm text-gray-500')
-                ui.button('Smazat označené', icon='delete', on_click=_smaz) \
-                    .props('color=negative outline no-caps dense')
+                ui.label(f'Řádků: {len(radky)} · pravý klik = přidat řádek '
+                         f'· Delete = smazat řádek').classes('text-sm text-gray-500')
+                with ui.row().classes('items-center gap-2'):
+                    if stav['kos']:
+                        ui.button(f'Vrátit smazání ({len(stav["kos"][-1])})',
+                                  icon='undo', on_click=_vrat_smazani) \
+                            .props('color=primary outline no-caps dense')
+                    ui.button('Smazat označené', icon='delete', on_click=_smaz) \
+                        .props('color=negative outline no-caps dense')
 
         if not poradi:
             ui.label('Žádné řádky.').classes('text-sm text-gray-500')
+            with ui.row().classes('items-center gap-2'):
+                # prázdná tabulka nemá kam kliknout pravým tlačítkem
+                ui.button('Přidat řádek', icon='add', on_click=_pridej) \
+                    .props('color=primary outline no-caps dense')
+                if stav['kos']:     # smazaný poslední řádek musí jít vrátit
+                    ui.button(f'Vrátit smazání ({len(stav["kos"][-1])})',
+                              icon='undo', on_click=_vrat_smazani) \
+                        .props('color=primary outline no-caps dense')
             return
 
         if stav.get('tab') not in poradi:
@@ -502,7 +561,7 @@ def _podkladova_tabulka(pobocka: str, user_name: str) -> None:
             _panel(stav['tab'], skupiny[stav['tab']])
 
     def _skoc_na_konec():
-        typ = _BEZ_TYPU
+        typ = stav.get('tab') or _BEZ_TYPU
         grid = stav['grids'].get(typ)
         radky = [r for r in stav['radky'] if _typ_bonusu(r) == typ]
         if grid is None or not radky:
@@ -512,14 +571,46 @@ def _podkladova_tabulka(pobocka: str, user_name: str) -> None:
         grid.run_grid_method('startEditingCell', {'rowIndex': idx, 'colKey': POLE[0]})
 
     def _pridej():
-        if not pridej_radek(pobocka):
+        # řádek vzniká v sekci, kde uživatel právě je → typ se předvyplní
+        typ = stav.get('tab')
+        if not pridej_radek(pobocka, None if typ == _BEZ_TYPU else typ):
             ui.notify('Řádek se nepodařilo přidat.', type='negative')
             return
         stav['radky'] = nacti_radky(pobocka)
-        stav['tab'] = _BEZ_TYPU          # nový řádek je prázdný → záložka bez typu
+        stav['tab'] = typ or _BEZ_TYPU
         _grid_box.refresh()
-        # grid se po refreshi staví znovu – skok až je na klientovi
-        ui.timer(0.3, _skoc_na_konec, once=True)
+        # grid se po refreshi staví znovu – skok až je na klientovi.
+        # Timer musí viset na kotvě: v handleru je aktivní slot uvnitř _grid_box,
+        # takže refresh() by ho smazal dřív, než vystřelí.
+        with stav['kotva']:
+            ui.timer(0.3, _skoc_na_konec, once=True)
+
+    def _smaz_ids(ids: list[int]) -> None:
+        if not ids:
+            ui.notify('Nejsou označené žádné řádky.', type='warning')
+            return
+        zaloha = smaz_radky(ids)
+        if not zaloha:
+            return
+        stav['kos'].append(zaloha)
+        stav['radky'] = nacti_radky(pobocka)
+        _grid_box.refresh()
+        ui.notify(f'Smazáno řádků: {len(zaloha)} · lze vrátit tlačítkem Vrátit smazání',
+                  type='positive')
+        intranet_logger.log_activity(
+            user_name, 'Bonusy AO',
+            f'{pobocka}: smazáno {len(zaloha)} řádků podkladové tabulky')
+
+    def _vrat_smazani():
+        if not stav['kos']:
+            return
+        pocet = obnov_radky(stav['kos'].pop())
+        stav['radky'] = nacti_radky(pobocka)
+        _grid_box.refresh()
+        ui.notify(f'Vráceno řádků: {pocet}', type='positive')
+        intranet_logger.log_activity(
+            user_name, 'Bonusy AO',
+            f'{pobocka}: vráceno {pocet} smazaných řádků podkladové tabulky')
 
     # ── dialog importu ──
     imp = {'raw': None, 'listy': [], 'nazev': ''}
@@ -582,10 +673,11 @@ def _podkladova_tabulka(pobocka: str, user_name: str) -> None:
             ui.button('Zavřít', on_click=dlg_import.close).props('flat no-caps')
             ui.button('Importovat', icon='upload', on_click=_importuj).props('color=primary no-caps')
 
-    with ui.column().classes('w-full gap-2'):
+    with ui.column().classes('w-full gap-2') as kotva:
+        stav['kotva'] = kotva
+        ui.on(f'bonusy_del_{kotva.id}', lambda e: _smaz_ids(
+            [int(i) for i in (e.args or {}).get('ids', []) if i]))
         with ui.row().classes('w-full justify-end gap-2'):
-            ui.button('Přidat řádek', icon='add', on_click=_pridej) \
-                .props('color=primary outline no-caps dense')
             ui.button('Import z Excelu', icon='upload_file', on_click=dlg_import.open) \
                 .props('color=teal outline no-caps dense')
         _grid_box()
@@ -645,7 +737,7 @@ def _datum_hodnota(hodnota):
     txt = str(hodnota or '').strip().replace('/', '.')      # „/“ → „.“
     if not txt:
         return None
-    for fmt in ('%d.%m.%y', '%d.%m.%Y', '%Y-%m-%d'):
+    for fmt in ('%d.%m.%Y', '%d.%m.%y', '%Y-%m-%d'):
         try:
             return datetime.datetime.strptime(txt, fmt).date()
         except ValueError:
@@ -701,6 +793,29 @@ def _radky_slk(cesta: str, pokrok=None):
 
 
 def _radky_xlsx(cesta: str, pokrok=None):
+    """Řádky XLSX. calamine (Rust) je ~12× rychlejší než openpyxl a zná počet
+    řádků dopředu, takže jde ukazovat postup. Celý list si ale drží v paměti
+    (~1,7 kB/řádek), takže velké soubory čte po řádcích dál openpyxl.
+    ponytail: strop je paměť; nad 40 MB pomalejší, zato konstantní openpyxl."""
+    try:
+        from python_calamine import CalamineWorkbook
+    except ImportError:
+        CalamineWorkbook = None
+    if CalamineWorkbook is None or os.path.getsize(cesta) > 40 * 1024 * 1024:
+        yield from _radky_xlsx_openpyxl(cesta, pokrok)
+        return
+    ws = CalamineWorkbook.from_path(cesta).get_sheet_by_index(0)
+    celkem = ws.height or 0
+    for y, radek in enumerate(ws.iter_rows(), 1):
+        if pokrok and celkem and y % 5000 == 0:
+            pokrok(min(y / celkem, 1.0))
+        # celá čísla vrací calamine jako float (IČO 12345678.0) – zpět na int,
+        # jinak by se z něj přes str() stalo „12345678.0“
+        yield y, {i: int(v) if type(v) is float and v.is_integer() else v
+                  for i, v in enumerate(radek, 1) if v is not None and v != ''}
+
+
+def _radky_xlsx_openpyxl(cesta: str, pokrok=None):
     import openpyxl
     wb = openpyxl.load_workbook(cesta, read_only=True, data_only=True)
     try:
@@ -845,6 +960,139 @@ def pocet_kontaktu() -> int:
         conn.close()
 
 
+# ─── Rychlý zápis XLSX ───────────────────────────────────────────────────────
+# openpyxl zvládne i ve write_only ~14 000 řádků/s a u velkých importů spolkne
+# většinu času. Tohle je proud XML rovnou do ZIPu – měřeno 5× rychlejší.
+# Umí jen to, co export dat potřebuje: jeden list, text / číslo / datum.
+# ponytail: bez stylů, vzorců a víc listů – na ty zůstává openpyxl.
+
+_XLSX_EPOCH = datetime.date(1899, 12, 30)       # Excel: sériové 1 = 31. 12. 1899
+_XLSX_ZAKAZANE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f]')   # v XML nepřípustné
+_XLSX_NS = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
+_XLSX_KOSTRA = (
+    ('[Content_Types].xml',
+     '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats'
+     '.org/package/2006/content-types"><Default Extension="rels" ContentType="application'
+     '/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType'
+     '="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/'
+     'vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName='
+     '"/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument'
+     '.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType='
+     '"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>'),
+    ('_rels/.rels',
+     '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.'
+     'openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://'
+     'schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target='
+     '"xl/workbook.xml"/></Relationships>'),
+    ('xl/workbook.xml',
+     f'<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="{_XLSX_NS}" xmlns:r="http://'
+     'schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name='
+     '"data" sheetId="1" r:id="rId1"/></sheets></workbook>'),
+    ('xl/_rels/workbook.xml.rels',
+     '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.'
+     'openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://'
+     'schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target='
+     '"worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats'
+     '.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>'),
+    ('xl/styles.xml',
+     f'<?xml version="1.0" encoding="UTF-8"?><styleSheet xmlns="{_XLSX_NS}"><numFmts '
+     'count="1"><numFmt numFmtId="164" formatCode="dd\\.mm\\.yyyy"/></numFmts><fonts '
+     'count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts><fills count="2">'
+     '<fill><patternFill patternType="none"/></fill><fill><patternFill patternType='
+     '"gray125"/></fill></fills><borders count="1"><border/></borders><cellStyleXfs '
+     'count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+     '<cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
+     '<xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat='
+     '"1"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId='
+     '"0"/></cellStyles></styleSheet>'),
+)
+
+
+def _xlsx_sloupce(pocet: int) -> list[str]:
+    """['A', 'B', … 'AA'] pro daný počet sloupců."""
+    out = []
+    for i in range(pocet):
+        znacka, x = '', i
+        while x >= 0:
+            znacka = chr(65 + x % 26) + znacka
+            x = x // 26 - 1
+        out.append(znacka)
+    return out
+
+
+class _XlsxZapis:
+    """Streamovaný zápis jednoho listu:
+
+        with _XlsxZapis(cesta, hlavicka) as sesit:
+            sesit.radek([...])
+
+    Píše do <cesta>.tmp a přejmenuje až po zavření – chyba uprostřed nenechá
+    ve Zpracovano poloviční soubor.
+    """
+
+    def __init__(self, cesta: str, hlavicka: list):
+        self.cesta = cesta
+        self.docasna = cesta + '.tmp'
+        self.sloupce = _xlsx_sloupce(len(hlavicka))
+        self.y = 0
+        self.buf: list[str] = []
+        # compresslevel=1: XML se komprimuje skoro stejně, ale výrazně rychleji
+        self.zip = zipfile.ZipFile(self.docasna, 'w', zipfile.ZIP_DEFLATED,
+                                   compresslevel=1)
+        self.list = self.zip.open('xl/worksheets/sheet1.xml', 'w')
+        self.list.write(f'<?xml version="1.0" encoding="UTF-8"?>'
+                        f'<worksheet xmlns="{_XLSX_NS}"><sheetData>'.encode())
+        self.radek(hlavicka)
+
+    def radek(self, hodnoty) -> None:
+        self.y += 1
+        y = self.y
+        cast = [f'<row r="{y}">']
+        for sl, v in zip(self.sloupce, hodnoty):
+            if v is None or v == '':
+                continue                                # prázdná buňka se nepíše
+            if isinstance(v, datetime.datetime):
+                v = v.date()
+            if isinstance(v, datetime.date):
+                cast.append(f'<c r="{sl}{y}" s="1"><v>{(v - _XLSX_EPOCH).days}</v></c>')
+            elif isinstance(v, (int, float)) and not isinstance(v, bool) \
+                    and math.isfinite(v):
+                cast.append(f'<c r="{sl}{y}"><v>{v}</v></c>')
+            else:                                       # nan/inf spadne sem jako text
+                txt = escape(_XLSX_ZAKAZANE.sub('', str(v)))
+                cast.append(f'<c r="{sl}{y}" t="inlineStr">'
+                            f'<is><t xml:space="preserve">{txt}</t></is></c>')
+        cast.append('</row>')
+        self.buf.append(''.join(cast))
+        if len(self.buf) >= 2000:
+            self.list.write(''.join(self.buf).encode())
+            self.buf.clear()
+
+    def close(self) -> None:
+        self.list.write((''.join(self.buf) + '</sheetData></worksheet>').encode())
+        self.buf.clear()
+        self.list.close()
+        for jmeno, obsah in _XLSX_KOSTRA:
+            self.zip.writestr(jmeno, obsah)
+        self.zip.close()
+        os.replace(self.docasna, self.cesta)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, typ, *_):
+        if typ is None:
+            self.close()
+            return
+        for zavri in (self.list.close, self.zip.close):      # úklid po chybě
+            try:
+                zavri()
+            except Exception:
+                pass
+        if os.path.exists(self.docasna):
+            os.remove(self.docasna)
+
+
 # ─── Zpracování souboru ──────────────────────────────────────────────────────
 
 def inicializace_bonusy_data_db():
@@ -884,10 +1132,9 @@ def zpracuj_soubor(pobocka: str, nazev: str, pokrok=None) -> tuple[int, str, str
     """Načte soubor z Edit, aplikuje pravidla, uloží do DB a do Zpracovano.
 
     Období řádku = měsíc data zdanitelného plnění; bez data → z názvu souboru.
+    Celý import je jedna transakce – pád nenechá období z poloviny smazané.
     Vrací (pocet, cil, prevazujici_obdobi).
     """
-    import openpyxl
-    from openpyxl.cell import WriteOnlyCell
     zdroj = os.path.join(_slozka(pobocka, 'Edit'), nazev)
     zaloha_obdobi = _obdobi_z_nazvu(nazev)
     pocty_obdobi: dict[str, int] = {}
@@ -896,54 +1143,43 @@ def zpracuj_soubor(pobocka: str, nazev: str, pokrok=None) -> tuple[int, str, str
     conn = intranet_data.get_db_connection()
     if not conn:
         raise RuntimeError('Databáze není dostupná.')
-    wb = openpyxl.Workbook(write_only=True)
-    ws = wb.create_sheet(title='data')
-    ws.append([h for _f, h, _s, _w in DATA_SLOUPCE])
+    cil = os.path.join(_slozka(pobocka, 'Zpracovano'),
+                       f'{os.path.splitext(nazev)[0]}_zpracovano.xlsx')
     sql = (f'INSERT INTO {TABULKA_DATA} (pobocka_klic, obdobi, {DATA_POLE_SQL}) '
            f'VALUES ({", ".join(["%s"] * (len(DATA_POLE) + 2))})')
+    smaz = f'DELETE FROM {TABULKA_DATA} WHERE pobocka_klic=%s AND obdobi=%s'
     davka, pocet = [], 0
     i_datum = DATA_POLE.index('datum')
     try:
         cur = conn.cursor()
-        for zdrojovy in zdrojove_radky(zdroj, pokrok):
-            radek = uprav_radek(zdrojovy, kontakty)
-            if radek is None:
-                continue
-            bunky = list(radek)
-            datum = bunky[i_datum]
-            if isinstance(datum, (datetime.date, datetime.datetime)):
-                obdobi = datum.strftime('%Y-%m')
-                b = WriteOnlyCell(ws, value=datum)
-                b.number_format = 'DD.MM.YYYY'
-                bunky[i_datum] = b
-            else:
-                obdobi = zaloha_obdobi
-            if obdobi not in smazana:      # staré řádky období pryč před importem
+        with _XlsxZapis(cil, [h for _f, h, _s, _w in DATA_SLOUPCE]) as sesit:
+            for zdrojovy in zdrojove_radky(zdroj, pokrok):
+                radek = uprav_radek(zdrojovy, kontakty)
+                if radek is None:
+                    continue
+                datum = radek[i_datum]
+                obdobi = (datum.strftime('%Y-%m')
+                          if isinstance(datum, (datetime.date, datetime.datetime))
+                          else zaloha_obdobi)
+                if obdobi not in smazana:   # staré řádky období pryč před importem
+                    cur.execute(smaz, (pobocka, obdobi))
+                    smazana.add(obdobi)
+                pocty_obdobi[obdobi] = pocty_obdobi.get(obdobi, 0) + 1
+                sesit.radek(radek)
+                davka.append((pobocka, obdobi, *radek))
+                pocet += 1
+                if len(davka) >= 10000:     # executemany = jeden víceřádkový INSERT
+                    cur.executemany(sql, davka)
+                    davka = []
+            if davka:
                 cur.executemany(sql, davka)
-                conn.commit()
-                davka = []
-                cur.execute(
-                    f'DELETE FROM {TABULKA_DATA} WHERE pobocka_klic=%s AND obdobi=%s',
-                    (pobocka, obdobi))
-                conn.commit()
-                smazana.add(obdobi)
-            pocty_obdobi[obdobi] = pocty_obdobi.get(obdobi, 0) + 1
-            ws.append(bunky)
-            davka.append((pobocka, obdobi, *radek))
-            pocet += 1
-            if len(davka) >= 5000:
-                cur.executemany(sql, davka)
-                conn.commit()
-                davka = []
-        if davka:
-            cur.executemany(sql, davka)
-            conn.commit()
+        conn.commit()
         cur.close()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
-    cil = os.path.join(_slozka(pobocka, 'Zpracovano'),
-                       f'{os.path.splitext(nazev)[0]}_zpracovano.xlsx')
-    wb.save(cil)
     if zdroj.lower().endswith('.slk'):   # zdrojový SLK po zpracování pryč
         os.remove(zdroj)
     hlavni = max(pocty_obdobi, key=pocty_obdobi.get) if pocty_obdobi else zaloha_obdobi
@@ -1674,8 +1910,12 @@ def _data_sekce(pobocka: str, user_name: str) -> None:
         raw = zdroj.read()
         if inspect.isawaitable(raw):
             raw = await raw
+        # NiceGUI 3.x má jméno na e.file.name, starší verze na e.name.
+        # Bez názvu se .xlsb načte jako .xlsx a rozpadne se na zipu.
+        nazev = (getattr(getattr(e, 'file', None), 'name', None)
+                 or getattr(e, 'name', None) or '')
         try:
-            dvojice = await asyncio.to_thread(parsuj_kontakty, raw, e.name)
+            dvojice = await asyncio.to_thread(parsuj_kontakty, raw, nazev)
             pocet = await asyncio.to_thread(uloz_kontakty, dvojice)
         except Exception as exc:
             ui.notify(f'Chyba: {exc}', type='negative', timeout=10000)
@@ -1825,3 +2065,26 @@ def vykresli_bonusy_ao(user_id: int, user_name: str, vsechna_prava: list):
         _panel.refresh()
 
     _panel()
+
+
+if __name__ == '__main__':      # rychlá kontrola zapisovače XLSX
+    import tempfile
+    assert _xlsx_sloupce(28)[-3:] == ['Z', 'AA', 'AB']
+    with tempfile.TemporaryDirectory() as slozka:
+        cesta = os.path.join(slozka, 'test.xlsx')
+        with _XlsxZapis(cesta, ['a', 'b', 'c', 'd']) as sesit:
+            sesit.radek(['<&"ampersand"', datetime.date(2025, 5, 19), 12.5, None])
+            sesit.radek(['0123', datetime.datetime(2025, 1, 2, 3, 4), float('nan'), ''])
+        import openpyxl
+        ws = openpyxl.load_workbook(cesta).worksheets[0]
+        assert [b.value for b in ws[1]] == ['a', 'b', 'c', 'd']
+        r = list(ws[2])
+        assert r[0].value == '<&"ampersand"', r[0].value
+        assert r[1].value == datetime.datetime(2025, 5, 19), r[1].value
+        assert r[1].number_format == 'dd\\.mm\\.yyyy', r[1].number_format
+        assert r[2].value == 12.5 and r[3].value is None
+        r = list(ws[3])
+        assert r[0].value == '0123', r[0].value       # IČO s nulou zůstává text
+        assert r[1].value == datetime.datetime(2025, 1, 2)
+        assert r[2].value == 'nan'                    # nan/inf nesmí rozbít XML
+    print('OK: _XlsxZapis')
