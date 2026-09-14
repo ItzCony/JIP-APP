@@ -1316,6 +1316,45 @@ def _okno_mesice(obdobi: str, rezim: str) -> tuple[str, list[str]]:
     return popis, mesice
 
 
+def _predchozi_okno(rezim: str, dnes: datetime.date | None = None) -> str:
+    """Kotevní měsíc 'YYYY-MM' posledního uzavřeného okna daného režimu.
+
+    Pro 'mesic' minulý měsíc, pro 'kvartal' první měsíc minulého kvartálu,
+    pro 'pololeti' minulé pololetí, pro 'rok' leden minulého roku.
+    """
+    dnes = dnes or datetime.date.today()
+    delka = _REZIM_DELKA.get(rezim, 1)
+    poradi = dnes.year * 12 + dnes.month - 1        # index měsíce (leden roku 0 = 0)
+    zac = (poradi // delka) * delka - delka         # začátek předchozího okna
+    return f'{zac // 12}-{zac % 12 + 1:02d}'
+
+
+def _volby_obdobi(v_db: list[str], vybrane: str | None, rezim: str = 'mesic',
+                  pocet: int = 24) -> dict:
+    """Nabídka oken pro zvolený interval: měsíce v DB + posledních `pocet`
+    měsíců zpátky, sbalené do oken režimu. Klíč = první měsíc okna."""
+    dnes = datetime.date.today()
+    zac = dnes.year * 12 + dnes.month - 1
+    mesice = {f'{m // 12}-{m % 12 + 1:02d}' for m in range(zac - pocet + 1, zac + 1)}
+    mesice.update(v_db)
+    if vybrane:
+        mesice.add(vybrane)
+    v_db = set(v_db)
+    out: dict[str, str] = {}
+    for m in sorted(mesice, reverse=True):
+        popis, okno = _okno_mesice(m, rezim)
+        if okno[0] in out:
+            continue
+        chybi = [x for x in okno if x not in v_db]
+        if not chybi:
+            out[okno[0]] = popis
+        elif len(chybi) == len(okno):
+            out[okno[0]] = f'{popis} (bez dat)'
+        else:
+            out[okno[0]] = f'{popis} (chybí {len(chybi)} z {len(okno)} měs.)'
+    return out
+
+
 def _bonus_datum(txt) -> datetime.date | None:
     txt = str(txt or '').strip()
     if not txt:
@@ -1618,14 +1657,19 @@ def _bonusy_sekce(pobocka: str, user_name: str) -> None:
     obdobi_klice = nacti_obdobi(pobocka)
     stav_klic = f'bonusy_ao_bonus_obdobi_{pobocka}'
     obdobi_sel = app.storage.user.get(stav_klic)
-    if obdobi_sel not in obdobi_klice:
-        obdobi_sel = obdobi_klice[0] if obdobi_klice else None
-        app.storage.user[stav_klic] = obdobi_sel
     rezim_klic = f'bonusy_ao_bonus_rezim_{pobocka}'
     rezim_sel = app.storage.user.get(rezim_klic)
     if rezim_sel not in [k for k, _l, _n in BONUS_REZIMY]:
         rezim_sel = 'mesic'
         app.storage.user[rezim_klic] = rezim_sel
+    try:        # volba se zarovná na začátek okna zvoleného intervalu
+        obdobi_sel = _okno_mesice(obdobi_sel, rezim_sel)[1][0] if obdobi_sel else None
+    except ValueError:
+        obdobi_sel = None
+    app.storage.user[stav_klic] = obdobi_sel
+    obdobi_volby = _volby_obdobi(obdobi_klice, obdobi_sel, rezim_sel)
+    nahled_klic = f'bonusy_ao_bonus_nahled_{pobocka}'
+    nahled_sel = bool(app.storage.user.get(nahled_klic))
     okno_popis, okno_mesice = (
         _okno_pro_vypocet(pobocka, obdobi_sel, rezim_sel) if obdobi_sel else ('', []))
     vysledek = _BONUS_CACHE.get(f'{pobocka}|{okno_popis}|{rezim_sel}')
@@ -1654,19 +1698,23 @@ def _bonusy_sekce(pobocka: str, user_name: str) -> None:
                       f'plnění – nelze ověřit platnost bonusu, výpočet zastaven.',
                       type='negative', timeout=15000)
             return
-        if kontrola['bez_platnosti']:
-            with ui.dialog() as dlg_upoz, ui.card().classes('w-[460px]'):
-                ui.label('Podklad bez platnosti').classes('text-lg font-bold')
+        with ui.dialog() as dlg_upoz, ui.card().classes('w-[460px]'):
+            ui.label('Podklad bez platnosti' if kontrola['bez_platnosti']
+                     else f'Spočítat bonusy {okno_popis}').classes('text-lg font-bold')
+            if kontrola['bez_platnosti']:
                 ui.label(f'{kontrola["bez_platnosti"]} řádků podkladové tabulky nemá '
                          f'vyplněno Od ani Do. Počítají se bez omezení platnosti.') \
                     .classes('text-sm text-gray-600')
-                with ui.row().classes('w-full justify-end gap-2'):
-                    ui.button('Zrušit', on_click=lambda: dlg_upoz.submit(False)) \
-                        .props('flat no-caps')
-                    ui.button('Pokračovat', on_click=lambda: dlg_upoz.submit(True)) \
-                        .props('color=primary no-caps')
-            if not await dlg_upoz:
-                return
+            volba_nahled = ui.checkbox('Zobrazit data po výpočtu', value=nahled_sel) \
+                .props('dense').classes('text-sm')
+            with ui.row().classes('w-full justify-end gap-2'):
+                ui.button('Zrušit', on_click=lambda: dlg_upoz.submit(False)) \
+                    .props('flat no-caps')
+                ui.button('Pokračovat', on_click=lambda: dlg_upoz.submit(True)) \
+                    .props('color=primary no-caps')
+        if not await dlg_upoz:
+            return
+        app.storage.user[nahled_klic] = bool(volba_nahled.value)
         stav_pokrok = {'f': 0.0}
         dlg, kruh, popisek = _prekryv_kolecko(f'Počítám bonusy {okno_popis}…')
 
@@ -1704,16 +1752,29 @@ def _bonusy_sekce(pobocka: str, user_name: str) -> None:
         app.storage.user[rezim_klic] = e.value
         _bonusy_sekce.refresh()
 
+    def _rychla_volba(e):
+        """Skok na poslední uzavřené okno zvoleného typu (minulý měsíc/kvartál…)."""
+        if not e.value:
+            return
+        app.storage.user[rezim_klic] = e.value
+        app.storage.user[stav_klic] = _predchozi_okno(e.value)
+        _bonusy_sekce.refresh()
+
     with ui.column().classes('w-full gap-2'):
         with ui.row().classes('w-full items-center gap-3'):
             ui.label('Bonusy').classes('text-lg font-bold text-gray-800')
             if obdobi_klice:
-                ui.select(obdobi_klice,
+                ui.select(obdobi_volby,
                           value=obdobi_sel, label='Období', on_change=_zmen_obdobi) \
                     .props('dense outlined options-dense').style('min-width: 220px')
                 ui.select({k: lbl for k, lbl, _n in BONUS_REZIMY},
                           value=rezim_sel, label='Interval', on_change=_zmen_rezim) \
                     .props('dense outlined options-dense').style('min-width: 160px')
+                ui.select({k: f'Předchozí {lbl.lower()}'
+                           for k, lbl, n in BONUS_REZIMY if n},
+                          value=None, label='Rychlá volba', on_change=_rychla_volba) \
+                    .props('dense outlined options-dense clearable') \
+                    .style('min-width: 190px')
                 ui.button('Spočítat', icon='calculate', on_click=_spocitej) \
                     .props('color=primary outline no-caps dense')
             else:
@@ -1747,6 +1808,11 @@ def _bonusy_sekce(pobocka: str, user_name: str) -> None:
         ui.label(f'Spočteno {vysledek["cas"]:%d.%m.%Y %H:%M} • '
                  f'zdroj: podkladová tabulka + data {vysledek["popis"]}') \
             .classes('text-xs text-gray-500')
+        if not nahled_sel:
+            ui.label('Náhled dat je vypnutý – výstup je v XLSX (tlačítka Stáhnout). '
+                     'Zaškrtněte „Zobrazit data po výpočtu“.') \
+                .classes('text-sm text-gray-400')
+            return
         with ui.tabs().props(
             'align=left active-color=primary indicator-color=primary'
         ).classes('w-full border-b border-gray-200') as taby:
@@ -1825,10 +1891,10 @@ def _data_sekce(pobocka: str, user_name: str) -> None:
     obdobi_klic = f'bonusy_ao_obdobi_{pobocka}'
     obdobi_klice = nacti_obdobi(pobocka)
     obdobi_sel = app.storage.user.get(obdobi_klic)
-    if obdobi_sel not in obdobi_klice:
-        obdobi_sel = obdobi_klice[0] if obdobi_klice else None
-        app.storage.user[obdobi_klic] = obdobi_sel
-    radky, celkem = nacti_data_nahled(pobocka, obdobi_sel)
+    if obdobi_sel not in obdobi_klice:      # náhled je prázdný, než si uživatel zvolí
+        obdobi_sel = None
+        app.storage.user[obdobi_klic] = None
+    radky, celkem = nacti_data_nahled(pobocka, obdobi_sel) if obdobi_sel else ([], 0)
 
     async def _zpracuj(nazev: str):
         stav_pokrok = {'f': 0.0}
@@ -1842,7 +1908,7 @@ def _data_sekce(pobocka: str, user_name: str) -> None:
 
         casovac = ui.timer(0.2, _tik)
         try:
-            pocet, cil, obdobi_sou = await asyncio.to_thread(
+            pocet, cil, _obdobi_sou = await asyncio.to_thread(
                 zpracuj_soubor, pobocka, nazev, lambda f: stav_pokrok.update(f=f))
         except Exception as exc:
             ui.notify(f'Chyba zpracování: {exc}', type='negative', timeout=10000)
@@ -1854,11 +1920,13 @@ def _data_sekce(pobocka: str, user_name: str) -> None:
         intranet_logger.log_activity(
             user_name, 'Bonusy AO',
             f'{pobocka}: zpracován soubor {nazev} ({pocet} řádků)')
-        app.storage.user[obdobi_klic] = obdobi_sou
-        _data_sekce.refresh()
+        _data_sekce.refresh()       # náhled zůstává prázdný, dokud si ho uživatel nezvolí
 
     async def _zmen_obdobi(e):
         app.storage.user[obdobi_klic] = e.value
+        if not e.value:                     # vyčištěná volba → prázdný náhled
+            _data_sekce.refresh()
+            return
         dlg, _kruh, _popisek = _prekryv_kolecko(f'Načítám období {e.value}…',
                                                 procenta=False)
         dlg.open()
@@ -1988,14 +2056,21 @@ def _data_sekce(pobocka: str, user_name: str) -> None:
             if obdobi_klice:
                 ui.select(obdobi_klice,
                           value=obdobi_sel, label='Období', on_change=_zmen_obdobi) \
-                    .props('dense outlined options-dense').style('min-width: 220px')
-                ui.button('Smazat období', icon='delete', on_click=dlg_smaz.open) \
-                    .props('color=negative outline no-caps dense')
+                    .props('dense outlined options-dense clearable') \
+                    .style('min-width: 220px')
+                if obdobi_sel:
+                    ui.button('Smazat období', icon='delete', on_click=dlg_smaz.open) \
+                        .props('color=negative outline no-caps dense')
             else:
                 ui.label('Žádná data v databázi.').classes('text-sm text-gray-400')
             ui.space()
-            ui.label(f'V databázi: {celkem} řádků • náhled prvních {len(radky)}') \
-                .classes('text-xs text-gray-500')
+            if obdobi_sel:
+                ui.label(f'V databázi: {celkem} řádků • náhled prvních {len(radky)}') \
+                    .classes('text-xs text-gray-500')
+        if not obdobi_sel:
+            ui.label('Vyberte období – náhled dat se načte až po volbě.') \
+                .classes('text-sm text-gray-400')
+            return
         ui.aggrid({
             'columnDefs': _data_col_defs(),
             'rowData': radky,
