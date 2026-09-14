@@ -618,13 +618,20 @@ def inicializace_asm_db():
                 dealer_kdy DATETIME DEFAULT NULL,
                 zalozil VARCHAR(255),
                 zalozil_id INT,
+                import_davka VARCHAR(20),
                 zalozeno DATETIME DEFAULT CURRENT_TIMESTAMP,
                 zmeneno DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                 INDEX idx_oz_cislo (cislo_oz),
                 INDEX idx_oz_aktivni (aktivni),
-                INDEX idx_oz_pobocka (pobocka)
+                INDEX idx_oz_pobocka (pobocka),
+                INDEX idx_oz_davka (import_davka)
             ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
         """)
+        # Migrace: značka importní dávky — bez ní nejde importovaná data zpětně
+        # najít a hromadně smazat. Starší řádky mají NULL (import před touto verzí).
+        if not _ma_sloupec("asm_oz", "import_davka"):
+            cur.execute("ALTER TABLE asm_oz ADD COLUMN import_davka VARCHAR(20)")
+            cur.execute("ALTER TABLE asm_oz ADD INDEX idx_oz_davka (import_davka)")
         # Přílohy formuláře — jeden soubor = jeden řádek (soubor leží mimo web root).
         cur.execute("""
             CREATE TABLE IF NOT EXISTS asm_oz_prilohy (
@@ -2140,7 +2147,7 @@ _OZ_SLOUPCE = [
     ("region",             "Region",                       "text"),
     ("poznamka",           "Poznámka",                     "text"),
     ("asm",                "ASM",                          "text"),
-    ("adresa",             "Adresa",                       "text"),
+    ("adresa",             "Adresa bydliště",              "text"),
     ("ico",                "IČ",                           "text"),
     ("dic",                "DIČ",                          "text"),
     ("banka_kod",          "Bankovní spojení (Kód banky)", "text"),
@@ -2158,10 +2165,10 @@ _OZ_LABEL = {k: l for k, l, _t in _OZ_SLOUPCE}
 _OZ_TYP = {k: t for k, _l, t in _OZ_SLOUPCE}
 
 # Povinná pole formuláře. Nepovinné dle zadání: IČO, DIČ, telefon, ukončení,
-# datum nástupu (+ poznámka/zpráva). Dokud nejsou doplněná, řádek svítí červeně.
+# datum nástupu, evidenční číslo (+ poznámka/zpráva). Dokud nejsou doplněná,
+# řádek svítí červeně.
 _OZ_POVINNA = ("pobocka", "cislo_oz", "jmeno_oz", "email", "osvc", "region", "asm",
-               "adresa", "banka_kod", "cislo_uctu", "adresa_koresp", "urad",
-               "evidencni_cislo")
+               "adresa", "banka_kod", "cislo_uctu", "adresa_koresp", "urad")
 
 _OZ_TYP_LABEL = {"novy": "Nový OZ", "zmena": "Změna OZ"}
 
@@ -2239,6 +2246,15 @@ def _oz_dt(v):
         if not v:
             return ""
     return v.strftime("%d.%m.%Y")
+
+
+def _oz_dt_cas(v):
+    """Datum i čas — u importních dávek je za den běžně víc pokusů."""
+    if not v:
+        return ""
+    if isinstance(v, str):
+        return v
+    return v.strftime("%d.%m.%Y %H:%M")
 
 
 def _oz_pobocka_label(kod):
@@ -2450,6 +2466,94 @@ def smaz_oz(zaznam_id) -> bool:
         conn.close()
 
 
+def nacti_import_davky() -> list:
+    """Importní dávky, které po sobě nechaly záznamy: kdy, kdo, kolik jich zbývá."""
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return []
+    try:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("""
+            SELECT import_davka, COUNT(*) AS pocet, MIN(zalozeno) AS kdy,
+                   MIN(zalozil) AS kdo
+            FROM asm_oz
+            WHERE import_davka IS NOT NULL AND import_davka <> ''
+            GROUP BY import_davka
+            ORDER BY import_davka DESC
+        """)
+        davky = cur.fetchall()
+        cur.close()
+        return davky
+    except Exception as e:
+        print(f"[asm] nacti_import_davky: {e}")
+        return []
+    finally:
+        conn.close()
+
+
+def _oz_oznac_davku(ids, davka) -> None:
+    """Orazítkuje nově založené řádky číslem dávky (jedním dotazem)."""
+    if not ids:
+        return
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return
+    try:
+        cur = conn.cursor()
+        misto = ",".join(["%s"] * len(ids))
+        cur.execute(f"UPDATE asm_oz SET import_davka=%s WHERE id IN ({misto})",
+                    (davka, *ids))
+        conn.commit()
+        cur.close()
+    except Exception as e:
+        print(f"[asm] _oz_oznac_davku: {e}")
+    finally:
+        conn.close()
+
+
+def smaz_import_davku(davka) -> int:
+    """Smaže záznamy založené jednou importní dávkou (vč. příloh a logu).
+
+    Řádky, které import jen aktualizoval, existovaly už před ním — ty zůstávají,
+    dávku nemají. Vrací počet smazaných záznamů.
+    """
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return 0
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM asm_oz WHERE import_davka=%s", (davka,))
+        ids = [r[0] for r in cur.fetchall()]
+        if not ids:
+            cur.close()
+            return 0
+        misto = ",".join(["%s"] * len(ids))
+        klic = tuple(ids)
+        cur.execute(f"SELECT soubor_cesta FROM asm_oz_prilohy "
+                    f"WHERE zaznam_id IN ({misto})", klic)
+        cesty = [r[0] for r in cur.fetchall()]
+        cur.execute(f"DELETE FROM asm_oz_prilohy WHERE zaznam_id IN ({misto})", klic)
+        cur.execute(f"DELETE FROM asm_oz_log WHERE zaznam_id IN ({misto})", klic)
+        # Mazaný záznam mohl být u jiného OZ veden jako nahrazovaný — zruš vazbu,
+        # ať nezůstane ukazovat na neexistující id.
+        cur.execute(f"UPDATE asm_oz SET stav_oz_id=NULL WHERE stav_oz_id IN ({misto})", klic)
+        cur.execute(f"DELETE FROM asm_oz WHERE id IN ({misto})", klic)
+        conn.commit()
+        cur.close()
+        for c in cesty:
+            _smaz_soubor_oz(c)
+        return len(ids)
+    except Exception as e:
+        print(f"[asm] smaz_import_davku: {e}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return 0
+    finally:
+        conn.close()
+
+
 def prepocet_aktivnich_oz() -> int:
     """Denní automat: nástup dnes → aktivní, ukončení dnes → neaktivní.
     Vrací počet přepsaných řádků (jediný UPDATE, běží i bez UI)."""
@@ -2527,22 +2631,34 @@ def kontrola_oz_proti_kartam() -> dict:
         conn.close()
 
 
+def _oz_jmeno_hole(s):
+    """Holé jméno z obou zdrojů: „Jan Andrle (Pardubice)/O/G/" → „Jan Andrle".
+
+    Karty i formulář nesou stejný balast (pobočka v závorce, kódy za lomítkem),
+    protože pocházejí ze stejného exportu. Čistit se musí OBĚ strany stejně —
+    jinak se „Jan Andrle" porovnává s „Jan Andrle Pardubice O G" a nesedí nic.
+    """
+    s = str(s or "").split("/", 1)[0]
+    s = re.sub(r"\(.*?\)", "", s)
+    return " ".join(s.split()).strip(" _")
+
+
 def _oz_karta_jmeno(s):
     """Jméno z číselníku karet: „§Není_Oldřich Dosedla (Pardubice)" → "" (není
     přiřazeno), „Jakub Ondráček (Pardubice)" → „Jakub Ondráček"."""
     if not s:
         return ""
-    s = re.sub(r"\(.*?\)", "", str(s)).strip()
+    s = _oz_jmeno_hole(s)
     if re.match(r"^\s*[§_]*\s*nen[íi]", s, re.IGNORECASE):
         return ""
     return s.strip(" _")
 
 
 def _oz_stejne_jmeno(a, b) -> bool:
-    """Porovnání jmen napříč zdroji — bez diakritiky, pořadí slov nerozhoduje
-    (v kartách bývá „Novák Jan", ve formuláři „Jan Novák")."""
+    """Porovnání jmen napříč zdroji — bez balastu z exportu, bez diakritiky,
+    pořadí slov nerozhoduje (v kartách bývá „Novák Jan", ve formuláři „Jan Novák")."""
     def _n(s):
-        s = (s or "").strip().lower()
+        s = _oz_jmeno_hole(s).lower()
         try:
             import unicodedata
             s = "".join(c for c in unicodedata.normalize("NFKD", s)
@@ -2649,6 +2765,13 @@ def _oz_prijemci():
     return _emaily_s_pravy("asm_oz_prijemce", "asm_oz_analytik")
 
 
+# Pole, která se do e-mailu nepíší: interní příznaky + osobní a fakturační
+# údaje (ty si příjemce dohledá v portálu, do pošty nepatří).
+_OZ_MIMO_EMAIL = ("zprava", "aktivni", "fakturovat_telefon",
+                  "email", "telefon", "adresa", "ico", "dic", "banka_kod",
+                  "cislo_uctu", "adresa_koresp", "urad", "evidencni_cislo")
+
+
 def _oz_email_text(z: dict, prilohy: list, autor: str) -> str:
     radky = [f"{_oz_pobocka_label(z.get('pobocka'))} | {z.get('cislo_oz') or ''} | "
              f"{z.get('jmeno_oz') or ''}",
@@ -2656,7 +2779,7 @@ def _oz_email_text(z: dict, prilohy: list, autor: str) -> str:
     if z.get("zprava"):
         radky += [z["zprava"], ""]
     for k, label, t in _OZ_SLOUPCE:
-        if k in ("zprava", "aktivni", "fakturovat_telefon"):
+        if k in _OZ_MIMO_EMAIL:
             continue
         v = z.get(k)
         if t == "bool":
@@ -2868,7 +2991,7 @@ def _oz_formular(user_id, user_name, vsechna_prava, po_ulozeni=None):
                 ui.label("Doplňující údaje").classes("text-base font-bold text-gray-700")
                 with ui.row().classes("w-full gap-4 no-wrap"):
                     with ui.column().classes("flex-1 gap-2"):
-                        _oz_input(stav, "adresa", "Adresa", povinne=True)
+                        _oz_input(stav, "adresa", "Adresa bydliště", povinne=True)
                         _oz_input(stav, "ico", "IČ")
                         _oz_input(stav, "dic", "DIČ")
                         _oz_input(stav, "banka_kod", "Bankovní spojení (Kód banky)", povinne=True)
@@ -2876,7 +2999,7 @@ def _oz_formular(user_id, user_name, vsechna_prava, po_ulozeni=None):
                         _oz_input(stav, "cislo_uctu", "Číslo účtu", povinne=True)
                         _oz_input(stav, "adresa_koresp", "Adresa korespondenční", povinne=True)
                         _oz_input(stav, "urad", "Registrovaný úřad", povinne=True)
-                        _oz_input(stav, "evidencni_cislo", "Evidenční číslo", povinne=True)
+                        _oz_input(stav, "evidencni_cislo", "Evidenční číslo")
                 _oz_input(stav, "poznamka", "Poznámka", typ="textarea")
 
             # ---- zpráva + přílohy ------------------------------------------
@@ -2902,7 +3025,7 @@ def _oz_formular(user_id, user_name, vsechna_prava, po_ulozeni=None):
                 async def _nahraj(e):
                     try:
                         nazev, cesta = await asyncio.to_thread(
-                            uloz_prilohu_oz, e.name, await e.content.read())
+                            uloz_prilohu_oz, e.file.name, await e.file.read())
                     except ValueError as ex:
                         ui.notify(str(ex), type="negative")
                         return
@@ -3022,6 +3145,22 @@ def _oz_row(z, poc_priloh=0):
     return r
 
 
+def _oz_sirka_sloupcu(rows):
+    """Šířka každého sloupce podle nejdelšího textu, který v něm je.
+
+    AG Grid autoSizeAllColumns() měří jen buňky vykreslené v DOM, takže při
+    virtualizaci (25 sloupců, stovky řádků) většinu sloupců minula. Počítáme
+    to proto z dat: ~7.1 px na znak textu, záhlaví je tučné (~7.6) a má navíc
+    ikonu filtru a řazení.
+    """
+    sirky = {}
+    for k in _OZ_GRID_SLOUPCE:
+        zahlavi = len(_OZ_LABEL.get(k, k)) * 7.6 + 46
+        text = max([0] + [len(str(r.get(k) or "")) for r in rows]) * 7.1 + 24
+        sirky[k] = int(min(340, max(80, zahlavi, text)))
+    return sirky
+
+
 def _oz_pocty_priloh():
     conn = intranet_data.get_db_connection()
     if not conn:
@@ -3069,6 +3208,7 @@ def _oz_parse_xlsx(obsah: bytes):
     import openpyxl
     wb = openpyxl.load_workbook(io.BytesIO(obsah), data_only=True)
     label2key = {l.strip().lower(): k for k, l, _t in _OZ_SLOUPCE}
+    label2key.setdefault("adresa", "adresa")   # starší exporty před přejmenováním
     hist = {"pobočka": "pobocka", "pobocka": "pobocka", "asm": "asm",
             "dealer": "cislo_oz", "oz jméno": "jmeno_oz", "oz jmeno": "jmeno_oz",
             "poznámka_1": "poznamka", "poznamka_1": "poznamka",
@@ -3149,7 +3289,9 @@ def _oz_import_zapis(radky, user_id, user_name):
             cur.close()
         finally:
             conn.close()
-    nove = akt = chyby = 0
+    davka = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+    nove_ids = []
+    akt = chyby = 0
     for d in radky:
         zid = existuji.get(str(d.get("cislo_oz")).strip())
         vysledek = uloz_oz(d, user_id, user_name, zaznam_id=zid)
@@ -3158,8 +3300,9 @@ def _oz_import_zapis(radky, user_id, user_name):
         elif zid:
             akt += 1
         else:
-            nove += 1
-    return nove, akt, chyby
+            nove_ids.append(vysledek)
+    _oz_oznac_davku(nove_ids, davka)
+    return len(nove_ids), akt, chyby
 
 
 def _oz_import_dialog(user_id, user_name, po_importu):
@@ -3177,7 +3320,7 @@ def _oz_import_dialog(user_id, user_name, po_importu):
         btn_import.disable()
 
         async def _nahraj(e):
-            obsah = await e.content.read()
+            obsah = await e.file.read()
             try:
                 radky, popis = await asyncio.to_thread(_oz_parse_xlsx, obsah)
             except Exception as ex:
@@ -3222,6 +3365,57 @@ def _oz_import_dialog(user_id, user_name, po_importu):
             po_importu()
 
         btn_import.on_click(_spust)
+    dlg.open()
+
+
+def _oz_import_smaz_dialog(user_name, po_zmene):
+    """Vymazání importovaných dat — po dávkách, jak byly nahrány."""
+    with ui.dialog() as dlg, ui.card().classes("p-4 gap-3") \
+            .style("min-width:560px;max-width:95vw"):
+        ui.label("Vymazat importovaná data").classes("text-lg font-bold text-gray-800")
+        ui.label("Smaže záznamy, které import založil — včetně jejich příloh, logu "
+                 "a pozdějších ručních úprav. Řádky, které import jen aktualizoval, "
+                 "zůstanou (existovaly už před ním).") \
+            .classes("text-xs text-gray-500")
+        seznam = ui.column().classes("w-full gap-1")
+
+        def _vykresli():
+            seznam.clear()
+            davky = nacti_import_davky()
+            with seznam:
+                if not davky:
+                    ui.label("Žádná importovaná data k smazání. (Importy z doby před "
+                             "touto verzí nejsou označené, ty jde mazat jen po záznamech "
+                             "v detailu.)").classes("text-sm text-gray-500 py-2")
+                    return
+                for d in davky:
+                    with ui.row().classes("w-full items-center gap-3 py-1 "
+                                          "border-b border-gray-100"):
+                        ui.label(_oz_dt_cas(d.get("kdy")) or str(d.get("import_davka"))) \
+                            .classes("text-sm text-gray-800 w-40")
+                        ui.label(d.get("kdo") or "").classes("text-xs text-gray-500 flex-1 truncate")
+                        ui.label(f"{d.get('pocet')} záznamů").classes("text-sm text-gray-700 w-28")
+                        ui.button("Smazat", icon="delete",
+                                  on_click=lambda _, dd=d: _smaz(dd)) \
+                            .props("flat dense no-caps color=negative")
+
+        async def _smaz(d):
+            kdy = _oz_dt_cas(d.get("kdy")) or str(d.get("import_davka"))
+            if not await _oz_potvrd(f"Opravdu smazat import z {kdy} "
+                                    f"({d.get('pocet')} záznamů)? Nelze vrátit zpět."):
+                return
+            kolik = await asyncio.to_thread(smaz_import_davku, d.get("import_davka"))
+            intranet_logger.log_activity(user_name, "Formuláře ASM",
+                                         f"Smazán import OZ z {kdy}: {kolik} záznamů")
+            ui.notify(f"Smazáno {kolik} záznamů.",
+                      type="positive" if kolik else "warning")
+            _vykresli()
+            vysl = po_zmene()          # _obnov je async — bez awaitu by se grid nepřenačetl
+            if asyncio.iscoroutine(vysl):
+                await vysl
+
+        _vykresli()
+        ui.button("Zavřít", on_click=dlg.close).props("flat no-caps").classes("self-end")
     dlg.open()
 
 
@@ -3344,7 +3538,7 @@ def _oz_detail_dialog(zaznam_id, user_id, user_name, vsechna_prava, po_zmene):
                     async def _nahraj(e):
                         try:
                             nazev, cesta = await asyncio.to_thread(
-                                uloz_prilohu_oz, e.name, await e.content.read())
+                                uloz_prilohu_oz, e.file.name, await e.file.read())
                         except ValueError as ex:
                             ui.notify(str(ex), type="negative")
                             return
@@ -3407,6 +3601,9 @@ async def _oz_prehled(user_id, user_name, vsechna_prava):
             ui.button(icon="upload_file",
                       on_click=lambda: _oz_import_dialog(user_id, user_name, _obnov)) \
                 .props("flat round color=grey-7").tooltip("Import z XLSX")
+            ui.button(icon="delete_sweep",
+                      on_click=lambda: _oz_import_smaz_dialog(user_name, _obnov)) \
+                .props("flat round color=grey-7").tooltip("Vymazat importovaná data")
             ui.button(icon="fact_check", on_click=lambda: _kontrola()) \
                 .props("flat round color=grey-7").tooltip("Kontrola proti kartám (Dealer)")
         ui.button(icon="refresh", on_click=lambda: _obnov()) \
@@ -3417,12 +3614,13 @@ async def _oz_prehled(user_id, user_name, vsechna_prava):
                          "headerTooltip": "Počet příloh"},
                         {"headerName": "Karty", "field": "karty", "width": 90,
                          "headerTooltip": "Shoda s číselníkem Dealer"}]
-                       + [{"headerName": _OZ_LABEL.get(k, k), "field": k,
-                           "width": 150 if k not in ("cislo_oz", "osvc", "typ") else 100}
+                       + [{"headerName": _OZ_LABEL.get(k, k), "field": k}
                           for k in _OZ_GRID_SLOUPCE]),
         "rowData": [],
+        # Hlavičky na jeden řádek (bez lámání), šířku počítá _oz_sirka_sloupcu
+        # z dat — viz tam.
         "defaultColDef": {"resizable": True, "sortable": True, "filter": True,
-                          "wrapHeaderText": True, "autoHeaderHeight": True},
+                          "wrapHeaderText": False, "autoHeaderHeight": False},
         "rowHeight": 32,
         ":getRowId": "(p) => String(p.data._id)",
         # Nekompletní záznam (chybí povinné pole) svítí červeně — bod 10 zadání.
@@ -3450,7 +3648,12 @@ async def _oz_prehled(user_id, user_name, vsechna_prava):
             ven.append(z)
         data["videne"] = ven
         poc = _oz_pocty_priloh()
-        grid.options["rowData"] = [_oz_row(z, poc.get(z["id"], 0)) for z in ven]
+        radky = [_oz_row(z, poc.get(z["id"], 0)) for z in ven]
+        sirky = _oz_sirka_sloupcu(radky)
+        for cd in grid.options["columnDefs"]:
+            if cd["field"] in sirky:
+                cd["width"] = sirky[cd["field"]]
+        grid.options["rowData"] = radky
         grid.update()
         nekompletni = sum(1 for z in ven if _oz_chybi_pole(z))
         pocet.set_text(f"Zobrazeno {len(ven)} z {len(data['zaznamy'])} záznamů"

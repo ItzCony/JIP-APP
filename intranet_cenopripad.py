@@ -6787,6 +6787,13 @@ _OPRAVA_POVINNE = ("kod", "ks", "pc_std", "pc_pozad")
 
 
 # ── Práva ───────────────────────────────────────────────────────────────────
+def _oprava_bez_pcstd(p):
+    """Mimořádné právo: sloupec G „Standartní prodejní cena“ smí zůstat prázdný.
+    Bez PC se nedopočítá % ani absolutní odchylka — v detailu je pak „—“."""
+    return "cenopripad_oprava_bez_pcstd" in p
+
+
+
 def _oprava_pristup(p):
     """Smí do dlaždice „Oprava cen"."""
     return _je_spravce(p) or "cenopripad_zadatel_oprava" in p \
@@ -6816,9 +6823,10 @@ def _oprava_dopocet(ks, pc_std, pc_pozad):
     return pct, abs_
 
 
-def _oprava_parse(raw_bytes, filename):
+def _oprava_parse(raw_bytes, filename, bez_pc_std=False):
     """Nahraný formulář → (radky, chyba|None). Řádky bez povinných polí se
-    přeskočí (prázdné patičky šablony), vadné se vrátí s popisem chyby."""
+    přeskočí (prázdné patičky šablony), vadné se vrátí s popisem chyby.
+    `bez_pc_std` (právo `cenopripad_oprava_bez_pcstd`) uvolní sloupec G."""
     try:
         rows = _nacti_rows(raw_bytes, filename)
     except Exception as e:
@@ -6844,7 +6852,8 @@ def _oprava_parse(raw_bytes, filename):
     if idx_hdr is None:
         return None, ("V souboru chybí hlavička formuláře (sloupce „IČO“ a „Kód karty“). "
                       "Použijte vzorový formulář z tlačítka „Vzorový formulář“.")
-    chybi = [k for k in _OPRAVA_POVINNE if k not in mapa]
+    povinne = tuple(k for k in _OPRAVA_POVINNE if not (bez_pc_std and k == "pc_std"))
+    chybi = [k for k in povinne if k not in mapa]
     if chybi:
         popisky = {s[0]: s[2][0] for s in _OPRAVA_SLOUPCE}
         return None, ("Ve formuláři chybí sloupce: "
@@ -6877,7 +6886,7 @@ def _oprava_parse(raw_bytes, filename):
             chyby.append("chybí kód karty")
         for klic, popis in (("ks", "počet ks"), ("pc_std", "standardní PC"),
                             ("pc_pozad", "požadovaná PC")):
-            if hodnoty.get(klic) is None:
+            if hodnoty.get(klic) is None and not (bez_pc_std and klic == "pc_std"):
                 chyby.append(f"chybí {popis}")
         if hodnoty.get("pc_std") == 0:
             chyby.append("standardní PC je 0 (nelze spočítat % odchylku)")
@@ -7201,7 +7210,8 @@ def _oprava_sekce_nova(user_id, user_name, prava):
             if not duvod:
                 ui.notify("Vyplňte důvod opravy.", type="warning")
                 return
-            radky, err = await run.cpu_bound(_oprava_parse, raw, name)
+            radky, err = await run.cpu_bound(_oprava_parse, raw, name,
+                                             _oprava_bez_pcstd(prava))
             if err:
                 ui.notify(err, type="negative", timeout=12000)
                 return
@@ -7389,7 +7399,8 @@ def _oprava_detail(pid, user_id, user_name, prava):
         "autoSizeStrategy": {"type": "fitGridWidth"},
     }).classes("w-full").style(f"height: min(42vh, {60 + len(grid_rows) * 28}px)")
 
-    _oprava_workflow(p, pid, stav, je_vlastnik, je_office, je_spravce, user_name)
+    _oprava_workflow(p, pid, stav, je_vlastnik, je_office, je_spravce, user_name,
+                     prava)
 
     # ── Průběh ──────────────────────────────────────────────────────────────
     kroky = _oprava_historie(pid)
@@ -7405,7 +7416,8 @@ def _oprava_detail(pid, user_id, user_name, prava):
                         ui.label(k["detail"]).classes("text-sm text-gray-600 italic")
 
 
-def _oprava_workflow(p, pid, stav, je_vlastnik, je_office, je_spravce, user_name):
+def _oprava_workflow(p, pid, stav, je_vlastnik, je_office, je_spravce, user_name,
+                     prava=None):
     """Akční tlačítka fronty — 1:1 stavový automat Formulářů ASM (splatnosti)."""
     cislo = p.get("cislo")
 
@@ -7430,7 +7442,8 @@ def _oprava_workflow(p, pid, stav, je_vlastnik, je_office, je_spravce, user_name
                     drzeny = {"radky": None, "raw": None, "name": ""}
 
                     async def _prijmi(raw, name, _nazev):
-                        radky, err = await run.cpu_bound(_oprava_parse, raw, name)
+                        radky, err = await run.cpu_bound(_oprava_parse, raw, name,
+                                                         _oprava_bez_pcstd(prava))
                         if err:
                             ui.notify(err, type="negative", timeout=12000)
                             return
