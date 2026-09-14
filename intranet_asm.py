@@ -2165,10 +2165,11 @@ _OZ_LABEL = {k: l for k, l, _t in _OZ_SLOUPCE}
 _OZ_TYP = {k: t for k, _l, t in _OZ_SLOUPCE}
 
 # Povinná pole formuláře. Nepovinné dle zadání: IČO, DIČ, telefon, ukončení,
-# datum nástupu, evidenční číslo (+ poznámka/zpráva). Dokud nejsou doplněná,
+# datum nástupu, evidenční číslo, registrovaný úřad (+ poznámka/zpráva).
+# Dokud nejsou doplněná,
 # řádek svítí červeně.
 _OZ_POVINNA = ("pobocka", "cislo_oz", "jmeno_oz", "email", "osvc", "region", "asm",
-               "adresa", "banka_kod", "cislo_uctu", "adresa_koresp", "urad")
+               "adresa", "banka_kod", "cislo_uctu", "adresa_koresp")
 
 _OZ_TYP_LABEL = {"novy": "Nový OZ", "zmena": "Změna OZ"}
 
@@ -2998,9 +2999,9 @@ def _oz_formular(user_id, user_name, vsechna_prava, po_ulozeni=None):
                     with ui.column().classes("flex-1 gap-2"):
                         _oz_input(stav, "cislo_uctu", "Číslo účtu", povinne=True)
                         _oz_input(stav, "adresa_koresp", "Adresa korespondenční", povinne=True)
-                        _oz_input(stav, "urad", "Registrovaný úřad", povinne=True)
+                        _oz_input(stav, "urad", "Registrovaný úřad")
                         _oz_input(stav, "evidencni_cislo", "Evidenční číslo")
-                _oz_input(stav, "poznamka", "Poznámka", typ="textarea")
+                _oz_input(stav, "poznamka", "Poznámka (stručná interní poznámka)", typ="textarea")
 
             # ---- zpráva + přílohy ------------------------------------------
             with ui.card().classes("w-full p-4 gap-3 rounded-xl bg-white"):
@@ -3108,11 +3109,8 @@ def _oz_pobocky_uzivatele(user_id):
 # ============================================================================
 # Nový OZ — UI (záložka „Přehled"), export, import
 # ============================================================================
-_OZ_GRID_SLOUPCE = ["pobocka", "cislo_oz", "jmeno_oz", "typ", "email", "telefon",
-                    "osvc", "nastup", "ukonceni", "aktivni", "region", "asm",
-                    "ico", "dic", "firemni_sim", "fakturovat_telefon",
-                    "banka_kod", "cislo_uctu", "adresa", "adresa_koresp",
-                    "urad", "evidencni_cislo", "poznamka"]
+# Sloupce gridu v přehledu. Zbytek polí je v detailu záznamu a v exportu.
+_OZ_GRID_SLOUPCE = ["ico", "cislo_oz", "jmeno_oz", "pobocka", "telefon"]
 
 
 def _oz_hodnota(z, k):
@@ -3141,7 +3139,7 @@ def _oz_row(z, poc_priloh=0):
     r["_chybi"] = bool(chybi)
     r["karty"] = {"ok": "OK", "neshoda": "Neshoda", "neni": "Není"}.get(
         z.get("dealer_stav"), "—")
-    r["prilohy"] = poc_priloh
+    r["prilohy"] = poc_priloh or ""      # 0 příloh = prázdná buňka, ne nula
     return r
 
 
@@ -3333,7 +3331,7 @@ def _oz_import_dialog(user_id, user_name, po_importu):
             if not radky:
                 btn_import.disable()
                 return
-            sloupce = [k for k in _OZ_GRID_SLOUPCE if any(r.get(k) not in (None, "")
+            sloupce = [k for k, _l, _t in _OZ_SLOUPCE if any(r.get(k) not in (None, "")
                                                           for r in radky)]
             with nahled:
                 ui.aggrid({
@@ -3582,7 +3580,8 @@ async def _oz_potvrd(text):
 
 
 async def _oz_prehled(user_id, user_name, vsechna_prava):
-    """Přehled záznamů — filtry OSVČ / Aktivní OZ / text, export, import, detail."""
+    """Přehled záznamů — filtry OSVČ / Aktivní OZ / Fakturovat telefon / text,
+    export, import, detail."""
     vsechny = _je_oz_analytik(vsechna_prava) or "asm_oz_prijemce" in vsechna_prava
     pobocky = None if vsechny else _oz_pobocky_uzivatele(user_id)
     data = {"zaznamy": [], "videne": []}
@@ -3592,6 +3591,10 @@ async def _oz_prehled(user_id, user_name, vsechna_prava):
             .props("outlined dense").classes("min-w-36")
         f_akt = ui.select({"1": "Aktivní OZ", "0": "Neaktivní", "": "Vše"}, value="1") \
             .props("outlined dense").classes("min-w-36")
+        f_fakt = ui.select({"": "Fakturovat telefon OSVČ: vše",
+                            "1": "Fakturovat telefon OSVČ: Ano",
+                            "0": "Fakturovat telefon OSVČ: Ne"}, value="") \
+            .props("outlined dense").classes("min-w-56")
         f_text = ui.input("Hledat (číslo, jméno, pobočka, ASM)") \
             .props("outlined dense clearable").classes("min-w-72")
         ui.space()
@@ -3610,12 +3613,10 @@ async def _oz_prehled(user_id, user_name, vsechna_prava):
             .props("flat round color=grey-7").tooltip("Obnovit")
 
     grid = ui.aggrid({
-        "columnDefs": ([{"headerName": "", "field": "prilohy", "width": 70,
-                         "headerTooltip": "Počet příloh"},
-                        {"headerName": "Karty", "field": "karty", "width": 90,
-                         "headerTooltip": "Shoda s číselníkem Dealer"}]
-                       + [{"headerName": _OZ_LABEL.get(k, k), "field": k}
-                          for k in _OZ_GRID_SLOUPCE]),
+        "columnDefs": ([{"headerName": _OZ_LABEL.get(k, k), "field": k}
+                        for k in _OZ_GRID_SLOUPCE]
+                       + [{"headerName": "Karty - Stav", "field": "karty", "width": 110,
+                          "headerTooltip": "Shoda s číselníkem Dealer"}]),
         "rowData": [],
         # Hlavičky na jeden řádek (bez lámání), šířku počítá _oz_sirka_sloupcu
         # z dat — viz tam.
@@ -3634,12 +3635,15 @@ async def _oz_prehled(user_id, user_name, vsechna_prava):
     def _filtruj():
         osvc = f_osvc.value
         akt = f_akt.value
+        fakt = f_fakt.value
         txt = (f_text.value or "").strip().lower()
         ven = []
         for z in data["zaznamy"]:
             if osvc != "" and str(z.get("osvc") if z.get("osvc") is not None else "") != osvc:
                 continue
             if akt != "" and str(z.get("aktivni") or 0) != akt:
+                continue
+            if fakt != "" and str(z.get("fakturovat_telefon") or 0) != fakt:
                 continue
             if txt and txt not in " ".join(
                     str(z.get(k) or "") for k in ("cislo_oz", "jmeno_oz", "pobocka",
@@ -3678,7 +3682,7 @@ async def _oz_prehled(user_id, user_name, vsechna_prava):
                   f"{len(souhrn.get('neni', []))} bez karty.",
                   type="positive" if not souhrn.get("neshoda") else "warning")
 
-    for f in (f_osvc, f_akt, f_text):
+    for f in (f_osvc, f_akt, f_fakt, f_text):
         f.on("update:model-value", lambda _=None: _filtruj())
     await _obnov()
     return _obnov
