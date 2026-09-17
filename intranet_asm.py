@@ -1367,10 +1367,54 @@ def _pripad_url(pripad_id):
         return ""
 
 
-def _posli_emaily_sync(prijemci, predmet, text, pripad_id=None):
+def _shrnuti_pripadu(pripad_id):
+    """Co se vlastně schvaluje — obsah případu + poslední kroky historie do těla
+    e-mailu. Bez toho je v notifikaci jen číslo případu a příjemce musí klikat,
+    aby zjistil, o kterého zákazníka jde."""
+    p = nacti_pripad(pripad_id)
+    if not p:
+        return ""
+    formular = p.get("formular") or "oz_zmena"
+    cfg = _FORMULARE.get(formular)
+    r = [f"Typ: {cfg['nazev'] if cfg else 'Změna zákazníků na OZ/ASM'}",
+         f"Žadatel: {p.get('zadavatel_jmeno') or '—'}",
+         f"Zadáno: {_dt_cz(p.get('datum_zadani')) or '—'}"]
+    if cfg:
+        # Jen pole z definice formuláře → skryté interní hodnoty (*_real,
+        # obrat_hodnoty) se do e-mailu nedostanou.
+        d = _data_pripadu(p)
+        for pole in _formular_pole(formular):
+            v = d.get(pole[0])
+            if v not in (None, "", []):
+                r.append(f"{pole[1]}: {v}")
+    else:
+        r += [f"Důvod změny: {p.get('duvod_zmeny') or '—'}",
+              f"ASM: {p.get('asm_jmeno') or '—'}",
+              f"Změna ASM: {p.get('zmena_asm_jmeno') or '—'} → {p.get('novy_asm_jmeno') or '—'}",
+              f"OZ: {p.get('cislo_oz') or '—'} → {p.get('cislo_novy_oz') or '—'}",
+              f"Dotčených řádků: {p.get('pocet_radku') or 0}"]
+    out = "--- Obsah případu ---\n" + "\n".join(r)
+    h = nacti_historie(pripad_id)[-5:]
+    if h:
+        out += "\n\n--- Historie (poslední kroky) ---\n" + "\n".join(
+            f"• {_dt_cz(z.get('kdy'))} · {z.get('akce')} · {z.get('kdo') or ''}"
+            + (f" — {z.get('detail')}" if z.get("detail") else "")
+            for z in h)
+    return out
+
+
+def _posli_emaily_sync(prijemci, predmet, text, pripad_id=None, shrnuti=True):
     if pripad_id:
         odkaz = _pripad_url(pripad_id)
         popis = "Otevřít případ v portálu"
+        if shrnuti:
+            try:
+                _s = _shrnuti_pripadu(pripad_id)
+            except Exception as e:
+                print(f"[asm] shrnutí případu {pripad_id}: {e}")
+                _s = ""
+            if _s:
+                text = f"{text}\n\n{_s}"
     else:
         odkaz = _app_url()
         popis = "Otevřít v portálu"
@@ -1383,14 +1427,15 @@ def _posli_emaily_sync(prijemci, predmet, text, pripad_id=None):
             print(f"[asm] e-mail {p}: {e}")
 
 
-def _odesli_emaily(prijemci, predmet, text, pripad_id=None):
+def _odesli_emaily(prijemci, predmet, text, pripad_id=None, shrnuti=True):
     prijemci = [p for p in dict.fromkeys(prijemci) if p and "@" in p]
     if not prijemci:
         return
     try:
-        asyncio.create_task(asyncio.to_thread(_posli_emaily_sync, prijemci, predmet, text, pripad_id))
+        asyncio.create_task(asyncio.to_thread(_posli_emaily_sync, prijemci, predmet,
+                                              text, pripad_id, shrnuti))
     except RuntimeError:
-        _posli_emaily_sync(prijemci, predmet, text, pripad_id)
+        _posli_emaily_sync(prijemci, predmet, text, pripad_id, shrnuti)
 
 
 def _smtp_domena():
@@ -1495,6 +1540,7 @@ def _notifikuj_oz(cisla_oz, cislo, nazev, user_name, detail, pripad_id=None,
         f"Vaše OZ je dotčeno případem, který podal {user_name}.\n\n"
         f"Číslo: {cislo}\nTyp: {nazev}\nDetail: {detail}\n",
         pripad_id=pripad_id,
+        shrnuti=False,   # OZ dostávají jen upozornění, ne limity/obraty zákazníka
     )
 
 
@@ -3720,6 +3766,34 @@ async def _view_oz(user_id, user_name, vsechna_prava):
 _OZ_POSLEDNI_BEH = None
 
 
+def _oz_denni_zabral() -> bool:
+    """Zamluví dnešní běh denního automatu OZ. True = tenhle proces ho má provést.
+
+    Značka se zapisuje do asm_oz_log (zaznam_id=0). RAM guard sám nestačí:
+    po restartu služby (deploy, /reboot) startuje proces s prázdnou pamětí,
+    projde podmínkou „hodina >= 6" a pošle souhrn o nesrovnalostech podruhé.
+    """
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return False
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM asm_oz_log WHERE zaznam_id=0 AND akce='denni_kontrola' "
+                    "AND DATE(kdy)=CURDATE() LIMIT 1")
+        if cur.fetchone():
+            cur.close()
+            return False
+        _oz_log(cur, 0, "systém", "denni_kontrola")
+        conn.commit()
+        cur.close()
+        return True
+    except Exception as e:
+        print(f"[asm] denní značka OZ: {e}")
+        return False
+    finally:
+        conn.close()
+
+
 async def bg_oz_denni():
     """Denní automat evidence OZ (bod 4 a 8 zadání): ráno přepočítá „Aktivní OZ"
     (nástup dnes → Ano, ukončení dnes → Ne) a porovná záznamy s číselníkem karet.
@@ -3730,8 +3804,12 @@ async def bg_oz_denni():
         try:
             nyni = datetime.datetime.now()
             if nyni.hour >= 6 and _OZ_POSLEDNI_BEH != nyni.date():
-                _OZ_POSLEDNI_BEH = nyni.date()
                 await asyncio.to_thread(inicializace_asm_db)
+                if not await asyncio.to_thread(_oz_denni_zabral):
+                    _OZ_POSLEDNI_BEH = nyni.date()   # dnes už proběhl (jiný běh procesu)
+                    await asyncio.sleep(300)
+                    continue
+                _OZ_POSLEDNI_BEH = nyni.date()
                 zmeneno = await asyncio.to_thread(prepocet_aktivnich_oz)
                 souhrn = await asyncio.to_thread(kontrola_oz_proti_kartam)
                 if zmeneno:
@@ -4609,10 +4687,8 @@ def _formular_novy_obecny(formular, user_id, user_name, prava, zpet_fn):
             p = nacti_pripad(pid)
             _odesli_emaily(_emaily_office(formular),
                            f"Formuláře ASM — nový případ {cislo} ({cfg['nazev']})",
-                           f"Máte nový případ k vyřešení.\n\nČíslo: {cislo}\n"
-                           f"Typ: {cfg['nazev']}\nŽadatel: {user_name}\n"
-                           f"IČO zákazníka: {data.get('ico')}\n"
-                           f"Zákazník: {data.get('fakt_nazev') or ''}", pripad_id=pid)
+                           f"Máte nový případ k vyřešení.\n\nČíslo: {cislo}",
+                           pripad_id=pid)
             # Notifikace vybraných OZ při podání žádosti — adresa oz<číslo>@doména.
             _notifikuj_oz(data.get("notifikovat_oz") or [],
                           cislo, cfg["nazev"], user_name, data.get("ico"), pid,
@@ -5355,9 +5431,8 @@ def _formular_novy(user_id, user_name, prava, zpet_fn):
             p = nacti_pripad(pid)
             _odesli_emaily(_emaily_office(),
                            f"Formuláře ASM — nový případ {cislo}",
-                           f"Máte nový případ k vyřešení.\n\nČíslo: {cislo}\n"
-                           f"Žadatel: {user_name}\nDůvod: {hlavicka['duvod_zmeny']}\n"
-                           f"Počet řádků: {len(platne)}", pripad_id=pid)
+                           f"Máte nový případ k vyřešení.\n\nČíslo: {cislo}",
+                           pripad_id=pid)
             # Notifikace dotčených OZ (původní + nový) při podání žádosti.
             _notifikuj_oz(list(dict.fromkeys(
                               [hlavicka.get("cislo_oz")]

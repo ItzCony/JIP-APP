@@ -30,6 +30,7 @@ import prodejni_aktivity
 import intranet_narozeniny
 import intranet_vysledky
 import intranet_spolvecer
+import intranet_gastrokurzy
 
 # ── Bezpečnostní HTTP hlavičky + ochrana statických příloh ───────────────────
 # Cesty servírované přes app.add_static_files, kam uživatelé NAHRÁVAJÍ soubory.
@@ -169,6 +170,10 @@ if __name__ == "__main__":
     app.on_startup(lambda: asyncio.create_task(znacky_provoz.bg_uzavreni_pripadu()))
     app.on_startup(prodejni_aktivity.inicializace_db)
     app.on_startup(intranet_spolvecer.inicializace_db)
+    # Gastrokurzy — tabulky + jednorázový import termínů z Excelu (jen když je prázdno).
+    app.on_startup(intranet_gastrokurzy.inicializace_db)
+    # Gastrokurzy — denní souhrn nových/upravených termínů (výchozí 12:00).
+    app.on_startup(lambda: asyncio.create_task(intranet_gastrokurzy.bg_gastrokurzy_souhrn()))
 
     app.on_startup(lambda: asyncio.create_task(intranet_narozeniny.bg_narozeniny_emaily()))
     # Evidence OZ — ranní přepočet „Aktivní OZ" + kontrola proti kartám.

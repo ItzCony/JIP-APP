@@ -642,6 +642,13 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
         'vse' in vsechna_prava and nastaveni.get('bonusy_ao_zapnuty', True)
     )
 
+    ma_pristup_gastrokurzy = (
+        'vse' in vsechna_prava or
+        'gastrokurzy_spravce' in vsechna_prava or
+        'gastrokurzy_zapisovatel' in vsechna_prava or
+        'gastrokurzy_ctenar' in vsechna_prava
+    ) and nastaveni.get('gastrokurzy_zapnuty', True)
+
     nazev_kviz       = "Zkouškový Kvíz"
     nazev_dochazka   = "Docházka a Volno"
     nazev_veletrh    = "Plán Veletrh 2027"
@@ -761,6 +768,8 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
            _akce('lupa', f'lupa_pohled_{user_id}')),
         _d('bonusy_ao', ma_pristup_bonusy_ao, '💰', 'Bonusy AO', '#eab308',
            _akce('bonusy_ao')),
+        _d('gastrokurzy', ma_pristup_gastrokurzy, '👨‍🍳', 'Gastrokurzy', '#f97316',
+           _akce('gastrokurzy')),
     ) if d]
 
     podle_klice = {d['klic']: d for d in dlazdice}

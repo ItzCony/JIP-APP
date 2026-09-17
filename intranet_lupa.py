@@ -27,6 +27,7 @@ from nicegui import ui, app
 import intranet_data
 import intranet_logger
 import intranet_notifikace
+from intranet_ui_utils import prekryv_kolecko
 
 # ============================================================================
 # Konstanty
@@ -1024,10 +1025,27 @@ def _nacti_souhrny(asmy):
         conn.close()
 
 
-def _dlazdice_asm(s, stav_klic, refreshable):
-    def otevri():
-        app.storage.user[stav_klic] = s['asm']
+async def _prepni_pohled(stav_klic, hodnota, refreshable, popis):
+    """Překryv s kolečkem po dobu, než se pohled vykreslí (stejné jako Bonusy AO).
+    Sestavení detailu = desítky dotazů na volby filtrů, bez překryvu to vypadá
+    jako zamrzlá dlaždice."""
+    app.storage.user[stav_klic] = hodnota
+    dlg, _kruh, _popisek = prekryv_kolecko(popis, procenta=False)
+    dlg.open()
+    try:
+        await asyncio.sleep(0.15)   # ať se překryv stihne vykreslit
         refreshable.refresh()
+    finally:
+        try:
+            dlg.close()
+        except RuntimeError:
+            pass    # refresh dlaždici i s dialogem smazal - překryv je už pryč
+
+
+def _dlazdice_asm(s, stav_klic, refreshable):
+    async def otevri():
+        await _prepni_pohled(stav_klic, s['asm'], refreshable,
+                             f"Načítám ASM {s['asm'].capitalize()}…")
 
     with ui.card().classes(_KARTA).on('click', otevri):
         ui.label('🔍').classes('text-5xl mb-2')
@@ -1036,9 +1054,8 @@ def _dlazdice_asm(s, stav_klic, refreshable):
 
 
 def _dlazdice_import(stav_klic, refreshable):
-    def otevri():
-        app.storage.user[stav_klic] = 'import'
-        refreshable.refresh()
+    async def otevri():
+        await _prepni_pohled(stav_klic, 'import', refreshable, 'Načítám import…')
 
     with ui.card().classes(_KARTA.replace('border-indigo-200', 'border-amber-200')) \
             .on('click', otevri):
@@ -2587,11 +2604,12 @@ def _vykresli_odberatele(asm, user_id, user_name, vsechna_prava):
         app.storage.user[filtr_klic] = filtr
         btn_nacti.disable()
         chk_rozpad.disable()
-        pozn = ui.notification('Načítám data…', spinner=True, timeout=None)
+        dlg, _kruh, _popisek = prekryv_kolecko('Generování přehledu', procenta=False)
+        dlg.open()
         try:
             rows = await asyncio.to_thread(_souhrn_odberatelu, asm, filtr)
         finally:
-            pozn.dismiss()
+            dlg.close()
             btn_nacti.enable()
             chk_rozpad.enable()
         rozpad = bool(filtr.get('rozpad'))
@@ -2801,12 +2819,13 @@ def _vykresli_srovnani(asm, user_id, user_name, vsechna_prava):
             return
         app.storage.user[filtr_klic] = filtr
         btn_nacti.disable()
-        pozn = ui.notification('Načítám data…', spinner=True, timeout=None)
+        dlg, _kruh, _popisek = prekryv_kolecko('Generování přehledu', procenta=False)
+        dlg.open()
         try:
             rows = await asyncio.to_thread(_srovnani_zakazniku, asm,
                                            filtr['a'], filtr['b'], filtr)
         finally:
-            pozn.dismiss()
+            dlg.close()
             btn_nacti.enable()
         stav.update({
             'rows': rows, 'filtr': filtr,
@@ -3185,12 +3204,13 @@ def _vykresli_obraty(asm, user_id, user_name, vsechna_prava):
         app.storage.user[filtr_klic] = filtr
         app.storage.user[prah_klic] = {'pct': prah_pct, 'kc': prah_kc}
         btn_nacti.disable()
-        pozn = ui.notification('Počítám obraty…', spinner=True, timeout=None)
+        dlg, _kruh, _popisek = prekryv_kolecko('Generování přehledu', procenta=False)
+        dlg.open()
         try:
             data = await asyncio.to_thread(_obraty_prehled, asm, filtr,
                                            prah_pct, prah_kc)
         finally:
-            pozn.dismiss()
+            dlg.close()
             btn_nacti.enable()
         stav.update({'data': data, 'filtr': filtr,
                      'popis': _popis_filtru(filtr, zak_volby)})

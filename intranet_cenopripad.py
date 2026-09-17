@@ -1763,10 +1763,10 @@ def _uloz_pripad(typ, nazev, zadavatel_id, zadavatel_jmeno, vstup_radky, vyslede
     `poznamka_zadani` = důvod nahrání (u mimolétáku povinné).
     `stav_override` = vynutí stav případu místo verdiktu (např. 'delisting' přeskočí
     fázi kontroly a jde rovnou na office).
-    Vrací (cislo, stav, chyba|None)."""
+    Vrací (cislo, stav, chyba|None, pripad_id|None)."""
     conn = intranet_data.get_db_connection()
     if not conn:
-        return None, None, "Chyba připojení k databázi."
+        return None, None, "Chyba připojení k databázi.", None
     try:
         cur = conn.cursor()
         cislo = _dalsi_cislo(cur)
@@ -1811,13 +1811,13 @@ def _uloz_pripad(typ, nazev, zadavatel_id, zadavatel_jmeno, vstup_radky, vyslede
                    else f"Vyhodnoceno: NENÍ v pořádku — {vysledek['chyby']} z {vysledek['pocet']} řádků"))
             + (" · TESTOVACÍ případ" if testovaci else "")
             + (f" · Důvod nahrání: {poznamka_zadani}" if poznamka_zadani else ""))
-        return cislo, stav, None
+        return cislo, stav, None, pid
     except Exception as e:
         try:
             conn.rollback()
         except Exception:
             pass
-        return None, None, f"Chyba uložení případu: {e}"
+        return None, None, f"Chyba uložení případu: {e}", None
     finally:
         conn.close()
 
@@ -2374,7 +2374,7 @@ def _odesli_emaily_zadateli(pripad, predmet, text):
     """Notifikace ŽADATELI (na e-mail z user.iduser = zadavatel_id)."""
     em = _email_uzivatele(pripad.get("zadavatel_id"))
     if em:
-        _odesli_emaily([em], predmet, text)
+        _odesli_emaily([em], predmet, text, _app_url(f"?pripad={pripad.get('id')}"))
 
 
 def _je_spravce_typu(typ, p):
@@ -2579,7 +2579,8 @@ def _oprava_widget(pripad, typ, user_name, po_akci):
                     f"Cenopřípad {pripad['cislo']}: případ je v pořádku ke zpracování",
                     f"Případ „{pripad['nazev']}“ ({TYPY[typ]['nazev']}) byl opraven a je v pořádku. "
                     f"Můžete ho zpracovat a dotáhnout do nastavení."
-                    + (_KONTROLA_VAROVANI_MAIL if _kontr == "chyba" else ""))
+                    + (_KONTROLA_VAROVANI_MAIL if _kontr == "chyba" else ""),
+                    _app_url(f"?pripad={pripad['id']}"))
             zprava = ("✅ Přepočítáno — vše v pořádku." if vys["ok"]
                       else f"❌ Přepočítáno — {vys['chyby']} z {vys['pocet']} řádků špatně.")
             await po_akci(zprava, "positive" if vys["ok"] else "negative")
@@ -3033,13 +3034,15 @@ def _dialog_detail(pripad, user_id, user_name, prava):
                                     f"„{pripad['nazev']}“ ({TYPY[typ]['nazev']}) z testovacího na "
                                     f"ostrý — je v pořádku. Můžete ho zpracovat a dotáhnout do "
                                     f"nastavení."
-                                    + (_KONTROLA_VAROVANI_MAIL if _kontr == "chyba" else ""))
+                                    + (_KONTROLA_VAROVANI_MAIL if _kontr == "chyba" else ""),
+                                    _app_url(f"?pripad={pripad['id']}"))
                             elif stav == "ceka_na_spravce":
                                 _odesli_emaily(
                                     _emaily_spravce(oddeleni),
                                     f"Cenopřípad {pripad['cislo']}: žádost o druhou kontrolu",
                                     f"Případ „{pripad['nazev']}“ ({TYPY[typ]['nazev']}) byl převeden "
-                                    f"z testovacího na ostrý a čeká na vaši druhou kontrolu.")
+                                    f"z testovacího na ostrý a čeká na vaši druhou kontrolu.",
+                                    _app_url(f"?pripad={pripad['id']}"))
                             intranet_logger.log_activity(
                                 user_name, "Cenopřípad", f"Převod na ostrý {pripad['cislo']}")
                             await _po_akci("Případ převeden na ostrý — pokračuje běžným procesem.",
@@ -3145,7 +3148,8 @@ def _dialog_detail(pripad, user_id, user_name, prava):
                             if not je_test:   # testovací případ NEodesílá e-maily
                                 _odesli_emaily(
                                     _emaily_spravce(oddeleni),
-                                    f"Cenopřípad {pripad['cislo']}: žádost o druhou kontrolu", text)
+                                    f"Cenopřípad {pripad['cislo']}: žádost o druhou kontrolu", text,
+                                    _app_url(f"?pripad={pripad['id']}"))
                             intranet_logger.log_activity(
                                 user_name, "Cenopřípad", f"Žádost o 2. kontrolu {pripad['cislo']}"
                                 + (f", {len(prilohy)} příloh" if prilohy else "")
@@ -3188,7 +3192,8 @@ def _dialog_detail(pripad, user_id, user_name, prava):
                             + (f" Vyřazeno {len(vyrazene)} položek (nejsou v exportu)."
                                if castecne else "")
                             + " Můžete ho zpracovat a dotáhnout do nastavení."
-                            + (_KONTROLA_VAROVANI_MAIL if _kontr == "chyba" else ""))
+                            + (_KONTROLA_VAROVANI_MAIL if _kontr == "chyba" else ""),
+                            _app_url(f"?pripad={pripad['id']}"))
                         _odesli_emaily_zadateli(
                             pripad,
                             f"Cenopřípad {pripad['cislo']}: "
@@ -3749,7 +3754,7 @@ def _formular_novy_pripad(typ, user_id, user_name, oddeleni):
                                       type="warning", timeout=8000)
                             return
                 soubor_raw = None if text else drzeny["raw"]   # ulož jen nahraný soubor, ne paste
-                cislo, stav_p, err2 = await asyncio.to_thread(
+                cislo, stav_p, err2, pid = await asyncio.to_thread(
                     _uloz_pripad, typ, nazev, user_id, user_name, radky, vys,
                     soubor_raw, drzeny["name"], testovaci, duvod or None,
                     "delisting" if delist else None)
@@ -3771,7 +3776,7 @@ def _formular_novy_pripad(typ, user_id, user_name, oddeleni):
                         f"Cenopřípad {cislo}: DELISTING ke zpracování",
                         f"Žadatel {user_name} vložil DELISTING „{nazev}“ ({cfg['nazev']}). "
                         f"Případ přeskočil fázi kontroly — můžete ho rovnou zpracovat a "
-                        f"dotáhnout do nastavení.")
+                        f"dotáhnout do nastavení.", _app_url(f"?pripad={pid}"))
                 ui.notify(f"Případ {cislo}: 🗑️ DELISTING ({vys['pocet']} řádků) — "
                           + ("🧪 TESTOVACÍ, e-maily se neodeslaly." if testovaci
                              else "předáno rovnou office ke zpracování."),
@@ -3794,7 +3799,8 @@ def _formular_novy_pripad(typ, user_id, user_name, oddeleni):
                         f"Cenopřípad {cislo}: nový případ ke zpracování",
                         f"Žadatel {user_name} vložil případ „{nazev}“ ({cfg['nazev']}), který je "
                         f"v pořádku. Můžete ho zpracovat a dotáhnout do nastavení."
-                        + (_KONTROLA_VAROVANI_MAIL if _kontr == "chyba" else ""))
+                        + (_KONTROLA_VAROVANI_MAIL if _kontr == "chyba" else ""),
+                        _app_url(f"?pripad={pid}"))
                 ui.notify(f"Případ {cislo}: ✅ VŠE V POŘÁDKU ({vys['pocet']} řádků). "
                           + ("🧪 TESTOVACÍ — e-maily se neodeslaly." if testovaci
                              else "Office byl informován."),
@@ -4527,6 +4533,14 @@ def _sub_view_typ(typ, user_id, user_name, prava):
         return data
 
     vsechny = _nacti_vsechny()
+    # Deep-link z e-mailu (?pripad=<id>) — otevři rovnou detail případu, ať ho
+    # příjemce nemusí dohledávat v seznamu. Zpracuje se jen jednou (pop).
+    _deep = app.storage.user.pop("pripad_detail", None)
+    if _deep:
+        _dp = next((p for p in vsechny if p["id"] == _deep), None)
+        if _dp:
+            ui.timer(0.25, lambda p=_dp: _dialog_detail(p, user_id, user_name, prava),
+                     once=True)
     nadpis = ("Historie případů" if _vidi_vsechny_pripady(prava)
               else "Případy oddělení" if (_vidi_oddeleni(prava) or _schval_odd_slugs(prava)
                                           or _vedouci_odd_slugs(prava))
@@ -7497,13 +7511,31 @@ def _oprava_workflow(p, pid, stav, je_vlastnik, je_office, je_spravce, user_name
         # ── Office obchod ───────────────────────────────────────────────────
         if je_office and stav in ("odeslano", "vraceno_zpet", "spravce_schvalil"):
             def _zpracovano():
-                _oprava_stav(pid, "zpracovano")
-                _oprava_zapis_historie(pid, "Zpracováno", user_name)
-                _oprava_mail_zadateli(p, f"Oprava cen — žádost {cislo} zpracována",
-                                      f"Vaše žádost o opravu ceny {cislo} byla zpracována.")
-                intranet_logger.log_activity(user_name, "Cenopřípad",
-                                             f"Oprava cen: zpracováno {cislo}")
-                _hotovo("Označeno jako zpracováno.")
+                with ui.dialog() as d, ui.card().classes("p-4 gap-3").style("min-width:460px"):
+                    ui.label("Označit jako zpracováno").classes("text-lg font-bold")
+                    ui.label("Nepovinná poznámka žadateli. Odejde mu v e-mailu "
+                             "a zůstane v historii případu.") \
+                        .classes("text-sm text-gray-500")
+                    pozn = ui.textarea("Poznámka žadateli") \
+                        .props("outlined autogrow").classes("w-full")
+
+                    def _ok():
+                        txt = (pozn.value or "").strip()
+                        _oprava_stav(pid, "zpracovano")
+                        _oprava_zapis_historie(pid, "Zpracováno", user_name, txt or None)
+                        _oprava_mail_zadateli(
+                            p, f"Oprava cen — žádost {cislo} zpracována",
+                            f"Vaše žádost o opravu ceny {cislo} byla zpracována."
+                            + (f"\n\nPoznámka od Office ({user_name}):\n{txt}" if txt else ""))
+                        intranet_logger.log_activity(user_name, "Cenopřípad",
+                                                     f"Oprava cen: zpracováno {cislo}")
+                        d.close()
+                        _hotovo("Označeno jako zpracováno.")
+                    with ui.row().classes("w-full justify-end gap-2"):
+                        ui.button("Zrušit", on_click=d.close).props("flat no-caps")
+                        ui.button("Zpracováno", on_click=_ok) \
+                            .props("unelevated no-caps color=green")
+                d.open()
 
             def _vratit():
                 with ui.dialog() as d, ui.card().classes("p-4 gap-3").style("min-width:420px"):
@@ -8525,6 +8557,18 @@ def vykresli_cenopripad(user_id, user_name, vsechna_prava):
             app.storage.user["cenopripad_pohled"] = klic
             app.storage.user[f"{klic}_detail"] = int(z_emailu)
             break
+    else:
+        # „…/cenopripad?pripad=<id>" — běžný cenopřípad. Typ (= záložka) neznáme
+        # z URL, dotáhneme ho z DB; detail otevře `_sub_view_typ`.
+        try:
+            z_emailu = context.client.request.query_params.get("pripad")
+        except Exception:
+            z_emailu = None
+        if z_emailu and str(z_emailu).isdigit():
+            p = nacti_pripad(int(z_emailu))
+            if p and p.get("typ") in _viditelne_typy(vsechna_prava):
+                app.storage.user["cenopripad_pohled"] = p["typ"]
+                app.storage.user["pripad_detail"] = int(z_emailu)
 
     @ui.refreshable
     def _obsah():
