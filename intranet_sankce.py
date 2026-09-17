@@ -36,7 +36,7 @@ import intranet_logger
 import intranet_notifikace
 import intranet_emaily
 import intranet_static
-from intranet_ui_utils import refreshable_na_klienta
+from intranet_ui_utils import prekryv_kolecko, refreshable_na_klienta
 import datetime
 import hashlib
 import io
@@ -2087,12 +2087,28 @@ def _je_xlsb(raw: bytes) -> bool:
         return False
 
 
-def _cti_list_data(raw: bytes):
+def _s_pokrokem(it, celkem: int, pokrok):
+    """Prožene iterátor a po každých 2 000 řádcích ohlásí podíl načteného.
+    Bez callbacku (nebo bez známého počtu řádků) jen propouští data dál."""
+    if not pokrok or celkem <= 0:
+        yield from it
+        return
+    for i, r in enumerate(it, 1):
+        if i % 2000 == 0:
+            pokrok(min(i / celkem, 1.0) * 0.9)
+        yield r
+
+
+def _cti_list_data(raw: bytes, pokrok=None):
     """Otevře sešit (.xlsx přes openpyxl, .xlsb přes pyxlsb) a vrátí
     (hlavička, iterátor řádků, chyba|None) listu „DATA" (název se porovnává bez
     ohledu na velikost písmen — jiné exporty ho mají jako „data").
     Pozn.: pyxlsb vrací každé číslo jako float, takže kódy a čísla objednávek by
-    skončily jako „87527.0" — celá čísla proto vracíme zpět jako int."""
+    skončily jako „87527.0" — celá čísla proto vracíme zpět jako int.
+
+    pokrok: volitelný callback(0.0–1.0) s podílem načteného listu; čtení souboru
+    zabírá 0–0,9 rozsahu, zbytek dopočítá zápis do DB.
+    """
     if _je_xlsb(raw):
         from pyxlsb import open_workbook
         try:
@@ -2112,7 +2128,7 @@ def _cti_list_data(raw: bytes):
                 radky.append([_cely(c.v) for c in r])
         if not radky:
             return None, None, 'List DATA je prázdný.'
-        return radky[0], iter(radky[1:]), None
+        return radky[0], _s_pokrokem(iter(radky[1:]), len(radky) - 1, pokrok), None
 
     import openpyxl
     try:
@@ -2122,11 +2138,14 @@ def _cti_list_data(raw: bytes):
     jmeno = next((s for s in wb.sheetnames if _norm(s) == 'data'), None)
     if not jmeno:
         return None, None, 'Soubor neobsahuje list „DATA".'
-    rows_iter = wb[jmeno].iter_rows(values_only=True)
+    ws = wb[jmeno]
+    celkem = (ws.max_row or 0) - 1      # read-only list zná rozměr z dimenze sešitu
+    rows_iter = ws.iter_rows(values_only=True)
     try:
-        return next(rows_iter), rows_iter, None
+        header = next(rows_iter)
     except StopIteration:
         return None, None, 'List DATA je prázdný.'
+    return header, _s_pokrokem(rows_iter, celkem, pokrok), None
 
 
 def _excel_datum(v):
@@ -2146,7 +2165,7 @@ def _excel_datum(v):
 
 def _importuj_sync(raw: bytes, tabulka: str, mapa: dict, cisla: set,
                    obdobi: str, od_iso: str, do_iso: str, user_name: str,
-                   pripoj: bool = False):
+                   pripoj: bool = False, pokrok=None):
     """Naimportuje list DATA. Dva režimy:
       • pripoj=False (výchozí) — NAHRADÍ celou dávku stejného období a zachová ručně
         zadané poznámky (a u 'Sankce k vystavení' i stavy) párováním přes row_hash;
@@ -2161,7 +2180,7 @@ def _importuj_sync(raw: bytes, tabulka: str, mapa: dict, cisla: set,
     datumy = spec.get('datumy') or ()
     filtr = spec.get('filtr') or {}
 
-    header, rows_iter, chyba = _cti_list_data(raw)
+    header, rows_iter, chyba = _cti_list_data(raw, pokrok)
     if chyba:
         return 0, 0, chyba
 
@@ -2205,6 +2224,8 @@ def _importuj_sync(raw: bytes, tabulka: str, mapa: dict, cisla: set,
                                       [radek.get(p) for p in spec['hash']])
         zaznamy.append(radek)
 
+    if pokrok:
+        pokrok(0.9)
     if not zaznamy:
         return 0, 0, 'V listu DATA nejsou žádné datové řádky.'
 
@@ -2277,6 +2298,8 @@ def _importuj_sync(raw: bytes, tabulka: str, mapa: dict, cisla: set,
             cur2.executemany(sql, davka)
         conn.commit()
         cur.close(); cur2.close()
+        if pokrok:
+            pokrok(1.0)
         return len(davka), preskoceno, None
     except Exception as e:
         try:
@@ -2796,9 +2819,26 @@ def _otevri_import_dialog(tabulka: str, mapa: dict, cisla: set, user_name: str, 
                 obdobi = _obdobi_label(od_iso, do_iso)
 
             pripoj = pripoj_mode
-            count, skipped, err = await asyncio.to_thread(
-                _importuj_sync, raw, tabulka, mapa, cisla, obdobi, od_iso, do_iso, user_name, pripoj)
+            stav_pokrok = {'f': 0.0}
+            kol_dlg, kruh, kol_popisek = prekryv_kolecko(f'Importuji {name}…')
+            dlg.close()             # formulář pryč, ať kolečko svítí na čistém pozadí
+            kol_dlg.open()
+
+            def _tik():
+                proc = stav_pokrok['f'] * 100
+                kruh.set_value(proc)
+                kol_popisek.set_text(f'{proc:.0f} %')
+
+            casovac = ui.timer(0.2, _tik)
+            try:
+                count, skipped, err = await asyncio.to_thread(
+                    _importuj_sync, raw, tabulka, mapa, cisla, obdobi, od_iso, do_iso,
+                    user_name, pripoj, lambda f: stav_pokrok.update(f=f))
+            finally:
+                casovac.cancel()
+                kol_dlg.close()
             if err:
+                dlg.open()          # zpět na formulář, ať lze import opravit a opakovat
                 ui.notify(f'Import se nezdařil: {err}', type='negative', timeout=10000)
                 return
 
@@ -2806,6 +2846,7 @@ def _otevri_import_dialog(tabulka: str, mapa: dict, cisla: set, user_name: str, 
                 # nic nového — podrž soubor, ať lze upravit období a zkusit znovu
                 drzeny['raw'] = raw
                 drzeny['name'] = name
+                dlg.open()
                 stav_lbl.set_text(f'Soubor „{name}": žádný nový řádek — vše už v období '
                                   f'{obdobi} je (přeskočeno {skipped}). Zkontrolujte období.')
                 stav_lbl.set_visibility(True)

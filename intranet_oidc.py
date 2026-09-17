@@ -263,4 +263,12 @@ async def oidc_callback(request: Request):
         app.storage.user['oidc_hint'] = email
     except Exception:
         pass
-    return RedirectResponse('/')
+    # Návrat na původně kliknutou URL (deep-link z e-mailu, /asm?pripad=206).
+    # Jen lokální cesta — nikdy cizí doména (open redirect).
+    try:
+        cil = str(app.storage.user.pop('po_prihlaseni', '') or '/')
+    except Exception:
+        cil = '/'
+    if not cil.startswith('/') or cil.startswith('//'):
+        cil = '/'
+    return RedirectResponse(cil)

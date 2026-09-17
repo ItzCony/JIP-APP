@@ -130,6 +130,10 @@ ZAKLADNI_PRAVA = {
     'sankce_tiket_oz': {'kategorie': 'Modul Sankce', 'podskupina': 'Nákupčí (tikety)', 'nazev': 'Tiket: nákupčí OZ', 'popis': 'Vidí a řeší tikety sankcí s kódem nákupčího OZ.', 'ikona': 'assignment_ind'},
     'sankce_tiket_vn': {'kategorie': 'Modul Sankce', 'podskupina': 'Nákupčí (tikety)', 'nazev': 'Tiket: nákupčí VN (vedoucí nákupu)', 'popis': 'Vidí a řeší tikety sankcí s kódem nákupčího VN.', 'ikona': 'assignment_ind'},
 
+    'gastrokurzy_spravce':     {'kategorie': 'Modul Gastrokurzy', 'nazev': 'Správce kurzů', 'popis': 'Zakládá a edituje kurzy, jejich termíny a lektory, zapisuje prezenci a manipuluje s přihlášenými lidmi.', 'ikona': 'manage_accounts'},
+    'gastrokurzy_zapisovatel': {'kategorie': 'Modul Gastrokurzy', 'nazev': 'Zapisovatel (ASM / vedoucí pobočky)', 'popis': 'Zapisuje pozvané zákazníky na kurzy a ruší zápisy. Nemůže měnit termíny kurzů.', 'ikona': 'person_add'},
+    'gastrokurzy_ctenar':      {'kategorie': 'Modul Gastrokurzy', 'nazev': 'Čtenář', 'popis': 'Vidí termíny kurzů i prezenční listiny pouze pro čtení. Nemůže zapisovat ani rušit zápisy.', 'ikona': 'visibility'},
+
     'spolvecer_schvalovatel': {'kategorie': 'Modul Společenský večer', 'nazev': 'Schvalovatel', 'popis': 'Vidí všechny pobočky, komunikuje v chatu a schvaluje náklady (mění stav na Schváleno).', 'ikona': 'verified'},
     'spolvecer_ctenar':       {'kategorie': 'Modul Společenský večer', 'nazev': 'Čtenář', 'popis': 'Vidí všechny pobočky pouze pro čtení a může psát do chatu. Nemůže editovat tabulku ani schvalovat.', 'ikona': 'visibility'},
 

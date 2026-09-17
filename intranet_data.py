@@ -470,6 +470,7 @@ MODULY = {
     'lupa_zapnuty':          ('🔍 Modul Lupou na obchod',        'Lupou na obchod'),
     'bonusy_ao_zapnuty':     ('💰 Modul Bonusy AO',              'Bonusy AO'),
     'schuzky_zapnuty':       ('🗓️ Modul Schůzky s vedoucími',    'Schůzky s vedoucími'),
+    'gastrokurzy_zapnuty':   ('👨‍🍳 Modul Gastrokurzy',            'Gastrokurzy'),
     # Má i vlastní přepínač na záložce Narozeniny v Nastavení portálu.
     'narozeniny_zapnuty':    ('Modul Narozeniny',               'Narozeniny'),
 }

@@ -29,6 +29,7 @@ import intranet_vizitky
 import intranet_spolvecer
 import intranet_lupa
 import intranet_bonusy_ao
+import intranet_gastrokurzy
 
 import time
 import asyncio
@@ -55,6 +56,19 @@ def _odhlas_vycisti_relaci():
         app.storage.user['login_email'] = _email
     if _oidc:
         app.storage.user['oidc_hint'] = _oidc
+
+
+def cil_po_prihlaseni(client, aktivni_tab='prehled'):
+    """Kam vrátit uživatele po přihlášení — PŘESNĚ na to, na co klikl, včetně
+    query stringu. Bez něj se ztratí deep-link z e-mailu (/asm?pripad=206,
+    /cenopripad?pripad=12) a otevře se jen modul bez konkrétního případu."""
+    try:
+        u = client.request.url
+        if u.path.startswith('/') and not u.path.startswith('//'):
+            return u.path + (f'?{u.query}' if u.query else '')
+    except Exception:
+        pass
+    return f'/{aktivni_tab}' if aktivni_tab != 'prehled' else '/'
 
 
 # Statické soubory — whitelist konkrétních povolených souborů.
@@ -660,6 +674,7 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
         'asm':           'asm_zapnuty',
         'lupa':          'lupa_zapnuty',
         'bonusy_ao':     'bonusy_ao_zapnuty',
+        'gastrokurzy':   'gastrokurzy_zapnuty',
 
     }
 
@@ -847,7 +862,22 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
     if ma_vse and nastaveni.get('bonusy_ao_zapnuty', True):
         dostupne_taby.append('bonusy_ao')
 
+    _ma_gastrokurzy = (
+        ma_vse
+        or 'gastrokurzy_spravce' in vsechna_prava
+        or 'gastrokurzy_zapisovatel' in vsechna_prava
+        or 'gastrokurzy_ctenar' in vsechna_prava
+    )
+    if _ma_gastrokurzy and nastaveni.get('gastrokurzy_zapnuty', True):
+        dostupne_taby.append('gastrokurzy')
+
     if not user_id:
+        # Deep-link z e-mailu musí přežít i přesměrování přes firemní účet (OIDC) —
+        # callback je běžný HTTP redirect a původní URL už nezná.
+        try:
+            app.storage.user['po_prihlaseni'] = cil_po_prihlaseni(client, aktivni_tab)
+        except Exception:
+            pass
         ui.query('body').classes(add='prihlaseni-pozadi', remove='intranet-pozadi')
         with ui.column().classes('w-full h-screen items-center justify-center m-0 py-8 px-4 overflow-y-auto'):
             try:
@@ -960,7 +990,7 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
                                 ui.label(f'Vítejte, {jmeno_u}!').classes('login-loading-name text-3xl font-black')
                         loading_dlg.open()
 
-                        _cil = f'/{aktivni_tab}' if aktivni_tab != 'prehled' else '/'
+                        _cil = cil_po_prihlaseni(client, aktivni_tab)
                         ui.timer(0.8, lambda: ui.navigate.to(_cil), once=True)
 
                         # Logování až PO zobrazení dialogu a naplánování navigace —
@@ -1465,6 +1495,8 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
                         tab_asm = ui.tab('asm', label='📝  Formuláře ASM').classes('justify-start text-lg text-gray-800')
                     if 'bonusy_ao' in dostupne_taby:
                         ui.tab('bonusy_ao', label='💰  Bonusy AO').classes('justify-start text-lg text-gray-800')
+                    if 'gastrokurzy' in dostupne_taby:
+                        ui.tab('gastrokurzy', label='👨‍🍳  Gastrokurzy').classes('justify-start text-lg text-gray-800')
                     if 'lupa' in dostupne_taby:
                         tab_lupa = ui.tab('lupa', label='🔍  Lupou na obchod').classes('justify-start text-lg text-gray-800')
 
@@ -1544,6 +1576,7 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
                 if 'asm'        in dostupne_taby: _RENDER_FNS['asm']        = lambda: intranet_asm.vykresli_asm(user_id, user_name, vsechna_prava)
                 if 'lupa'       in dostupne_taby: _RENDER_FNS['lupa']       = lambda: intranet_lupa.vykresli_lupa(user_id, user_name, vsechna_prava)
                 if 'bonusy_ao'  in dostupne_taby: _RENDER_FNS['bonusy_ao']  = lambda: intranet_bonusy_ao.vykresli_bonusy_ao(user_id, user_name, vsechna_prava)
+                if 'gastrokurzy' in dostupne_taby: _RENDER_FNS['gastrokurzy'] = lambda: intranet_gastrokurzy.vykresli(user_id, user_name, vsechna_prava)
 
                 if tab_logy:        _RENDER_FNS['logy']          = lambda: intranet_logger.vykresli_logy(user_name, vsechna_prava)
                 if tab_server:      _RENDER_FNS['server']        = lambda: intranet_monitor.vykresli_monitor(vsechna_prava)

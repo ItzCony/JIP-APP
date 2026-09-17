@@ -306,3 +306,19 @@ def prepni_tab(nazev: str) -> None:
         fn = None
     if fn is not None:
         fn(nazev)
+
+
+def prekryv_kolecko(popis: str, procenta: bool = True):
+    """Šedý překryv s kolečkem uprostřed. Vrací (dialog, kruh, popisek).
+    procenta=False → kolečko se točí (délka operace není známá)."""
+    with ui.dialog().props('persistent') as dlg, \
+            ui.card().classes('bg-transparent shadow-none items-center gap-2'):
+        kruh = ui.circular_progress(value=0, max=100, size='98px', show_value=False) \
+            .props('thickness=0.2 color=primary track-color=grey-5')
+        if not procenta:
+            kruh.props('indeterminate')
+        with kruh:
+            popisek = ui.label('0 %' if procenta else '') \
+                .classes('absolute-center text-lg font-bold')
+        ui.label(popis).classes('text-white').style('font-size: 1.25rem')
+    return dlg, kruh, popisek

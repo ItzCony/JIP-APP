@@ -21,7 +21,7 @@ from nicegui import app, ui
 
 import intranet_data
 import intranet_logger
-from intranet_ui_utils import refreshable_na_klienta
+from intranet_ui_utils import prekryv_kolecko, refreshable_na_klienta
 
 POBOCKY = [
     'Praha', 'Pardubice', 'Most', 'Jilemnice', 'Liberec', 'Nová role', 'Brno',
@@ -1716,7 +1716,7 @@ def _bonusy_sekce(pobocka: str, user_name: str) -> None:
             return
         app.storage.user[nahled_klic] = bool(volba_nahled.value)
         stav_pokrok = {'f': 0.0}
-        dlg, kruh, popisek = _prekryv_kolecko(f'Počítám bonusy {okno_popis}…')
+        dlg, kruh, popisek = prekryv_kolecko(f'Počítám bonusy {okno_popis}…')
 
         def _tik():
             proc = stav_pokrok['f'] * 100
@@ -1855,22 +1855,6 @@ def _velikost(b: int) -> str:
     return f'{b:.1f} GB'
 
 
-def _prekryv_kolecko(popis: str, procenta: bool = True):
-    """Šedý překryv s kolečkem uprostřed. Vrací (dialog, kruh, popisek).
-    procenta=False → kolečko se točí (délka operace není známá)."""
-    with ui.dialog().props('persistent') as dlg, \
-            ui.card().classes('bg-transparent shadow-none items-center gap-2'):
-        kruh = ui.circular_progress(value=0, max=100, size='98px', show_value=False) \
-            .props('thickness=0.2 color=primary track-color=grey-5')
-        if not procenta:
-            kruh.props('indeterminate')
-        with kruh:
-            popisek = ui.label('0 %' if procenta else '') \
-                .classes('absolute-center text-lg font-bold')
-        ui.label(popis).classes('text-white').style('font-size: 1.25rem')
-    return dlg, kruh, popisek
-
-
 def _data_col_defs() -> list[dict]:
     cols = []
     for f, h, typ, sirka in DATA_SLOUPCE:
@@ -1898,7 +1882,7 @@ def _data_sekce(pobocka: str, user_name: str) -> None:
 
     async def _zpracuj(nazev: str):
         stav_pokrok = {'f': 0.0}
-        dlg, kruh, popisek = _prekryv_kolecko(f'Zpracovávám {nazev}…')
+        dlg, kruh, popisek = prekryv_kolecko(f'Zpracovávám {nazev}…')
         dlg.open()
 
         def _tik():
@@ -1927,7 +1911,7 @@ def _data_sekce(pobocka: str, user_name: str) -> None:
         if not e.value:                     # vyčištěná volba → prázdný náhled
             _data_sekce.refresh()
             return
-        dlg, _kruh, _popisek = _prekryv_kolecko(f'Načítám období {e.value}…',
+        dlg, _kruh, _popisek = prekryv_kolecko(f'Načítám období {e.value}…',
                                                 procenta=False)
         dlg.open()
         await asyncio.sleep(0.15)   # ať se překryv vykreslí před načtením z DB
@@ -1938,7 +1922,7 @@ def _data_sekce(pobocka: str, user_name: str) -> None:
         if not obdobi_sel:
             return
         dlg_smaz.close()
-        dlg, _kruh, _popisek = _prekryv_kolecko(f'Mažu období {obdobi_sel}…',
+        dlg, _kruh, _popisek = prekryv_kolecko(f'Mažu období {obdobi_sel}…',
                                                 procenta=False)
         dlg.open()
         try:
