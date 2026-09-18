@@ -132,6 +132,7 @@ _KAT_IKONY = (
     ('úkol',         'task_alt'),
     ('výsledky',     'leaderboard'),
     ('sankce',       'gavel'),
+    ('monitor',      'monitor_heart'),
     ('společenský',  'celebration'),
     ('vizitky',      'badge'),
     ('cenopřípad',   'sell'),
@@ -598,6 +599,10 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
         'sankce_ctenar' in vsechna_prava or
         any(p.startswith('sankce_tiket_') for p in vsechna_prava)
     ) and nastaveni.get('sankce_zapnuty', True)
+    ma_pristup_monitor = (
+        'vse' in vsechna_prava or
+        any(p.startswith('monitor_') for p in vsechna_prava)
+    ) and nastaveni.get('monitor_zapnuty', True)
     ma_pristup_spolvecer = (
         'vse' in vsechna_prava or
         'spolvecer_ctenar' in vsechna_prava or
@@ -758,6 +763,7 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
            _akce('ukolovnik'), _pocet_ukolu),
         _d('vysledky', ma_pristup_vysledky, '📊', 'Výsledky poboček', '#0ea5e9', _akce('vysledky')),
         _d('sankce', ma_pristup_sankce, '⚖️', 'Sankce', '#ef4444', _akce('sankce', 'sankce_pohled')),
+        _d('monitor', ma_pristup_monitor, '📈', 'Monitor', '#0ea5e9', _akce('monitor', 'monitor_typ')),
         _d('spolvecer', ma_pristup_spolvecer, '🎉', 'Spol. večer 2026', '#d946ef',
            _akce('spolvecer', f'spolvecer_sel_{user_id}')),
         _d('vizitky', ma_pristup_vizitky, '🪪', 'Vizitky a podpisy', '#0ea5e9', _akce('vizitky')),
@@ -2884,7 +2890,8 @@ def vykresli_spravu_uzivatelu(user_email, user_name, vsechna_prava=None):
     role = intranet_data.ziskej_vsechny_role()
     oddeleni = intranet_data.ziskej_vsechna_oddeleni()
     typy_v = intranet_data.ziskej_typy_volna()
-    zakladni_prava = intranet_prava.ziskej_kompletni_seznam_prav(oddeleni, typy_v)
+    sortimenty = intranet_data.ziskej_sortimenty_monitoru()
+    zakladni_prava = intranet_prava.ziskej_kompletni_seznam_prav(oddeleni, typy_v, sortimenty)
 
     _nast = intranet_data.nacti_nastaveni_intranetu()
     _skryte_kategorie = set()
@@ -4521,7 +4528,7 @@ def vykresli_spravu_uzivatelu(user_email, user_name, vsechna_prava=None):
             if not _je_superadmin:
                 ui.notify('Matici práv smí stáhnout jen administrátor.', type='negative')
                 return
-            katalog = intranet_prava.ziskej_kompletni_seznam_prav(oddeleni, typy_v)
+            katalog = intranet_prava.ziskej_kompletni_seznam_prav(oddeleni, typy_v, sortimenty)
             kategorie_opts = sorted({v.get('kategorie', '') for v in katalog.values() if v.get('kategorie')})
             odd_opts = sorted(oddeleni.keys())
             with ui.dialog() as dlg, ui.card().classes('w-[560px] max-w-full p-5 gap-3'):

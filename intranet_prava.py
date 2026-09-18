@@ -1,3 +1,5 @@
+import re as _re
+
 # ==========================================
 # --- ZÁKLADNÍ STATICKÁ PRÁVA (STRUKTUROVANÁ) ---
 # ==========================================
@@ -28,6 +30,7 @@ ZAKLADNI_PRAVA = {
     'kviz': {'kategorie': 'Modul Kvíz', 'nazev': 'Přístup do Kvízu', 'popis': 'Může otevřít modul Zkouškový Kvíz.', 'ikona': 'school'},
     'vystup_osobni': {'kategorie': 'Modul Kvíz', 'nazev': 'Kvíz: Osobní výsledky', 'popis': 'Vidí v exportech jen vlastní absolvované testy.', 'ikona': 'assessment'},
     'vystup_vse': {'kategorie': 'Modul Kvíz', 'nazev': 'Kvíz: Všechny výsledky', 'popis': 'Může exportovat výsledky testů za celou firmu.', 'ikona': 'insights'},
+    'kviz_hoste': {'kategorie': 'Modul Kvíz', 'nazev': 'Kvíz: Generování přístupů', 'popis': 'Může vygenerovat časově omezené odkazy do kvízu pro zkoušené osoby.', 'ikona': 'key'},
 
     'veletrh_pristup':    {'kategorie': 'Modul Veletrh', 'nazev': 'Základní přístup (Čtení)',  'popis': 'Vidí mapu, ceník a seznam stánků. Nemůže je upravovat.',                           'ikona': 'visibility'},
     'veletrh_komentator': {'kategorie': 'Modul Veletrh', 'nazev': 'Komentátor zákazníků',      'popis': 'Může přidávat zákazníky do evidence veletrhu. Nemůže upravovat ani mazat.',     'ikona': 'person_add'},
@@ -130,6 +133,23 @@ ZAKLADNI_PRAVA = {
     'sankce_tiket_oz': {'kategorie': 'Modul Sankce', 'podskupina': 'Nákupčí (tikety)', 'nazev': 'Tiket: nákupčí OZ', 'popis': 'Vidí a řeší tikety sankcí s kódem nákupčího OZ.', 'ikona': 'assignment_ind'},
     'sankce_tiket_vn': {'kategorie': 'Modul Sankce', 'podskupina': 'Nákupčí (tikety)', 'nazev': 'Tiket: nákupčí VN (vedoucí nákupu)', 'popis': 'Vidí a řeší tikety sankcí s kódem nákupčího VN.', 'ikona': 'assignment_ind'},
 
+    # -- Modul Monitor - každý monitor je samostatná podsekce (viz MONITORY v intranet_monitory.py) --
+    'monitor_kupi_ctenar':   {'kategorie': 'Modul Monitor', 'podskupina': 'KUPI', 'nazev': 'Čtenář - KUPI', 'popis': 'Vidí sestavu monitoru KUPI, může filtrovat, řadit a exportovat. NEsmí psát vyjádření ani nahrávat data.', 'ikona': 'visibility'},
+    'monitor_kupi_zadatel':  {'kategorie': 'Modul Monitor', 'podskupina': 'KUPI', 'nazev': 'Vyjádření - KUPI', 'popis': 'Vše co čtenář + píše vyjádření k řádkům monitoru KUPI (zápis se propíše do všech označených řádků).', 'ikona': 'edit_note'},
+    'monitor_kupi_admin':    {'kategorie': 'Modul Monitor', 'podskupina': 'KUPI', 'nazev': 'Správce - KUPI', 'popis': 'Vše co Vyjádření + nahrává týdenní sestavu KUPI a smí mazat data (nevratné, včetně vyjádření).', 'ikona': 'local_police'},
+
+    'monitor_makro_ctenar':  {'kategorie': 'Modul Monitor', 'podskupina': 'MAKRO', 'nazev': 'Čtenář - MAKRO', 'popis': 'Vidí sestavy monitoru MAKRO (listy makro-akce i makro-ceny), může filtrovat, řadit a exportovat. NEsmí psát vyjádření ani nahrávat data.', 'ikona': 'visibility'},
+    'monitor_makro_zadatel': {'kategorie': 'Modul Monitor', 'podskupina': 'MAKRO', 'nazev': 'Vyjádření - MAKRO', 'popis': 'Vše co čtenář + píše vyjádření k řádkům monitoru MAKRO.', 'ikona': 'edit_note'},
+    'monitor_makro_admin':   {'kategorie': 'Modul Monitor', 'podskupina': 'MAKRO', 'nazev': 'Správce - MAKRO', 'popis': 'Vše co Vyjádření + nahrává sestavu MAKRO a smí mazat data (nevratné, včetně vyjádření).', 'ikona': 'local_police'},
+
+    'monitor_vo_ctenar':     {'kategorie': 'Modul Monitor', 'podskupina': 'VO letáky', 'nazev': 'Čtenář - VO letáky', 'popis': 'Vidí sestavu monitoru VO letáky, může filtrovat, řadit a exportovat. NEsmí psát vyjádření ani nahrávat data.', 'ikona': 'visibility'},
+    'monitor_vo_zadatel':    {'kategorie': 'Modul Monitor', 'podskupina': 'VO letáky', 'nazev': 'Vyjádření - VO letáky', 'popis': 'Vše co čtenář + píše vyjádření k řádkům monitoru VO letáky.', 'ikona': 'edit_note'},
+    'monitor_vo_admin':      {'kategorie': 'Modul Monitor', 'podskupina': 'VO letáky', 'nazev': 'Správce - VO letáky', 'popis': 'Vše co Vyjádření + nahrává sestavu VO letáky a smí mazat data (nevratné, včetně vyjádření).', 'ikona': 'local_police'},
+
+    'monitor_tamda_ctenar':  {'kategorie': 'Modul Monitor', 'podskupina': 'TAMDA', 'nazev': 'Čtenář - TAMDA', 'popis': 'Vidí sestavu monitoru TAMDA, může filtrovat, řadit a exportovat. NEsmí psát vyjádření ani nahrávat data.', 'ikona': 'visibility'},
+    'monitor_tamda_zadatel': {'kategorie': 'Modul Monitor', 'podskupina': 'TAMDA', 'nazev': 'Vyjádření - TAMDA', 'popis': 'Vše co čtenář + píše vyjádření k řádkům monitoru TAMDA.', 'ikona': 'edit_note'},
+    'monitor_tamda_admin':   {'kategorie': 'Modul Monitor', 'podskupina': 'TAMDA', 'nazev': 'Správce - TAMDA', 'popis': 'Vše co Vyjádření + nahrává sestavu TAMDA a smí mazat data (nevratné, včetně vyjádření).', 'ikona': 'local_police'},
+
     'gastrokurzy_spravce':     {'kategorie': 'Modul Gastrokurzy', 'nazev': 'Správce kurzů', 'popis': 'Zakládá a edituje kurzy, jejich termíny a lektory, zapisuje prezenci a manipuluje s přihlášenými lidmi.', 'ikona': 'manage_accounts'},
     'gastrokurzy_zapisovatel': {'kategorie': 'Modul Gastrokurzy', 'nazev': 'Zapisovatel (ASM / vedoucí pobočky)', 'popis': 'Zapisuje pozvané zákazníky na kurzy a ruší zápisy. Nemůže měnit termíny kurzů.', 'ikona': 'person_add'},
     'gastrokurzy_ctenar':      {'kategorie': 'Modul Gastrokurzy', 'nazev': 'Čtenář', 'popis': 'Vidí termíny kurzů i prezenční listiny pouze pro čtení. Nemůže zapisovat ani rušit zápisy.', 'ikona': 'visibility'},
@@ -201,11 +221,31 @@ ZAKLADNI_PRAVA = {
 # Katalog si je ponechává kvůli popiskům a kontrolám v kódu; z nabídky
 # (ziskej_kompletni_seznam_prav) i z DB (intranet_data._vycisti_admin_prava)
 # jsou odstraněna.
+# Kód sortimentu smí do názvu práva jen takhle — privileges.name je
+# VARCHAR(45), „monitor_sort_" sežere 13 znaků.
+_SORT_KOD_OK = _re.compile(r'^[a-z0-9_-]{1,30}$')
+
 ADMIN_ONLY_PRAVA = {k for k, v in ZAKLADNI_PRAVA.items()
                     if v.get('kategorie') == 'Administrace portálu'}
 
-def ziskej_kompletni_seznam_prav(oddeleni, typy_volna):
+def ziskej_kompletni_seznam_prav(oddeleni, typy_volna, sortimenty=None):
     prava = {k: v for k, v in ZAKLADNI_PRAVA.items() if k not in ADMIN_ONLY_PRAVA}
+
+    # Nákupní sortimenty modulu Monitor — číselník plní import, ne kód.
+    # Prefix „monitor_sort_" se kontroluje v intranet_monitory.povolene_sorty.
+    for kod, popis in sorted((sortimenty or {}).items()):
+        kod = str(kod).strip().lower()
+        if not kod or not _SORT_KOD_OK.match(kod):
+            continue
+        titulek = f'{kod.upper()} – {popis}' if popis else kod.upper()
+        prava[f'monitor_sort_{kod}'] = {
+            'kategorie': 'Modul Monitor', 'podskupina': 'Nákupní sortiment',
+            'nazev': f'Sortiment: {titulek}',
+            'popis': f'V monitorech (KUPI, MAKRO, VO letáky, TAMDA) vidí jen řádky '
+                     f'se sortimentem {kod.upper()}. Sortimenty se sčítají — komu '
+                     f'nepřiřadíte žádný, ten neuvidí nic. Správce monitoru vidí vše '
+                     f'včetně nezařazeného zboží (#N/A).',
+            'ikona': 'category'}
 
     for odd in oddeleni.keys():
         prava[f'slozka_{odd.lower()}'] = {'kategorie': 'Složky a Evidence', 'nazev': f'Složka: {odd}', 'popis': f'Přístup do záznamů oddělení {odd}.', 'ikona': 'folder'}

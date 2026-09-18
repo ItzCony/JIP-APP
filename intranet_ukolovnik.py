@@ -1515,7 +1515,7 @@ def _dialog_detail_ukolu(ukol_id, user_id, user_name, vsechna_prava=None, on_ref
                     ui.button(icon='close', on_click=dlg.close).props('flat round dense').classes('text-gray-400 hover:text-red-500')
 
             # ── Tělo: 3 sloupce ──────────────────────────────────────────────────
-            with ui.row().classes('w-full flex-1 overflow-hidden'):
+            with ui.row().classes('w-full flex-1 items-stretch overflow-hidden'):
 
                 # Levý panel: meta + timer + poznámky + přílohy
                 with ui.column().classes('flex-1 overflow-y-auto p-5 gap-4 bg-white border-r border-gray-100'):
@@ -1987,6 +1987,9 @@ def _dialog_detail_ukolu(ukol_id, user_id, user_name, vsechna_prava=None, on_ref
                                 ui.label(doba).classes('text-blue-600 font-bold')
 
         _telo()
+        # Refreshable vkládá vlastní <div>; ten by přerušil flex řetěz karty
+        # (tělo přeroste okno a náhled nejde scrollovat).
+        ui.context.slot.children[-1].style('display:contents')
 
     _dialog_guard_open()
     # Evidence pro živou obnovu: změní-li úkol jiný uživatel, obsah otevřeného
@@ -3226,6 +3229,9 @@ async def _vykresli_ukoly(user_id, user_name, vsechna_prava, dialog_anchor=None,
 
         def _prepni_rezim():
             _rezim['kanban'] = not _rezim['kanban']
+            # Volba přežije odhlášení i změnu zařízení; zápis na pozadí, UI nečeká na DB.
+            background_tasks.create(asyncio.to_thread(
+                intranet_data.uloz_predvolbu, user_id, 'ukoly_rezim', _rezim['kanban']))
             _aplikuj_rezim_btn()
             prekresli()
 
@@ -4626,9 +4632,9 @@ def _dialog_detail_porady(porada_id, user_id, user_name, vsechna_prava, on_refre
                                 .tooltip('Smazat poradu'))
                     ui.button(icon='close', on_click=dlg.close).props('flat round dense').classes('text-gray-400 hover:text-red-500')
 
-            with ui.row().classes('w-full flex-1 overflow-hidden gap-0'):
+            with ui.row().classes('w-full flex-1 items-stretch overflow-hidden gap-0'):
 
-                with ui.column().classes('flex-1 overflow-y-auto p-6 gap-4 bg-white border-r border-gray-200'):
+                with ui.column().classes('flex-1 min-h-0 max-h-[calc(100dvh-76px)] overflow-y-auto p-6 gap-4 bg-white border-r border-gray-200'):
 
                     with ui.card().classes('w-full p-4 bg-gray-50 border border-gray-200 rounded-xl'):
                         ucastnici = _ziskej_ucastniky_porady(porada_id)
@@ -4765,7 +4771,7 @@ def _dialog_detail_porady(porada_id, user_id, user_name, vsechna_prava, on_refre
                             .props('accept=".pdf,.xlsx,.xls,.csv,.jpg,.jpeg,.png,.gif,.doc,.docx" flat color=blue-grey').classes('w-full mt-1')
 
                     ui.label('Zápis z porady').classes('text-lg font-extrabold text-gray-700 mt-2')
-                    poznamky_box = ui.column().classes('w-full gap-3')
+                    poznamky_box = ui.column().classes('w-full gap-3 max-h-[55vh] overflow-y-auto pr-1')
 
                     def nacti_poz():
                         poznamky_box.clear()
@@ -4820,7 +4826,7 @@ def _dialog_detail_porady(porada_id, user_id, user_name, vsechna_prava, on_refre
                                 .classes('bg-blue-600 text-white h-14 w-14 rounded-xl shadow-md'))
 
                 # Pravý panel: úkoly porady
-                with ui.column().classes('w-96 shrink-0 overflow-y-auto p-5 gap-4 bg-gray-50'):
+                with ui.column().classes('w-96 shrink-0 min-h-0 max-h-[calc(100dvh-76px)] overflow-y-auto p-5 gap-4 bg-gray-50'):
                     with ui.row().classes('w-full justify-between items-center'):
                         ui.label('Úkoly z porady').classes('text-lg font-extrabold text-gray-700')
                         if muze_editovat:
@@ -4866,6 +4872,9 @@ def _dialog_detail_porady(porada_id, user_id, user_name, vsechna_prava, on_refre
                     nacti_ukoly_p()
 
         _telo()
+        # Refreshable vkládá vlastní <div>; ten by přerušil flex řetěz karty
+        # (tělo přeroste okno a náhled nejde scrollovat).
+        ui.context.slot.children[-1].style('display:contents')
 
     _registruj_otevreny_detail('porada', porada_id, dlg, _telo.refresh)
     dlg.open()
@@ -6835,7 +6844,7 @@ def _dialog_detail_projektu(projekt_id, user_id, user_name, vsechna_prava, on_re
                     ui.button(icon='close', on_click=dlg.close).props('flat round dense').classes('text-gray-400 hover:text-red-500')
 
             # ── Tělo ──────────────────────────────────────────────────────────────
-            with ui.row().classes('w-full flex-1 overflow-hidden gap-0'):
+            with ui.row().classes('w-full flex-1 items-stretch overflow-hidden gap-0'):
 
                 # ── LEVÝ PANEL: info + chat ────────────────────────────────────────
                 with ui.column().classes('flex-1 overflow-y-auto p-5 gap-4 bg-white border-r border-gray-100'):
@@ -7133,6 +7142,9 @@ def _dialog_detail_projektu(projekt_id, user_id, user_name, vsechna_prava, on_re
                     nacti_ukoly_proj()
 
         _telo()
+        # Refreshable vkládá vlastní <div>; ten by přerušil flex řetěz karty
+        # (tělo přeroste okno a náhled nejde scrollovat).
+        ui.context.slot.children[-1].style('display:contents')
 
     _registruj_otevreny_detail('projekt', projekt_id, dlg, _telo.refresh)
     dlg.open()
@@ -7393,6 +7405,10 @@ async def vykresli_ukolovnik(user_id, user_name, vsechna_prava):
                 await _vykresli_porady(user_id, user_name, vsechna_prava)
         if 'ukoly' in viditelne:
             with ui.tab_panel('ukoly'):
+                # Zapamatované rozložení (kanban/seznam) — jediný DB dotaz, jen pro toho,
+                # kdo sekci opravdu vidí. _vykresli_ukoly bere hodnotu přes setdefault.
+                ukoly_stav['rezim'] = {'kanban': bool(await asyncio.to_thread(
+                    intranet_data.nacti_predvolbu, user_id, 'ukoly_rezim', True))}
                 # Kontejner pro dialogy MIMO refreshable – přežije _vykresli_ukoly.refresh()
                 _dlg_anchor = ui.element('div')
                 await _vykresli_ukoly(user_id, user_name, vsechna_prava, _dlg_anchor, ukoly_stav)
