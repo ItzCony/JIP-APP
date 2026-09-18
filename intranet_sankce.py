@@ -2099,25 +2099,30 @@ def _s_pokrokem(it, celkem: int, pokrok):
         yield r
 
 
-def _cti_list_data(raw: bytes, pokrok=None):
+def _cti_list_data(raw: bytes, pokrok=None, list_nazev: str = 'data'):
     """Otevře sešit (.xlsx přes openpyxl, .xlsb přes pyxlsb) a vrátí
     (hlavička, iterátor řádků, chyba|None) listu „DATA" (název se porovnává bez
-    ohledu na velikost písmen — jiné exporty ho mají jako „data").
+    ohledu na velikost písmen a diakritiku — jiné exporty ho mají jako „data").
     Pozn.: pyxlsb vrací každé číslo jako float, takže kódy a čísla objednávek by
     skončily jako „87527.0" — celá čísla proto vracíme zpět jako int.
 
     pokrok: volitelný callback(0.0–1.0) s podílem načteného listu; čtení souboru
     zabírá 0–0,9 rozsahu, zbytek dopočítá zápis do DB.
+    list_nazev: Monitory mají data na jinak pojmenovaných listech („porovnání",
+    „makro-akce", …), sankce si nechají výchozí „DATA".
     """
+    hledany = _norm(list_nazev)
+    popis = list_nazev.upper() if hledany == 'data' else list_nazev
+
     if _je_xlsb(raw):
         from pyxlsb import open_workbook
         try:
             wb = open_workbook(io.BytesIO(raw))
         except Exception as e:
             return None, None, f'Soubor nelze otevřít: {e}'
-        jmeno = next((s for s in wb.sheets if _norm(s) == 'data'), None)
+        jmeno = next((s for s in wb.sheets if _norm(s) == hledany), None)
         if not jmeno:
-            return None, None, 'Soubor neobsahuje list „DATA".'
+            return None, None, f'Soubor neobsahuje list „{popis}".'
 
         def _cely(v):
             return int(v) if isinstance(v, float) and v.is_integer() else v
@@ -2127,7 +2132,7 @@ def _cti_list_data(raw: bytes, pokrok=None):
             for r in sh.rows():
                 radky.append([_cely(c.v) for c in r])
         if not radky:
-            return None, None, 'List DATA je prázdný.'
+            return None, None, f'List {popis} je prázdný.'
         return radky[0], _s_pokrokem(iter(radky[1:]), len(radky) - 1, pokrok), None
 
     import openpyxl
@@ -2135,16 +2140,16 @@ def _cti_list_data(raw: bytes, pokrok=None):
         wb = openpyxl.load_workbook(io.BytesIO(raw), data_only=True, read_only=True)
     except Exception as e:
         return None, None, f'Soubor nelze otevřít: {e}'
-    jmeno = next((s for s in wb.sheetnames if _norm(s) == 'data'), None)
+    jmeno = next((s for s in wb.sheetnames if _norm(s) == hledany), None)
     if not jmeno:
-        return None, None, 'Soubor neobsahuje list „DATA".'
+        return None, None, f'Soubor neobsahuje list „{popis}".'
     ws = wb[jmeno]
     celkem = (ws.max_row or 0) - 1      # read-only list zná rozměr z dimenze sešitu
     rows_iter = ws.iter_rows(values_only=True)
     try:
         header = next(rows_iter)
     except StopIteration:
-        return None, None, 'List DATA je prázdný.'
+        return None, None, f'List {popis} je prázdný.'
     return header, _s_pokrokem(rows_iter, celkem, pokrok), None
 
 
@@ -6040,8 +6045,14 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
     VSE_OBD = '(všechna období)'
     pohled = {'v': 'souhrn' if app.storage.user.get('sankce_nedodavky_pohled', 'souhrn')
                               == 'souhrn' else 'radky'}
+    VSE_NAK = '(všichni nákupčí)'
+    nak_list = sorted({(r.get('nak') or '').strip() for r in vsechny if (r.get('nak') or '').strip()})
+    # Filtr nákupčího drží session — po přepnutí souhrn/detail i po návratu do
+    # sestavy zůstává nastavený (v hlavičce gridu by se ztratil).
+    _nak_ulozeny = app.storage.user.get('sankce_nedodavky_nak')
     stav = {'obdobi': obdobi_list[0] if obdobi_list else None,
-            'jen_bez': False, 'ico': None}
+            'jen_bez': False, 'ico': None,
+            'nak': _nak_ulozeny if _nak_ulozeny in nak_list else None}
 
     edit_js = _nedod_edit_js(moje_kody, psat_vse)
 
@@ -6054,6 +6065,8 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
         data = vsechny
         if stav['obdobi']:
             data = [r for r in data if r.get('obdobi') == stav['obdobi']]
+        if stav['nak']:
+            data = [r for r in data if (r.get('nak') or '').strip() == stav['nak']]
         if stav['jen_bez']:
             data = [r for r in data if not (r.get('vyjadreni') or '').strip()]
         if stav['ico']:
@@ -6162,6 +6175,18 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
             stav['obdobi'] = None if e.value == VSE_OBD else e.value
             _aplikuj()
         sel_obd.on_value_change(_on_obd)
+
+        if len(nak_list) > 1:
+            sel_nak = ui.select([VSE_NAK] + nak_list, value=stav['nak'] or VSE_NAK,
+                                label='Nákupčí (NAK)') \
+                .props('outlined dense options-dense').classes('w-48') \
+                .tooltip('Filtr zůstane nastavený i po přepnutí na detail a zpět na souhrn')
+
+            def _on_nak(e):
+                stav['nak'] = None if e.value == VSE_NAK else e.value
+                app.storage.user['sankce_nedodavky_nak'] = stav['nak']
+                _aplikuj()
+            sel_nak.on_value_change(_on_nak)
 
         sw_bez = ui.switch('Jen bez vyjádření', value=False) \
             .tooltip('Zobrazí pouze řádky, ke kterým nákupčí zatím nic nenapsal')

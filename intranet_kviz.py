@@ -7,6 +7,8 @@ import zipfile
 import asyncio
 from openpyxl.styles import PatternFill
 
+from datetime import datetime, timedelta
+
 import intranet_data
 import intranet_logger
 import intranet_session
@@ -147,6 +149,52 @@ def _nav_na_prehled():
     _dlg_back.open()
     ui.timer(0.2, lambda: ui.navigate.to('/'), once=True)
 
+def _zakladni_url() -> str:
+    """Absolutní adresa portálu pro odkazy do e-mailu/tisku. Stejná konvence jako OIDC_REDIRECT_URI."""
+    return os.environ.get('PORTAL_URL', '').strip().rstrip('/')
+
+def kviz_host_odkaz(token: str) -> str:
+    return f"{_zakladni_url()}/kviz/host/{token}"
+
+@ui.page('/kviz/host/{token}')
+def kviz_host_page(token: str):
+    """Vstup zkoušeného bez účtu v intranetu. Token jen uloží do session a pošle na /kviz."""
+    if app.storage.user.get('user_id'):
+        # Přihlášený uživatel jde svou vlastní cestou, token se nespotřebuje.
+        ui.navigate.to('/kviz')
+        return
+
+    pristup = intranet_data.over_kviz_pristup(token)
+    with ui.column().classes('w-full max-w-2xl mx-auto items-center mt-32 gap-4'):
+        if not pristup:
+            ui.label('🚫 Odkaz je neplatný, zrušený, nebo mu vypršela platnost.').classes('text-2xl text-red-600 font-bold text-center')
+            ui.label('Požádejte o nový odkaz osobu, která test zadává.').classes('text-lg text-gray-600')
+            return
+        app.storage.user['kviz_host_token'] = token
+
+        if pristup['anonymni'] and not pristup['jmeno']:
+            # Odkaz nikomu nepatří — jméno pod výsledkem určí ten, kdo přijde.
+            ui.label('📝 Představte se').classes('text-3xl font-black text-blue-900')
+            ui.label('Pod tímto jménem bude uložen váš výsledek testu.').classes('text-lg text-gray-600 mb-4')
+            i_jmeno = ui.input(label='Jméno').props('outlined').classes('w-80')
+            i_prijmeni = ui.input(label='Příjmení').props('outlined').classes('w-80')
+
+            def _potvrd():
+                if not (i_jmeno.value or '').strip() or not (i_prijmeni.value or '').strip():
+                    ui.notify('Vyplňte jméno i příjmení.', type='negative', position='top'); return
+                if not intranet_data.uloz_jmeno_hosta(token, i_jmeno.value, i_prijmeni.value):
+                    ui.notify('Odkaz mezitím propadl. Požádejte o nový.', type='negative', position='top'); return
+                ui.navigate.to('/kviz')
+
+            ui.button('POKRAČOVAT NA TEST', on_click=_potvrd).classes('mt-4 h-14 px-8 text-xl font-bold bg-blue-500 hover:bg-blue-600 text-white rounded-2xl shadow-md')
+            i_prijmeni.on('keydown.enter', _potvrd)
+            return
+
+        ui.label(f"Vítejte, {pristup['jmeno']}").classes('text-3xl font-black text-blue-900')
+        ui.label('Otevírám zkouškový kvíz…').classes('text-lg text-gray-600')
+        ui.spinner(size='xl')
+        ui.timer(1.0, lambda: ui.navigate.to('/kviz'), once=True)
+
 @ui.page('/kviz')
 def index_page(client: Client):
 
@@ -177,8 +225,22 @@ def index_page(client: Client):
 
     user_id = app.storage.user.get('user_id')
     user_name = app.storage.user.get('user_name')
+    je_host = False
+    host_krestni = host_prijmeni = None
 
     if not user_id:
+        # Zkoušený, který přišel přes časově omezený odkaz — nemá žádná práva a
+        # zůstává uvnitř /kviz. Buď píše jménem přiřazeného uživatele, nebo je
+        # anonymní (user_id zůstane None) a jméno si vyplnil na vstupní stránce.
+        _host = intranet_data.over_kviz_pristup(app.storage.user.get('kviz_host_token'))
+        if _host and _host['jmeno']:
+            user_id, user_name, je_host = _host['user_id'], _host['jmeno'], True
+            host_krestni, host_prijmeni = _host['krestni'], _host['prijmeni']
+        elif _host:
+            ui.navigate.to(f"/kviz/host/{app.storage.user.get('kviz_host_token')}")
+            return
+
+    if not user_id and not je_host:
         app.storage.user['redirect_to'] = '/kviz'
         with ui.column().classes('w-full max-w-2xl mx-auto items-center mt-32'):
             ui.label('🚫 Nejste přihlášen(a)').classes('text-5xl font-bold text-red-600 mb-6')
@@ -191,12 +253,14 @@ def index_page(client: Client):
     # + odhlašování po zavření prohlížeče), ať návrat sem nezpůsobí výpadek relace.
     _user_email = str(app.storage.user.get('user_email', '')).lower()
     _token = app.storage.user.get('login_token')
-    if _token:
+    if _token and not je_host:
         intranet_session.registruj_pripojeni(client, _token, _user_email, user_name)
 
-    vsechna_prava = intranet_data.ziskej_prava_uzivatele(user_id)
+    # Host nedědí práva uživatele, jehož jménem test píše.
+    vsechna_prava = [] if je_host else intranet_data.ziskej_prava_uzivatele(user_id)
     is_admin = 'vse' in vsechna_prava
     ma_pristup_k_vysledkum = "vystup_osobni" in vsechna_prava or "vystup_vse" in vsechna_prava or "vse" in vsechna_prava
+    muze_generovat_hosty = is_admin or 'kviz_hoste' in vsechna_prava
 
     # Skupina kvízu je řízena globálním nastavením administrátora
     kviz_typ = config.get('aktivni_skupina', 'oz')
@@ -210,7 +274,8 @@ def index_page(client: Client):
         with ui.column().classes('w-full max-w-2xl mx-auto items-center mt-32'):
             ui.label('🚫 MODUL JE VYPNUTÝ').classes('text-5xl font-bold text-orange-600 mb-6')
             ui.label('Zkouškový kvíz je momentálně administrátorem deaktivován.').classes('text-2xl text-gray-700 text-center')
-            ui.button('Zpět na Přehled', on_click=_nav_na_prehled).classes('mt-10 bg-blue-600 text-white font-bold px-8 py-3 rounded-lg shadow-md')
+            if not je_host:
+                ui.button('Zpět na Přehled', on_click=_nav_na_prehled).classes('mt-10 bg-blue-600 text-white font-bold px-8 py-3 rounded-lg shadow-md')
         return
 
     if 'quiz_initialized' not in app.storage.browser or app.storage.browser.get('jmeno') != user_name:
@@ -226,6 +291,131 @@ def index_page(client: Client):
     def prepni_admin_panel(zobrazit):
         state['zobrazit_admin_panel'] = zobrazit
         hlavni_rozhrani.refresh()
+
+    # ── Správa hostovských přístupů (admin panel i samostatné právo kviz_hoste) ──
+    def vykresli_spravu_pristupu():
+        vsichni = intranet_data.ziskej_vsechny_uzivatele()
+        kandidati = {}
+        for email, u in vsichni.items():
+            prava_u = set(str(u.get('prava') or '').split(','))
+            if u.get('aktivni') and ('kviz' in prava_u or 'vse' in prava_u):
+                kandidati[u['id']] = f"{u['jmeno_cele']} ({email})"
+
+        ted = datetime.now().replace(second=0, microsecond=0)
+        vyber = {'ids': [], 'od': ted.strftime('%Y-%m-%dT%H:%M'),
+                 'do': (ted + timedelta(hours=1)).strftime('%Y-%m-%dT%H:%M')}
+
+        with ui.card().classes('w-full p-6 shadow-xl rounded-2xl border border-gray-100 bg-white/95 backdrop-blur-sm mb-6'):
+            ui.label('🎟️ Vygenerovat přístupy do kvízu').classes('text-2xl font-bold mb-4 text-purple-600')
+            ui.label('Vyberte zkoušené a okno platnosti. Každý dostane vlastní odkaz, '
+                     'kterým se do kvízu dostane bez přihlášení do intranetu.').classes('text-sm text-gray-500 mb-4')
+
+            sel = ui.select(kandidati, multiple=True, with_input=True,
+                            label='Zkoušení uživatelé').props('use-chips outlined').classes('w-full mb-4')
+            sel.bind_value(vyber, 'ids')
+
+            with ui.row().classes('w-full items-center gap-4 mb-4'):
+                ui.input(label='Platnost od').props('type=datetime-local outlined dense').classes('w-64').bind_value(vyber, 'od')
+                ui.input(label='Platnost do').props('type=datetime-local outlined dense').classes('w-64').bind_value(vyber, 'do')
+                for popis, hodin in (('+1 h', 1), ('+2 h', 2), ('+1 den', 24)):
+                    def _posun(h=hodin):
+                        zac = datetime.now().replace(second=0, microsecond=0)
+                        vyber['od'] = zac.strftime('%Y-%m-%dT%H:%M')
+                        vyber['do'] = (zac + timedelta(hours=h)).strftime('%Y-%m-%dT%H:%M')
+                    ui.button(popis, on_click=_posun).props('flat dense').classes('text-blue-600')
+
+            def _okno():
+                """(od, do) z formuláře, nebo None když je okno nesmyslné."""
+                try:
+                    od = datetime.fromisoformat(vyber['od'])
+                    do = datetime.fromisoformat(vyber['do'])
+                except (TypeError, ValueError):
+                    ui.notify('Vyplňte platnost od i do.', type='negative', position='top'); return None
+                if do <= od:
+                    ui.notify('Konec platnosti musí být po začátku.', type='negative', position='top'); return None
+                return od, do
+
+            def _generuj():
+                if not vyber['ids']:
+                    ui.notify('Vyberte alespoň jednoho uživatele.', type='negative', position='top'); return
+                okno = _okno()
+                if not okno: return
+                od, do = okno
+
+                nove = intranet_data.vytvor_kviz_pristupy(vyber['ids'], od, do, user_id)
+                if not nove:
+                    ui.notify('Přístupy se nepodařilo vytvořit.', type='negative', position='top'); return
+                intranet_logger.log_activity(user_name, 'Kvíz', f'Vygeneroval {len(nove)} hostovských přístupů do kvízu')
+                ui.notify(f'Vygenerováno {len(nove)} přístupů.', type='positive', position='top')
+                seznam_pristupu.refresh()
+
+            ui.button('VYGENEROVAT ODKAZY', on_click=_generuj).classes(
+                'h-12 px-8 text-lg font-bold bg-blue-500 hover:bg-blue-600 text-white rounded-2xl shadow-md')
+
+            # --- Odkazy pro zkoušené, kteří v intranetu účet vůbec nemají ---
+            ui.separator().classes('my-6')
+            ui.label('👤 Odkazy bez účtu (jméno vyplní zkoušený)').classes('text-lg font-bold text-purple-600 mb-1')
+            ui.label('Odkazy nikomu nepatří. Kdo přijde, vyplní jméno a příjmení a to se uloží '
+                     'k jeho výsledku. Platí stejné okno platnosti jako výše.').classes('text-sm text-gray-500 mb-3')
+            with ui.row().classes('items-center gap-4'):
+                i_pocet = ui.number(label='Počet odkazů', value=10, min=1, max=100, precision=0).props('outlined dense').classes('w-40')
+
+                def _generuj_anonymni():
+                    okno = _okno()
+                    if not okno: return
+                    od, do = okno
+                    try: pocet = int(i_pocet.value or 0)
+                    except (TypeError, ValueError): pocet = 0
+                    if not 1 <= pocet <= 100:
+                        ui.notify('Zadejte počet 1 až 100.', type='negative', position='top'); return
+
+                    nove = intranet_data.vytvor_anonymni_pristupy(pocet, od, do, user_id)
+                    if not nove:
+                        ui.notify('Přístupy se nepodařilo vytvořit.', type='negative', position='top'); return
+                    intranet_logger.log_activity(user_name, 'Kvíz', f'Vygeneroval {len(nove)} anonymních přístupů do kvízu')
+                    ui.notify(f'Vygenerováno {len(nove)} odkazů bez účtu.', type='positive', position='top')
+                    seznam_pristupu.refresh()
+
+                ui.button('VYGENEROVAT BEZ ÚČTU', on_click=_generuj_anonymni).classes(
+                    'h-12 px-8 text-lg font-bold bg-purple-500 hover:bg-purple-600 text-white rounded-2xl shadow-md')
+
+        @ui.refreshable
+        def seznam_pristupu():
+            zaznamy = intranet_data.seznam_kviz_pristupu()
+            if not _zakladni_url():
+                ui.label('⚠️ Není nastavena proměnná PORTAL_URL – odkazy jsou zobrazeny relativně '
+                         'a je nutné před ně doplnit adresu portálu.').classes('text-sm text-orange-600 mb-3')
+            if not zaznamy:
+                ui.label('Zatím nebyly vygenerovány žádné přístupy.').classes('text-gray-500 italic'); return
+
+            odkazy = [kviz_host_odkaz(z['token']) for z in zaznamy if z['je_platny']]
+            if odkazy:
+                ui.button(f'📋 Kopírovat všechny platné odkazy ({len(odkazy)})',
+                          on_click=lambda: ui.clipboard.write('\n'.join(odkazy))).props('flat').classes('text-blue-600 mb-2')
+
+            for z in zaznamy:
+                url = kviz_host_odkaz(z['token'])
+                platny = bool(z['je_platny'])
+                barva = 'border-green-400' if platny else 'border-gray-300 opacity-60'
+                with ui.row().classes(f'w-full items-center gap-3 border-l-4 {barva} bg-gray-50 rounded-lg px-3 py-2 mb-2 no-wrap'):
+                    with ui.column().classes('gap-0 w-64 shrink-0'):
+                        if z['name'] and z['surname']:
+                            popis = f"{z['name']} {z['surname']}"
+                        else:
+                            popis = '👤 bez účtu – jméno nevyplněno'
+                        ui.label(popis).classes('font-bold text-gray-800' if z['name'] else 'font-bold text-gray-500 italic')
+                        ui.label(f"{z['platnost_od']:%d.%m. %H:%M} – {z['platnost_do']:%d.%m. %H:%M}").classes('text-xs text-gray-500')
+                    ui.label('✅ použito' if z['pouzito_at'] else ('⏳ nepoužito' if platny else '⌛ propadlé')).classes('text-xs w-24 shrink-0')
+                    ui.input(value=url).props('readonly outlined dense').classes('flex-1')
+                    ui.button(icon='content_copy', on_click=lambda u=url: ui.clipboard.write(u)).props('flat dense').tooltip('Kopírovat odkaz')
+                    def _zrus(pid=z['id']):
+                        intranet_data.zrus_kviz_pristup(pid)
+                        seznam_pristupu.refresh()
+                    ui.button(icon='delete', on_click=_zrus).props('flat dense color=negative').tooltip('Zrušit přístup')
+
+        with ui.card().classes('w-full p-6 shadow-xl rounded-2xl border border-gray-100 bg-white/95 backdrop-blur-sm mb-6'):
+            ui.label('📜 Vygenerované přístupy').classes('text-2xl font-bold mb-4 text-purple-600')
+            seznam_pristupu()
 
     @ui.refreshable
     def hlavni_rozhrani():
@@ -246,12 +436,16 @@ def index_page(client: Client):
                             tab_parametry = ui.tab('⚙️ Nastavení').classes('justify-start')
                             tab_otazky = ui.tab('📝 Otázky (CSV)').classes('justify-start')
                             tab_soubory = ui.tab('📁 Excel Výstupy').classes('justify-start')
+                            tab_pristupy = ui.tab('🎟️ Přístupy hostů').classes('justify-start')
 
                     with ui.column().classes('flex-1 w-full'):
                         with ui.tab_panels(
                             tabs,
                             value=state.get('admin_aktivni_tab', tab_monitor)
                         ).classes('w-full bg-transparent p-0').on_value_change(lambda e: state.update(admin_aktivni_tab=e.value)):
+
+                            with ui.tab_panel(tab_pristupy):
+                                vykresli_spravu_pristupu()
 
                             with ui.tab_panel(tab_monitor):
                                 with ui.card().classes('w-full p-6 shadow-xl rounded-2xl border border-gray-100 bg-white/95 backdrop-blur-sm mb-6'):
@@ -525,6 +719,15 @@ def index_page(client: Client):
                                                             ui.button('📥 Excel', on_click=lambda c=cesta_k_souboru: ui.download(c)).classes('bg-blue-500 text-white px-3 py-1 shadow-sm hover:bg-blue-600')
                                     obnovit_seznam_souboru()
 
+            # --- A2) SPRÁVA PŘÍSTUPŮ BEZ PLNÝCH ADMIN PRÁV ---
+            elif state['zobrazit_admin_panel'] and muze_generovat_hosty:
+                with ui.row().classes('w-full justify-between items-center mb-6 pb-4 border-b-2 border-gray-200 dark:border-gray-700 skryt-pri-tisku'):
+                    with ui.card().classes('p-2 bg-white/90 backdrop-blur-sm rounded-xl'):
+                        ui.label('🎟️ Přístupy do Kvízu').classes('text-4xl font-extrabold text-gray-800')
+                    ui.button('Zpět na test', on_click=lambda: prepni_admin_panel(False)).classes('bg-blue-500 hover:bg-blue-600 text-lg rounded-2xl shadow-md')
+                with ui.column().classes('w-full skryt-pri-tisku pb-10'):
+                    vykresli_spravu_pristupu()
+
             # --- B) BĚŽÍCÍ TEST ---
             elif state['bezi_test']:
                 with ui.column().classes('w-full max-w-4xl mt-12 skryt-pri-tisku'):
@@ -591,7 +794,8 @@ def index_page(client: Client):
                                 ui.button('🖨️ Vytisknout', on_click=lambda: ui.run_javascript('window.print()')).classes('bg-orange-500 hover:bg-orange-600 text-white font-bold px-8 h-14 text-lg shadow-md ml-4')
 
                     with ui.row().classes('gap-4 mt-8'):
-                        ui.button('Zpět na Přehled', on_click=_nav_na_prehled).classes('bg-blue-600 hover:bg-blue-700 text-white font-bold h-16 px-8 text-xl shadow-md')
+                        if not je_host:
+                            ui.button('Zpět na Přehled', on_click=_nav_na_prehled).classes('bg-blue-600 hover:bg-blue-700 text-white font-bold h-16 px-8 text-xl shadow-md')
 
                         if ma_pristup_k_vysledkum:
                             ui.button('📊 Zobrazit mé výsledky', on_click=vysledky_dlg.open).classes('bg-green-600 hover:bg-green-700 text-white font-bold h-16 px-8 text-xl shadow-md')
@@ -609,11 +813,14 @@ def index_page(client: Client):
                     ui.label(f'Čeká vás {config[kviz_typ]["pocet_otazek"]} otázek. Na vypracování máte {config[kviz_typ]["casovy_limit_minuty"]} minut.').classes('text-lg text-gray-500 mb-8 skryt-pri-tisku')
 
                     with ui.row().classes('gap-4 items-center'):
-                        ui.button('Zpět na Přehled', on_click=_nav_na_prehled).classes('h-20 text-xl font-bold bg-gray-500 hover:bg-gray-600 text-white shadow-md rounded-2xl skryt-pri-tisku')
+                        if not je_host:
+                            ui.button('Zpět na Přehled', on_click=_nav_na_prehled).classes('h-20 text-xl font-bold bg-gray-500 hover:bg-gray-600 text-white shadow-md rounded-2xl skryt-pri-tisku')
                         ui.button('SPUSTIT TEST', on_click=spustit_test).classes('w-[25rem] h-20 text-3xl font-bold bg-blue-500 hover:bg-blue-600 text-white shadow-xl rounded-2xl skryt-pri-tisku')
 
                     if is_admin:
                         ui.button('⚙️ Správa Kvízu', on_click=lambda: prepni_admin_panel(True)).classes('mt-12 w-64 h-12 text-lg bg-gray-800 hover:bg-gray-700 text-white shadow-md rounded-2xl skryt-pri-tisku')
+                    elif muze_generovat_hosty:
+                        ui.button('🎟️ Přístupy do Kvízu', on_click=lambda: prepni_admin_panel(True)).classes('mt-12 w-64 h-12 text-lg bg-gray-800 hover:bg-gray-700 text-white shadow-md rounded-2xl skryt-pri-tisku')
 
     def tik_casovace():
         if state.get('bezi_test') and state.get('zbyva_sekund', 0) > 0:
@@ -674,12 +881,14 @@ def index_page(client: Client):
 
         if intranet_data.nacti_mysql().get("enabled"):
             intranet_data.uloz_vysledek_kvizu(
-                app.storage.user.get('user_id'),
+                user_id,
                 stav_testu,
                 f"{proc:.2f}%",
                 f"{state['body']}/{celkem}",
                 f"{m}m {s}s",
-                state['historie_odpovedi']
+                state['historie_odpovedi'],
+                host_jmeno=host_krestni if user_id is None else None,
+                host_prijmeni=host_prijmeni if user_id is None else None
             )
 
         hlavni_rozhrani.refresh()
@@ -705,7 +914,7 @@ def vykresli_vystup_kviz(user_name, vsechna_prava):
                 if not conn: raise ValueError('Nelze se připojit k databázi.')
                 cursor = conn.cursor(dictionary=True)
                 if "vse" in vsechna_prava or "vystup_vse" in vsechna_prava:
-                    cursor.execute("SELECT u.name AS Jméno, u.surname AS Příjmení, v.stav_testu AS Stav, v.uspesnost AS Úspěšnost, v.body AS Body, v.doba_trvani AS Trvání, v.datum AS Odevzdáno FROM vysledky_kvizu v JOIN user u ON v.user_iduser = u.iduser ORDER BY v.datum DESC")
+                    cursor.execute("SELECT COALESCE(u.name, v.host_jmeno) AS Jméno, COALESCE(u.surname, v.host_prijmeni) AS Příjmení, v.stav_testu AS Stav, v.uspesnost AS Úspěšnost, v.body AS Body, v.doba_trvani AS Trvání, v.datum AS Odevzdáno FROM vysledky_kvizu v LEFT JOIN user u ON v.user_iduser = u.iduser ORDER BY v.datum DESC")
                 else:
                     u_id = next((u['id'] for u in intranet_data.ziskej_vsechny_uzivatele().values() if f"{u['jmeno']} {u['prijmeni']}" == user_name), None)
                     cursor.execute("SELECT u.name AS Jméno, u.surname AS Příjmení, v.stav_testu AS Stav, v.uspesnost AS Úspěšnost, v.body AS Body, v.doba_trvani AS Trvání, v.datum AS Odevzdáno FROM vysledky_kvizu v JOIN user u ON v.user_iduser = u.iduser WHERE v.user_iduser = %s ORDER BY v.datum DESC", (u_id,))
@@ -739,7 +948,7 @@ def vykresli_vystup_kviz(user_name, vsechna_prava):
 
     cursor = conn.cursor(dictionary=True)
     if "vse" in vsechna_prava or "vystup_vse" in vsechna_prava:
-        cursor.execute("SELECT v.id, u.name, u.surname, v.stav_testu, v.uspesnost, v.body, v.doba_trvani, v.datum FROM vysledky_kvizu v JOIN user u ON v.user_iduser = u.iduser ORDER BY v.datum DESC")
+        cursor.execute("SELECT v.id, COALESCE(u.name, v.host_jmeno) AS name, COALESCE(u.surname, v.host_prijmeni) AS surname, v.stav_testu, v.uspesnost, v.body, v.doba_trvani, v.datum FROM vysledky_kvizu v LEFT JOIN user u ON v.user_iduser = u.iduser ORDER BY v.datum DESC")
     else:
         u_id = next((u['id'] for u in intranet_data.ziskej_vsechny_uzivatele().values() if f"{u['jmeno']} {u['prijmeni']}" == user_name), None)
         cursor.execute("SELECT v.id, u.name, u.surname, v.stav_testu, v.uspesnost, v.body, v.doba_trvani, v.datum FROM vysledky_kvizu v JOIN user u ON v.user_iduser = u.iduser WHERE v.user_iduser = %s ORDER BY v.datum DESC", (u_id,))

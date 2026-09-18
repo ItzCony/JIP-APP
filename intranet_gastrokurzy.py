@@ -36,6 +36,7 @@ import gastrokurzy_seed_prezence
 import asyncio
 import calendar
 import datetime
+import unicodedata
 
 # ==========================================
 # KONSTANTY
@@ -62,6 +63,7 @@ FIRMY_STYL = {
     'NESTLE':   ('#B45309', '#FBBF24'),
 }
 _FIRMA_DEFAULT = ('#334155', '#94A3B8')
+_JIP_STYL = ('#F43F5E', '#E11D48')      # kurz JIP – růžová jako datumový sloupec
 
 _MESICE = ['', 'leden', 'únor', 'březen', 'duben', 'květen', 'červen',
            'červenec', 'srpen', 'září', 'říjen', 'listopad', 'prosinec']
@@ -73,6 +75,12 @@ _POSLEDNI_SOUHRN_DATUM = None   # datum posledního odeslaného denního souhrnu
 # ==========================================
 # POMOCNÉ FORMÁTOVÁNÍ
 # ==========================================
+def _bez_diakritiky(s):
+    """'Plzeň:' → 'plzen' – klíč pro párování hlaviček a názvů poboček z Excelu."""
+    s = unicodedata.normalize('NFKD', str(s or ''))
+    return ''.join(c for c in s if not unicodedata.combining(c)).lower().replace(':', '').strip()
+
+
 def _fmt_datum(d):
     """date → '09.09.2026'; None → 'neurčeno'."""
     if not d:
@@ -276,6 +284,148 @@ def _naseeduj_prezenci():
         conn.close()
 
 
+# Pobočky v Excelu bývají zkratkou, ne plným názvem.
+_POBOCKA_ALIAS = {'ov': 'ostrava', 'cb': 'ceske_budejovice', 'ht': 'horsovsky_tyn'}
+
+
+def _klic_pobocky(nazev):
+    k = _bez_diakritiky(nazev)
+    if not k:
+        return None
+    if k in _POBOCKA_ALIAS:
+        return _POBOCKA_ALIAS[k]
+    for klic, popis in POBOCKY:
+        if k in (klic, _bez_diakritiky(popis)):
+            return klic
+    return None
+
+
+def _pole_sloupce(hlavicka):
+    """Název sloupce z Excelu → pole importu. 'provozovna' před 'oz' (obsahuje ho)."""
+    k = _bez_diakritiky(hlavicka)
+    for slovo, pole in (('datum', 'datum'), ('nazev', 'nazev'), ('pobocka', 'pobocka'),
+                        ('provozovna', 'provozovna'), ('ico', 'ico'), ('jmeno', 'jmeno'),
+                        ('funkce', 'funkce'), ('telefon', 'telefon'), ('podpis', 'podpis'),
+                        ('misto', 'misto'), ('praha', 'misto')):
+        if slovo in k:
+            return pole
+    return 'oz' if 'oz' in k.split() else None
+
+
+def _txt(v):
+    """Buňka → text bez '.0' u čísel; prázdná → None."""
+    if v is None:
+        return None
+    if isinstance(v, float) and v.is_integer():
+        v = int(v)
+    return str(v).strip() or None
+
+
+def _import_excel(raw):
+    """Import kurzů i účastníků z Excelu (jeden řádek = jeden účastník).
+
+    Termín se páruje podle místa, data a názvu – existující se jen doplní o lidi,
+    jinak vznikne nový. Účastník se přeskočí, když na termínu už stejné jméno + IČO
+    je, takže opakovaný import nic nezdvojí.
+    """
+    import io
+    import openpyxl
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(raw), data_only=True, read_only=True)
+        radky = list(wb.worksheets[0].iter_rows(values_only=True))
+    except Exception as e:
+        return {'chyba': f'Soubor nejde přečíst: {e}'}
+    if len(radky) < 2:
+        return {'chyba': 'Soubor je prázdný.'}
+
+    idx = {}
+    for i, h in enumerate(radky[0]):
+        pole = _pole_sloupce(h)
+        if pole and pole not in idx:
+            idx[pole] = i
+    chybi = [p for p in ('misto', 'datum', 'nazev', 'jmeno') if p not in idx]
+    if chybi:
+        return {'chyba': f"V hlavičce chybí sloupce: {', '.join(chybi)}"}
+
+    def bunka(r, pole):
+        i = idx.get(pole)
+        return _txt(r[i]) if i is not None and i < len(r) else None
+
+    skupiny = {}
+    spatnych = 0
+    for r in radky[1:]:
+        jmeno = bunka(r, 'jmeno')
+        d = r[idx['datum']] if idx['datum'] < len(r) else None
+        datum = d.date() if isinstance(d, datetime.datetime) else (
+            d if isinstance(d, datetime.date) else _parse_datum(_txt(d)))
+        nazev = bunka(r, 'nazev')
+        misto_txt = bunka(r, 'misto')
+        if not (jmeno and datum and nazev and misto_txt):
+            if any(v is not None for v in r):
+                spatnych += 1
+            continue
+        misto = next((m for m in MISTA if _bez_diakritiky(m) == _bez_diakritiky(misto_txt)),
+                     misto_txt)
+        skupiny.setdefault((misto, datum, nazev), []).append({
+            'pobocka': _klic_pobocky(bunka(r, 'pobocka')) or _klic_pobocky(misto),
+            'oz': bunka(r, 'oz'), 'ico': bunka(r, 'ico'),
+            'provozovna': bunka(r, 'provozovna'), 'jmeno': jmeno,
+            'funkce': bunka(r, 'funkce'), 'telefon': bunka(r, 'telefon'),
+            'podpis': 1 if bunka(r, 'podpis') else 0,
+        })
+    if not skupiny:
+        return {'chyba': 'Žádný použitelný řádek (chybí místo, datum, název nebo jméno).'}
+
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return {'chyba': 'Databáze není dostupná.'}
+    cur = conn.cursor()
+    nove = doplnene = osob = duplicit = 0
+    try:
+        for (misto, datum, nazev), lide in skupiny.items():
+            cur.execute("""SELECT id FROM gastrokurzy_termin
+                  WHERE misto=%s AND datum=%s AND nazev=%s ORDER BY id LIMIT 1""",
+                        (misto, datum, nazev))
+            radek = cur.fetchone()
+            if radek:
+                tid = radek[0]
+                doplnene += 1
+            else:
+                # souhrn_odeslan = NOW(): import se do denního souhrnu nehlásí.
+                cur.execute("""INSERT INTO gastrokurzy_termin
+                      (typ, misto, datum, nazev, stav, zdroj, souhrn_verze, souhrn_odeslan)
+                      VALUES ('standard', %s, %s, %s, 'aktivni', 'import-excel', 1, NOW())""",
+                            (misto, datum, nazev))
+                tid = cur.lastrowid
+                nove += 1
+            cur.execute("SELECT zakaznik, ico FROM gastrokurzy_prihlaska WHERE termin_id=%s",
+                        (tid,))
+            uz_tam = {(_bez_diakritiky(a), _bez_diakritiky(b)) for a, b in cur.fetchall()}
+            for o in lide:
+                klic = (_bez_diakritiky(o['jmeno']), _bez_diakritiky(o['ico']))
+                if klic in uz_tam:
+                    duplicit += 1
+                    continue
+                uz_tam.add(klic)
+                cur.execute("""INSERT INTO gastrokurzy_prihlaska
+                      (termin_id, pobocka_klic, oz, ico, provozovna, zakaznik, funkce,
+                       telefon, podpis, zapsal)
+                      VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'import-excel')""",
+                            (tid, o['pobocka'], o['oz'], o['ico'], o['provozovna'],
+                             o['jmeno'], o['funkce'], o['telefon'], o['podpis']))
+                osob += 1
+        conn.commit()
+        return {'nove': nove, 'doplnene': doplnene, 'osob': osob,
+                'duplicit': duplicit, 'spatnych': spatnych}
+    except Exception as e:
+        conn.rollback()
+        print(f"[gastrokurzy] Import Excelu: {e}")
+        return {'chyba': f'Import selhal: {e}'}
+    finally:
+        cur.close()
+        conn.close()
+
+
 # ==========================================
 # DB VRSTVA (blokující – volat přes asyncio.to_thread)
 # ==========================================
@@ -337,6 +487,28 @@ def _nacti_prihlasky(termin_id):
         conn.close()
 
 
+def _nacti_vsechny_prihlasky():
+    """Kompletní soupis účastníků napříč všemi termíny (datová sada)."""
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return []
+    cur = conn.cursor(dictionary=True)
+    try:
+        cur.execute("""SELECT p.id, p.pobocka_klic, p.oz, p.ico, p.provozovna, p.zakaznik,
+                      p.funkce, p.telefon, p.podpis, p.stav, p.zapsal,
+                      t.datum, t.misto, t.nazev, t.firma, t.lektor, t.typ
+                  FROM gastrokurzy_prihlaska p
+                  JOIN gastrokurzy_termin t ON t.id = p.termin_id
+                  ORDER BY t.datum IS NULL, t.datum DESC, t.id, p.pobocka_klic, p.id""")
+        return cur.fetchall()
+    except Exception as e:
+        print(f"[gastrokurzy] Načtení soupisu účastníků: {e}")
+        return []
+    finally:
+        cur.close()
+        conn.close()
+
+
 def _uloz_termin(data, termin_id=None):
     """INSERT/UPDATE termínu. Vrací id, nebo None při chybě."""
     conn = intranet_data.get_db_connection()
@@ -346,10 +518,10 @@ def _uloz_termin(data, termin_id=None):
     try:
         if termin_id:
             cur.execute("""UPDATE gastrokurzy_termin
-                  SET misto=%s, datum=%s, nazev=%s, firma=%s, lektor=%s,
+                  SET typ=%s, misto=%s, datum=%s, nazev=%s, firma=%s, lektor=%s,
                       kapacita=%s, stav=%s, poznamka=%s, verze = verze + 1
                   WHERE id=%s""",
-                        (data['misto'], data['datum'], data['nazev'], data.get('firma'),
+                        (data['typ'], data['misto'], data['datum'], data['nazev'], data.get('firma'),
                          data.get('lektor'), data.get('kapacita'), data['stav'],
                          data.get('poznamka'), termin_id))
         else:
@@ -657,7 +829,8 @@ def vykresli(user_id, user_name, vsechna_prava):
         return
 
     dnes_ = datetime.date.today()
-    filtr = {'misto': 'vse', 'hledej': '', 'skryt_stare': True, 'pohled': 'seznam'}
+    filtr = {'misto': 'vse', 'hledej': '', 'skryt_stare': True, 'pohled': 'seznam',
+             'typ': 'vse', 'od': '', 'do': ''}
     kal = {'rok': dnes_.year, 'mesic': dnes_.month}
     posledni_pobocka_key = f'gastrokurzy_pob_{user_id}'
 
@@ -888,13 +1061,48 @@ def vykresli(user_id, user_name, vsechna_prava):
     # =================================================================
     # DIALOG: TERMÍN KURZU (jen správce)
     # =================================================================
+    def _otevri_import_dialog():
+        """Nalití kurzů i účastníků z Excelu (prezenční listina v řádcích)."""
+        with ui.dialog() as dlg, ui.card().classes('p-6 gap-3').style('min-width: 560px'):
+            ui.label('Import kurzů z Excelu').classes('text-lg font-extrabold text-gray-800')
+            ui.label('Hlavička: místo, datum, název kurzu, pobočka, OZ, IČO, provozovna, '
+                     'jméno, funkce, telefon, podpis. Termín se páruje podle místa, data a '
+                     'názvu – existující se jen doplní o účastníky, stejný člověk se nezdvojí.'
+                     ).classes('text-xs text-gray-500')
+            stav = ui.label('').classes('text-sm font-bold text-gray-700')
+
+            async def _nahraj(e):
+                stav.set_text('Importuji…')
+                raw = await e.file.read()          # NiceGUI 3.x: FileUpload.read() je async
+                vysl = await asyncio.to_thread(_import_excel, raw)
+                if vysl.get('chyba'):
+                    stav.set_text(vysl['chyba'])
+                    ui.notify(vysl['chyba'], type='negative')
+                    return
+                zprava = (f"nové termíny: {vysl['nove']}, doplněné: {vysl['doplnene']}, "
+                          f"účastníků: {vysl['osob']}, duplicit přeskočeno: {vysl['duplicit']}"
+                          + (f", vadných řádků: {vysl['spatnych']}" if vysl['spatnych'] else ''))
+                stav.set_text(f'Hotovo – {zprava}')
+                intranet_logger.log_activity(user_name, LOG_KATEGORIE,
+                                             f"Import z Excelu – {zprava}")
+                ui.notify('Import hotov.', type='positive')
+                _panel.refresh()
+
+            ui.upload(label='Vybrat soubor (.xlsx)', on_upload=_nahraj, auto_upload=True,
+                      max_file_size=20_000_000).props('accept=".xlsx" flat dense') \
+                .classes('w-full')
+            with ui.row().classes('w-full justify-end pt-2'):
+                ui.button('Zavřít', on_click=dlg.close).props('flat')
+        dlg.open()
+
     def _otevri_termin_dialog(t=None, typ='standard'):
         novy = t is None
         t = t or {}
         with ui.dialog() as dlg, ui.card().classes('p-6 gap-3').style('min-width: 560px'):
-            ui.label(('Nový termín' if novy else 'Úprava termínu')
-                     + (' – TOP kurz' if typ == 'top' else '')).classes(
+            ui.label('Nový kurz' if novy else 'Úprava termínu').classes(
                 'text-lg font-extrabold text-gray-800')
+            i_typ = ui.toggle({'standard': 'Kurz JIP', 'top': 'Kurz dodavatel'}, value=typ
+                              ).props('no-caps dense unelevated color=deep-purple')
             with ui.row().classes('w-full gap-2'):
                 i_misto = ui.select(MISTA, label='Místo konání *',
                                     value=t.get('misto', 'Praha')).props('outlined dense').classes('flex-1')
@@ -914,11 +1122,9 @@ def vykresli(user_id, user_name, vsechna_prava):
                     'outlined dense').classes('flex-1')
                 i_kapacita = ui.number('Kapacita (prázdné = neomezená)', value=t.get('kapacita'),
                                        min=0, format='%.0f').props('outlined dense').classes('flex-1')
-            if typ == 'top':
-                i_firma = ui.input('Firma (ORKLA / UNILEVER / NESTLE) *',
-                                   value=t.get('firma') or '').props('outlined dense').classes('w-full')
-            else:
-                i_firma = None
+            i_firma = ui.input('Firma (ORKLA / UNILEVER / NESTLE) *',
+                               value=t.get('firma') or '').props('outlined dense').classes('w-full')
+            i_firma.bind_visibility_from(i_typ, 'value', lambda v: v == 'top')
             i_stav = ui.select({'aktivni': 'Aktivní', 'zruseno': 'Zrušený termín'}, label='Stav',
                                value=t.get('stav', 'aktivni')).props('outlined dense').classes('w-full')
             i_pozn = ui.textarea('Poznámka', value=t.get('poznamka') or '').props(
@@ -932,9 +1138,10 @@ def vykresli(user_id, user_name, vsechna_prava):
                 if not datum and i_stav.value != 'zruseno':
                     ui.notify('Vyplňte datum ve tvaru DD.MM.RRRR.', type='warning')
                     return
-                data = {'typ': typ, 'misto': i_misto.value, 'datum': datum,
+                data = {'typ': i_typ.value, 'misto': i_misto.value, 'datum': datum,
                         'nazev': str(i_nazev.value).strip(),
-                        'firma': str(i_firma.value).strip().upper() if i_firma else t.get('firma'),
+                        'firma': (str(i_firma.value or '').strip().upper() or None
+                                  if i_typ.value == 'top' else None),
                         'lektor': str(i_lektor.value or '').strip() or None,
                         'kapacita': int(i_kapacita.value) if i_kapacita.value else None,
                         'stav': i_stav.value,
@@ -984,18 +1191,90 @@ def vykresli(user_id, user_name, vsechna_prava):
                 ui.label(str(pocet)).classes(
                     'text-[11px] font-black text-white bg-rose-500 rounded-full px-1.5')
 
+    def _karta_velka(t):
+        """Nadcházející termín – velká dlaždice (styl TOP kurzů)."""
+        zruseno = t['stav'] == 'zruseno'
+        je_top = t['typ'] == 'top'
+        od, do = (FIRMY_STYL.get((t['firma'] or '').upper(), _FIRMA_DEFAULT)
+                  if je_top else _JIP_STYL)
+        volno = _volna_mista(t, None)
+        obsazeno_pct = min(100, round(t['pocet'] / t['kapacita'] * 100)) if t['kapacita'] else 0
+        dnu = (t['datum'] - datetime.date.today()).days
+        odpocet = 'DNES' if dnu == 0 else ('ZÍTRA' if dnu == 1 else f'ZA {dnu} DNÍ')
+        karta = ui.card().classes(
+            'p-0 gap-0 overflow-hidden cursor-pointer transition-all '
+            'hover:-translate-y-1 hover:shadow-2xl'
+            + (' opacity-60' if zruseno else '')).style('width: 340px; border-radius: 18px')
+        with karta:
+            with ui.column().classes('w-full p-4 gap-1 text-white').style(
+                    f'background: linear-gradient(135deg, {od} 0%, {do} 100%)'):
+                with ui.row().classes('w-full items-center gap-2 no-wrap'):
+                    ui.icon('workspace_premium' if je_top else 'restaurant_menu',
+                            size='1.4rem').classes('opacity-90')
+                    ui.label(t['firma'] or 'KURZ JIP').classes(
+                        'text-lg font-black tracking-wide truncate')
+                    ui.element('div').classes('flex-1')
+                    ui.label(odpocet).classes(
+                        'text-[10px] font-black bg-white/25 px-2 py-0.5 rounded-full whitespace-nowrap')
+                ui.label(t['nazev'] or 'Volný termín').classes(
+                    'text-sm font-bold opacity-95 leading-snug')
+                with ui.row().classes('items-center gap-3 pt-1'):
+                    with ui.row().classes('items-center gap-1'):
+                        ui.icon('event', size='0.9rem').classes('opacity-80')
+                        ui.label(_fmt_datum(t['datum'])).classes('text-xs font-bold')
+                    with ui.row().classes('items-center gap-1'):
+                        ui.icon('place', size='0.9rem').classes('opacity-80')
+                        ui.label(t['misto']).classes('text-xs font-bold')
+                    if t['lektor']:
+                        with ui.row().classes('items-center gap-1'):
+                            ui.icon('person', size='0.9rem').classes('opacity-80')
+                            ui.label(t['lektor']).classes('text-xs font-bold truncate')
+                if zruseno:
+                    ui.label('ZRUŠENO').classes(
+                        'text-[10px] font-black bg-white/25 px-2 py-0.5 rounded-full w-fit')
+            with ui.column().classes('w-full px-4 py-3 gap-2 bg-white'):
+                with ui.row().classes('w-full items-end gap-2'):
+                    ui.label(str(t['pocet'])).classes('text-3xl font-black text-gray-800 leading-none')
+                    ui.label(f"/ {t['kapacita'] or '∞'} míst").classes(
+                        'text-sm font-bold text-gray-400 pb-0.5')
+                    ui.element('div').classes('flex-1')
+                    if volno is not None:
+                        cls = 'bg-red-100 text-red-700' if volno <= 0 else 'bg-green-100 text-green-700'
+                        ui.label(f'volno {volno}').classes(
+                            f'text-xs font-black px-2 py-1 rounded-full {cls}')
+                if t['kapacita']:
+                    with ui.element('div').classes('w-full h-2 bg-gray-100 rounded-full overflow-hidden'):
+                        ui.element('div').classes('h-full rounded-full').style(
+                            f'width: {obsazeno_pct}%; background: linear-gradient(90deg, {od}, {do})')
+                with ui.row().classes('w-full items-center gap-1 flex-wrap'):
+                    _chipy_pobocek(t)
+                with ui.row().classes('w-full items-center gap-1 pt-1'):
+                    ui.button('Prezenční listina', icon='assignment_ind',
+                              on_click=lambda _, tt=t: _otevri_prezencku(tt)
+                              ).props('flat dense no-caps').classes('text-xs font-bold flex-1')
+                    if je_spravce:
+                        ui.button(icon='edit',
+                                  on_click=lambda _, tt=t: _otevri_termin_dialog(tt, tt['typ'])
+                                  ).props('flat dense round color=grey')
+        karta.on('dblclick', lambda _, tt=t: _otevri_prezencku(tt))
+
     def _karta_terminu(t):
         zruseno = t['stav'] == 'zruseno'
+        je_top = t['typ'] == 'top'
         volno = _volna_mista(t, None)
         karta = ui.card().classes(
             'w-full p-0 gap-0 overflow-hidden transition-all cursor-pointer '
             + ('opacity-60 ' if zruseno else 'hover:shadow-lg '))
         with karta:
             with ui.row().classes('w-full items-stretch gap-0 no-wrap'):
-                # datum – růžový sloupec jako v Excelu; hover ukáže lektora
-                with ui.column().classes(
-                        'items-center justify-center px-4 py-3 gap-0 min-w-28 '
-                        + ('bg-gray-300' if zruseno else 'bg-rose-500')):
+                # datum – růžový sloupec jako v Excelu, kurz dodavatele si drží barvu firmy
+                sloupec = ui.column().classes(
+                    'items-center justify-center px-4 py-3 gap-0 min-w-28 '
+                    + ('bg-gray-300' if zruseno else 'bg-rose-500'))
+                if je_top and not zruseno:
+                    od, do = FIRMY_STYL.get((t['firma'] or '').upper(), _FIRMA_DEFAULT)
+                    sloupec.style(f'background: linear-gradient(135deg, {od} 0%, {do} 100%)')
+                with sloupec:
                     if t['datum']:
                         ui.label(f"{t['datum'].day:02d}.{t['datum'].month:02d}.").classes(
                             'text-xl font-black text-white leading-tight')
@@ -1009,6 +1288,11 @@ def vykresli(user_id, user_name, vsechna_prava):
                         ui.label(t['nazev'] or 'Volný termín').classes(
                             'text-base font-extrabold text-gray-800 truncate'
                             + (' line-through' if zruseno else ''))
+                        if je_top:
+                            od, do = FIRMY_STYL.get((t['firma'] or '').upper(), _FIRMA_DEFAULT)
+                            ui.label(t['firma'] or 'DODAVATEL').classes(
+                                'text-[10px] font-black text-white px-2 py-0.5 rounded-full '
+                                'whitespace-nowrap').style(f'background: {od}')
                         if zruseno:
                             ui.label('ZRUŠENO').classes(
                                 'text-[10px] font-black text-red-600 bg-red-100 px-2 py-0.5 rounded-full')
@@ -1044,76 +1328,18 @@ def vykresli(user_id, user_name, vsechna_prava):
                                       ).props('flat dense round color=grey').tooltip('Upravit termín')
         karta.on('dblclick', lambda _, tt=t: _otevri_prezencku(tt))
 
-    def _karta_top(t):
-        """TOP kurz – prémiová dlaždice (firemní kurz s hlídanou kapacitou)."""
-        zruseno = t['stav'] == 'zruseno'
-        od, do = FIRMY_STYL.get((t['firma'] or '').upper(), _FIRMA_DEFAULT)
-        volno = _volna_mista(t, None)
-        obsazeno_pct = 0
-        if t['kapacita']:
-            obsazeno_pct = min(100, round(t['pocet'] / t['kapacita'] * 100))
-        karta = ui.card().classes(
-            'p-0 gap-0 overflow-hidden cursor-pointer transition-all hover:-translate-y-1 hover:shadow-2xl'
-            + (' opacity-60' if zruseno else '')).style('width: 340px; border-radius: 18px')
-        with karta:
-            with ui.column().classes('w-full p-4 gap-1 text-white relative').style(
-                    f'background: linear-gradient(135deg, {od} 0%, {do} 100%)'):
-                with ui.row().classes('w-full items-center gap-2 no-wrap'):
-                    ui.icon('workspace_premium', size='1.4rem').classes('opacity-90')
-                    ui.label(t['firma'] or 'TOP KURZ').classes(
-                        'text-lg font-black tracking-wide truncate')
-                    ui.element('div').classes('flex-1')
-                    ui.label('TOP').classes(
-                        'text-[10px] font-black bg-white/25 px-2 py-0.5 rounded-full')
-                ui.label(t['nazev'] or '—').classes('text-sm font-bold opacity-95 leading-snug')
-                with ui.row().classes('items-center gap-3 pt-1'):
-                    with ui.row().classes('items-center gap-1'):
-                        ui.icon('event', size='0.9rem').classes('opacity-80')
-                        ui.label(_fmt_datum(t['datum'])).classes('text-xs font-bold')
-                    with ui.row().classes('items-center gap-1'):
-                        ui.icon('place', size='0.9rem').classes('opacity-80')
-                        ui.label(t['misto']).classes('text-xs font-bold')
-                if zruseno:
-                    ui.label('ZRUŠENO').classes(
-                        'text-[10px] font-black bg-white/25 px-2 py-0.5 rounded-full w-fit')
-
-            with ui.column().classes('w-full px-4 py-3 gap-2 bg-white'):
-                with ui.row().classes('w-full items-end gap-2'):
-                    ui.label(str(t['pocet'])).classes('text-3xl font-black text-gray-800 leading-none')
-                    ui.label(f"/ {t['kapacita'] or '∞'} míst").classes(
-                        'text-sm font-bold text-gray-400 pb-0.5')
-                    ui.element('div').classes('flex-1')
-                    if volno is not None:
-                        cls = ('bg-red-100 text-red-700' if volno <= 0
-                               else 'bg-green-100 text-green-700')
-                        ui.label(f'volno {volno}').classes(
-                            f'text-xs font-black px-2 py-1 rounded-full {cls}')
-                if t['kapacita']:
-                    with ui.element('div').classes('w-full h-2 bg-gray-100 rounded-full overflow-hidden'):
-                        ui.element('div').classes('h-full rounded-full').style(
-                            f'width: {obsazeno_pct}%; background: linear-gradient(90deg, {od}, {do})')
-                with ui.row().classes('w-full items-center gap-1 flex-wrap'):
-                    _chipy_pobocek(t)
-                with ui.row().classes('w-full items-center gap-1 pt-1'):
-                    ui.button('Prezenční listina', icon='assignment_ind',
-                              on_click=lambda _, tt=t: _otevri_prezencku(tt)
-                              ).props('flat dense no-caps').classes('text-xs font-bold flex-1')
-                    if je_spravce:
-                        ui.button(icon='edit',
-                                  on_click=lambda _, tt=t: _otevri_termin_dialog(tt, 'top')
-                                  ).props('flat dense round color=grey')
-        karta.on('dblclick', lambda _, tt=t: _otevri_prezencku(tt))
-
     # =================================================================
     # HLAVNÍ PANEL
     # =================================================================
     @ui.refreshable
     def _panel():
-        ref = {'std': None, 'top': None}
+        ref = {'std': None, 'top': None, 'ucastnici': []}
 
         async def _nacti():
             ref['std'] = await asyncio.to_thread(_nacti_terminy, 'standard')
             ref['top'] = await asyncio.to_thread(_nacti_terminy, 'top')
+            if filtr['pohled'] == 'ucastnici':      # celá datová sada jen když se zobrazuje
+                ref['ucastnici'] = await asyncio.to_thread(_nacti_vsechny_prihlasky)
             _obsah.refresh()
 
         # =============================================================
@@ -1229,11 +1455,66 @@ def vykresli(user_id, user_name, vsechna_prava):
                     _bunka_dne(datum, sorted(podle_dne.get(datum, []),
                                              key=lambda t: (t['typ'] != 'top', t['misto'])), mesic)
 
+        def _soupis_ucastniku(zaznamy):
+            """Celá datová sada přihlášek – bez proklikávání jednotlivých kurzů."""
+            sloupce = [
+                {'name': 'datum', 'label': 'Datum', 'field': 'datum', 'align': 'left'},
+                {'name': 'kurz', 'label': 'Kurz', 'field': 'kurz', 'align': 'left', 'sortable': True},
+                {'name': 'misto', 'label': 'Místo', 'field': 'misto', 'align': 'left', 'sortable': True},
+                {'name': 'firma', 'label': 'Firma', 'field': 'firma', 'align': 'left', 'sortable': True},
+                {'name': 'pobocka', 'label': 'Pobočka', 'field': 'pobocka', 'align': 'left', 'sortable': True},
+                {'name': 'oz', 'label': 'OZ', 'field': 'oz', 'align': 'left', 'sortable': True},
+                {'name': 'ico', 'label': 'IČO', 'field': 'ico', 'align': 'left'},
+                {'name': 'provozovna', 'label': 'Provozovna', 'field': 'provozovna', 'align': 'left'},
+                {'name': 'zakaznik', 'label': 'Zákazník', 'field': 'zakaznik', 'align': 'left', 'sortable': True},
+                {'name': 'funkce', 'label': 'Funkce', 'field': 'funkce', 'align': 'left'},
+                {'name': 'telefon', 'label': 'Telefon', 'field': 'telefon', 'align': 'left'},
+                {'name': 'podpis', 'label': 'Podpis', 'field': 'podpis', 'align': 'center'},
+                {'name': 'stav', 'label': 'Stav', 'field': 'stav', 'align': 'left', 'sortable': True},
+            ]
+            radky = [{
+                'id': r['id'],
+                'datum': _fmt_datum(r['datum']),
+                'kurz': r['nazev'] or '-',
+                'misto': r['misto'] or '-',
+                'firma': r['firma'] or ('dodavatel' if r['typ'] == 'top' else 'JIP'),
+                'pobocka': POBOCKY_NAZVY.get(r['pobocka_klic'], r['pobocka_klic']) or '-',
+                'oz': r['oz'] or '-',
+                'ico': r['ico'] or '-',
+                'provozovna': r['provozovna'] or '-',
+                'zakaznik': r['zakaznik'] or '-',
+                'funkce': r['funkce'] or '-',
+                'telefon': r['telefon'] or '-',
+                'podpis': '✓' if r['podpis'] else '-',
+                'stav': 'Zrušeno' if r['stav'] == 'zruseno' else 'Aktivní',
+            } for r in zaznamy]
+
+            with ui.row().classes('w-full items-center gap-3 mb-3'):
+                ui.icon('groups', color='primary').classes('text-3xl')
+                ui.label('Účastníci – kompletní data').classes(
+                    'text-2xl font-black text-gray-800')
+                ui.label(f'{len(radky)} zápisů').classes('text-xs font-bold text-gray-400 pt-2')
+                ui.element('div').classes('flex-1')
+                hledani = ui.input(placeholder='Hledat v datech…').props(
+                    'outlined dense clearable').classes('w-72')
+            if not radky:
+                with ui.column().classes('w-full items-center py-12 gap-2'):
+                    ui.icon('inbox', size='3rem', color='grey-4')
+                    ui.label('Zatím nikdo není zapsaný.').classes('text-gray-400')
+                return
+            tabulka = ui.table(columns=sloupce, rows=radky, row_key='id',
+                               pagination=50).classes('w-full').props('dense flat bordered')
+            hledani.on_value_change(lambda e: tabulka.set_filter(e.value or ''))
+
         @ui.refreshable
         def _obsah():
             if ref['std'] is None:
                 with ui.column().classes('w-full items-center py-16'):
                     ui.spinner(size='3rem', color='primary')
+                return
+
+            if filtr['pohled'] == 'ucastnici':
+                _soupis_ucastniku(ref['ucastnici'])
                 return
 
             if filtr['pohled'] == 'kalendar':
@@ -1242,38 +1523,31 @@ def vykresli(user_id, user_name, vsechna_prava):
                 _kalendar(vse)
                 return
 
-            # --- TOP kurzy ---
-            top = _filtruj(ref['top'])
-            with ui.row().classes('w-full items-center gap-2 mb-3'):
-                ui.icon('workspace_premium', color='deep-purple').classes('text-2xl')
-                ui.label('TOP kurzy').classes('text-xl font-black text-gray-800')
-                ui.label('firemní kurzy s omezenou kapacitou').classes(
-                    'text-xs font-bold text-gray-400 pt-1')
-                ui.element('div').classes('flex-1')
-                if je_spravce:
-                    ui.button('Nový TOP kurz', icon='add',
-                              on_click=lambda: _otevri_termin_dialog(None, 'top')
-                              ).props('outline dense no-caps color=deep-purple').classes('font-bold')
-            if top:
+            # --- všechny kurzy (JIP i dodavatelské) v jednom seznamu, po měsících ---
+            std = sorted(_filtruj(ref['std']) + _filtruj(ref['top']),
+                         key=lambda t: (t['datum'] is None, t['datum'] or datetime.date.min,
+                                        t['misto'] or '', t['nazev'] or ''))
+            # Nejbližší týden nahoře velkými dlaždicemi – v seznamu dole zůstávají také.
+            dnes = datetime.date.today()
+            blizke = [t for t in std if t['datum'] and 0 <= (t['datum'] - dnes).days <= 7]
+            if blizke:
+                with ui.row().classes('w-full items-center gap-2 mb-3'):
+                    ui.icon('local_fire_department', color='deep-orange').classes('text-2xl')
+                    ui.label('Nejbližší kurzy').classes('text-xl font-black text-gray-800')
                 with ui.row().classes('w-full gap-4 flex-wrap mb-8'):
-                    for t in top:
-                        _karta_top(t)
-            else:
-                ui.label('Žádné TOP kurzy neodpovídají filtru.').classes(
-                    'text-sm italic text-gray-400 mb-8')
+                    for t in blizke:
+                        _karta_velka(t)
 
-            # --- běžné kurzy, po měsících ---
-            std = _filtruj(ref['std'])
             with ui.row().classes('w-full items-center gap-2 mb-3'):
-                ui.icon('restaurant_menu', color='primary').classes('text-2xl')
-                ui.label('Termíny kurzů').classes('text-xl font-black text-gray-800')
-                ui.label(f'{len(std)} termínů').classes('text-xs font-bold text-gray-400 pt-1')
                 ui.element('div').classes('flex-1')
                 if je_spravce:
-                    ui.button('Nový termín', icon='add',
+                    ui.button('Import z Excelu', icon='upload_file',
+                              on_click=_otevri_import_dialog
+                              ).props('outline dense no-caps color=grey-8').classes('font-bold')
+                    ui.button('Nový kurz', icon='add',
                               on_click=lambda: _otevri_termin_dialog(None, 'standard')
                               ).props('outline dense no-caps color=primary').classes('font-bold')
-            if not std:
+            if not std and not blizke:
                 with ui.column().classes('w-full items-center py-12 gap-2'):
                     ui.icon('event_busy', size='3rem', color='grey-4')
                     ui.label('Žádné termíny neodpovídají filtru.').classes('text-gray-400')
@@ -1293,11 +1567,22 @@ def vykresli(user_id, user_name, vsechna_prava):
         def _filtruj(terminy, i_stare=False):
             dnes = datetime.date.today()
             hledej = filtr['hledej'].strip().lower()
+            od = _parse_datum(filtr['od'])
+            do = _parse_datum(filtr['do'])
             out = []
             for t in terminy or []:
                 if filtr['misto'] != 'vse' and t['misto'] != filtr['misto']:
                     continue
-                if not i_stare and filtr['skryt_stare'] and t['datum'] and t['datum'] < dnes:
+                if filtr['typ'] != 'vse' and t['typ'] != filtr['typ']:
+                    continue
+                if od or do:            # zvolené období má přednost před "skrýt proběhlé"
+                    if not t['datum']:
+                        continue
+                    if od and t['datum'] < od:
+                        continue
+                    if do and t['datum'] > do:
+                        continue
+                elif not i_stare and filtr['skryt_stare'] and t['datum'] and t['datum'] < dnes:
                     continue
                 if hledej and hledej not in ' '.join(
                         str(t.get(k) or '') for k in ('nazev', 'lektor', 'firma', 'misto')).lower():
@@ -1322,19 +1607,34 @@ def vykresli(user_id, user_name, vsechna_prava):
             _obsah.refresh()
 
         with ui.row().classes('w-full items-center gap-2 mb-6'):
-            ui.select({'vse': 'Praha i Ostrava', **{m: m for m in MISTA}}, value='vse',
-                      on_change=lambda e: (filtr.update(misto=e.value), _zmena())
-                      ).props('outlined dense').classes('w-48')
-            ui.input(placeholder='Hledat kurz nebo lektora…',
-                     on_change=lambda e: (filtr.update(hledej=e.value or ''), _zmena())
-                     ).props('outlined dense clearable').classes('w-72')
+            if filtr['pohled'] != 'ucastnici':      # soupis dat má vlastní hledání
+                ui.select({'vse': 'Praha i Ostrava', **{m: m for m in MISTA}}, value='vse',
+                          on_change=lambda e: (filtr.update(misto=e.value), _zmena())
+                          ).props('outlined dense').classes('w-48')
+                ui.select({'vse': 'Všechny kurzy', 'top': 'Kurzy dodavatel', 'standard': 'Kurzy JIP'},
+                          value=filtr['typ'],
+                          on_change=lambda e: (filtr.update(typ=e.value), _zmena())
+                          ).props('outlined dense').classes('w-44')
+                ui.input(placeholder='Hledat kurz nebo lektora…',
+                         on_change=lambda e: (filtr.update(hledej=e.value or ''), _zmena())
+                         ).props('outlined dense clearable').classes('w-72')
+                with ui.row().classes('items-center gap-1 no-wrap'):
+                    ui.label('Období').classes('text-xs font-bold text-gray-400')
+                    ui.input(value=filtr['od'],
+                             on_change=lambda e: (filtr.update(od=e.value or ''), _zmena())
+                             ).props('type=date outlined dense').classes('w-36')
+                    ui.label('–').classes('text-xs font-bold text-gray-400')
+                    ui.input(value=filtr['do'],
+                             on_change=lambda e: (filtr.update(do=e.value or ''), _zmena())
+                             ).props('type=date outlined dense').classes('w-36')
             if filtr['pohled'] == 'seznam':     # v kalendáři se listuje po měsících
                 ui.checkbox('Skrýt proběhlé', value=filtr['skryt_stare'],
                             on_change=lambda e: (filtr.update(skryt_stare=e.value), _zmena()))
             ui.element('div').classes('flex-1')
             with ui.row().classes('items-center gap-0 bg-gray-100 rounded-lg p-0.5'):
                 for kod, popis, ikona in (('seznam', 'Seznam', 'view_list'),
-                                          ('kalendar', 'Kalendář', 'calendar_month')):
+                                          ('kalendar', 'Kalendář', 'calendar_month'),
+                                          ('ucastnici', 'Účastníci', 'table_view')):
                     akt = filtr['pohled'] == kod
                     with ui.row().classes(
                             'items-center gap-1 px-3 py-1 rounded-md cursor-pointer transition-colors '
