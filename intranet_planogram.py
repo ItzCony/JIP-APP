@@ -1559,13 +1559,53 @@ def _build_planogram_html(titulek, popis_str, fochy, absorbed,
     ch    = CELL_H   # 173 px
     gap   = 1        # px mezera mezi buňkami (background #cbd5e1)
 
+    # ── Ořez na oblast s daty + jedno prázdné pole kolem ─────────────────────
+    obsazene = [
+        (r, c,
+         max(1, (f.get('merge_vyska') or 1)),
+         max(1, (f.get('merge_sirka') or 1)))
+        for (r, c), f in fochy.items()
+        if (f.get('nazev') or '').strip()
+        or (f.get('foto_cesta') or '').strip()
+        or (f.get('barva') or '').strip().lower() not in ('', '#ffffff', '#fff')
+    ]
+    if obsazene:
+        r0 = max(0, min(r for r, _, _, _ in obsazene) - 1)
+        c0 = max(0, min(c for _, c, _, _ in obsazene) - 1)
+        r1 = min(vyska - 1, max(r + mh for r, _, mh, _ in obsazene))
+        c1 = min(sirka - 1, max(c + mw for _, c, _, mw in obsazene))
+    else:
+        r0, c0, r1, c1 = 0, 0, vyska - 1, sirka - 1
+    n_sl  = c1 - c0 + 1
+    n_rad = r1 - r0 + 1
+
+    # ── Měřítko na A4: buňky zmenšíme, písmo ne ──────────────────────────────
+    # (dřív se škálovala celá stránka až v tiskárně, čímž se text srazil
+    #  na pár desetin mm – tady buňka dostane menší px a font zůstane čitelný)
+    A4_W, A4_H = 794, 1122      # px @96 dpi
+    PAGE_MARGIN = 30            # px ≈ 8 mm
+    HEAD_H      = 78            # px – titulek + popis nad gridem
+    orientace, k = max(
+        (('landscape', min((A4_H - 2 * PAGE_MARGIN) / (28 + n_sl * CELL_W),
+                           (A4_W - 2 * PAGE_MARGIN - HEAD_H) / (n_rad * CELL_H))),
+         ('portrait',  min((A4_W - 2 * PAGE_MARGIN) / (28 + n_sl * CELL_W),
+                           (A4_H - 2 * PAGE_MARGIN - HEAD_H) / (n_rad * CELL_H)))),
+        key=lambda t: t[1],
+    )
+    k  = min(1.0, k)
+    cw = max(24, round(CELL_W * k))
+    ch = max(26, round(CELL_H * k))
+    pad     = max(1, round(4 * k))
+    fs_cell = round(max(6.0, min(13.0, cw / 8.0)), 1)   # px, ne rem
+    fs_hdr  = round(max(5.0, min(10.0, cw / 14.0)), 1)
+
     # ── Záhlaví sloupců – přesná kopie _render_grid ──────────────────────────
-    row_num_w = 28  # px – šířka sloupce s čísly řádků
+    row_num_w = max(14, round(28 * k))  # px – šířka sloupce s čísly řádků
     hdr_divs = ''.join(
-        f'<div style="text-align:center;font-size:0.65rem;font-weight:700;'
-        f'color:#64748b;padding:3px 0;background:#f8fafc;'
+        f'<div style="text-align:center;font-size:{fs_hdr}px;font-weight:700;'
+        f'color:#64748b;padding:{pad}px 0;background:#f8fafc;'
         f'width:{cw}px;flex-shrink:0">{i + 1}</div>'
-        for i in range(sirka)
+        for i in range(c0, c1 + 1)
     )
     hdr_html = (
         f'<div style="display:flex;flex-direction:row;gap:{gap}px;'
@@ -1575,8 +1615,8 @@ def _build_planogram_html(titulek, popis_str, fochy, absorbed,
 
     # ── Buňky gridu ──────────────────────────────────────────────────────────
     cells_html = ''
-    for r in range(vyska):
-        for c in range(sirka):
+    for r in range(r0, r1 + 1):
+        for c in range(c0, c1 + 1):
             if (r, c) in absorbed:
                 continue
 
@@ -1594,12 +1634,13 @@ def _build_planogram_html(titulek, popis_str, fochy, absorbed,
 
             cell_style = (
                 f'background:{barva};'
-                f'grid-column:{c + 1}/span {mw};'
-                f'grid-row:{r + 1}/span {mh};'
+                f'grid-column:{c - c0 + 1}/span {mw};'
+                f'grid-row:{r - r0 + 1}/span {mh};'
                 f'display:flex;flex-direction:column;'
                 f'align-items:center;justify-content:{justify};'
                 f'overflow:hidden;border:{border};'
-                f'padding:4px 2px 2px;box-sizing:border-box;'
+                f'padding:{pad}px {max(1, pad // 2)}px {max(1, pad // 2)}px;'
+                f'box-sizing:border-box;'
             )
 
             inner = ''
@@ -1617,20 +1658,19 @@ def _build_planogram_html(titulek, popis_str, fochy, absorbed,
                            .replace('&', '&amp;').replace('<', '&lt;')
                            .replace('>', '&gt;'))
                     inner += (
-                        f'<span style="font-size:0.72rem;line-height:1.2;'
+                        f'<span style="font-size:{fs_cell}px;line-height:1.2;'
                         f'text-align:center;word-break:break-word;overflow:hidden;'
-                        f'padding:0 3px;color:#1e293b;font-weight:600;'
+                        f'padding:0 2px;color:#1e293b;font-weight:600;'
                         f'flex-shrink:0">{esc}</span>'
                     )
             elif nazev_b:
                 esc = (nazev_b
                        .replace('&', '&amp;').replace('<', '&lt;')
                        .replace('>', '&gt;'))
-                fsize = '0.70rem' if show_foto else '0.64rem'
                 inner = (
-                    f'<span style="font-size:{fsize};line-height:1.25;'
+                    f'<span style="font-size:{fs_cell}px;line-height:1.2;'
                     f'text-align:center;word-break:break-word;overflow:hidden;'
-                    f'max-height:60%;padding:0 4px;color:#1e293b;'
+                    f'max-height:92%;padding:0 2px;color:#1e293b;'
                     f'font-weight:700">{esc}</span>'
                 )
 
@@ -1639,10 +1679,10 @@ def _build_planogram_html(titulek, popis_str, fochy, absorbed,
     # ── Čísla řádků (vlevo od gridu) ─────────────────────────────────────────
     row_nums_html = ''.join(
         f'<div style="height:{ch}px;display:flex;align-items:center;'
-        f'justify-content:flex-end;padding-right:6px;'
-        f'font-size:0.65rem;font-weight:700;color:#64748b;'
+        f'justify-content:flex-end;padding-right:{max(2, pad)}px;'
+        f'font-size:{fs_hdr}px;font-weight:700;color:#64748b;'
         f'flex-shrink:0;box-sizing:border-box">{r + 1}</div>'
-        for r in range(vyska)
+        for r in range(r0, r1 + 1)
     )
     row_nums_col = (
         f'<div style="display:flex;flex-direction:column;gap:{gap}px;'
@@ -1651,13 +1691,13 @@ def _build_planogram_html(titulek, popis_str, fochy, absorbed,
         f'{row_nums_html}</div>'
     )
 
-    grid_w = sirka * cw + (sirka - 1) * gap
-    grid_h = vyska * ch + (vyska - 1) * gap
+    grid_w = n_sl * cw + (n_sl - 1) * gap
+    grid_h = n_rad * ch + (n_rad - 1) * gap
 
     grid_div = (
         f'<div style="display:grid;'
-        f'grid-template-columns:repeat({sirka},{cw}px);'
-        f'grid-template-rows:repeat({vyska},{ch}px);'
+        f'grid-template-columns:repeat({n_sl},{cw}px);'
+        f'grid-template-rows:repeat({n_rad},{ch}px);'
         f'gap:{gap}px;background:#cbd5e1;'
         f'width:{grid_w}px;height:{grid_h}px;flex-shrink:0">'
         f'{cells_html}</div>'
@@ -1685,8 +1725,9 @@ h1{{font-size:16px;font-weight:900;color:#1e3a5f;margin-bottom:3px}}
 .grid-body{{display:flex;flex-direction:row}}
 @media print{{
   .btn{{display:none}}
+  .top{{padding:0 0 8px}}
   .wrap{{padding:0;overflow:visible}}
-  @page{{size:{total_w + 48}px {grid_h + 120}px;margin:16px}}
+  @page{{size:A4 {orientace};margin:8mm}}
 }}
 </style>
 </head>
