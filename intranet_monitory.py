@@ -754,16 +754,21 @@ def _uloz_vyjadreni(tabulka: str, radky: list, text: str, user_id, user_name: st
 # ============================================================
 
 def prava_typu(typ: str, vsechna_prava) -> tuple:
-    """(vidí, smí psát vyjádření, je správce) pro jeden monitor."""
+    """(vidí, smí psát vyjádření, je správce, smí nahrávat data) pro jeden
+    monitor. Vkladatel je role napříč — data nahraje, ale žádná neuvidí,
+    proto se nedědí ze čtenáře."""
     ma_vse = 'vse' in vsechna_prava
     admin = ma_vse or f'monitor_{typ}_admin' in vsechna_prava
     psat = admin or f'monitor_{typ}_zadatel' in vsechna_prava
     vidi = psat or f'monitor_{typ}_ctenar' in vsechna_prava
-    return vidi, psat, admin
+    vklad = admin or f'monitor_{typ}_vkladatel' in vsechna_prava
+    return vidi, psat, admin, vklad
 
 
 def dostupne_typy(vsechna_prava) -> list:
-    return [t for t in MONITORY if prava_typu(t, vsechna_prava)[0]]
+    """Monitory, kam uživatel vůbec smí — ke čtení NEBO k nahrání dat."""
+    return [t for t in MONITORY
+            if any(prava_typu(t, vsechna_prava)[i] for i in (0, 3))]
 
 
 # ── Sortiment: kdo vidí které řádky ──────────────────────────
@@ -1097,7 +1102,7 @@ async def vykresli_monitor(user_id, user_name: str, vsechna_prava):
 async def _vykresli_typ(typ: str, user_id, user_name: str, vsechna_prava):
     spec = MONITORY[typ]
     tabulka = spec['tabulka']
-    _, psat_vse, je_admin = prava_typu(typ, vsechna_prava)
+    vidi, psat_vse, je_admin, smi_vkladat = prava_typu(typ, vsechna_prava)
 
     meta = await asyncio.to_thread(_nacti_meta, tabulka)
     vsechny_styly = await asyncio.to_thread(_nacti_styly, tabulka)
@@ -1113,12 +1118,25 @@ async def _vykresli_typ(typ: str, user_id, user_name: str, vsechna_prava):
         ui.icon('monitor_heart', size='2.2rem').classes('text-sky-600')
         ui.label(f'Monitor {spec["nazev"]}').classes('text-3xl font-extrabold text-gray-800')
 
+    # Vkladatel bez práva čtení: končíme dřív, než se sáhne na řádky — do UI
+    # se tak nemá co propsat (žádný grid, export ani počty).
+    if not vidi:
+        with ui.column().classes('items-center py-16 gap-3 w-full'):
+            ui.icon('upload_file', size='4rem', color='grey-4')
+            ui.label('Máte právo pouze nahrávat data.') \
+                .classes('text-xl text-gray-400 font-bold')
+            ui.label('Sestavu si prohlédnout nemůžete — po importu ji uvidí '
+                     'čtenáři monitoru.').classes('text-sm text-gray-400')
+            with ui.row().classes('w-full justify-center mt-2'):
+                _import_button(typ, user_name, _vykresli_typ.refresh)
+        return
+
     if not listy:
         with ui.column().classes('items-center py-16 gap-3 w-full'):
             ui.icon('inventory_2', size='4rem', color='grey-4')
             ui.label('Zatím nejsou naimportována žádná data.') \
                 .classes('text-xl text-gray-400 font-bold')
-            if je_admin:
+            if smi_vkladat:
                 ui.label('Nahrajte soubor tlačítkem „Nahrát data" vpravo nahoře.') \
                     .classes('text-sm text-gray-400')
                 with ui.row().classes('w-full justify-center mt-2'):
@@ -1222,8 +1240,9 @@ async def _vykresli_typ(typ: str, user_id, user_name: str, vsechna_prava):
         ui.button(icon='download', text='Export', on_click=_export) \
             .props('color=secondary outline dense no-caps') \
             .tooltip('Stáhne .xlsx podle aktuálního filtru (včetně filtrů v hlavičkách).')
-        if je_admin:
+        if smi_vkladat:
             _import_button(typ, user_name, _vykresli_typ.refresh)
+        if je_admin:
             _smazat_button(typ, user_name, _vykresli_typ.refresh)
 
     if psat_vse:

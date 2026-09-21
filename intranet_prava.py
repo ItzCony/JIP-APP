@@ -137,18 +137,22 @@ ZAKLADNI_PRAVA = {
     'monitor_kupi_ctenar':   {'kategorie': 'Modul Monitor', 'podskupina': 'KUPI', 'nazev': 'Čtenář - KUPI', 'popis': 'Vidí sestavu monitoru KUPI, může filtrovat, řadit a exportovat. NEsmí psát vyjádření ani nahrávat data.', 'ikona': 'visibility'},
     'monitor_kupi_zadatel':  {'kategorie': 'Modul Monitor', 'podskupina': 'KUPI', 'nazev': 'Vyjádření - KUPI', 'popis': 'Vše co čtenář + píše vyjádření k řádkům monitoru KUPI (zápis se propíše do všech označených řádků).', 'ikona': 'edit_note'},
     'monitor_kupi_admin':    {'kategorie': 'Modul Monitor', 'podskupina': 'KUPI', 'nazev': 'Správce - KUPI', 'popis': 'Vše co Vyjádření + nahrává týdenní sestavu KUPI a smí mazat data (nevratné, včetně vyjádření).', 'ikona': 'local_police'},
+    'monitor_kupi_vkladatel': {'kategorie': 'Modul Monitor', 'podskupina': 'KUPI', 'nazev': 'Vkladatel dat - KUPI', 'popis': 'Smí POUZE nahrát sestavu KUPI. NEVIDÍ žádná data — nefiltruje, neexportuje, nepíše vyjádření a nemaže.', 'ikona': 'upload_file'},
 
     'monitor_makro_ctenar':  {'kategorie': 'Modul Monitor', 'podskupina': 'MAKRO', 'nazev': 'Čtenář - MAKRO', 'popis': 'Vidí sestavy monitoru MAKRO (listy makro-akce i makro-ceny), může filtrovat, řadit a exportovat. NEsmí psát vyjádření ani nahrávat data.', 'ikona': 'visibility'},
     'monitor_makro_zadatel': {'kategorie': 'Modul Monitor', 'podskupina': 'MAKRO', 'nazev': 'Vyjádření - MAKRO', 'popis': 'Vše co čtenář + píše vyjádření k řádkům monitoru MAKRO.', 'ikona': 'edit_note'},
     'monitor_makro_admin':   {'kategorie': 'Modul Monitor', 'podskupina': 'MAKRO', 'nazev': 'Správce - MAKRO', 'popis': 'Vše co Vyjádření + nahrává sestavu MAKRO a smí mazat data (nevratné, včetně vyjádření).', 'ikona': 'local_police'},
+    'monitor_makro_vkladatel': {'kategorie': 'Modul Monitor', 'podskupina': 'MAKRO', 'nazev': 'Vkladatel dat - MAKRO', 'popis': 'Smí POUZE nahrát sestavu MAKRO. NEVIDÍ žádná data — nefiltruje, neexportuje, nepíše vyjádření a nemaže.', 'ikona': 'upload_file'},
 
     'monitor_vo_ctenar':     {'kategorie': 'Modul Monitor', 'podskupina': 'VO letáky', 'nazev': 'Čtenář - VO letáky', 'popis': 'Vidí sestavu monitoru VO letáky, může filtrovat, řadit a exportovat. NEsmí psát vyjádření ani nahrávat data.', 'ikona': 'visibility'},
     'monitor_vo_zadatel':    {'kategorie': 'Modul Monitor', 'podskupina': 'VO letáky', 'nazev': 'Vyjádření - VO letáky', 'popis': 'Vše co čtenář + píše vyjádření k řádkům monitoru VO letáky.', 'ikona': 'edit_note'},
     'monitor_vo_admin':      {'kategorie': 'Modul Monitor', 'podskupina': 'VO letáky', 'nazev': 'Správce - VO letáky', 'popis': 'Vše co Vyjádření + nahrává sestavu VO letáky a smí mazat data (nevratné, včetně vyjádření).', 'ikona': 'local_police'},
+    'monitor_vo_vkladatel': {'kategorie': 'Modul Monitor', 'podskupina': 'VO letáky', 'nazev': 'Vkladatel dat - VO letáky', 'popis': 'Smí POUZE nahrát sestavu VO letáky. NEVIDÍ žádná data — nefiltruje, neexportuje, nepíše vyjádření a nemaže.', 'ikona': 'upload_file'},
 
     'monitor_tamda_ctenar':  {'kategorie': 'Modul Monitor', 'podskupina': 'TAMDA', 'nazev': 'Čtenář - TAMDA', 'popis': 'Vidí sestavu monitoru TAMDA, může filtrovat, řadit a exportovat. NEsmí psát vyjádření ani nahrávat data.', 'ikona': 'visibility'},
     'monitor_tamda_zadatel': {'kategorie': 'Modul Monitor', 'podskupina': 'TAMDA', 'nazev': 'Vyjádření - TAMDA', 'popis': 'Vše co čtenář + píše vyjádření k řádkům monitoru TAMDA.', 'ikona': 'edit_note'},
     'monitor_tamda_admin':   {'kategorie': 'Modul Monitor', 'podskupina': 'TAMDA', 'nazev': 'Správce - TAMDA', 'popis': 'Vše co Vyjádření + nahrává sestavu TAMDA a smí mazat data (nevratné, včetně vyjádření).', 'ikona': 'local_police'},
+    'monitor_tamda_vkladatel': {'kategorie': 'Modul Monitor', 'podskupina': 'TAMDA', 'nazev': 'Vkladatel dat - TAMDA', 'popis': 'Smí POUZE nahrát sestavu TAMDA. NEVIDÍ žádná data — nefiltruje, neexportuje, nepíše vyjádření a nemaže.', 'ikona': 'upload_file'},
 
     'gastrokurzy_spravce':     {'kategorie': 'Modul Gastrokurzy', 'nazev': 'Správce kurzů', 'popis': 'Zakládá a edituje kurzy, jejich termíny a lektory, zapisuje prezenci a manipuluje s přihlášenými lidmi.', 'ikona': 'manage_accounts'},
     'gastrokurzy_zapisovatel': {'kategorie': 'Modul Gastrokurzy', 'nazev': 'Zapisovatel (ASM / vedoucí pobočky)', 'popis': 'Zapisuje pozvané zákazníky na kurzy a ruší zápisy. Nemůže měnit termíny kurzů.', 'ikona': 'person_add'},
