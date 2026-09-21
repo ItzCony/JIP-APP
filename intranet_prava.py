@@ -161,6 +161,10 @@ ZAKLADNI_PRAVA = {
     'zalistovaci_vkladatel':  {'kategorie': 'Modul Zalistovací komise', 'nazev': 'Vkladatel dat', 'popis': 'Smí POUZE nahrát zápis komise. NEVIDÍ žádná data — nefiltruje, neexportuje, nevyjadřuje se.', 'ikona': 'upload_file'},
     'zalistovaci_admin':      {'kategorie': 'Modul Zalistovací komise', 'nazev': 'Správce', 'popis': 'Obě kola vyjádření + nahrává zápisy a smí mazat celé období (nevratné, včetně vyjádření).', 'ikona': 'local_police'},
 
+    # -- Modul Manuály - online čtečka firemních manuálů --
+    'manualy_ctenar': {'kategorie': 'Modul Manuály', 'nazev': 'Čtenář', 'popis': 'Čte manuál online — listuje kapitolami, hledá v textu. Nesmí nahrávat novou verzi.', 'ikona': 'menu_book'},
+    'manualy_admin':  {'kategorie': 'Modul Manuály', 'nazev': 'Správce', 'popis': 'Vše co čtenář + nahrává novou verzi manuálu (DOCX). Nahráním se přepíše celý obsah včetně obrázků.', 'ikona': 'upload_file'},
+
     'gastrokurzy_spravce':     {'kategorie': 'Modul Gastrokurzy', 'nazev': 'Správce kurzů', 'popis': 'Zakládá a edituje kurzy, jejich termíny a lektory, zapisuje prezenci a manipuluje s přihlášenými lidmi.', 'ikona': 'manage_accounts'},
     'gastrokurzy_zapisovatel': {'kategorie': 'Modul Gastrokurzy', 'nazev': 'Zapisovatel (ASM / vedoucí pobočky)', 'popis': 'Zapisuje pozvané zákazníky na kurzy a ruší zápisy. Nemůže měnit termíny kurzů.', 'ikona': 'person_add'},
     'gastrokurzy_ctenar':      {'kategorie': 'Modul Gastrokurzy', 'nazev': 'Čtenář', 'popis': 'Vidí termíny kurzů i prezenční listiny pouze pro čtení. Nemůže zapisovat ani rušit zápisy.', 'ikona': 'visibility'},

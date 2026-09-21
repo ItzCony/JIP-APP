@@ -507,6 +507,7 @@ MODULY = {
     'gastrokurzy_zapnuty':   ('👨‍🍳 Modul Gastrokurzy',            'Gastrokurzy'),
     'monitor_zapnuty':       ('📈 Modul Monitor',                'Monitor'),
     'zalistovaci_zapnuty':   ('🗳️ Modul Zalistovací komise',     'Zalistovací komise'),
+    'manualy_zapnuty':       ('📖 Modul Manuály',                'Manuály'),
     # Má i vlastní přepínač na záložce Narozeniny v Nastavení portálu.
     'narozeniny_zapnuty':    ('Modul Narozeniny',               'Narozeniny'),
 }

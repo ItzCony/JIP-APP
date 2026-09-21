@@ -32,6 +32,11 @@ import intranet_vysledky
 import intranet_spolvecer
 import intranet_gastrokurzy
 
+# Ladění `TypeError: u.match is not a function` (Quasar QIcon dostal ne-string):
+# JIP_ICON_AUDIT=1 vypíše viníka do logu. Bez proměnné se modul neimportuje.
+if os.environ.get('JIP_ICON_AUDIT') == '1':
+    import intranet_icon_audit  # noqa: F401  (registruje app.on_connect)
+
 # ── Bezpečnostní HTTP hlavičky + ochrana statických příloh ───────────────────
 # Cesty servírované přes app.add_static_files, kam uživatelé NAHRÁVAJÍ soubory.
 # U nich nutíme nebezpečné (inline-spustitelné) typy ke stažení, aby přes přímou
@@ -194,6 +199,10 @@ if __name__ == "__main__":
             storage_secret=_STORAGE_SECRET,
             reload=False,
             reconnect_timeout=30,  # tolerance pro déle trvající JS operace (PDF export mapy apod.)
+            # JIP_DEV_VUE=1 => nemíněný (dev) Vue/Quasar: chyby v konzoli hlásí jméno
+            # komponenty a vadný prop místo minifikovaného `u.match is not a function`.
+            # Jen pro ladění na testu — dev build je větší a pomalejší.
+            prod_js=os.environ.get('JIP_DEV_VUE') != '1',
         )
     except KeyboardInterrupt:
         pass

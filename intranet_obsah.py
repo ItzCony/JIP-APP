@@ -603,6 +603,10 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
         'vse' in vsechna_prava or
         any(p.startswith('monitor_') for p in vsechna_prava)
     ) and nastaveni.get('monitor_zapnuty', True)
+    ma_pristup_zalistovaci = (
+        'vse' in vsechna_prava or
+        any(p.startswith('zalistovaci_') for p in vsechna_prava)
+    ) and nastaveni.get('zalistovaci_zapnuty', True)
     ma_pristup_spolvecer = (
         'vse' in vsechna_prava or
         'spolvecer_ctenar' in vsechna_prava or
@@ -764,6 +768,8 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
         _d('vysledky', ma_pristup_vysledky, '📊', 'Výsledky poboček', '#0ea5e9', _akce('vysledky')),
         _d('sankce', ma_pristup_sankce, '⚖️', 'Sankce', '#ef4444', _akce('sankce', 'sankce_pohled')),
         _d('monitor', ma_pristup_monitor, '📈', 'Monitor', '#0ea5e9', _akce('monitor', 'monitor_typ')),
+        _d('zalistovaci', ma_pristup_zalistovaci, '🗳️', 'Zalistovací komise', '#8b5cf6',
+           _akce('zalistovaci')),
         _d('spolvecer', ma_pristup_spolvecer, '🎉', 'Spol. večer 2026', '#d946ef',
            _akce('spolvecer', f'spolvecer_sel_{user_id}')),
         _d('vizitky', ma_pristup_vizitky, '🪪', 'Vizitky a podpisy', '#0ea5e9', _akce('vizitky')),
