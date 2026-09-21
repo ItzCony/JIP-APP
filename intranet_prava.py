@@ -154,6 +154,13 @@ ZAKLADNI_PRAVA = {
     'monitor_tamda_admin':   {'kategorie': 'Modul Monitor', 'podskupina': 'TAMDA', 'nazev': 'Správce - TAMDA', 'popis': 'Vše co Vyjádření + nahrává sestavu TAMDA a smí mazat data (nevratné, včetně vyjádření).', 'ikona': 'local_police'},
     'monitor_tamda_vkladatel': {'kategorie': 'Modul Monitor', 'podskupina': 'TAMDA', 'nazev': 'Vkladatel dat - TAMDA', 'popis': 'Smí POUZE nahrát sestavu TAMDA. NEVIDÍ žádná data — nefiltruje, neexportuje, nepíše vyjádření a nemaže.', 'ikona': 'upload_file'},
 
+    # -- Modul Zalistovací komise - dvě kola vyjádření (nákup → kontrola) --
+    'zalistovaci_ctenar':     {'kategorie': 'Modul Zalistovací komise', 'nazev': 'Čtenář', 'popis': 'Vidí zápis komise, může filtrovat, řadit a exportovat. NEsmí psát vyjádření ani nahrávat data.', 'ikona': 'visibility'},
+    'zalistovaci_nakup':      {'kategorie': 'Modul Zalistovací komise', 'nazev': 'Vyjádření nákupu', 'popis': 'Vše co čtenář + píše první kolo vyjádření (stanovisko nákupu k položce).', 'ikona': 'edit_note'},
+    'zalistovaci_kontrola':   {'kategorie': 'Modul Zalistovací komise', 'nazev': 'Potvrzení zalistování', 'popis': 'Vše co čtenář + druhé kolo: potvrzuje ANO/NE, že k zalistování došlo, a píše komentář. Buňka jde vyplnit až poté, co se vyjádřil nákup.', 'ikona': 'fact_check'},
+    'zalistovaci_vkladatel':  {'kategorie': 'Modul Zalistovací komise', 'nazev': 'Vkladatel dat', 'popis': 'Smí POUZE nahrát zápis komise. NEVIDÍ žádná data — nefiltruje, neexportuje, nevyjadřuje se.', 'ikona': 'upload_file'},
+    'zalistovaci_admin':      {'kategorie': 'Modul Zalistovací komise', 'nazev': 'Správce', 'popis': 'Obě kola vyjádření + nahrává zápisy a smí mazat celé období (nevratné, včetně vyjádření).', 'ikona': 'local_police'},
+
     'gastrokurzy_spravce':     {'kategorie': 'Modul Gastrokurzy', 'nazev': 'Správce kurzů', 'popis': 'Zakládá a edituje kurzy, jejich termíny a lektory, zapisuje prezenci a manipuluje s přihlášenými lidmi.', 'ikona': 'manage_accounts'},
     'gastrokurzy_zapisovatel': {'kategorie': 'Modul Gastrokurzy', 'nazev': 'Zapisovatel (ASM / vedoucí pobočky)', 'popis': 'Zapisuje pozvané zákazníky na kurzy a ruší zápisy. Nemůže měnit termíny kurzů.', 'ikona': 'person_add'},
     'gastrokurzy_ctenar':      {'kategorie': 'Modul Gastrokurzy', 'nazev': 'Čtenář', 'popis': 'Vidí termíny kurzů i prezenční listiny pouze pro čtení. Nemůže zapisovat ani rušit zápisy.', 'ikona': 'visibility'},

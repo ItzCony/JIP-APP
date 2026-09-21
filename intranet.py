@@ -31,6 +31,7 @@ import intranet_lupa
 import intranet_bonusy_ao
 import intranet_gastrokurzy
 import intranet_monitory
+import intranet_zalistovaci
 
 import time
 import asyncio
@@ -692,6 +693,7 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
         'bonusy_ao':     'bonusy_ao_zapnuty',
         'gastrokurzy':   'gastrokurzy_zapnuty',
         'monitor':       'monitor_zapnuty',
+        'zalistovaci':   'zalistovaci_zapnuty',
 
     }
 
@@ -825,6 +827,11 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
     _ma_monitor = ma_vse or any(p.startswith('monitor_') for p in vsechna_prava)
     if _ma_monitor and nastaveni.get('monitor_zapnuty', True):
         dostupne_taby.append('monitor')
+
+    # Zalistovací komise: čtenář, nákup, kontrola, vkladatel i správce.
+    _ma_zalistovaci = ma_vse or any(p.startswith('zalistovaci_') for p in vsechna_prava)
+    if _ma_zalistovaci and nastaveni.get('zalistovaci_zapnuty', True):
+        dostupne_taby.append('zalistovaci')
 
     _ma_spolvecer = (
         ma_vse or
@@ -1509,6 +1516,8 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
                         tab_sankce = ui.tab('sankce', label='⚖️  Sankce').classes('justify-start text-lg text-gray-800')
                     if 'monitor' in dostupne_taby:
                         tab_monitor = ui.tab('monitor', label='📈  Monitor').classes('justify-start text-lg text-gray-800')
+                    if 'zalistovaci' in dostupne_taby:
+                        tab_zalistovaci = ui.tab('zalistovaci', label='🗳️  Zalistovací komise').classes('justify-start text-lg text-gray-800')
                     if 'spolvecer' in dostupne_taby:
                         tab_spolvecer = ui.tab('spolvecer', label='🎉  Společenský večer').classes('justify-start text-lg text-gray-800')
                     if 'vizitky' in dostupne_taby:
@@ -1595,6 +1604,7 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
                     # „Event listeners changed after initial definition".
                     intranet_sankce._zaregistruj_mazani_radku(user_name, vsechna_prava)
                 if 'monitor'    in dostupne_taby: _RENDER_FNS['monitor']    = lambda: intranet_monitory.vykresli_monitor(user_id, user_name, vsechna_prava)
+                if 'zalistovaci' in dostupne_taby: _RENDER_FNS['zalistovaci'] = lambda: intranet_zalistovaci.vykresli_zalistovaci(user_id, user_name, vsechna_prava)
                 if 'spolvecer'  in dostupne_taby: _RENDER_FNS['spolvecer']  = lambda: intranet_spolvecer.vykresli(user_id, user_name, vsechna_prava)
                 if 'vizitky'    in dostupne_taby: _RENDER_FNS['vizitky']    = lambda: intranet_vizitky.vykresli_vizitky(user_id, user_name, user_email, vsechna_prava)
                 if 'cenopripad' in dostupne_taby: _RENDER_FNS['cenopripad'] = lambda: intranet_cenopripad.vykresli_cenopripad(user_id, user_name, vsechna_prava)
