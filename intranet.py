@@ -32,6 +32,7 @@ import intranet_bonusy_ao
 import intranet_gastrokurzy
 import intranet_monitory
 import intranet_zalistovaci
+import intranet_manualy
 
 import time
 import asyncio
@@ -491,6 +492,10 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
     </style>
     ''')
 
+    # Modul Manuály se kreslí lazy až po připojení klienta — tam už hlavička
+    # stránky nejde měnit (NiceGUI 3.8 na ostrém styl zahodí). Vložíme ji tady.
+    intranet_manualy.vloz_css()
+
     # Přidáme preloader ihned do initial HTML — jestliže je uživatel přihlášený,
     # browser dostane spinner ještě před tím, než se navázaným WebSocketem dokreslí UI.
     # Pro nepřihlášené (login stránka) preloader nevytváříme vůbec.
@@ -832,6 +837,11 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
     _ma_zalistovaci = ma_vse or any(p.startswith('zalistovaci_') for p in vsechna_prava)
     if _ma_zalistovaci and nastaveni.get('zalistovaci_zapnuty', True):
         dostupne_taby.append('zalistovaci')
+
+    # Manuály: čtenář i správce, jinak je dlaždice zbytečná.
+    _ma_manualy = ma_vse or any(p.startswith('manualy_') for p in vsechna_prava)
+    if _ma_manualy and nastaveni.get('manualy_zapnuty', True):
+        dostupne_taby.append('manualy')
 
     _ma_spolvecer = (
         ma_vse or
@@ -1530,6 +1540,8 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
                         ui.tab('bonusy_ao', label='💰  Bonusy AO').classes('justify-start text-lg text-gray-800')
                     if 'gastrokurzy' in dostupne_taby:
                         ui.tab('gastrokurzy', label='👨‍🍳  Gastrokurzy').classes('justify-start text-lg text-gray-800')
+                    if 'manualy' in dostupne_taby:
+                        ui.tab('manualy', label='📖  Manuály').classes('justify-start text-lg text-gray-800')
                     if 'lupa' in dostupne_taby:
                         tab_lupa = ui.tab('lupa', label='🔍  Lupou na obchod').classes('justify-start text-lg text-gray-800')
 
@@ -1605,6 +1617,7 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
                     intranet_sankce._zaregistruj_mazani_radku(user_name, vsechna_prava)
                 if 'monitor'    in dostupne_taby: _RENDER_FNS['monitor']    = lambda: intranet_monitory.vykresli_monitor(user_id, user_name, vsechna_prava)
                 if 'zalistovaci' in dostupne_taby: _RENDER_FNS['zalistovaci'] = lambda: intranet_zalistovaci.vykresli_zalistovaci(user_id, user_name, vsechna_prava)
+                if 'manualy'    in dostupne_taby: _RENDER_FNS['manualy']    = lambda: intranet_manualy.vykresli_manualy(user_id, user_name, vsechna_prava)
                 if 'spolvecer'  in dostupne_taby: _RENDER_FNS['spolvecer']  = lambda: intranet_spolvecer.vykresli(user_id, user_name, vsechna_prava)
                 if 'vizitky'    in dostupne_taby: _RENDER_FNS['vizitky']    = lambda: intranet_vizitky.vykresli_vizitky(user_id, user_name, user_email, vsechna_prava)
                 if 'cenopripad' in dostupne_taby: _RENDER_FNS['cenopripad'] = lambda: intranet_cenopripad.vykresli_cenopripad(user_id, user_name, vsechna_prava)
