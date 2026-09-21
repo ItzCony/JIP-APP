@@ -208,6 +208,7 @@ POVOLENE_UROVNE = {
     "Lupa",
     "Schůzky",
     "Bonusy AO",
+    "Zalistovací komise",
 }
 
 # Strukturovaná metadata (IP / zařízení) připojujeme na konec řádku do ⟦…⟧.
