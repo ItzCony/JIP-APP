@@ -100,8 +100,48 @@ for _dir in ('planogram_fotos', 'ochutnavky_prilohy', 'ukol_prilohy',
 # prohlížeče). Drží se pravidlo 1 účet = 1 aktivní relace.
 
 # --- Vzhled přihlašovací obrazovky (varianta „tmavá cinematic") ---
-# Scoped na body.prihlaseni-pozadi => aktivní JEN na přihlašovací stránce, jinde inertní.
-# Používá se na přihlašovací obrazovce.
+# Scoped na body.prihlaseni-pozadi => aktivní JEN tam, kde se ta třída nasadí, jinde inertní.
+# Kromě přihlášení ji používá i hostovský vstup do kvízu (/kviz/host/{token}),
+# který si ji bere přes css_prihlasovaci_obrazovky() — pozadí i styl polí musí zůstat jedny.
+_POZADI_CSS = '''
+            body.prihlaseni-pozadi {
+                margin: 0 !important;
+                padding: 0 !important;
+                overflow: hidden !important;
+                width: 100% !important;
+                height: 100% !important;
+                background: transparent !important;
+            }
+            /* Pozadí jako fixní pseudo-element — vždy přesně pokrývá viewport, žádné přetékání */
+            body.prihlaseni-pozadi::before {
+                content: '' !important;
+                position: fixed !important;
+                inset: 0 !important;
+                background-image: url("/static/pozadi.jpg") !important;
+                background-size: cover !important;
+                background-position: center center !important;
+                background-repeat: no-repeat !important;
+                filter: grayscale(0.35) contrast(1.05) !important;
+                z-index: -2 !important;
+            }
+            /* Tmavý cinematic overlay nad fotkou */
+            body.prihlaseni-pozadi::after {
+                content: '' !important;
+                position: fixed !important;
+                inset: 0 !important;
+                background: radial-gradient(ellipse at 50% 45%,
+                            rgba(10,14,22,0.55) 0%, rgba(8,11,18,0.93) 72%) !important;
+                z-index: -1 !important;
+                pointer-events: none !important;
+            }
+            body.prihlaseni-pozadi #q-app {
+                height: 100% !important;
+                width: 100% !important;
+                overflow: hidden !important;
+                background: transparent !important;
+            }
+'''
+
 _LOGIN_CSS = '''
             /* ===== Přihlášení: tmavý cinematic vzhled ===== */
             .login-wrap { width: 100%; max-width: 400px; }
@@ -225,6 +265,17 @@ _LOGIN_CSS = '''
                 background: rgba(255,255,255,0.18) !important;
             }
 '''
+
+
+def css_prihlasovaci_obrazovky() -> str:
+    """CSS tmavé přihlašovací obrazovky: pozadí (/static/pozadi.jpg + overlay),
+    karta `gate-card`, obal `login-wrap` a čitelná pole na tmavém podkladu.
+
+    Vrací holý obsah <style>, aby ji mohly použít i stránky mimo tento modul
+    (hostovský vstup do kvízu). Vše je scoped na `body.prihlaseni-pozadi`,
+    takže bez nasazení té třídy na body je blok inertní.
+    """
+    return _POZADI_CSS + _LOGIN_CSS
 
 def _obrazovka_vynucene_zmeny_hesla(user_id, user_email, user_name):
     """Fullscreen brána pro nový účet / heslo nastavené adminem.
@@ -506,43 +557,7 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
             /* Okamžité nastavení pozadí přes CSS ještě před spuštěním JS – eliminuje bílý záblesk */
             html, body { background-color: #f3f4f6; }
 
-            body.prihlaseni-pozadi {
-                margin: 0 !important;
-                padding: 0 !important;
-                overflow: hidden !important;
-                width: 100% !important;
-                height: 100% !important;
-                background: transparent !important;
-            }
-            /* Pozadí jako fixní pseudo-element — vždy přesně pokrývá viewport, žádné přetékání */
-            body.prihlaseni-pozadi::before {
-                content: '' !important;
-                position: fixed !important;
-                inset: 0 !important;
-                background-image: url("/static/pozadi.jpg") !important;
-                background-size: cover !important;
-                background-position: center center !important;
-                background-repeat: no-repeat !important;
-                filter: grayscale(0.35) contrast(1.05) !important;
-                z-index: -2 !important;
-            }
-            /* Tmavý cinematic overlay nad fotkou */
-            body.prihlaseni-pozadi::after {
-                content: '' !important;
-                position: fixed !important;
-                inset: 0 !important;
-                background: radial-gradient(ellipse at 50% 45%,
-                            rgba(10,14,22,0.55) 0%, rgba(8,11,18,0.93) 72%) !important;
-                z-index: -1 !important;
-                pointer-events: none !important;
-            }
-            body.prihlaseni-pozadi #q-app {
-                height: 100% !important;
-                width: 100% !important;
-                overflow: hidden !important;
-                background: transparent !important;
-            }
-''' + _LOGIN_CSS + '''
+''' + _POZADI_CSS + _LOGIN_CSS + '''
             body.intranet-pozadi {
                 margin: 0 !important;
                 padding: 0 !important;
