@@ -30,7 +30,7 @@ ZAKLADNI_PRAVA = {
     'kviz': {'kategorie': 'Modul Kvíz', 'nazev': 'Přístup do Kvízu', 'popis': 'Může otevřít modul Zkouškový Kvíz.', 'ikona': 'school'},
     'vystup_osobni': {'kategorie': 'Modul Kvíz', 'nazev': 'Kvíz: Osobní výsledky', 'popis': 'Vidí v exportech jen vlastní absolvované testy.', 'ikona': 'assessment'},
     'vystup_vse': {'kategorie': 'Modul Kvíz', 'nazev': 'Kvíz: Všechny výsledky', 'popis': 'Může exportovat výsledky testů za celou firmu.', 'ikona': 'insights'},
-    'kviz_hoste': {'kategorie': 'Modul Kvíz', 'nazev': 'Kvíz: Generování přístupů', 'popis': 'Může vygenerovat časově omezené odkazy do kvízu pro zkoušené osoby.', 'ikona': 'key'},
+    'kviz_hoste': {'kategorie': 'Modul Kvíz', 'nazev': 'Kvíz: Generování přístupů', 'popis': 'Může vygenerovat časově omezené odkazy do kvízu (včetně volby OZ/ASM) pro zkoušené osoby.', 'ikona': 'key'},
 
     'veletrh_pristup':    {'kategorie': 'Modul Veletrh', 'nazev': 'Základní přístup (Čtení)',  'popis': 'Vidí mapu, ceník a seznam stánků. Nemůže je upravovat.',                           'ikona': 'visibility'},
     'veletrh_komentator': {'kategorie': 'Modul Veletrh', 'nazev': 'Komentátor zákazníků',      'popis': 'Může přidávat zákazníky do evidence veletrhu. Nemůže upravovat ani mazat.',     'ikona': 'person_add'},

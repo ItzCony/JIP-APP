@@ -1069,11 +1069,19 @@ def inicializace_db():
         except Exception: pass
         try: cursor.execute("ALTER TABLE vysledky_kvizu ADD COLUMN host_prijmeni VARCHAR(100) DEFAULT NULL")
         except Exception: pass
+        # Token odkazu, přes který se test psal — jediná vazba výsledku na zadavatele.
+        try: cursor.execute("ALTER TABLE vysledky_kvizu ADD COLUMN pristup_token VARCHAR(64) DEFAULT NULL")
+        except Exception: pass
+        try: cursor.execute("CREATE INDEX idx_vysledky_pristup ON vysledky_kvizu (pristup_token)")
+        except Exception: pass
         cursor.execute("CREATE TABLE IF NOT EXISTS zaznamy_odpovedi (id INT AUTO_INCREMENT PRIMARY KEY, vysledek_id INT, poradi INT, otazka TEXT, tvoje_volba TEXT, spravna_odpoved TEXT, hodnoceni VARCHAR(50), FOREIGN KEY (vysledek_id) REFERENCES vysledky_kvizu(id) ON DELETE CASCADE) ENGINE=InnoDB")
         # Časově omezené odkazy do kvízu pro zkoušené bez přihlášení do intranetu.
         # Dva režimy: token vázaný na řádek v `user`, nebo anonymní (user_iduser
         # NULL), kde si zkoušený vyplní jméno a příjmení až na vstupní stránce.
-        cursor.execute("CREATE TABLE IF NOT EXISTS kviz_pristupy (id INT AUTO_INCREMENT PRIMARY KEY, token VARCHAR(64) NOT NULL UNIQUE, user_iduser INT NULL, host_jmeno VARCHAR(100) DEFAULT NULL, host_prijmeni VARCHAR(100) DEFAULT NULL, platnost_od DATETIME NOT NULL, platnost_do DATETIME NOT NULL, pouzito_at DATETIME DEFAULT NULL, vytvoril_iduser INT, vytvoreno TIMESTAMP DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (user_iduser) REFERENCES user(iduser) ON DELETE CASCADE) ENGINE=InnoDB")
+        # `skupina` = OZ/ASM napevno pro daný odkaz; NULL bere globální nastavení.
+        cursor.execute("CREATE TABLE IF NOT EXISTS kviz_pristupy (id INT AUTO_INCREMENT PRIMARY KEY, token VARCHAR(64) NOT NULL UNIQUE, user_iduser INT NULL, host_jmeno VARCHAR(100) DEFAULT NULL, host_prijmeni VARCHAR(100) DEFAULT NULL, skupina VARCHAR(10) DEFAULT NULL, platnost_od DATETIME NOT NULL, platnost_do DATETIME NOT NULL, pouzito_at DATETIME DEFAULT NULL, vytvoril_iduser INT, vytvoreno TIMESTAMP DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (user_iduser) REFERENCES user(iduser) ON DELETE CASCADE) ENGINE=InnoDB")
+        try: cursor.execute("ALTER TABLE kviz_pristupy ADD COLUMN skupina VARCHAR(10) DEFAULT NULL")
+        except Exception: pass
         try: cursor.execute("ALTER TABLE kviz_pristupy MODIFY COLUMN user_iduser INT NULL")
         except Exception: pass
         try: cursor.execute("ALTER TABLE kviz_pristupy ADD COLUMN host_jmeno VARCHAR(100) DEFAULT NULL")
@@ -2345,14 +2353,14 @@ def smaz_uzivatele(email):
         if conn: conn.close()
 
 
-def uloz_vysledek_kvizu(user_id, stav, uspesnost, body, doba, historie_odpovedi=None, host_jmeno=None, host_prijmeni=None):
+def uloz_vysledek_kvizu(user_id, stav, uspesnost, body, doba, historie_odpovedi=None, host_jmeno=None, host_prijmeni=None, pristup_token=None):
     conn = get_db_connection()
     if not conn: return False
     cursor = None
     try:
         cursor = conn.cursor(buffered=True)
-        cursor.execute("INSERT INTO vysledky_kvizu (user_iduser, stav_testu, uspesnost, body, doba_trvani, host_jmeno, host_prijmeni) VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                       (user_id, stav, uspesnost, body, doba, host_jmeno, host_prijmeni))
+        cursor.execute("INSERT INTO vysledky_kvizu (user_iduser, stav_testu, uspesnost, body, doba_trvani, host_jmeno, host_prijmeni, pristup_token) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                       (user_id, stav, uspesnost, body, doba, host_jmeno, host_prijmeni, pristup_token))
         vysledek_id = cursor.lastrowid
         if historie_odpovedi:
             for o in historie_odpovedi:
@@ -2369,18 +2377,24 @@ def uloz_vysledek_kvizu(user_id, stav, uspesnost, body, doba, historie_odpovedi=
 # Token je náhodný řetězec v URL; kdo ho má, píše test jménem přiřazeného
 # uživatele a jen v okně platnosti. Žádná jiná práva z něj neplynou.
 
-def vytvor_kviz_pristupy(user_ids, platnost_od, platnost_do, vytvoril_id=None):
+def _osetri_skupinu(skupina):
+    """'oz'/'asm' nebo None (= odkaz jede podle globálního nastavení)."""
+    s = (skupina or '').strip().lower()
+    return s if s in ('oz', 'asm') else None
+
+def vytvor_kviz_pristupy(user_ids, platnost_od, platnost_do, vytvoril_id=None, skupina=None):
     """Založí jeden token pro každé user_id. Vrací [(token, user_id), ...]."""
     conn = get_db_connection()
     if not conn: return []
     cursor = None
+    skupina = _osetri_skupinu(skupina)
     try:
         cursor = conn.cursor(buffered=True)
         vysledek = []
         for uid in user_ids:
             token = _secrets.token_urlsafe(24)
-            cursor.execute("INSERT INTO kviz_pristupy (token, user_iduser, platnost_od, platnost_do, vytvoril_iduser) VALUES (%s, %s, %s, %s, %s)",
-                           (token, uid, platnost_od, platnost_do, vytvoril_id))
+            cursor.execute("INSERT INTO kviz_pristupy (token, user_iduser, platnost_od, platnost_do, vytvoril_iduser, skupina) VALUES (%s, %s, %s, %s, %s, %s)",
+                           (token, uid, platnost_od, platnost_do, vytvoril_id, skupina))
             vysledek.append((token, uid))
         conn.commit()
         return vysledek
@@ -2391,19 +2405,20 @@ def vytvor_kviz_pristupy(user_ids, platnost_od, platnost_do, vytvoril_id=None):
         if cursor: cursor.close()
         if conn: conn.close()
 
-def vytvor_anonymni_pristupy(pocet, platnost_od, platnost_do, vytvoril_id=None):
+def vytvor_anonymni_pristupy(pocet, platnost_od, platnost_do, vytvoril_id=None, skupina=None):
     """Tokeny bez vazby na `user` — jméno si zkoušený vyplní až při vstupu.
     Vrací [token, ...]."""
     conn = get_db_connection()
     if not conn: return []
     cursor = None
+    skupina = _osetri_skupinu(skupina)
     try:
         cursor = conn.cursor(buffered=True)
         vysledek = []
         for _ in range(max(1, int(pocet))):
             token = _secrets.token_urlsafe(24)
-            cursor.execute("INSERT INTO kviz_pristupy (token, user_iduser, platnost_od, platnost_do, vytvoril_iduser) VALUES (%s, NULL, %s, %s, %s)",
-                           (token, platnost_od, platnost_do, vytvoril_id))
+            cursor.execute("INSERT INTO kviz_pristupy (token, user_iduser, platnost_od, platnost_do, vytvoril_iduser, skupina) VALUES (%s, NULL, %s, %s, %s, %s)",
+                           (token, platnost_od, platnost_do, vytvoril_id, skupina))
             vysledek.append(token)
         conn.commit()
         return vysledek
@@ -2444,7 +2459,7 @@ def over_kviz_pristup(token):
     try:
         cursor = conn.cursor(dictionary=True, buffered=True)
         cursor.execute("""SELECT p.id, p.user_iduser, p.platnost_do, p.pouzito_at,
-                                 p.host_jmeno, p.host_prijmeni,
+                                 p.host_jmeno, p.host_prijmeni, p.skupina,
                                  u.name, u.surname, u.email, u.is_active
                           FROM kviz_pristupy p LEFT JOIN user u ON u.iduser = p.user_iduser
                           WHERE p.token = %s AND NOW() BETWEEN p.platnost_od AND p.platnost_do""", (token,))
@@ -2460,43 +2475,106 @@ def over_kviz_pristup(token):
         prijmeni = r['host_prijmeni'] if anonymni else r['surname']
         return {'user_id': r['user_iduser'], 'anonymni': anonymni,
                 'jmeno': f"{jmeno} {prijmeni}" if jmeno and prijmeni else None,
-                'krestni': jmeno, 'prijmeni': prijmeni,
+                'krestni': jmeno, 'prijmeni': prijmeni, 'skupina': _osetri_skupinu(r.get('skupina')),
                 'email': r['email'], 'platnost_do': r['platnost_do']}
     except Exception: return None
     finally:
         if cursor: cursor.close()
         if conn: conn.close()
 
-def seznam_kviz_pristupu(limit=200):
-    """Poslední vygenerované přístupy včetně propadlých (pro admin přehled)."""
+def stav_kviz_pristupu(token):
+    """Stav okna platnosti pro hlášku na vstupní stránce, bez ohledu na to, jestli
+    token pustí dovnitř: {'stav': 'ceka'|'bezi'|'propadlo', 'platnost_od', 'platnost_do'}.
+    None = token neexistuje (zrušený nebo vymyšlený)."""
+    if not token: return None
+    conn = get_db_connection()
+    if not conn: return None
+    cursor = None
+    try:
+        cursor = conn.cursor(dictionary=True, buffered=True)
+        cursor.execute("""SELECT p.platnost_od, p.platnost_do,
+                                 NOW() < p.platnost_od AS ceka,
+                                 NOW() > p.platnost_do AS propadlo
+                          FROM kviz_pristupy p WHERE p.token = %s""", (token,))
+        r = cursor.fetchone()
+        if not r: return None
+        stav = 'ceka' if r['ceka'] else ('propadlo' if r['propadlo'] else 'bezi')
+        return {'stav': stav, 'platnost_od': r['platnost_od'], 'platnost_do': r['platnost_do']}
+    except Exception: return None
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
+
+def seznam_kviz_pristupu(vytvoril_id=None, limit=200):
+    """Poslední vygenerované přístupy včetně propadlých. vytvoril_id = jen
+    odkazy, které ten člověk sám vygeneroval; None = všechny (admin)."""
     conn = get_db_connection()
     if not conn: return []
     cursor = None
     try:
         cursor = conn.cursor(dictionary=True, buffered=True)
-        cursor.execute("""SELECT p.id, p.token, p.user_iduser, p.platnost_od, p.platnost_do,
-                                 p.pouzito_at, p.vytvoreno,
+        kde = "WHERE p.vytvoril_iduser = %s" if vytvoril_id else ""
+        params = ([int(vytvoril_id)] if vytvoril_id else []) + [int(limit)]
+        cursor.execute(f"""SELECT p.id, p.token, p.user_iduser, p.platnost_od, p.platnost_do,
+                                 p.pouzito_at, p.vytvoreno, p.skupina,
                                  COALESCE(u.name, p.host_jmeno) AS name,
                                  COALESCE(u.surname, p.host_prijmeni) AS surname,
                                  p.user_iduser IS NULL AS anonymni,
-                                 NOW() BETWEEN p.platnost_od AND p.platnost_do AS je_platny
+                                 NOW() BETWEEN p.platnost_od AND p.platnost_do AS je_platny,
+                                 NOW() < p.platnost_od AS ceka,
+                                 v.stav_testu AS vysledek_stav, v.uspesnost AS vysledek_uspesnost
                           FROM kviz_pristupy p LEFT JOIN user u ON u.iduser = p.user_iduser
-                          ORDER BY p.vytvoreno DESC, p.id DESC LIMIT %s""", (int(limit),))
+                          LEFT JOIN vysledky_kvizu v ON v.id = (SELECT x.id FROM vysledky_kvizu x
+                                                                WHERE x.pristup_token = p.token
+                                                                ORDER BY x.datum DESC, x.id DESC LIMIT 1)
+                          {kde}
+                          ORDER BY p.vytvoreno DESC, p.id DESC LIMIT %s""", tuple(params))
         return cursor.fetchall()
     except Exception: return []
     finally:
         if cursor: cursor.close()
         if conn: conn.close()
 
-def zrus_kviz_pristup(pristup_id):
+def vysledky_kviz_pristupu(vytvoril_id=None, limit=500):
+    """Výsledky testů psaných přes hostovské odkazy. vytvoril_id = jen odkazy,
+    které ten člověk sám vygeneroval; None = všechny (admin)."""
+    conn = get_db_connection()
+    if not conn: return []
+    cursor = None
+    try:
+        cursor = conn.cursor(dictionary=True, buffered=True)
+        kde = "WHERE p.vytvoril_iduser = %s" if vytvoril_id else ""
+        params = ([int(vytvoril_id)] if vytvoril_id else []) + [int(limit)]
+        cursor.execute(f"""SELECT v.id, v.stav_testu, v.uspesnost, v.body, v.doba_trvani, v.datum,
+                                  COALESCE(u.name, v.host_jmeno) AS name,
+                                  COALESCE(u.surname, v.host_prijmeni) AS surname,
+                                  p.skupina, p.platnost_od, p.platnost_do,
+                                  p.user_iduser IS NULL AS anonymni
+                           FROM vysledky_kvizu v
+                           JOIN kviz_pristupy p ON p.token = v.pristup_token
+                           LEFT JOIN user u ON u.iduser = v.user_iduser
+                           {kde}
+                           ORDER BY v.datum DESC, v.id DESC LIMIT %s""", tuple(params))
+        return cursor.fetchall()
+    except Exception: return []
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
+
+def zrus_kviz_pristup(pristup_id, vytvoril_id=None):
+    """vytvoril_id = smaže jen vlastní odkaz; None = bez omezení (admin)."""
     conn = get_db_connection()
     if not conn: return False
     cursor = None
     try:
         cursor = conn.cursor(buffered=True)
-        cursor.execute("DELETE FROM kviz_pristupy WHERE id = %s", (int(pristup_id),))
+        if vytvoril_id:
+            cursor.execute("DELETE FROM kviz_pristupy WHERE id = %s AND vytvoril_iduser = %s",
+                           (int(pristup_id), int(vytvoril_id)))
+        else:
+            cursor.execute("DELETE FROM kviz_pristupy WHERE id = %s", (int(pristup_id),))
         conn.commit()
-        return True
+        return cursor.rowcount > 0
     except Exception: return False
     finally:
         if cursor: cursor.close()
