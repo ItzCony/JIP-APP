@@ -163,7 +163,7 @@ ZAKLADNI_PRAVA = {
 
     # -- Modul Manuály - online čtečka firemních manuálů --
     'manualy_ctenar': {'kategorie': 'Modul Manuály', 'nazev': 'Čtenář', 'popis': 'Čte manuál online — listuje kapitolami, hledá v textu. Nesmí nahrávat novou verzi.', 'ikona': 'menu_book'},
-    'manualy_admin':  {'kategorie': 'Modul Manuály', 'nazev': 'Správce', 'popis': 'Vše co čtenář + nahrává novou verzi manuálu (DOCX). Nahráním se přepíše celý obsah včetně obrázků.', 'ikona': 'upload_file'},
+    'manualy_admin':  {'kategorie': 'Modul Manuály', 'nazev': 'Správce', 'popis': 'Vše co čtenář + edituje kapitoly přímo v aplikaci, vrací starší verze a nahrává nový DOCX. Každý zásah jde do logu.', 'ikona': 'upload_file'},
 
     'gastrokurzy_spravce':     {'kategorie': 'Modul Gastrokurzy', 'nazev': 'Správce kurzů', 'popis': 'Zakládá a edituje kurzy, jejich termíny a lektory, zapisuje prezenci a manipuluje s přihlášenými lidmi.', 'ikona': 'manage_accounts'},
     'gastrokurzy_zapisovatel': {'kategorie': 'Modul Gastrokurzy', 'nazev': 'Zapisovatel (ASM / vedoucí pobočky)', 'popis': 'Zapisuje pozvané zákazníky na kurzy a ruší zápisy. Nemůže měnit termíny kurzů.', 'ikona': 'person_add'},
