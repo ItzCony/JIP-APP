@@ -1,8 +1,0 @@
-{
-    "host": "localhost",
-    "port": "3306",
-    "user": "spravce",
-    "pass": "Dochazka@26",
-    "db": "firemni_portal",
-    "enabled": true
-}
