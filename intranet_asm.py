@@ -23,6 +23,7 @@ Mapování zdrojových dat (potvrzeno):
 """
 import asyncio
 import datetime
+import hashlib
 import io
 import json
 import os
@@ -3794,10 +3795,39 @@ def _oz_denni_zabral() -> bool:
         conn.close()
 
 
+def _oz_otisk_zmenen(problemy: list) -> bool:
+    """Zapíše otisk dnešního seznamu nesrovnalostí a vrátí, zda se od minule změnil.
+
+    Neshoda trvá, dokud ji někdo nespraví — bez téhle paměti dostávali analytici
+    každé ráno tentýž e-mail. Otisk se zapisuje i pro prázdný seznam: když se
+    stejná neshoda za týden vrátí, e-mail musí přijít znovu.
+    """
+    otisk = hashlib.md5("\n".join(sorted(problemy)).encode("utf-8")).hexdigest()
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return True          # bez DB radši poslat, než zamlčet
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT nova_hodnota FROM asm_oz_log WHERE zaznam_id=0 "
+                    "AND akce='denni_otisk' ORDER BY id DESC LIMIT 1")
+        r = cur.fetchone()
+        _oz_log(cur, 0, "systém", "denni_otisk", pole=f"{len(problemy)} neshod",
+                nova=otisk)
+        conn.commit()
+        cur.close()
+        return not r or r[0] != otisk
+    except Exception as e:
+        print(f"[asm] otisk denní kontroly OZ: {e}")
+        return True
+    finally:
+        conn.close()
+
+
 async def bg_oz_denni():
     """Denní automat evidence OZ (bod 4 a 8 zadání): ráno přepočítá „Aktivní OZ"
     (nástup dnes → Ano, ukončení dnes → Ne) a porovná záznamy s číselníkem karet.
-    Neshody pošle souhrnem analytikům — jinak mlčí."""
+    Neshody pošle souhrnem analytikům — a jen když se seznam od minule změnil
+    (nová/zmizelá neshoda). Beze změny mlčí, ať pošta není denní šum."""
     global _OZ_POSLEDNI_BEH
     await asyncio.sleep(180)
     while True:
@@ -3814,12 +3844,14 @@ async def bg_oz_denni():
                 souhrn = await asyncio.to_thread(kontrola_oz_proti_kartam)
                 if zmeneno:
                     print(f"[asm] přepočet aktivních OZ: {zmeneno} změn")
-                problemy = (souhrn.get("neshoda") or []) + (souhrn.get("neni") or [])
-                if problemy:
-                    text = ("Kontrola evidence OZ proti číselníku karet (Dealer):\n\n"
-                            + "\n".join(f"  • {x}" for x in problemy[:100]))
-                    _odesli_emaily(_emaily_s_pravy("asm_oz_analytik"),
-                                   "Nesrovnalosti v evidenci OZ", text)
+                if souhrn:      # prázdný dict = kontrola spadla, otisk nepřepisovat
+                    problemy = (souhrn.get("neshoda") or []) + (souhrn.get("neni") or [])
+                    zmena = await asyncio.to_thread(_oz_otisk_zmenen, problemy)
+                    if problemy and zmena:
+                        text = ("Kontrola evidence OZ proti číselníku karet (Dealer):\n\n"
+                                + "\n".join(f"  • {x}" for x in problemy[:100]))
+                        _odesli_emaily(_emaily_s_pravy("asm_oz_analytik"),
+                                       "Nesrovnalosti v evidenci OZ", text)
         except Exception as e:
             print(f"[bg_oz_denni] Chyba: {e}")
         await asyncio.sleep(300)
