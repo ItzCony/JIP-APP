@@ -11,7 +11,8 @@ Dvojklik na termín (resp. tlačítko „Prezenční listina") otevře prezenčk
 ASM/vedoucí pobočky zapisuje pozvané zákazníky: OZ, IČO, jméno, funkce, telefon
 (nepovinný) a podpis (dá se doplnit až v den kurzu). Místo, datum, kurz i pobočka
 se doplní podle termínu. Zrušený zápis se nemaže – zůstane přeškrtnutý s údajem
-kdo a kdy ho zrušil.
+kdo a kdy ho zrušil. Tlačítko „+1" přidá kopii posledního řádku formuláře (bez jména
+a podpisu) – u dalších osob ze stejné provozovny stačí doplnit jméno.
 
 Práva:
   gastrokurzy_spravce      – zakládá/edituje termíny, zapisuje za kohokoliv, ruší zápisy
@@ -559,32 +560,49 @@ def _smaz_termin(termin_id):
         conn.close()
 
 
-def _uloz_prihlasku(data, prihlaska_id=None):
+def _uloz_prihlasku(data, prihlaska_id):
     conn = intranet_data.get_db_connection()
     if not conn:
         return False
     cur = conn.cursor()
     try:
-        if prihlaska_id:
-            cur.execute("""UPDATE gastrokurzy_prihlaska
-                  SET pobocka_klic=%s, oz=%s, ico=%s, provozovna=%s, zakaznik=%s,
-                      funkce=%s, telefon=%s, podpis=%s
-                  WHERE id=%s""",
-                        (data['pobocka_klic'], data['oz'], data['ico'], data['provozovna'],
-                         data['zakaznik'], data['funkce'], data['telefon'],
-                         int(data['podpis']), prihlaska_id))
-        else:
-            cur.execute("""INSERT INTO gastrokurzy_prihlaska
-                  (termin_id, pobocka_klic, oz, ico, provozovna, zakaznik,
-                   funkce, telefon, podpis, zapsal)
-                  VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                        (data['termin_id'], data['pobocka_klic'], data['oz'], data['ico'],
-                         data['provozovna'], data['zakaznik'], data['funkce'],
-                         data['telefon'], int(data['podpis']), data['zapsal']))
+        cur.execute("""UPDATE gastrokurzy_prihlaska
+              SET pobocka_klic=%s, oz=%s, ico=%s, provozovna=%s, zakaznik=%s,
+                  funkce=%s, telefon=%s, podpis=%s
+              WHERE id=%s""",
+                    (data['pobocka_klic'], data['oz'], data['ico'], data['provozovna'],
+                     data['zakaznik'], data['funkce'], data['telefon'],
+                     int(data['podpis']), prihlaska_id))
         conn.commit()
         return True
     except Exception as e:
         print(f"[gastrokurzy] Uložení přihlášky: {e}")
+        return False
+    finally:
+        cur.close()
+        conn.close()
+
+
+def _zapis_prihlasky(zaznamy):
+    """Zapíše nové přihlášky v jedné transakci – buď všechny, nebo žádnou
+    (zákazník + další účastníci ze stejné provozovny)."""
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return False
+    cur = conn.cursor()
+    try:
+        cur.executemany("""INSERT INTO gastrokurzy_prihlaska
+              (termin_id, pobocka_klic, oz, ico, provozovna, zakaznik,
+               funkce, telefon, podpis, zapsal)
+              VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                        [(d['termin_id'], d['pobocka_klic'], d['oz'], d['ico'],
+                          d['provozovna'], d['zakaznik'], d['funkce'],
+                          d['telefon'], int(d['podpis']), d['zapsal']) for d in zaznamy])
+        conn.commit()
+        return True
+    except Exception as e:
+        conn.rollback()
+        print(f"[gastrokurzy] Zápis přihlášek: {e}")
         return False
     finally:
         cur.close()
@@ -843,7 +861,9 @@ def vykresli(user_id, user_name, vsechna_prava):
         zruseny_termin = t['stav'] == 'zruseno'
         editovat = muze_zapisovat and not zruseny_termin
 
-        with ui.dialog() as dlg, ui.card().classes('p-0 gap-0').style(
+        # Dialog visí mimo _panel — _obnov() volá _panel.refresh(), který by ho
+        # jinak smazal i s otevřenou prezenčkou (zrušení/zápis ji zavíral).
+        with ui.context.client.layout, ui.dialog() as dlg, ui.card().classes('p-0 gap-0').style(
                 'min-width: 1100px; max-width: 1400px; max-height: 90vh; overflow-y: auto'):
 
             # --- hlavička: údaje se doplňují automaticky z termínu ---
@@ -874,49 +894,85 @@ def vykresli(user_id, user_name, vsechna_prava):
                 with ui.column().classes('w-full px-6 py-4 gap-2 bg-gray-50 border-b'):
                     ui.label('Přidat pozvaného zákazníka').classes(
                         'text-xs font-black text-gray-500 uppercase tracking-wide')
-                    with ui.row().classes('w-full items-center gap-2'):
-                        pob_i = ui.select({k: n for k, n in POBOCKY}, label='Pobočka *',
-                                          value=app.storage.user.get(posledni_pobocka_key, 'praha')
-                                          ).props('outlined dense').classes('w-40')
-                        oz_i = ui.input('OZ (kdo zve) *').props('outlined dense').classes('w-40')
-                        ico_i = ui.input('IČO zákazníka *').props('outlined dense').classes('w-32')
-                        prov_i = ui.input('Provozovna').props('outlined dense').classes('flex-1 min-w-40')
-                        jm_i = ui.input('Jméno zákazníka *').props('outlined dense').classes('flex-1 min-w-48')
-                        fce_i = ui.input('Funkce *').props('outlined dense').classes('w-40')
-                        tel_i = ui.input('Telefon').props('outlined dense').classes('w-36')
-                        pod_i = ui.checkbox('Podpis')
+                    # každý řádek = jeden zápis; „+1“ přidá kopii posledního řádku
+                    # (jméno a podpis zůstanou prázdné – jde o jinou osobu)
+                    radky = []
+                    radky_box = ui.column().classes('w-full gap-2')
 
-                        async def _pridej():
-                            chybi = [lbl for lbl, el in (('Pobočka', pob_i), ('OZ', oz_i), ('IČO', ico_i),
-                                                         ('Jméno', jm_i), ('Funkce', fce_i))
-                                     if not str(el.value or '').strip()]
-                            if chybi:
-                                ui.notify('Vyplňte: ' + ', '.join(chybi), type='warning')
-                                return
-                            volno = _volna_mista(t, ref['data'])
-                            if volno is not None and volno <= 0:
-                                ui.notify('Kurz je plně obsazen.', type='negative')
-                                return
-                            ok = await asyncio.to_thread(_uloz_prihlasku, {
-                                'termin_id': t['id'], 'pobocka_klic': pob_i.value,
-                                'oz': str(oz_i.value).strip(), 'ico': str(ico_i.value).strip(),
-                                'provozovna': str(prov_i.value or '').strip(),
-                                'zakaznik': str(jm_i.value).strip(), 'funkce': str(fce_i.value).strip(),
-                                'telefon': str(tel_i.value or '').strip(), 'podpis': pod_i.value,
-                                'zapsal': user_name})
-                            if not ok:
-                                ui.notify('Zápis se nepodařilo uložit.', type='negative')
-                                return
-                            app.storage.user[posledni_pobocka_key] = pob_i.value
-                            intranet_logger.log_activity(
-                                user_name, LOG_KATEGORIE,
-                                f"Zápis na kurz {t['nazev']} ({t['misto']} {_fmt_datum(t['datum'])}): "
-                                f"{jm_i.value} – {POBOCKY_NAZVY.get(pob_i.value, pob_i.value)}")
-                            for el in (oz_i, ico_i, prov_i, jm_i, fce_i, tel_i):
-                                el.value = ''
-                            pod_i.value = False
-                            await _obnov()
+                    def _novy_radek(vzor=None):
+                        v = vzor or {}
+                        with radky_box, ui.row().classes('w-full items-center gap-2') as radek:
+                            r = {
+                                'pobocka_klic': ui.select(
+                                    {k: n for k, n in POBOCKY}, label='Pobočka *',
+                                    value=v.get('pobocka_klic') or app.storage.user.get(posledni_pobocka_key, 'praha')
+                                ).props('outlined dense').classes('w-40'),
+                                'oz': ui.input('OZ (kdo zve) *', value=v.get('oz', '')).props(
+                                    'outlined dense').classes('w-40'),
+                                'ico': ui.input('IČO zákazníka *', value=v.get('ico', '')).props(
+                                    'outlined dense').classes('w-32'),
+                                'provozovna': ui.input('Provozovna', value=v.get('provozovna', '')).props(
+                                    'outlined dense').classes('flex-1 min-w-40'),
+                                'zakaznik': ui.input('Jméno zákazníka *').props(
+                                    'outlined dense' + (' autofocus' if vzor else '')).classes('flex-1 min-w-48'),
+                                'funkce': ui.input('Funkce *', value=v.get('funkce', '')).props(
+                                    'outlined dense').classes('w-40'),
+                                'telefon': ui.input('Telefon', value=v.get('telefon', '')).props(
+                                    'outlined dense').classes('w-36'),
+                                'podpis': ui.checkbox('Podpis'),
+                            }
+                            radky.append(r)
 
+                            def _odeber():
+                                radky.remove(r)
+                                radek.delete()
+                            # první řádek nejde odebrat; neviditelné tlačítko drží zarovnání sloupců
+                            ui.button(icon='close', on_click=_odeber).props(
+                                'flat round dense size=sm color=grey').tooltip('Odebrat řádek').classes(
+                                '' if vzor else 'invisible')
+
+                    _novy_radek()
+
+                    async def _pridej():
+                        povinne = (('Pobočka', 'pobocka_klic'), ('OZ', 'oz'), ('IČO', 'ico'),
+                                   ('Jméno', 'zakaznik'), ('Funkce', 'funkce'))
+                        chybi = []
+                        for i, r in enumerate(radky, 1):
+                            pole = [lbl for lbl, k in povinne if not str(r[k].value or '').strip()]
+                            if pole:
+                                chybi.append((f'řádek {i} – ' if len(radky) > 1 else '') + ', '.join(pole))
+                        if chybi:
+                            ui.notify('Vyplňte: ' + '; '.join(chybi), type='warning')
+                            return
+                        zaznamy = [{'termin_id': t['id'], 'zapsal': user_name,
+                                    'pobocka_klic': r['pobocka_klic'].value, 'podpis': bool(r['podpis'].value),
+                                    **{k: str(r[k].value or '').strip() for k in
+                                       ('oz', 'ico', 'provozovna', 'zakaznik', 'funkce', 'telefon')}}
+                                   for r in radky]
+                        volno = _volna_mista(t, ref['data'])
+                        if volno is not None and volno < len(zaznamy):
+                            ui.notify('Kurz je plně obsazen.' if volno <= 0 else
+                                      f'Volná místa: {volno}, zapisujete {len(zaznamy)}.', type='negative')
+                            return
+                        if not await asyncio.to_thread(_zapis_prihlasky, zaznamy):
+                            ui.notify('Zápis se nepodařilo uložit.', type='negative')
+                            return
+                        app.storage.user[posledni_pobocka_key] = zaznamy[0]['pobocka_klic']
+                        pobocky = dict.fromkeys(POBOCKY_NAZVY.get(z['pobocka_klic'], z['pobocka_klic'])
+                                                for z in zaznamy)
+                        intranet_logger.log_activity(
+                            user_name, LOG_KATEGORIE,
+                            f"Zápis na kurz {t['nazev']} ({t['misto']} {_fmt_datum(t['datum'])}): "
+                            f"{', '.join(z['zakaznik'] for z in zaznamy)} – {', '.join(pobocky)}")
+                        radky.clear()
+                        radky_box.clear()
+                        _novy_radek()
+                        await _obnov()
+
+                    with ui.row().classes('w-full justify-end gap-2'):
+                        ui.button('+1', on_click=lambda: _novy_radek({k: el.value for k, el in radky[-1].items()})
+                                  ).props('outline color=primary').classes('font-bold').tooltip(
+                            'Další osoba – zkopíruje poslední řádek, stačí doplnit jméno')
                         ui.button('Zapsat', icon='person_add', on_click=_pridej).props(
                             'unelevated color=primary').classes('font-bold')
 
@@ -1056,6 +1112,7 @@ def vykresli(user_id, user_name, vsechna_prava):
                 _panel.refresh()
 
             _seznam()
+        dlg.on('hide', dlg.delete)
         dlg.open()
 
     # =================================================================
