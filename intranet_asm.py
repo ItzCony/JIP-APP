@@ -117,6 +117,8 @@ _SEKCE_IDENT_NAVYSENI = ("1. Obecné informace a identifikace", [
 _FORMULARE = {
     "limity": {
         "nazev": "Navýšení limitů a splatností", "emoji": "💳", "barva": "border-amber-200",
+        # Povinná pole (v UI označená „ *", kontroluje _chyba_formulare).
+        "povinne": {"pravni_forma", "smlouva_zajisteni", "zduvodneni"},
         "sekce": [
             _SEKCE_IDENT_LIMITY,
             ("3. Současný stav a ekonomické ukazatele", [
@@ -137,6 +139,8 @@ _FORMULARE = {
     },
     "dodaci": {
         "nazev": "Změna splatnosti dodacích listů", "emoji": "🚚", "barva": "border-cyan-200",
+        "povinne": {"rezim_fakturace", "el_fakturace", "splatnost1_akt", "splatnost2_akt",
+                    "navrh_splatnost1", "navrh_splatnost2", "zduvodneni"},
         "sekce": [
             _SEKCE_IDENT,
             ("2. Specifické údaje pro Dodací listy (DL)", [
@@ -158,13 +162,15 @@ _FORMULARE = {
     },
     "navyseni": {
         "nazev": "Navýšení položek v cenotvorbě", "emoji": "🧾", "barva": "border-violet-200",
+        "povinne": {"akt_pocet_polozek", "navrh_pocet_polozek", "zduvodneni"},
         "sekce": [
             _SEKCE_IDENT_NAVYSENI,
+            # number: (key, label, "number", minimum, výchozí) — CRM má standardně 250 položek.
             ("2. Původní stav", [
-                ("akt_pocet_polozek", "Aktuální počet položek", "number"),
+                ("akt_pocet_polozek", "Aktuální počet položek", "number", 250, 250),
             ]),
             ("3. Žádost o navýšení", [
-                ("navrh_pocet_polozek", "Navýšení počtu položek na", "number"),
+                ("navrh_pocet_polozek", "Navýšení počtu položek na", "number", 250),
                 ("zduvodneni",          "Zdůvodnění žádosti",       "textarea"),
             ]),
         ],
@@ -267,11 +273,17 @@ def _ico_auto_hodnoty(k, o=None, maskovat_obrat=False):
     return out
 
 
-def _chyba_cisel(formular, data):
-    """Kontrola polí typu „number“ — povinná, celé nezáporné číslo.
+def _chyba_formulare(formular, data):
+    """Kontrola povinných polí (cfg „povinne“) a polí typu „number“ — ta jsou
+    povinná vždy, celé nezáporné číslo.
     Vrací text chyby, nebo None když je vše v pořádku."""
+    povinne = _FORMULARE[formular].get("povinne", ())
     for spec in _formular_pole(formular):
         key, label, typ = spec[0], spec[1], spec[2]
+        if key in povinne and not str(data.get(key) or "").strip():
+            if typ == "auto":   # žadatel ho nevyplňuje — dotahuje se dle IČO
+                return f"„{label}“ se nedotáhlo z kontaktů — zkontrolujte IČO."
+            return f"Vyplňte „{label}“."
         if typ != "number":
             continue
         v = str(data.get(key) or "").strip().replace(" ", "").replace("\u00a0", "")
@@ -279,6 +291,9 @@ def _chyba_cisel(formular, data):
             return f"Vyplňte „{label}“."
         if not v.isdigit():
             return f"„{label}“ musí být celé číslo."
+        minimum = spec[3] if len(spec) > 3 else 0
+        if int(v) < minimum:
+            return f"„{label}“ musí být alespoň {minimum}."
     return None
 
 
@@ -2063,6 +2078,8 @@ Tato sekce se doplní automaticky z evidence (aktuální kreditní limit, aktuá
 - **Návrh nové splatnosti 1 (zboží)** a **Návrh nové splatnosti 2 (cigarety)** – zadejte počet dnů.
 - **Zdůvodnění požadované změny / žádosti** – vysvětlete, proč o navýšení žádáte.
 
+Povinná pole jsou označena hvězdičkou (*): **Právní forma**, **Smlouva se zajištěním / ručením** a **Zdůvodnění požadované změny / žádosti**. Bez jejich vyplnění žádost nepůjde odeslat.
+
 ### 5.5 Odeslání a sledování žádosti
 
 Klikněte na „Odeslat“. Žádost se zařadí do fronty pod číslem ve formátu ASM000xx se jménem zákazníka, IČO a aktuálním stavem.
@@ -2102,6 +2119,8 @@ Stejně jako u navýšení limitů zadejte IČO zákazníka a stiskněte Tab/Ent
 
 - **Splatnost 1 (zboží)** a **Splatnost 2 (cigarety)** – aktuální hodnoty (sekce 3).
 - **Návrh nové splatnosti 1 a 2** a **Zdůvodnění požadované změny / žádosti** (sekce 4).
+
+Všechna pole sekcí 2–4 jsou povinná a mají u popisku hvězdičku (*). Bez jejich vyplnění žádost nepůjde odeslat. Aktuální splatnosti se doplní samy podle IČO.
 
 ### 6.5 Odeslání a sledování žádosti
 
@@ -4310,12 +4329,15 @@ def _render_form_pole(formular, hodnoty, editable, auto_editovatelne=False,
     # a obrat_real (přesná, skrytá); obrat_widgets jsou readonly pole s porovnáním.
     obrat_widgets = {}
     obrat_hodnoty = {k: hodnoty.get(k, "") for k in ("obrat_1m", "obrat_3m")}
+    povinne = _FORMULARE[formular].get("povinne", ())
     for nadpis, pola in _FORMULARE[formular]["sekce"]:
         ui.label(nadpis).classes("text-sm font-semibold text-gray-500 uppercase mt-2")
         with ui.row().classes("w-full gap-3 flex-wrap items-start"):
             for spec in pola:
                 key, label, typ = spec[0], spec[1], spec[2]
                 val = hodnoty.get(key, "")
+                if editable and key in povinne:
+                    label += " *"
                 if not editable:
                     # Detail případu: částka obratu se nezobrazuje, jen porovnání
                     # s aktuálním kreditním limitem (tabulka IČ 10 níže je beze změny).
@@ -4349,8 +4371,11 @@ def _render_form_pole(formular, hodnoty, editable, auto_editovatelne=False,
                             else "Dotaženo automaticky podle IČO")
                     auto_refs[key] = w
                 elif typ == "number":
+                    minimum = spec[3] if len(spec) > 3 else 0
+                    if val in (None, "") and len(spec) > 4:
+                        val = str(spec[4])
                     w = ui.input(label, value=val) \
-                        .props("outlined dense type=number min=0").classes("min-w-56")
+                        .props(f"outlined dense type=number min={minimum}").classes("min-w-56")
                 else:   # ico / text
                     w = ui.input(label, value=val).props("outlined dense").classes("min-w-56")
                 widgets[key] = w
@@ -4706,7 +4731,7 @@ def _formular_novy_obecny(formular, user_id, user_name, prava, zpet_fn):
             if not (data.get("ico") or "").strip():
                 ui.notify("Vyplňte IČO zákazníka.", type="warning")
                 return
-            chyba = _chyba_cisel(formular, data)
+            chyba = _chyba_formulare(formular, data)
             if chyba:
                 ui.notify(chyba, type="warning")
                 return
@@ -5677,7 +5702,7 @@ def _detail_dialog(pid, user_id, user_name, prava):
                             ok = uloz_radky(pid, radky)
                         elif cti_form:
                             _d = cti_form()
-                            chyba = _chyba_cisel(formular, _d)
+                            chyba = _chyba_formulare(formular, _d)
                             if chyba:
                                 ui.notify(chyba, type="warning"); return
                             ok = uloz_data_formular(pid, _d)
