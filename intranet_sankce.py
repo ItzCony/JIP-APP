@@ -174,6 +174,21 @@ _MAPA_NEDODAVKY = {
 _CISLA_NEDODAVKY = {'rozdil_dodano_kc', 'odmitnuto_mj'}
 _DATUMY_NEDODAVKY = {'pozadovano', 'datum_zalozeni'}
 
+# Kontingenční tabulka (kopie listu „Souhrn") potřebuje CELÝ list „data" — i řádky,
+# které pevný filtr sestavy vyřadí —, aby šly filtry Stav příjemky / DCERA / STATUS
+# přepínat jako v Excelu. Ukládá se proto zvlášť a jen pro čtení (nic ručního).
+_NEDOD_KT_TABULKA = 'sankce_nedodavky_kt'
+_MAPA_NEDOD_KT = {
+    **_MAPA_NEDODAVKY,
+    'objednanomj':  'objednano_mj',
+    'dodanomj':     'dodano_mj',
+    'dcera':        'dcera',
+    'status':       'status',
+    'stavprijemky': 'stav_prijemky',
+    'odmitnuto':    'odmitnuto',
+}
+_CISLA_NEDOD_KT = _CISLA_NEDODAVKY | {'objednano_mj', 'dodano_mj'}
+
 # Sloupce, které v importovaném souboru chybět SMĚJÍ (import je nepovažuje za chybu).
 _VOLITELNE = {'nakupci_pob'}
 
@@ -207,6 +222,7 @@ _SESTAVA_IMPORT = {
         'rucni': ('vyjadreni', 'vyjadreni_by', 'vyjadreni_at'),
         'datumy': _DATUMY_NEDODAVKY,
         'filtr': {'dcera': 'ne', 'status': 'nedodano', 'stavprijemky': 'prijemka'},
+        'kt': _NEDOD_KT_TABULKA,    # + celý list do kontingenční tabulky
     },
 }
 
@@ -810,6 +826,25 @@ _EXP_NEDODAVKY_SOUHRN = [
     ('Vyjádření nákupčího', 'vyjadreni',      'text',  46),
 ]
 
+# Kontingenční tabulka = sloupce listu „Souhrn" (grid i export z jednoho místa).
+_EXP_NEDOD_KT = [
+    ('IČO',                     'ico',              'text',  18),
+    ('Jméno',                   'jmeno_dodavatele', 'text',  32),
+    ('Dodavatel-popis',         'dodavatel_popis',  'text',  26),
+    ('Kód zboží',               'kod_zbozi',        'text',  12),
+    ('Název zboží',             'nazev_zbozi',      'text',  40),
+    ('KOD 2',                   'kod2',             'text',   9),
+    ('Číslo obj.',              'cislo_obj',        'text',  12),
+    ('Pobočka',                 'pobocka',          'text',  18),
+    ('Požadováno',              'pozadovano',       'date',  12),
+    ('Dat. Založení z dokladu', 'datum_zalozeni',   'date',  13),
+    ('Objednáno MJ',            'objednano_mj',     'num',   13),
+    ('Dodáno MJ',               'dodano_mj',        'num',   12),
+    ('Rozdíl dodáno MJ',        'rozdil_dodano_mj', 'num',   14),
+    ('Rozdíl dodáno Kč',        'rozdil_dodano_kc', 'money', 16),
+    ('Odmítnuto MJ',            'odmitnuto_mj',     'num',   13),
+]
+
 _EXP_SOUHRN = [
     ('IČ',             'ico',              'text',  13),
     ('Dodavatel',      'jmeno_dodavatele', 'text',  40),
@@ -1256,6 +1291,34 @@ def inicializace_sankce_db():
                 imported_by VARCHAR(255),
                 INDEX idx_obdobi (obdobi), INDEX idx_hash (row_hash),
                 INDEX idx_nak (nak)
+            ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        """)
+        # Kontingenční tabulka Nedodávek — celý list „data" (bez pevného filtru),
+        # jen pro čtení; každý import období ji pro to období přepíše.
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {_NEDOD_KT_TABULKA} (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                obdobi VARCHAR(60),
+                ico VARCHAR(30),
+                jmeno_dodavatele VARCHAR(255),
+                dodavatel_popis VARCHAR(255),
+                kod_zbozi VARCHAR(40),
+                nazev_zbozi VARCHAR(255),
+                kod2 VARCHAR(40),
+                cislo_obj VARCHAR(40),
+                pobocka VARCHAR(60),
+                pozadovano DATE,
+                datum_zalozeni DATE,
+                objednano_mj DOUBLE,
+                dodano_mj DOUBLE,
+                rozdil_dodano_kc DOUBLE,
+                odmitnuto_mj DOUBLE,
+                nak VARCHAR(20),
+                dcera VARCHAR(20),
+                status VARCHAR(60),
+                stav_prijemky VARCHAR(60),
+                odmitnuto VARCHAR(20),
+                INDEX idx_obdobi (obdobi)
             ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
         """)
         # Zálohy / body obnovení sestav — celá tabulka jako JSON snímek.
@@ -2165,7 +2228,15 @@ def _excel_datum(v):
             return (datetime.date(1899, 12, 30) + datetime.timedelta(days=int(v))).isoformat()
         except (ValueError, OverflowError):
             return None
-    return _s(v) or None
+    # Text: jen rozpoznatelné datum. Cokoli jiného (např. „x" u řádků bez příjemky)
+    # by DATE sloupec v DB odmítl a shodil celý import.
+    s = _s(v)
+    for vzor in _DATUM_VZORY:
+        try:
+            return datetime.datetime.strptime(s, vzor).date().isoformat()
+        except ValueError:
+            continue
+    return None
 
 
 def _importuj_sync(raw: bytes, tabulka: str, mapa: dict, cisla: set,
@@ -2207,21 +2278,37 @@ def _importuj_sync(raw: bytes, tabulka: str, mapa: dict, cisla: set,
     if chybi_f:
         return 0, 0, 'V listu DATA chybí sloupce filtru: ' + ', '.join(sorted(chybi_f))
 
+    # Kontingenční tabulka (Nedodávky): celý list, i řádky mimo pevný filtr.
+    # Chybějící sloupec import neshodí, v tabulce jen zůstane prázdný.
+    kt = spec.get('kt')
+    kt_idx = {i: _MAPA_NEDOD_KT[_norm(h)] for i, h in enumerate(header)
+              if _norm(h) in _MAPA_NEDOD_KT} if kt else {}
+
+    def _bunky(r, idx: dict, cisla_: set) -> dict:
+        """Řádek listu → {pole: hodnota} podle typu pole (datum / číslo / text)."""
+        out = {}
+        for i, pole in idx.items():
+            v = r[i] if i < len(r) else None
+            if pole in datumy:
+                out[pole] = _excel_datum(v)
+            else:
+                out[pole] = _f(v) if pole in cisla_ else _s(v)
+        return out
+
     je_vystaveni = (tabulka == 'sankce_vystaveni')
     zaznamy = []
+    kt_zaznamy = []
     for r in rows_iter:
         if r is None or all(c is None or c == '' for c in r):
             continue
+        if kt:
+            k = _bunky(r, kt_idx, _CISLA_NEDOD_KT)
+            if k.get('ico') or k.get('nazev_zbozi'):
+                kt_zaznamy.append(k)
         # pevný filtr sestavy (např. Nedodávky: DCERA=NE, STATUS=Nedodáno, s příjemkou)
         if any(_norm(r[i] if i < len(r) else None) != ocek for i, ocek in filtr_idx.items()):
             continue
-        radek = {}
-        for i, pole in idx_na_pole.items():
-            v = r[i] if i < len(r) else None
-            if pole in datumy:
-                radek[pole] = _excel_datum(v)
-            else:
-                radek[pole] = _f(v) if pole in cisla else _s(v)
+        radek = _bunky(r, idx_na_pole, cisla)
         # přeskoč úplně prázdné (bez IČO i názvu)
         if not radek.get('ico') and not radek.get('nazev_zbozi'):
             continue
@@ -2301,6 +2388,16 @@ def _importuj_sync(raw: bytes, tabulka: str, mapa: dict, cisla: set,
             davka.append(tuple(zaklad))
         if davka:
             cur2.executemany(sql, davka)
+        if kt and not pripoj:
+            # Celý list pro kontingenční tabulku — import období ho celý přepíše.
+            cur2.execute(f'DELETE FROM {kt} WHERE obdobi=%s', (obdobi,))
+            kt_pole = list(_MAPA_NEDOD_KT.values())
+            kt_sql = (f"INSERT INTO {kt} (obdobi,{','.join(kt_pole)}) "
+                      f"VALUES ({','.join(['%s'] * (len(kt_pole) + 1))})")
+            kt_davka = [(obdobi, *(z.get(p) for p in kt_pole)) for z in kt_zaznamy]
+            # ~60 tis. řádků → po dávkách, ať nenarazíme na max_allowed_packet
+            for j in range(0, len(kt_davka), 5000):
+                cur2.executemany(kt_sql, kt_davka[j:j + 5000])
         conn.commit()
         cur.close(); cur2.close()
         if pokrok:
@@ -2339,6 +2436,12 @@ def _smaz_data(tabulka: str, obdobi=None) -> tuple:
             cur.execute(f'DELETE FROM sankce_audit WHERE tabulka=%s AND row_hash IN '
                         f'(SELECT row_hash FROM {tabulka} WHERE obdobi=%s)', (tabulka, obdobi))
             cur.execute(f'DELETE FROM {tabulka} WHERE obdobi=%s', (obdobi,))
+        kt = _SESTAVA_IMPORT.get(tabulka, {}).get('kt')
+        if kt:   # kontingenční tabulka jde s daty sestavy
+            if obdobi is None:
+                cur.execute(f'DELETE FROM {kt}')
+            else:
+                cur.execute(f'DELETE FROM {kt} WHERE obdobi=%s', (obdobi,))
         conn.commit()
         cur.close()
         return pocet, None
@@ -5999,6 +6102,114 @@ def _col_defs_nedod_souhrn(edit_js: str) -> list:
     ]
 
 
+# -- Kontingenční tabulka (kopie listu „Souhrn") ------------------------------
+# Filtry stránky (pole v DB, popisek) — pořadí jako v Excelu.
+_KT_FILTRY = (('stav_prijemky', 'Stav příjemky'), ('odmitnuto', 'Odmítnuto'),
+              ('dcera', 'DCERA'), ('status', 'STATUS'), ('nak', 'NAK'))
+# Řádková pole kontingenční tabulky; mezisoučet se dělá za první z nich (IČO).
+_KT_RADKY = ('ico', 'jmeno_dodavatele', 'dodavatel_popis', 'kod_zbozi', 'nazev_zbozi',
+             'kod2', 'cislo_obj', 'pobocka', 'pozadovano', 'datum_zalozeni')
+_KT_HODNOTY = ('objednano_mj', 'dodano_mj', 'rozdil_dodano_mj', 'rozdil_dodano_kc',
+               'odmitnuto_mj')
+_KT_SUMY = ('SUM(objednano_mj) objednano_mj, SUM(dodano_mj) dodano_mj, '
+            'SUM(dodano_mj) - SUM(objednano_mj) rozdil_dodano_mj, '
+            'SUM(rozdil_dodano_kc) rozdil_dodano_kc, SUM(odmitnuto_mj) odmitnuto_mj')
+# ponytail: nad limit (typicky filtr STATUS = Vše, ~60 tis. řádků) jen součty
+# dodavatelů — celé by to šlo přes WebSocket v desítkách MB.
+_KT_MAX_RADKU = 10000
+_KT_ROW_STYLE = (
+    "function(p){"
+    "if(p.node&&p.node.rowPinned==='bottom')return{fontWeight:'700',"
+    "backgroundColor:'#f1f5f9',borderTop:'2px solid #cbd5e1'};"
+    "if(p.data&&p.data._sub)return{fontWeight:'700',backgroundColor:'#eef2ff'};"
+    "return null;}"
+)
+
+
+def _col_defs_nedod_kt() -> list:
+    return [{'headerName': nadpis, 'field': field,
+             **({'type': 'numericColumn',
+                 ':valueFormatter': _MONEY_FMT if typ == 'money' else _NUM_FMT}
+                if typ in ('num', 'money') else {}),
+             **({'pinned': 'left'} if field == 'ico' else {})}
+            for nadpis, field, typ, _w in _EXP_NEDOD_KT]
+
+
+def _kt_where(obdobi: str, filtry, jen_nak, jen_unibrands: bool) -> tuple:
+    """WHERE pro kontingenční tabulku: období + viditelnost role + filtry stránky.
+    `jen_nak` = kódy NAK, na které je uživatel omezen (None = vidí vše)."""
+    w, par = ['obdobi=%s'], [obdobi]
+    if jen_unibrands:
+        w.append('UPPER(jmeno_dodavatele) LIKE %s')
+        par.append('%UNIBRANDS%')
+    elif jen_nak is not None:
+        w.append(f"nak IN ({','.join(['%s'] * len(jen_nak))})" if jen_nak else '1=0')
+        par += list(jen_nak)
+    for pole, hodnoty in (filtry or {}).items():
+        if hodnoty:   # prázdný výběr = (Vše)
+            w.append(f"{pole} IN ({','.join(['%s'] * len(hodnoty))})")
+            par += list(hodnoty)
+    return ' AND '.join(w), par
+
+
+def _kt_moznosti(obdobi: str, jen_nak, jen_unibrands: bool) -> dict:
+    """Hodnoty, které jdou vybrat ve filtrech (jen z řádků, které uživatel smí vidět)."""
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return {}
+    try:
+        w, par = _kt_where(obdobi, None, jen_nak, jen_unibrands)
+        pole = [p for p, _n in _KT_FILTRY]
+        cur = conn.cursor()
+        cur.execute(f"SELECT DISTINCT {','.join(pole)} FROM {_NEDOD_KT_TABULKA} "
+                    f"WHERE {w}", par)
+        out = {p: set() for p in pole}
+        for r in cur.fetchall():
+            for p, v in zip(pole, r):
+                out[p].add(v or '')
+        return {p: sorted(v) for p, v in out.items()}
+    finally:
+        conn.close()
+
+
+def _kt_souhrn(obdobi: str, filtry: dict, sbalit: bool, jen_nak, jen_unibrands: bool):
+    """Kontingenční tabulka jako list „Souhrn": řádky podle _KT_RADKY, za každým IČO
+    řádek „… Celkem", dole „Celkový součet". Agreguje MySQL. None = bez spojení."""
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return None
+    try:
+        w, par = _kt_where(obdobi, filtry, jen_nak, jen_unibrands)
+        cur = conn.cursor(dictionary=True)
+        cur.execute(f"SELECT ico, MIN(jmeno_dodavatele) jmeno_dodavatele, COUNT(*) pocet, "
+                    f"{_KT_SUMY} FROM {_NEDOD_KT_TABULKA} WHERE {w} "
+                    f"GROUP BY ico ORDER BY ico", par)
+        dod = cur.fetchall()
+        pocet = sum(d['pocet'] for d in dod)
+        orezano = not sbalit and pocet > _KT_MAX_RADKU
+        detail = {}
+        if dod and not sbalit and not orezano:
+            sl = ','.join(_KT_RADKY)
+            cur.execute(f"SELECT {sl}, {_KT_SUMY} FROM {_NEDOD_KT_TABULKA} WHERE {w} "
+                        f"GROUP BY {sl} ORDER BY {sl}", par)
+            for r in cur.fetchall():
+                for p in ('pozadovano', 'datum_zalozeni'):
+                    if r[p]:
+                        r[p] = r[p].strftime('%d.%m.%Y')
+                detail.setdefault(r['ico'], []).append(r)
+        radky = []
+        for d in dod:
+            radky += detail.get(d['ico'], [])
+            radky.append({'ico': f"{d['ico']} Celkem", 'jmeno_dodavatele': d['jmeno_dodavatele'],
+                          '_sub': True, **{p: d[p] for p in _KT_HODNOTY}})
+        celkem = {'ico': 'Celkový součet',
+                  **{p: sum(d[p] or 0 for d in dod) for p in _KT_HODNOTY}}
+        return {'radky': radky, 'celkem': celkem, 'dodavatelu': len(dod),
+                'pocet': pocet, 'orezano': orezano}
+    finally:
+        conn.close()
+
+
 @refreshable_na_klienta
 async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
     ma_vse = 'vse' in vsechna_prava
@@ -6043,8 +6254,8 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
 
     obdobi_list = _seznam_obdobi(_NEDOD_TABULKA)
     VSE_OBD = '(všechna období)'
-    pohled = {'v': 'souhrn' if app.storage.user.get('sankce_nedodavky_pohled', 'souhrn')
-                              == 'souhrn' else 'radky'}
+    _ulozeny = app.storage.user.get('sankce_nedodavky_pohled', 'souhrn')
+    pohled = {'v': _ulozeny if _ulozeny in ('souhrn', 'kt') else 'radky'}
     VSE_NAK = '(všichni nákupčí)'
     nak_list = sorted({(r.get('nak') or '').strip() for r in vsechny if (r.get('nak') or '').strip()})
     # Filtr nákupčího drží session — po přepnutí souhrn/detail i po návratu do
@@ -6124,6 +6335,15 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
     async def _export():
         """Export do .xlsx podle právě zvoleného pohledu — detailní řádky, nebo
         souhrn po dodavatelích. Respektuje filtry v hlavičkách i řazení."""
+        if pohled['v'] == 'kt':   # kontingenční tabulka tak, jak je zobrazená
+            d = kt['data']
+            if not d or not d['radky']:
+                ui.notify('Kontingenční tabulka je prázdná — není co exportovat.',
+                          type='warning', position='top', timeout=6000)
+                return
+            await _export_xlsx(_EXP_NEDOD_KT, d['radky'], d['celkem'],
+                               'nedodavky_kontingencni', 'Souhrn')
+            return
         je_souhrn = pohled['v'] == 'souhrn'
         data = _souhrn_data() if je_souhrn else _zobrazene()
         ids = await _viditelne_ids(souhrn if je_souhrn else grid)
@@ -6164,7 +6384,8 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
 
     # ── Ovládací lišta ──
     with ui.row().classes('w-full items-center gap-3 mb-2 flex-wrap'):
-        prep = ui.toggle({'souhrn': '📇 Dodavatelé (souhrn)', 'radky': '📋 Řádky (detail)'},
+        prep = ui.toggle({'souhrn': '📇 Dodavatelé (souhrn)', 'radky': '📋 Řádky (detail)',
+                          'kt': '📊 Kontingenční tabulka'},
                          value=pohled['v']).props('no-caps dense unelevated')
 
         sel_obd = ui.select([VSE_OBD] + obdobi_list,
@@ -6203,10 +6424,12 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
 
         ui.space()
         info = ui.label('').classes('text-sm text-gray-500')
+        # Filtry sestavy — v kontingenční tabulce se schovají (ta má vlastní lištu).
+        jen_sestava = [sel_obd, sw_bez, lbl_dod, info] + ([sel_nak] if len(nak_list) > 1 else [])
         ui.button(icon='download', text='Export', on_click=_export) \
             .props('color=secondary outline dense no-caps') \
-            .tooltip('Stáhne .xlsx podle zvoleného pohledu (detail / dodavatelé) '
-                     'včetně filtrů v hlavičkách i řazení.')
+            .tooltip('Stáhne .xlsx podle zvoleného pohledu (detail / dodavatelé / '
+                     'kontingenční tabulka) včetně filtrů v hlavičkách i řazení.')
         if je_analytik:
             # Obnova přepíše celou sestavu — jen analytik / 'vse'.
             _obnova_button(user_name, _vykresli_nedodavky.refresh, je_hlavni_admin=ma_vse,
@@ -6262,15 +6485,120 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
         ':getRowId': _GET_ROW_ID,
     }).classes('w-full').style(_GRID_STYLE)
 
-    def _prepni(v: str):
+    # ── Kontingenční tabulka: list „Souhrn" nad celým nahraným listem „data" ──
+    # Výchozí filtry = pevný filtr sestavy (Příjemka, DCERA=NE, STATUS=Nedodáno), jako v Excelu.
+    kt_vychozi = {_MAPA_NEDOD_KT[k]: v for k, v in _SESTAVA_IMPORT[_NEDOD_TABULKA]['filtr'].items()}
+    kt_omez = {'jen_nak': None if vidi_vse else sorted(moje_kody), 'jen_unibrands': jen_unibrands}
+    kt = {'obdobi': obdobi_list[0] if obdobi_list else None, 'data': None,
+          'nacteno': False, 'ticho': False, 'seq': 0, 'prazdne': False}
+
+    with ui.column().classes('w-full gap-2') as kt_box:
+        with ui.row().classes('w-full items-center gap-3 flex-wrap'):
+            kt_obd = ui.select(obdobi_list, value=kt['obdobi'], label='Období') \
+                .props('outlined dense options-dense').classes('w-60')
+            kt_sel = {pole: ui.select({}, multiple=True, value=[], label=nazev)
+                      .props('outlined dense options-dense display-value="(Vše)"').classes('w-44')
+                      for pole, nazev in _KT_FILTRY}
+            kt_sbal = ui.switch('Jen součty dodavatelů', value=False)
+            ui.space()
+            kt_info = ui.label('').classes('text-sm text-gray-500')
+        kt_grid = ui.aggrid({
+            'columnDefs': _col_defs_nedod_kt(),
+            'rowData': [],
+            'defaultColDef': {'resizable': True, 'sortable': False, 'filter': False},
+            'rowHeight': 32,
+            'suppressMovableColumns': True,
+            ':getRowStyle': _KT_ROW_STYLE,
+            ':onFirstDataRendered': _AUTOSIZE_FIT,
+            ':onGridSizeChanged': _AUTOSIZE_FIT,
+        }).classes('w-full').style(_GRID_STYLE)
+
+    async def _kt_obnov(moznosti: bool = False):
+        """Načte kontingenční tabulku podle filtrů (moznosti=True: i nabídky filtrů)."""
+        if not kt['obdobi']:
+            return
+        kt['seq'] += 1
+        moje = kt['seq']
+        kt_info.set_text('Načítám…')
+        if moznosti:
+            mo = await asyncio.to_thread(_kt_moznosti, kt['obdobi'], **kt_omez)
+            if moje != kt['seq']:
+                return
+            kt['prazdne'] = not any(mo.values())
+            kt['ticho'] = True     # nastavení hodnot nesmí spustit další načtení
+            try:
+                for pole, sel in kt_sel.items():
+                    hodn = mo.get(pole, [])
+                    if kt['nacteno']:   # jiné období: výběr ponech, co jde
+                        vyber = [h for h in (sel.value or []) if h in hodn]
+                    else:               # první načtení: výchozí filtry jako v Excelu
+                        vyber = [h for h in hodn if _norm(h) == kt_vychozi.get(pole)]
+                    sel.set_options({h: h or '(prázdné)' for h in hodn}, value=vyber)
+                    _kt_popisek(sel)
+            finally:
+                kt['ticho'] = False
+            kt['nacteno'] = True
+        filtry = {p: list(s.value or []) for p, s in kt_sel.items()}
+        d = await asyncio.to_thread(_kt_souhrn, kt['obdobi'], filtry, kt_sbal.value, **kt_omez)
+        if moje != kt['seq']:
+            return    # mezitím přišla novější změna filtru
+        if d is None:
+            kt_info.set_text('')
+            ui.notify('Není spojení s databází.', type='negative')
+            return
+        kt['data'] = d
+        kt_grid.options['rowData'] = d['radky']
+        kt_grid.options['pinnedBottomRowData'] = [d['celkem']] if d['pocet'] else []
+        kt_grid.update()
+        if kt['prazdne']:
+            kt_info.set_text('Pro toto období chybí data kontingenční tabulky — '
+                             'nahrajte soubor období znovu.')
+        else:
+            kt_info.set_text(f"Dodavatelů: {d['dodavatelu']} · řádků dat: {d['pocet']}"
+                             + (f" · přes {_KT_MAX_RADKU} řádků, zobrazeny jen součty "
+                                f"dodavatelů — zužte filtr" if d['orezano'] else ''))
+
+    def _kt_popisek(sel):
+        # prázdný výběr = (Vše), jako v Excelu
+        if sel.value:
+            sel.props(remove='display-value')
+        else:
+            sel.props('display-value="(Vše)"')
+
+    def _kt_zmena(_e=None):
+        # Synchronně: `ticho` se musí zkontrolovat hned při set_options, ne až v tasku.
+        if kt['ticho']:
+            return None
+        for s in kt_sel.values():
+            _kt_popisek(s)
+        return _kt_obnov()
+
+    async def _kt_zmena_obd(e):
+        kt['obdobi'] = e.value
+        await _kt_obnov(moznosti=True)
+
+    for s in kt_sel.values():
+        s.on_value_change(_kt_zmena)
+    kt_sbal.on_value_change(_kt_zmena)
+    kt_obd.on_value_change(_kt_zmena_obd)
+
+    async def _prepni(v: str):
         pohled['v'] = v
         app.storage.user['sankce_nedodavky_pohled'] = v
-        je_s = v == 'souhrn'
-        souhrn.set_visibility(je_s)
-        grid.set_visibility(not je_s)
-        (souhrn if je_s else grid).run_grid_method('sizeColumnsToFit')
+        je_kt = v == 'kt'
+        souhrn.set_visibility(v == 'souhrn')
+        grid.set_visibility(v == 'radky')
+        kt_box.set_visibility(je_kt)
+        for w in jen_sestava:
+            w.set_visibility(not je_kt)
+        btn_zrus_dod.set_visibility(not je_kt and bool(stav['ico']))
+        if je_kt:
+            if not kt['nacteno']:
+                await _kt_obnov(moznosti=True)
+        else:
+            (souhrn if v == 'souhrn' else grid).run_grid_method('sizeColumnsToFit')
     prep.on_value_change(lambda e: _prepni(e.value or 'radky'))
-    _prepni(pohled['v'])
+    await _prepni(pohled['v'])
 
     def _zrus_dodavatele():
         stav['ico'] = None
