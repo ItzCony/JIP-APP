@@ -951,7 +951,8 @@ def inicializace_cenopripad_db():
                            ("testovaci", "TINYINT DEFAULT 0"),
                            ("poznamka_zadani", "VARCHAR(1000)"),
                            ("zamitnuti_duvod", "VARCHAR(1000)"),
-                           ("pobocka", "VARCHAR(3) DEFAULT NULL")):
+                           ("pobocka", "VARCHAR(3) DEFAULT NULL"),
+                           ("prodlouzeno_z", "INT DEFAULT NULL")):   # id původního případu
             cur.execute("SELECT COUNT(*) FROM information_schema.COLUMNS WHERE "
                         "TABLE_SCHEMA=DATABASE() AND TABLE_NAME='cenopripad_pripady' AND "
                         "COLUMN_NAME=%s", (_col,))
@@ -1757,8 +1758,9 @@ def _dalsi_cislo(cur):
 
 def _uloz_pripad(typ, nazev, zadavatel_id, zadavatel_jmeno, vstup_radky, vysledek,
                  soubor_raw=None, soubor_nazev=None, testovaci=False, poznamka_zadani=None,
-                 stav_override=None):
+                 stav_override=None, prodlouzeno_z=None):
     """Uloží případ + jeho řádky (+ volitelně původní nahraný soubor).
+    `prodlouzeno_z` = id případu, jehož prodloužením tento vzniká (IND).
     `testovaci` = zkušební případ (neodesílají se e-maily, vizuálně fialový).
     `poznamka_zadani` = důvod nahrání (u mimolétáku povinné).
     `stav_override` = vynutí stav případu místo verdiktu (např. 'delisting' přeskočí
@@ -1778,11 +1780,12 @@ def _uloz_pripad(typ, nazev, zadavatel_id, zadavatel_jmeno, vstup_radky, vyslede
         cur.execute(
             "INSERT INTO cenopripad_pripady "
             "(cislo, nazev, typ, oddeleni, zadavatel_id, zadavatel_jmeno, stav, "
-            " pocet_radku, pocet_chyb, vysledek_ok, testovaci, poznamka_zadani, pobocka) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            " pocet_radku, pocet_chyb, vysledek_ok, testovaci, poznamka_zadani, pobocka,"
+            " prodlouzeno_z) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
             (cislo, nazev, typ, TYPY[typ]["oddeleni"], zadavatel_id, zadavatel_jmeno,
              stav, vysledek["pocet"], vysledek["chyby"], 1 if vysledek["ok"] else 0,
-             1 if testovaci else 0, _str(poznamka_zadani, 1000), _pobocka))
+             1 if testovaci else 0, _str(poznamka_zadani, 1000), _pobocka, prodlouzeno_z))
         pid = cur.lastrowid
         davka = []
         for i, (inp, rr) in enumerate(zip(vstup_radky, vysledek["radky"]), 1):
@@ -2120,6 +2123,38 @@ def schval_pripad(pripad_id, vyrazene_poradi=None):
         return None, False, f"Chyba schválení případu: {e}"
     finally:
         conn.close()
+
+
+def prodluz_pripad(pripad, novy_od, novy_do, user_id, user_name):
+    """IND ceny: založí NOVÝ případ se schválenými řádky `pripad` (bez vyřazených),
+    `termin_od` = `novy_od` a `termin_do` = `novy_do` (date). Projde běžným
+    vyhodnocením a kontrolou.
+    Vrací (cislo, stav, chyba|None, pid, vysledek, vstup_radky)."""
+    if prodlouzeni_pripadu(pripad["id"]):   # pojistka i pro souběh dvou uživatelů
+        return None, None, f"Případ {pripad['cislo']} už je prodloužen.", None, None, None
+    vstup = []
+    for r in nacti_radky(pripad["id"]):
+        if r.get("neschvaleno"):
+            continue
+        try:
+            v = json.loads(r["vstup_json"]) if r["vstup_json"] else {}
+        except Exception:
+            continue
+        v["termin_od"] = novy_od.isoformat()
+        v["termin_do"] = novy_do.isoformat()
+        vstup.append(v)
+    if not vstup:
+        return None, None, "Případ nemá žádné schválené řádky k prodloužení.", None, None, None
+    vys = vyhodnot_pripad_z_db(pripad["typ"], vstup)
+    obdobi = f"od {novy_od:%d.%m.%Y} do {novy_do:%d.%m.%Y}"
+    cislo, stav, err, pid = _uloz_pripad(
+        pripad["typ"], pripad["nazev"], user_id, user_name, vstup, vys,
+        poznamka_zadani=f"Prodloužení případu {pripad['cislo']} {obdobi}",
+        prodlouzeno_z=pripad["id"])
+    if not err:
+        zaznam_historie(pripad["id"], "Prodlouženo", user_name,
+                        f"Nový případ {cislo} s platností {obdobi}.")
+    return cislo, stav, err, pid, vys, vstup
 
 
 def oprav_pripad(pripad_id, typ, vstup_radky, vysledek, soubor_raw=None, soubor_nazev=None):
@@ -3298,6 +3333,94 @@ def _dialog_detail(pripad, user_id, user_name, prava):
                     .tooltip("Převede případ ze stavu „Zpracováno“ na „Uzavřeno“ "
                              "(bez e-mailové notifikace).")
 
+            if (typ == "porovnani" and not je_test
+                    and stav in ("schvaleno", "castecne_schvaleno", "zpracovano", "uzavreno")
+                    and (je_muj or _muze_zadat(typ, prava))):
+                async def _prodlouzit_dialog():
+                    jiz = await asyncio.to_thread(prodlouzeni_pripadu, pripad["id"])
+                    if jiz:   # už prodloužen → místo formuláře odkaz na nový případ
+                        with ui.dialog() as jdlg, ui.card().classes("p-4").style("width: 420px"):
+                            ui.label(f"Případ {pripad['cislo']} už je prodloužen.") \
+                                .classes("font-medium")
+                            ui.label("Další prodloužení proveďte z prodlouženého případu.") \
+                                .classes("text-sm text-gray-500")
+                            for nid, ncislo in jiz:
+                                ui.link(f"Otevřít prodloužený případ {ncislo}",
+                                        f"/cenopripad?pripad={nid}") \
+                                    .classes("text-teal-700 font-semibold")
+                            with ui.row().classes("w-full justify-end mt-2"):
+                                ui.button("Zavřít", on_click=jdlg.close).props("flat no-caps")
+                        jdlg.open()
+                        return
+                    with ui.dialog() as pdlg, ui.card().classes("p-4").style("width: 420px"):
+                        ui.label(f"Prodloužit případ {pripad['cislo']} — {pripad['nazev']}") \
+                            .classes("font-medium")
+                        ui.label("Založí se NOVÝ případ se stejnými (schválenými) řádky a novým "
+                                 "termínem od/do. Projde běžnou kontrolou a schválením.") \
+                            .classes("text-sm text-gray-500")
+                        # Předvyplněný „od" = den po starém „do" (ať se období nepřekrývají);
+                        # je-li to v minulosti (případ po platnosti) nebo „do" neznáme → dnes.
+                        _dnes = datetime.date.today()
+                        _stary_do = pripad.get("_platnost_do")
+                        _od_navrh = max(_stary_do + datetime.timedelta(days=1), _dnes) \
+                            if _stary_do else _dnes
+                        with ui.row().classes("gap-2"):
+                            od_in = ui.input("Nový termín od *", value=_od_navrh.isoformat()) \
+                                .props("outlined dense type=date").classes("w-44")
+                            do_in = ui.input("Nový termín do *") \
+                                .props("outlined dense type=date").classes("w-44")
+
+                        async def _potvrd():
+                            try:
+                                novy_od = datetime.date.fromisoformat(od_in.value or "")
+                                novy_do = datetime.date.fromisoformat(do_in.value or "")
+                            except ValueError:
+                                ui.notify("Zadejte nový termín od i do.", type="warning")
+                                return
+                            if novy_do < datetime.date.today():
+                                ui.notify("Termín do nesmí být v minulosti.", type="warning")
+                                return
+                            if novy_od > novy_do:
+                                ui.notify("Termín od nesmí být po termínu do.", type="warning")
+                                return
+                            obdobi = f"od {novy_od:%d.%m.%Y} do {novy_do:%d.%m.%Y}"
+                            cislo, stav_n, err, pid, vys, vstup = await asyncio.to_thread(
+                                prodluz_pripad, pripad, novy_od, novy_do, user_id, user_name)
+                            pdlg.close()
+                            if err:
+                                _bezpecne_notify(err, "negative")
+                                return
+                            _kontr = _kontrola_z_vysledku(typ, vstup, vys)
+                            _odesli_emaily(
+                                _emaily_office(oddeleni),
+                                f"Cenopřípad {cislo}: prodloužení {pripad['cislo']} ke zpracování",
+                                f"Žadatel {user_name} prodloužil případ {pripad['cislo']} "
+                                f"„{pripad['nazev']}“ {obdobi} → nový případ {cislo}, "
+                                f"který je {'v pořádku' if vys['ok'] else 'NENÍ v pořádku'}. "
+                                f"Můžete ho zpracovat a dotáhnout do nastavení."
+                                + (_KONTROLA_VAROVANI_MAIL if _kontr == "chyba" else ""),
+                                _app_url(f"?pripad={pid}"))
+                            intranet_logger.log_activity(
+                                user_name, "Cenopřípad",
+                                f"Prodloužení {pripad['cislo']} → {cislo} {obdobi}")
+                            await _po_akci(
+                                f"Založen případ {cislo} (prodloužení {obdobi}) — "
+                                + ("vše v pořádku." if vys["ok"]
+                                   else f"NENÍ v pořádku ({vys['chyby']} z {vys['pocet']} řádků)."),
+                                "positive" if vys["ok"] else "warning")
+
+                        with ui.row().classes("w-full justify-end gap-2 mt-2"):
+                            ui.button("Zrušit", on_click=pdlg.close).props("flat no-caps")
+                            ui.button("Prodloužit", icon="event_repeat", on_click=_potvrd) \
+                                .props("unelevated no-caps") \
+                                .classes("bg-teal-600 text-white rounded-lg px-4")
+                    pdlg.open()
+
+                ui.button("Prodloužit", icon="event_repeat", on_click=_prodlouzit_dialog) \
+                    .props("unelevated no-caps").classes("bg-teal-600 text-white rounded-lg px-4") \
+                    .tooltip("Založí nový případ se stejnými řádky a novým termínem do "
+                             "— bez nového vyplňování Excelu.")
+
         # Office (nákup i obchod) smí stornovat případy svého oddělení (s povinným důvodem).
         smi_stornovat = (je_muj or _je_spravce_typu(typ, prava)
                          or _je_office_typu(typ, prava))
@@ -3510,6 +3633,11 @@ def _karta_pripadu(p, user_id, user_name, prava):
                 ui.badge("Kontrola: V pořádku", color="green").props("outline")
             if p.get("_archiv"):   # IND: po platnosti
                 ui.badge("🗄️ ARCHIV", color="grey-7")
+            if p.get("_prodlouzeni_z"):
+                ui.badge(f"Prodloužení {p['_prodlouzeni_z']}", color="teal").props("outline")
+            if p.get("_prodlouzeno_na"):
+                ui.badge(f"Prodlouženo → {', '.join(p['_prodlouzeno_na'])}",
+                         color="teal").props("outline")
             if p.get("poznamka"):
                 ui.icon("sticky_note_2", color="amber-8").classes("text-lg") \
                     .tooltip(p["poznamka"])
@@ -3908,6 +4036,49 @@ def platnosti_do_pro_pripady(case_ids):
         conn.close()
 
 
+def prodlouzeni_pripadu(pripad_id):
+    """[(id, cislo)] nestornovaných případů vzniklých prodloužením `pripad_id`.
+    Stornované prodloužení se nepočítá — případ jde prodloužit znovu."""
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return []
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id, cislo FROM cenopripad_pripady WHERE prodlouzeno_z=%s "
+                    "AND stav <> 'stornovano' ORDER BY id", (pripad_id,))
+        r = cur.fetchall()
+        cur.close()
+        return r
+    except Exception as e:
+        print(f"[cenopripad] prodlouzeni_pripadu: {e}")
+        return []
+    finally:
+        conn.close()
+
+
+def vazby_prodlouzeni():
+    """Vazby prodloužení přes všechny případy (i ty, které uživatel nevidí):
+    ({nový_id: číslo původního}, {původní_id: [čísla nových]})."""
+    z, na = {}, {}
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return z, na
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT n.id, n.cislo, o.id, o.cislo FROM cenopripad_pripady n "
+                    "JOIN cenopripad_pripady o ON o.id = n.prodlouzeno_z ORDER BY n.id")
+        for nid, ncislo, oid, ocislo in cur.fetchall():
+            z[nid] = ocislo
+            na.setdefault(oid, []).append(ncislo)
+        cur.close()
+        return z, na
+    except Exception as e:
+        print(f"[cenopripad] vazby_prodlouzeni: {e}")
+        return z, na
+    finally:
+        conn.close()
+
+
 def kontrola_stav_pro_pripady(case_ids):
     """{pripad_id: 'ok'|'chyba'} — agregovaný sloupec „Kontrola" z řádků případu.
     Počítá se POUZE pro případy, které mají aspoň v jednom řádku vyplněný sloupec
@@ -3973,11 +4144,15 @@ def _filtruj(items, flt):
     nazev = flt["nazev"].strip().lower()
     out = []
     for p in items:
-        if nazev and nazev not in (p["nazev"] or "").lower():
+        if nazev and nazev not in (p["nazev"] or "").lower() \
+                and nazev not in str(p.get("cislo") or "").lower():
             continue
         if flt["zadavatel"] and p["zadavatel_jmeno"] != flt["zadavatel"]:
             continue
-        if flt["stav"] and p["stav"] != flt["stav"]:
+        if flt["stav"] == "_prodlouzene":
+            if not (p.get("_prodlouzeni_z") or p.get("_prodlouzeno_na")):
+                continue
+        elif flt["stav"] and p["stav"] != flt["stav"]:
             continue
         d = str(p["datum_zadani"])[:10]
         if flt["od"] and d < flt["od"]:
@@ -4525,7 +4700,10 @@ def _sub_view_typ(typ, user_id, user_name, prava):
             _ids = [p["id"] for p in data]
             _mapa_plat = platnosti_do_pro_pripady(_ids)
             _mapa_kontrola = kontrola_stav_pro_pripady(_ids)   # agregovaný sloupec „Kontrola"
+            _prodl_z, _prodl_na = vazby_prodlouzeni()
             for p in data:
+                p["_prodlouzeni_z"] = _prodl_z.get(p["id"])        # číslo původního případu
+                p["_prodlouzeno_na"] = _prodl_na.get(p["id"], [])  # čísla nových případů
                 _pd = _mapa_plat.get(p["id"])
                 p["_platnost_do"] = _pd
                 p["_archiv"] = bool(_pd and _pd < _dnes)
@@ -4557,6 +4735,8 @@ def _sub_view_typ(typ, user_id, user_name, prava):
     zadavatele = sorted({p["zadavatel_jmeno"] for p in vsechny if p["zadavatel_jmeno"]})
     stav_opts = {"": "— stav —", **{s: _STAV_BADGE.get(s, (s,))[0]
                                     for s in sorted({p["stav"] for p in vsechny})}}
+    if typ == "porovnani":   # pseudo-stav: původní i nové případy z prodloužení
+        stav_opts["_prodlouzene"] = "Prodloužené"
 
     @ui.refreshable
     def _seznam():
@@ -4614,7 +4794,7 @@ def _sub_view_typ(typ, user_id, user_name, prava):
     # flex-nowrap = filtry zůstanou v jedné rovině (jinak se „platnost" zalomí na další
     # řádek); šířky zmenšené tak, aby se vše vešlo do max-w-5xl.
     with ui.row().classes("w-full gap-2 flex-nowrap items-end max-w-5xl mb-2"):
-        ui.input("Název", on_change=lambda e: _zmen("nazev", e)) \
+        ui.input("Název / číslo", on_change=lambda e: _zmen("nazev", e)) \
             .props("outlined dense clearable").classes("w-40")
         ui.select({"": "— žadatel —", **{z: z for z in zadavatele}}, value="",
                   on_change=lambda e: _zmen("zadavatel", e)).props("outlined dense").classes("w-40")
