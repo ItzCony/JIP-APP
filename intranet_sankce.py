@@ -843,6 +843,7 @@ _EXP_NEDOD_KT = [
     ('Rozdíl dodáno MJ',        'rozdil_dodano_mj', 'num',   14),
     ('Rozdíl dodáno Kč',        'rozdil_dodano_kc', 'money', 16),
     ('Odmítnuto MJ',            'odmitnuto_mj',     'num',   13),
+    ('Vyjádření nákupčího',     'vyjadreni',        'text',  46),
 ]
 
 _EXP_SOUHRN = [
@@ -1318,9 +1319,19 @@ def inicializace_sankce_db():
                 status VARCHAR(60),
                 stav_prijemky VARCHAR(60),
                 odmitnuto VARCHAR(20),
+                row_hash VARCHAR(40) NULL,
                 INDEX idx_obdobi (obdobi)
             ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
         """)
+        # Migrace: row_hash = otisk řádku sestavy Nedodávek ze STEJNÉHO řádku listu
+        # (vazba vyjádření; NULL = řádek mimo sestavu). Stará kopie bez vazby nejde
+        # spárovat jistě → smazat, import období ji vytvoří znovu.
+        cur.execute("SELECT COUNT(*) FROM information_schema.COLUMNS "
+                    "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s "
+                    "AND COLUMN_NAME='row_hash'", (_NEDOD_KT_TABULKA,))
+        if cur.fetchone()[0] == 0:
+            cur.execute(f'DELETE FROM {_NEDOD_KT_TABULKA}')
+            cur.execute(f'ALTER TABLE {_NEDOD_KT_TABULKA} ADD COLUMN row_hash VARCHAR(40) NULL')
         # Zálohy / body obnovení sestav — celá tabulka jako JSON snímek.
         # Druh 'auto' (pravidelná) / 'rucni' (ruční bod obnovy); sloupec `tabulka`
         # říká, ke které sestavě snímek patří.
@@ -2314,6 +2325,8 @@ def _importuj_sync(raw: bytes, tabulka: str, mapa: dict, cisla: set,
             continue
         radek['row_hash'] = _row_hash(tabulka, obdobi,
                                       [radek.get(p) for p in spec['hash']])
+        if kt:   # tentýž řádek listu v kontingenční tabulce → vazba na řádek sestavy
+            k['row_hash'] = radek['row_hash']
         zaznamy.append(radek)
 
     if pokrok:
@@ -2391,7 +2404,7 @@ def _importuj_sync(raw: bytes, tabulka: str, mapa: dict, cisla: set,
         if kt and not pripoj:
             # Celý list pro kontingenční tabulku — import období ho celý přepíše.
             cur2.execute(f'DELETE FROM {kt} WHERE obdobi=%s', (obdobi,))
-            kt_pole = list(_MAPA_NEDOD_KT.values())
+            kt_pole = list(_MAPA_NEDOD_KT.values()) + ['row_hash']
             kt_sql = (f"INSERT INTO {kt} (obdobi,{','.join(kt_pole)}) "
                       f"VALUES ({','.join(['%s'] * (len(kt_pole) + 1))})")
             kt_davka = [(obdobi, *(z.get(p) for p in kt_pole)) for z in kt_zaznamy]
@@ -6126,12 +6139,25 @@ _KT_ROW_STYLE = (
 )
 
 
+# Vyjádření v kontingenční tabulce: jen na řádcích, které jsou v sestavě Nedodávek
+# a uživatel do nich smí psát (`_smi` doplní server).
+_KT_VYJ_COL = {
+    ':editable': 'function(p){return !!(p.data&&p.data._smi);}',
+    'cellEditor': 'agLargeTextCellEditor',
+    'cellEditorPopup': True,
+    ':cellStyle': 'function(p){return p.data&&p.data._smi?{backgroundColor:"#fffbeb"}:null;}',
+    'headerTooltip': 'Totéž vyjádření jako v detailu a souhrnu (zápis jde do řádků '
+                     'sestavy, ze kterých je tento řádek). Řádky mimo sestavu nejdou psát.',
+}
+
+
 def _col_defs_nedod_kt() -> list:
     return [{'headerName': nadpis, 'field': field,
              **({'type': 'numericColumn',
                  ':valueFormatter': _MONEY_FMT if typ == 'money' else _NUM_FMT}
                 if typ in ('num', 'money') else {}),
-             **({'pinned': 'left'} if field == 'ico' else {})}
+             **({'pinned': 'left'} if field == 'ico' else {}),
+             **(_KT_VYJ_COL if field == 'vyjadreni' else {})}
             for nadpis, field, typ, _w in _EXP_NEDOD_KT]
 
 
@@ -6190,12 +6216,17 @@ def _kt_souhrn(obdobi: str, filtry: dict, sbalit: bool, jen_nak, jen_unibrands: 
         detail = {}
         if dod and not sbalit and not orezano:
             sl = ','.join(_KT_RADKY)
-            cur.execute(f"SELECT {sl}, {_KT_SUMY} FROM {_NEDOD_KT_TABULKA} WHERE {w} "
+            # _hashe = otisky řádků sestavy, ze kterých řádek tabulky vznikl (vazba vyjádření)
+            cur.execute('SET SESSION group_concat_max_len = 1000000')
+            cur.execute(f"SELECT {sl}, {_KT_SUMY}, GROUP_CONCAT(DISTINCT row_hash) hashe "
+                        f"FROM {_NEDOD_KT_TABULKA} WHERE {w} "
                         f"GROUP BY {sl} ORDER BY {sl}", par)
             for r in cur.fetchall():
                 for p in ('pozadovano', 'datum_zalozeni'):
                     if r[p]:
                         r[p] = r[p].strftime('%d.%m.%Y')
+                h = r.pop('hashe')
+                r['_hashe'] = h.split(',') if h else []
                 detail.setdefault(r['ico'], []).append(r)
         radky = []
         for d in dod:
@@ -6384,8 +6415,8 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
 
     # ── Ovládací lišta ──
     with ui.row().classes('w-full items-center gap-3 mb-2 flex-wrap'):
-        prep = ui.toggle({'souhrn': '📇 Dodavatelé (souhrn)', 'radky': '📋 Řádky (detail)',
-                          'kt': '📊 Kontingenční tabulka'},
+        prep = ui.toggle({'kt': '📊 Kontingenční tabulka',
+                          'souhrn': '📇 Dodavatelé (souhrn)', 'radky': '📋 Řádky (detail)'},
                          value=pohled['v']).props('no-caps dense unelevated')
 
         sel_obd = ui.select([VSE_OBD] + obdobi_list,
@@ -6490,7 +6521,8 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
     kt_vychozi = {_MAPA_NEDOD_KT[k]: v for k, v in _SESTAVA_IMPORT[_NEDOD_TABULKA]['filtr'].items()}
     kt_omez = {'jen_nak': None if vidi_vse else sorted(moje_kody), 'jen_unibrands': jen_unibrands}
     kt = {'obdobi': obdobi_list[0] if obdobi_list else None, 'data': None,
-          'nacteno': False, 'ticho': False, 'seq': 0, 'prazdne': False}
+          'nacteno': False, 'ticho': False, 'seq': 0, 'prazdne': False,
+          'hashe': {}}   # id řádku tabulky → otisky jeho řádků sestavy (jen na serveru)
 
     with ui.column().classes('w-full gap-2') as kt_box:
         with ui.row().classes('w-full items-center gap-3 flex-wrap'):
@@ -6509,9 +6541,29 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
             'rowHeight': 32,
             'suppressMovableColumns': True,
             ':getRowStyle': _KT_ROW_STYLE,
+            ':getRowId': 'function(p){return String(p.data.id);}',
+            'singleClickEdit': True,
+            'stopEditingWhenCellsLoseFocus': True,
             ':onFirstDataRendered': _AUTOSIZE_FIT,
             ':onGridSizeChanged': _AUTOSIZE_FIT,
         }).classes('w-full').style(_GRID_STYLE)
+
+    def _kt_zdroj(rid) -> list:
+        """Řádky sestavy, ze kterých vznikl řádek kontingenční tabulky `rid`."""
+        hs = set(kt['hashe'].get(rid, ()))
+        return [s for s in vsechny if s.get('row_hash') in hs] if hs else []
+
+    def _kt_vyjadreni():
+        """Doplní řádkům tabulky vyjádření z jejich řádků sestavy (stejně jako souhrn:
+        různá vyjádření → _MIX_LABEL) a `_smi` = uživatel do nich smí psát."""
+        podle_hash = {}
+        for s in vsechny:
+            podle_hash.setdefault(s.get('row_hash'), []).append(s)
+        for r in (kt['data'] or {}).get('radky', []):
+            zdroj = [s for h in kt['hashe'].get(r['id'], ()) for s in podle_hash.get(h, ())]
+            vyj = {(s.get('vyjadreni') or '').strip() for s in zdroj}
+            r['vyjadreni'] = (next(iter(vyj)) if len(vyj) == 1 else _MIX_LABEL) if vyj else ''
+            r['_smi'] = any(_smi_psat(s) for s in zdroj)
 
     async def _kt_obnov(moznosti: bool = False):
         """Načte kontingenční tabulku podle filtrů (moznosti=True: i nabídky filtrů)."""
@@ -6546,7 +6598,12 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
             kt_info.set_text('')
             ui.notify('Není spojení s databází.', type='negative')
             return
+        for i, r in enumerate(d['radky']):
+            r['id'] = i
+        d['celkem']['id'] = 'C'
+        kt['hashe'] = {r['id']: r.pop('_hashe') for r in d['radky'] if '_hashe' in r}
         kt['data'] = d
+        _kt_vyjadreni()
         kt_grid.options['rowData'] = d['radky']
         kt_grid.options['pinnedBottomRowData'] = [d['celkem']] if d['pocet'] else []
         kt_grid.update()
@@ -6595,6 +6652,11 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
         if je_kt:
             if not kt['nacteno']:
                 await _kt_obnov(moznosti=True)
+            elif kt['data']:   # vyjádření mohlo přibýt v detailu / souhrnu
+                _kt_vyjadreni()
+                # znovu přiřadit: options drží KOPII řádků (NiceGUI observable)
+                kt_grid.options['rowData'] = kt['data']['radky']
+                kt_grid.update()
         else:
             (souhrn if v == 'souhrn' else grid).run_grid_method('sizeColumnsToFit')
     prep.on_value_change(lambda e: _prepni(e.value or 'radky'))
@@ -6657,6 +6719,37 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
             _aplikuj_souhrn()
             info.set_text(_info_text())
     grid.on('cellValueChanged', _on_change)
+
+    def _on_change_kt(e):
+        """Zápis v kontingenční tabulce → do řádků sestavy, ze kterých řádek vznikl."""
+        a = e.args or {}
+        if a.get('colId') != 'vyjadreni':
+            return
+        d = a.get('data') or {}
+        rid = d.get('id')
+        nova = a.get('newValue')
+        radek = next((r for r in (kt['data'] or {}).get('radky', [])
+                      if r.get('id') == rid), None)
+        # Pojistka: mezitím se tabulka mohla přenačíst → id by patřilo jinému řádku.
+        if radek is None or any(d.get(p) != radek.get(p) for p in _KT_RADKY):
+            ui.notify('Tabulka se mezitím změnila — vyjádření se neuložilo, zkuste znovu.',
+                      type='warning')
+            return
+        zdroj = _kt_zdroj(rid)
+        chyba = ('Řádek není v sestavě Nedodávek (jiný Stav příjemky / DCERA / STATUS) '
+                 '— vyjádření k němu nejde zapsat.' if not zdroj else
+                 'Vyjádření smí psát jen nákupčí s odpovídajícím kódem NAK.'
+                 if not any(_smi_psat(s) for s in zdroj) else None)
+        pocet = 0 if chyba or nova == _MIX_LABEL else _uloz_vyjadreni(zdroj, nova or '')
+        if chyba:
+            ui.notify(chyba, type='warning')
+        _kt_vyjadreni()   # vrátí / potvrdí hodnotu v buňce
+        kt_grid.run_grid_method('applyTransaction', {'update': [radek]})
+        if pocet:
+            intranet_logger.log_activity(
+                user_name, 'Sankce', f'Vyjádření (Nedodávky, kontingenční) {pocet} řádků')
+            _aplikuj()
+    kt_grid.on('cellValueChanged', _on_change_kt)
 
     async def _on_change_souhrn(e):
         """Zápis v souhrnu = vyjádření na VŠECH zobrazených řádcích dodavatele
@@ -6828,6 +6921,7 @@ async def vykresli_sankce(user_id, user_name, vsechna_prava):
         if vidi_nedodavky:
             def _otevri_n():
                 app.storage.user['sankce_pohled'] = 'nedodavky'
+                app.storage.user['sankce_nedodavky_pohled'] = 'kt'   # proklik dlaždice → vždy kontingenční tabulka
                 vykresli_sankce.refresh()
             _dlazdice('📦', 'Nedodávky dod. k vyjádření',
                       'border-sky-200', 'bg-sky-600 hover:bg-sky-700', _otevri_n)
