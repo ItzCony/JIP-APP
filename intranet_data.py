@@ -1081,7 +1081,13 @@ def inicializace_db():
         # Dva režimy: token vázaný na řádek v `user`, nebo anonymní (user_iduser
         # NULL), kde si zkoušený vyplní jméno a příjmení až na vstupní stránce.
         # `skupina` = OZ/ASM napevno pro daný odkaz; NULL bere globální nastavení.
-        cursor.execute("CREATE TABLE IF NOT EXISTS kviz_pristupy (id INT AUTO_INCREMENT PRIMARY KEY, token VARCHAR(64) NOT NULL UNIQUE, user_iduser INT NULL, host_jmeno VARCHAR(100) DEFAULT NULL, host_prijmeni VARCHAR(100) DEFAULT NULL, skupina VARCHAR(10) DEFAULT NULL, platnost_od DATETIME NOT NULL, platnost_do DATETIME NOT NULL, pouzito_at DATETIME DEFAULT NULL, vytvoril_iduser INT, vytvoreno TIMESTAMP DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (user_iduser) REFERENCES user(iduser) ON DELETE CASCADE) ENGINE=InnoDB")
+        cursor.execute("CREATE TABLE IF NOT EXISTS kviz_pristupy (id INT AUTO_INCREMENT PRIMARY KEY, token VARCHAR(64) NOT NULL UNIQUE, user_iduser INT NULL, host_jmeno VARCHAR(100) DEFAULT NULL, host_prijmeni VARCHAR(100) DEFAULT NULL, skupina VARCHAR(10) DEFAULT NULL, platnost_od DATETIME NOT NULL, platnost_do DATETIME NOT NULL, pouzito_at DATETIME DEFAULT NULL, vytvoril_iduser INT, vytvoreno TIMESTAMP DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (user_iduser) REFERENCES user(iduser) ON DELETE CASCADE) ENGINE=InnoDB CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
+        # Tabulka mohla vzniknout s výchozí collation DB (utf8mb4_czech_ci) — pak
+        # JOIN token = vysledky_kvizu.pristup_token a COALESCE se jmény z `user`
+        # padá na "Illegal mix of collations" a seznam odkazů je prázdný.
+        cursor.execute("SELECT TABLE_COLLATION FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'kviz_pristupy'")
+        if (cursor.fetchone() or [None])[0] != 'utf8mb4_unicode_ci':
+            cursor.execute("ALTER TABLE kviz_pristupy CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
         try: cursor.execute("ALTER TABLE kviz_pristupy ADD COLUMN skupina VARCHAR(10) DEFAULT NULL")
         except Exception: pass
         try: cursor.execute("ALTER TABLE kviz_pristupy MODIFY COLUMN user_iduser INT NULL")
@@ -2532,7 +2538,9 @@ def seznam_kviz_pristupu(vytvoril_id=None, limit=200):
                           {kde}
                           ORDER BY p.vytvoreno DESC, p.id DESC LIMIT %s""", tuple(params))
         return cursor.fetchall()
-    except Exception: return []
+    except Exception as e:
+        print(f"Chyba při načítání přístupů do kvízu: {e}")
+        return []
     finally:
         if cursor: cursor.close()
         if conn: conn.close()
@@ -2558,7 +2566,9 @@ def vysledky_kviz_pristupu(vytvoril_id=None, limit=500):
                            {kde}
                            ORDER BY v.datum DESC, v.id DESC LIMIT %s""", tuple(params))
         return cursor.fetchall()
-    except Exception: return []
+    except Exception as e:
+        print(f"Chyba při načítání výsledků z odkazů do kvízu: {e}")
+        return []
     finally:
         if cursor: cursor.close()
         if conn: conn.close()

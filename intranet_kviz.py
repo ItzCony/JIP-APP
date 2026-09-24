@@ -150,8 +150,8 @@ def _nav_na_prehled():
     ui.timer(0.2, lambda: ui.navigate.to('/'), once=True)
 
 def _zakladni_url() -> str:
-    """Absolutní adresa portálu pro odkazy do e-mailu/tisku. Stejná konvence jako OIDC_REDIRECT_URI."""
-    return os.environ.get('PORTAL_URL', '').strip().rstrip('/')
+    """Absolutní adresa portálu (JIPKA_APP_URL, výchozí ostrý portál) – stejná jako v e-mailech ostatních modulů."""
+    return intranet_data.APP_URL
 
 def kviz_host_odkaz(token: str) -> str:
     return f"{_zakladni_url()}/kviz/host/{token}"
@@ -446,9 +446,6 @@ def index_page(client: Client):
         @ui.refreshable
         def seznam_pristupu():
             zaznamy = intranet_data.seznam_kviz_pristupu(vlastnik)
-            if not _zakladni_url():
-                ui.label('⚠️ Není nastavena proměnná PORTAL_URL – odkazy jsou zobrazeny relativně '
-                         'a je nutné před ně doplnit adresu portálu.').classes('text-sm text-orange-600 mb-3')
             if not zaznamy:
                 ui.label('Zatím nebyly vygenerovány žádné přístupy.').classes('text-gray-500 italic'); return
 
