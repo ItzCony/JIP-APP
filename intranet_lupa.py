@@ -64,6 +64,7 @@ _SLOUPCE = {
     'k jmeno':            'k_jmeno',
     'k mesto':            'k_mesto',
     'k ulice':            'k_ulice',
+    'site':               'site',
     'produkt kod':        'kod',
     'produkt nazev':      'nazev',
     'dodavatel popis':    'dodavatel',
@@ -135,6 +136,13 @@ def _cislo(hodnota):
         return 0.0
 
 
+def _ano_ne(hodnota):
+    """Buňka 'Ano'/'Ne' (i 1/0) → 1/0. Prázdno = Ne."""
+    if isinstance(hodnota, (int, float)) and not isinstance(hodnota, bool):
+        return 1 if hodnota else 0
+    return 1 if str(hodnota or '').strip().lower().startswith(('a', 'y', 't')) else 0
+
+
 def _obdobi(hodnota):
     """'2026M01' → (2026, 1). Nerozpoznané → (None, None)."""
     m = _MESIC_RE.match(str(hodnota or ''))
@@ -184,9 +192,24 @@ def inicializace_db():
                 k_ulice VARCHAR(255),
                 k_mesto VARCHAR(255),
                 asm     VARCHAR(40),
+                site    TINYINT NOT NULL DEFAULT 0,
                 INDEX idx_asm (asm)
             ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci ENGINE=InnoDB
         """)
+        # Migrace: sloupec Sítě přibyl do exportu až dodatečně. NULL nesmí
+        # zůstat — kód slibuje NOT NULL, aby 'WHERE site=0' bylo past pro staré
+        # zákazníky.
+        cur.execute("SELECT IS_NULLABLE FROM information_schema.COLUMNS WHERE "
+                    "TABLE_SCHEMA=DATABASE() AND TABLE_NAME='lupa_zakaznik' AND "
+                    "COLUMN_NAME='site'")
+        radek = cur.fetchone()
+        if not radek:
+            cur.execute('ALTER TABLE lupa_zakaznik '
+                        'ADD COLUMN site TINYINT NOT NULL DEFAULT 0')
+        elif radek[0] == 'YES':
+            cur.execute('UPDATE lupa_zakaznik SET site = 0 WHERE site IS NULL')
+            cur.execute('ALTER TABLE lupa_zakaznik '
+                        'MODIFY site TINYINT NOT NULL DEFAULT 0')
         cur.execute("""
             CREATE TABLE IF NOT EXISTS lupa_produkt (
                 kod       VARCHAR(40) PRIMARY KEY,
@@ -575,7 +598,8 @@ def importuj_soubor(raw_bytes, nazev_souboru, stav=None):
 
             zakaznici.setdefault(ico, (
                 str(bunka('jmeno') or '')[:255], str(bunka('k_jmeno') or '')[:255],
-                str(bunka('k_ulice') or '')[:255], str(bunka('k_mesto') or '')[:255], asm))
+                str(bunka('k_ulice') or '')[:255], str(bunka('k_mesto') or '')[:255], asm,
+                _ano_ne(bunka('site'))))
             if kod:
                 produkty.setdefault(kod, (str(bunka('nazev') or '')[:255],
                                           str(bunka('dodavatel') or '')[:255]))
@@ -608,7 +632,8 @@ def importuj_soubor(raw_bytes, nazev_souboru, stav=None):
             return vysledek
 
         stav['faze'] = 'ukládám číselníky'
-        _uloz_dimenze(conn, cur, zakaznici, produkty, dealeri)
+        _uloz_dimenze(conn, cur, zakaznici, produkty, dealeri,
+                      ma_site='site' in mapa)
 
         vysledek['obdobi'] = sorted({f'{r}M{m:02d}' for _, r, m in smazane_partice})
         stav['faze'] = 'přepočítávám souhrn'
@@ -638,7 +663,7 @@ def _uloz_davku(cur, davka):
         'VALUES (%s,%s,%s,%s,%s,%s,%s,%s)', davka)
 
 
-def _uloz_dimenze(conn, cur, zakaznici, produkty, dealeri):
+def _uloz_dimenze(conn, cur, zakaznici, produkty, dealeri, ma_site=True):
     """Sdílené číselníky — katalog produktů má každé ASM stejný.
 
     Souběžné ON DUPLICATE KEY UPDATE nad týmiž klíči = deadlock, proto jeden
@@ -647,11 +672,15 @@ def _uloz_dimenze(conn, cur, zakaznici, produkty, dealeri):
     """
     with _DIMENZE_ZAMEK:
         if zakaznici:
+            # Soubor bez sloupce Sítě hodnotu nezná — nesmí přepsat dřív
+            # naimportovanou.
             cur.executemany(
-                'INSERT INTO lupa_zakaznik (ico, jmeno, k_jmeno, k_ulice, k_mesto, asm) '
-                'VALUES (%s,%s,%s,%s,%s,%s) ON DUPLICATE KEY UPDATE '
+                'INSERT INTO lupa_zakaznik '
+                '(ico, jmeno, k_jmeno, k_ulice, k_mesto, asm, site) '
+                'VALUES (%s,%s,%s,%s,%s,%s,%s) ON DUPLICATE KEY UPDATE '
                 'jmeno=VALUES(jmeno), k_jmeno=VALUES(k_jmeno), k_ulice=VALUES(k_ulice), '
-                'k_mesto=VALUES(k_mesto), asm=VALUES(asm)',
+                'k_mesto=VALUES(k_mesto), asm=VALUES(asm), '
+                + ('site=VALUES(site)' if ma_site else 'site=site'),
                 [(k[:40],) + v for k, v in sorted(zakaznici.items())])
         if produkty:
             cur.executemany(
@@ -1264,6 +1293,12 @@ def _filtr_sql(asm, filtr, produkt_uz_pripojen=False):
     if dod:
         kde.append('p.dodavatel IN (%s)' % ','.join(['%s'] * len(dod)))
         par += dod
+    site = filtr.get('site')
+    if site in ('ano', 'ne'):
+        # Poddotaz místo JOINu: lupa_zakaznik má ~6 tis. řádků s ico jako PK,
+        # takže semi-join je levný a volající nemusí řešit další join.
+        kde.append('o.ico IN (SELECT ico FROM lupa_zakaznik WHERE site = %s)')
+        par.append(1 if site == 'ano' else 0)
     return ' AND '.join(kde), par, bool(dod) and not produkt_uz_pripojen
 
 
@@ -1277,6 +1312,7 @@ def _souhrn_odberatelu(asm, filtr):
     if filtr.get('rozpad'):
         return _dotaz(f"""
             SELECT a.ico, z.jmeno, z.k_jmeno, z.k_ulice, z.k_mesto,
+                   IF(z.site, 'Ano', 'Ne') AS site,
                    a.kod, p.nazev, p.dodavatel, a.mj, a.kc
             FROM (SELECT o.ico, o.kod,
                          SUM(o.obrat_mj) AS mj, SUM(o.obrat_kc) AS kc
@@ -1289,6 +1325,7 @@ def _souhrn_odberatelu(asm, filtr):
         """, par, slovnik=True)
     return _dotaz(f"""
         SELECT a.ico, z.jmeno, z.k_jmeno, z.k_ulice, z.k_mesto,
+               IF(z.site, 'Ano', 'Ne') AS site,
                a.polozek, a.mj, a.kc
         FROM (SELECT o.ico, COUNT(DISTINCT o.kod) AS polozek,
                      SUM(o.obrat_mj) AS mj, SUM(o.obrat_kc) AS kc
@@ -1583,6 +1620,7 @@ _DETAIL_SQL = """
     SELECT o.asm, o.dealer, d.jmeno AS dealer_jmeno,
            CONCAT(o.rok, 'M', LPAD(o.mesic, 2, '0')) AS mesic,
            o.ico, z.jmeno, z.k_jmeno, z.k_ulice, z.k_mesto,
+           IF(z.site, 'Ano', 'Ne') AS site,
            o.kod, p.nazev, p.dodavatel, o.obrat_mj, o.obrat_kc
     FROM lupa_obrat o
     LEFT JOIN lupa_dealer d ON d.dealer = o.dealer
@@ -1613,6 +1651,7 @@ _COLS_SOUHRN = [
     ('K. jméno', 'k_jmeno', 'text', 30),
     ('K. ulice', 'k_ulice', 'text', 28),
     ('K. město', 'k_mesto', 'text', 20),
+    ('Sítě', 'site', 'text', 8),
     ('Položek', 'polozek', 'int', 10),
     ('Obrat v MJ', 'mj', 'num', 14),
     ('Obrat v Kč bez DPH', 'kc', 'money', 20),
@@ -1624,6 +1663,7 @@ _COLS_SOUHRN_ROZPAD = [
     ('K. jméno', 'k_jmeno', 'text', 30),
     ('K. ulice', 'k_ulice', 'text', 28),
     ('K. město', 'k_mesto', 'text', 20),
+    ('Sítě', 'site', 'text', 8),
     ('Produkt - Kód', 'kod', 'text', 16),
     ('Produkt - název', 'nazev', 'text', 40),
     ('Dodavatel - popis', 'dodavatel', 'text', 30),
@@ -1641,6 +1681,7 @@ _COLS_DETAIL = [
     ('K. jméno', 'k_jmeno', 'text', 30),
     ('K. ulice', 'k_ulice', 'text', 28),
     ('K. město', 'k_mesto', 'text', 20),
+    ('Sítě', 'site', 'text', 8),
     ('Produkt - Kód', 'kod', 'text', 16),
     ('Produkt - název', 'nazev', 'text', 40),
     ('Dodavatel - popis', 'dodavatel', 'text', 30),
@@ -1928,6 +1969,9 @@ def _popis_filtru(filtr, zakaznici_volby):
     if dod:
         casti.append('Dodavatelé: ' + ', '.join(dod[:5])
                      + (f' (+{len(dod) - 5} dalších)' if len(dod) > 5 else ''))
+    site = filtr.get('site')
+    if site in ('ano', 'ne'):
+        casti.append('Jen sítě' if site == 'ano' else 'Bez sítí')
     if filtr.get('rozpad'):
         casti.append('Rozpad po produktech')
     return ' · '.join(casti)
@@ -2452,7 +2496,9 @@ def _vykresli_odberatele(asm, user_id, user_name, vsechna_prava):
     dod_volby = _volby_dodavatelu()
     oz_volby = _volby_oz(asm)
 
-    stav = {'rows': [], 'total': {}, 'filtr': {}, 'popis': ''}
+    # 'vse' = co vrátila DB, 'rows' = co je vidět po přepínači sítí.
+    stav = {'vse': [], 'rows': [], 'total': {}, 'filtr': {},
+            'popis': '', 'popis_vse': ''}
 
     def _zaklad_jmena(co):
         return (f'lupa_{_bezpecne_jmeno(asm)}_{co}_'
@@ -2502,9 +2548,15 @@ def _vykresli_odberatele(asm, user_id, user_name, vsechna_prava):
         btn_detail = ui.button('Detailní pohled (Excel)', icon='download') \
             .props('outline color=green-9') \
             .tooltip('Surové řádky dle filtru — zákazník × produkt × měsíc. '
-                     'U celého ASM jde o stovky tisíc řádků a export trvá minuty.')
+                     'U celého ASM jde o stovky tisíc řádků a export trvá minuty. '
+                     'Přepínač sítí neřeší, jede vždy celý filtr.')
+        tgl_site = ui.toggle({'vse': 'Vše', 'ano': 'Jen sítě', 'ne': 'Bez sítí'},
+                             value='vse') \
+            .props('dense no-caps unelevated toggle-color=indigo-7') \
+            .tooltip('Překresluje už načtená data, Načíst se nemačká znovu. '
+                     'PDF a XLSX souhrn exportují zobrazený výběr.')
 
-    for b in (btn_pdf, btn_xlsx, btn_detail):
+    for b in (btn_pdf, btn_xlsx, btn_detail, tgl_site):
         b.disable()
 
     vysledek = ui.column().classes('w-full')
@@ -2574,6 +2626,7 @@ def _vykresli_odberatele(asm, user_id, user_name, vsechna_prava):
                     {'headerName': 'K. ulice', 'field': 'k_ulice', 'flex': 1,
                      'minWidth': 150},
                     {'headerName': 'K. město', 'field': 'k_mesto', 'width': 150},
+                    {'headerName': 'Sítě', 'field': 'site', 'width': 100},
                 ] + ([
                     {'headerName': 'Produkt - Kód', 'field': 'kod', 'width': 130},
                     {'headerName': 'Produkt - název', 'field': 'nazev', 'flex': 2,
@@ -2597,6 +2650,23 @@ def _vykresli_odberatele(asm, user_id, user_name, vsechna_prava):
             ui.label('Klikem na řádek zobrazíte, co zákazník ve zvoleném období bral.') \
                 .classes('text-xs text-gray-400 mt-1')
 
+    def prepni_site():
+        """Přepínač sítí jen filtruje už načtená data — do DB se nesahá."""
+        volba = tgl_site.value or 'vse'
+        vse = stav['vse']
+        rows = vse if volba == 'vse' else [
+            r for r in vse if (r.get('site') == 'Ano') == (volba == 'ano')]
+        stav['rows'] = rows
+        stav['total'] = _souhrn_total(rows, bool(stav['filtr'].get('rozpad')))
+        # Export i hlavička dialogu se ptají na popis — musí přiznat zúžení.
+        stav['popis'] = stav['popis_vse'] + {
+            'ano': ' · Jen sítě', 'ne': ' · Bez sítí'}.get(volba, '')
+        for b in (btn_pdf, btn_xlsx):
+            b.set_enabled(bool(rows))
+        vykresli_vysledek()
+
+    tgl_site.on_value_change(lambda _=None: prepni_site())
+
     async def nacti():
         if _blokuje_import(asm):
             return
@@ -2612,14 +2682,13 @@ def _vykresli_odberatele(asm, user_id, user_name, vsechna_prava):
             dlg.close()
             btn_nacti.enable()
             chk_rozpad.enable()
-        rozpad = bool(filtr.get('rozpad'))
-        stav.update({'rows': rows, 'total': _souhrn_total(rows, rozpad),
-                     'filtr': filtr, 'popis': _popis_filtru(filtr, zak_volby)})
-        for b in (btn_pdf, btn_xlsx, btn_detail):
-            b.set_enabled(bool(rows))
-        vykresli_vysledek()
+        stav.update({'vse': rows, 'filtr': filtr,
+                     'popis_vse': _popis_filtru(filtr, zak_volby)})
+        btn_detail.set_enabled(bool(rows))
+        tgl_site.set_enabled(bool(rows))
+        prepni_site()
         await asyncio.to_thread(zapis_log, user_id, user_name, 'nahled', asm,
-                                stav['popis'], len(rows))
+                                stav['popis'], len(stav['rows']))
 
     async def export_pdf():
         rows = stav['rows']
@@ -2674,7 +2743,7 @@ def _vykresli_odberatele(asm, user_id, user_name, vsechna_prava):
             _stahni_soubor(cesta, jmeno)
             ui.notify(f'Hotovo — {pocet} řádků.', type='positive')
             await asyncio.to_thread(zapis_log, user_id, user_name, 'export_xlsx_detail',
-                                    asm, stav['popis'], pocet)
+                                    asm, stav['popis_vse'], pocet)
         except Exception as e:
             ui.notify(f'Export selhal: {e}', type='negative', multi_line=True)
         finally:
@@ -3008,10 +3077,16 @@ def _vykresli_obraty(asm, user_id, user_name, vsechna_prava):
     def _soucasny_filtr():
         return {'od': sel_od.value, 'do': sel_do.value,
                 'ico': list(sel_zak.value or []), 'oz': list(sel_oz.value or []),
-                'dodavatel': list(sel_dod.value or [])}
+                'dodavatel': list(sel_dod.value or []),
+                'site': tgl_site.value or 'vse'}
 
     with ui.row().classes('w-full items-center gap-3 mb-3 flex-wrap'):
         btn_nacti = ui.button('Načíst', icon='insights').props('unelevated color=indigo-7')
+        tgl_site = ui.toggle({'vse': 'Vše', 'ano': 'Jen sítě', 'ne': 'Bez sítí'},
+                             value=ulozeny.get('site') or 'vse') \
+            .props('dense no-caps unelevated toggle-color=indigo-7') \
+            .tooltip('KPI, řady i propady počítá databáze — přepnutí pustí nový '
+                     'dotaz samo, Načíst se nemačká.')
         btn_pdf = ui.button('PDF přehled', icon='picture_as_pdf') \
             .props('outline color=indigo-7') \
             .tooltip('Celý zvolený výběr včetně KPI a grafů — filtr TOP položek '
@@ -3285,9 +3360,16 @@ def _vykresli_obraty(asm, user_id, user_name, vsechna_prava):
         finally:
             pozn.dismiss()
 
+    async def prepni_site():
+        # KPI, řady i propady počítá SQL → jiný okruh zákazníků = nutný nový
+        # dotaz. Dokud se nic nenačetlo, není co překreslovat.
+        if stav['data']:
+            await nacti()
+
     btn_nacti.on_click(_bez_klienta(nacti))
     btn_pdf.on_click(_bez_klienta(export_pdf))
     btn_xlsx.on_click(_bez_klienta(export_xlsx))
+    tgl_site.on_value_change(_bez_klienta(prepni_site))
 
 
 def _zamek_asm(klic):
