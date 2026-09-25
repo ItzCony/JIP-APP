@@ -512,13 +512,31 @@ def index_page(client: Client):
 
             async def _export():
                 def _soubor():
-                    df = pd.DataFrame([{'Jméno': r['jmeno'], 'Typ kvízu': r['skupina'], 'Stav': r['stav'],
-                                        'Úspěšnost': r['uspesnost'], 'Body': r['body'],
-                                        'Trvání': r['trvani'], 'Odevzdáno': r['datum']} for r in rows])
+                    df = pd.DataFrame([{'Jméno': z['name'] or '', 'Příjmení': z['surname'] or '',
+                                        'Anonymní': 'ano' if z['anonymni'] else '',
+                                        'Typ kvízu': (z['skupina'] or '—').upper(), 'Stav': z['stav_testu'],
+                                        'Úspěšnost': z['uspesnost'], 'Body': z['body'],
+                                        'Trvání': z['doba_trvani'], 'Odevzdáno': z['datum']} for z in data])
+                    kdo = {z['id']: (z['name'] or '', z['surname'] or '', z['datum']) for z in data}
+                    odpovedi = []
+                    conn = intranet_data.get_db_connection()
+                    if conn and kdo:
+                        cur = conn.cursor(dictionary=True)
+                        cur.execute(f"SELECT vysledek_id, poradi, otazka, tvoje_volba, spravna_odpoved, hodnoceni "
+                                    f"FROM zaznamy_odpovedi WHERE vysledek_id IN ({','.join(['%s'] * len(kdo))}) "
+                                    f"ORDER BY vysledek_id, poradi", tuple(kdo))
+                        for o in cur.fetchall():
+                            j, p, d = kdo[o['vysledek_id']]
+                            odpovedi.append({'Jméno': j, 'Příjmení': p, 'Odevzdáno': d,
+                                             'Pořadí v testu': o['poradi'], 'Otázka': o['otazka'],
+                                             'Tvoje volba': o['tvoje_volba'], 'Správná odpověď': o['spravna_odpoved'],
+                                             'Hodnocení': o['hodnoceni']})
+                        cur.close(); conn.close()
                     os.makedirs('Exporty_Kviz', exist_ok=True)
                     cesta = os.path.join('Exporty_Kviz', f"Hoste_Kviz_{time.strftime('%Y%m%d_%H%M%S')}.xlsx")
                     with pd.ExcelWriter(cesta, engine='openpyxl') as w:
                         df.to_excel(w, sheet_name='Výsledky', index=False)
+                        if odpovedi: pd.DataFrame(odpovedi).to_excel(w, sheet_name='Analýza', index=False)
                     return cesta
                 try:
                     ui.download(await asyncio.to_thread(_soubor))
