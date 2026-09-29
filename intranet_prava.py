@@ -231,6 +231,21 @@ ZAKLADNI_PRAVA = {
 
 }
 
+# Leták – WebPortál (Cenopřípad): vlastní sada práv, zcela vyňatá z ostatních práv modulu.
+# Nákup je po kódech nákupčího (sloupec S „Nak" v DATA_POROVNANI) — musí sedět
+# s WP_KODY_NAKUPCI / WP_PRAVO_* v intranet_cenopripad.py.
+_WP_POD = 'Leták – WebPortál'
+ZAKLADNI_PRAVA.update({
+    'cenopripad_wp_zadatel': {'kategorie': 'Modul Cenopřípad', 'podskupina': _WP_POD, 'nazev': 'Zadavatel', 'popis': 'Nahrává letákové případy WebPortál ke kontrole. Vidí jen své případy a jejich stav, NEVIDÍ OP a marže %. Případ „V pořádku“ sám označí jako zpracovaný.', 'ikona': 'upload_file'},
+    'cenopripad_wp_sprava':   {'kategorie': 'Modul Cenopřípad', 'podskupina': _WP_POD, 'nazev': 'Správa', 'popis': 'Vidí všechny případy Leták – WebPortál vč. celé fronty (všechny kódy nákupčích), OP a marže %. Může se vyjádřit za kohokoli.', 'ikona': 'admin_panel_settings'},
+})
+for _k in ('CK', 'DR', 'HV', 'KO', 'LT', 'ML', 'MR', 'NP', 'OZ', 'RD', 'SK', 'UP', 'VI'):
+    ZAKLADNI_PRAVA[f'cenopripad_wp_nakup_{_k.lower()}'] = {
+        'kategorie': 'Modul Cenopřípad', 'podskupina': _WP_POD, 'nazev': f'Nákup: {_k}',
+        'popis': f'Vidí sekci „Fronta“ — jen nesouhlasící položky s kódem nákupčího {_k} '
+                 f'(sloupec S v DATA_POROVNANI) — a vyjadřuje se k nim. NEVIDÍ OP a marže %.',
+        'ikona': 'assignment_ind'}
+
 # Práva kategorie „Administrace portálu" — nikdy se nepřidělují přes UI ani
 # se neukládají komukoliv jinému než skrytému hlavnímu adminovi (iduser=1).
 # Katalog si je ponechává kvůli popiskům a kontrolám v kódu; z nabídky

@@ -2,7 +2,6 @@ import sys
 sys.setrecursionlimit(3000)   # NiceGUI/inspect potřebuje více prostoru pro komplexní render stromy
 
 import asyncio
-import datetime
 import os
 from nicegui import ui, app
 from starlette.middleware.gzip import GZipMiddleware
@@ -103,44 +102,6 @@ async def bg_periodicky_cleanup():
             print(f"[bg_periodicky_cleanup] Chyba: {e}")
         await asyncio.sleep(1800)
 
-def _rotuj_audit_log(max_archivu: int = 30):
-    """Při startu serveru audit log ZAARCHIVUJE (nemaže) — zachová forenzní stopu.
-
-    Stávající activity.log se přesune do Exporty_Logy/activity_<timestamp>.log
-    a běh pokračuje s čistým souborem. Drží se posledních `max_archivu` archivů."""
-    try:
-        log_file = intranet_logger.LOG_FILE
-        archiv_dir = intranet_logger.EXPORT_DIR
-        os.makedirs(archiv_dir, exist_ok=True)
-
-        if os.path.exists(log_file) and os.path.getsize(log_file) > 0:
-            ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-            cil = os.path.join(archiv_dir, f'activity_{ts}.log')
-            os.replace(log_file, cil)
-            print(f"[startup] Audit log zaarchivován do '{cil}'.")
-
-        # Začni s prázdným aktivním logem.
-        with open(log_file, 'w'):
-            pass
-        intranet_logger.LOG_CACHE.clear()
-        intranet_logger.CACHE_INITIALIZED = True
-
-        # Úklid starých archivů (ponech jen posledních max_archivu).
-        try:
-            archivy = sorted(
-                f for f in os.listdir(archiv_dir)
-                if f.startswith('activity_') and f.endswith('.log')
-            )
-            for stary in archivy[:-max_archivu]:
-                try:
-                    os.remove(os.path.join(archiv_dir, stary))
-                except OSError:
-                    pass
-        except OSError:
-            pass
-    except Exception as e:
-        print(f"[startup] Nepodařilo se zarotovat audit log: {e}")
-
 
 # POZN.: guard je ZÁMĚRNĚ jen "__main__" (ne "__mp_main__"). Proces-pool
 # (intranet_jobs) spouští worker-procesy, které re-importují tento modul jako
@@ -159,7 +120,11 @@ if __name__ == "__main__":
         print("=" * 72 + "\n")
         raise SystemExit(1)
 
-    _rotuj_audit_log()
+    # Audit log (SQLite audit_log.db): schéma + jednorázový import starých activity.log
+    # a archivů z Exporty_Logy, pak spustí zapisovací vlákno.
+    intranet_logger.init_db()
+    # Audit: pády, chyby v UI handlerech a každý krok (kliknutí / výběr) ve všech modulech.
+    intranet_logger.aktivuj_globalni_logovani()
     app.on_startup(_nastav_exception_handler)
     # Proces-pool pro CPU-náročné úlohy (exporty, tisk, parsování uploadů).
     app.on_startup(intranet_jobs.init_pool)
@@ -214,4 +179,6 @@ if __name__ == "__main__":
     if intranet_logger.RESTART_POZADOVAN:
         print('[reboot] Restart aplikace vyžádán z audit konzole — spouštím znovu…')
         sys.stdout.flush()
+        # os.execv nespouští atexit — frontu audit logu dopíšeme do DB ručně.
+        intranet_logger.dokonci_zapis()
         os.execv(sys.executable, [sys.executable] + sys.argv)
