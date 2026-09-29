@@ -958,6 +958,7 @@ def vykresli_smeny(user_id, user_name, vsechna_prava):
 
         # ESC zavře kalendář (návrat na dashboard). Když je otevřený dialog,
         # ESC řeší Quasar (zavře dialog) a návrat se neprovede – kontrola .q-dialog.
+        # preventDefault: desktopová aplikace pak ESC nebere jako „ukončit aplikaci“.
         ui.timer(0.05, lambda: ui.run_javascript('''
             if (!window._smenyEscBound) {
                 window._smenyEscBound = true;
@@ -965,7 +966,7 @@ def vykresli_smeny(user_id, user_name, vsechna_prava):
                     if (e.key !== 'Escape') return;
                     if (document.querySelector('.q-dialog')) return;
                     var btn = document.querySelector('.smeny-zpet-btn');
-                    if (btn) btn.click();
+                    if (btn) { e.preventDefault(); btn.click(); }
                 });
             }
         '''), once=True)

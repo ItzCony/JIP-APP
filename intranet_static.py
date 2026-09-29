@@ -18,6 +18,8 @@ import os
 from fastapi.responses import FileResponse, PlainTextResponse
 from nicegui import app
 
+import intranet_data
+
 # Prefixy už zaregistrované (ukol_prilohy/projekt_prilohy se mountují ze dvou modulů).
 _ZAREGISTROVANE: set[str] = set()
 
@@ -34,8 +36,22 @@ def je_prihlasen() -> bool:
         return False
 
 
-def chranene_soubory(url_prefix: str, adresar: str) -> None:
-    """Servíruje obsah `adresar` na `url_prefix` pouze přihlášeným uživatelům."""
+def ma_pravo(pravo: str) -> bool:
+    """True, pokud přihlášený a aktivní uživatel requestu má `pravo`.
+
+    Čte práva z DB při každém requestu, takže odebrání práva platí hned.
+    Chyba nebo výpadek DB (= prázdná práva) → False. Fail closed.
+    """
+    try:
+        prava, aktivni = intranet_data.ziskej_prava_a_aktivitu(app.storage.user.get('user_id'))
+        return aktivni and pravo in (p.lower() for p in prava)
+    except Exception:
+        return False
+
+
+def chranene_soubory(url_prefix: str, adresar: str, pravo: str | None = None) -> None:
+    """Servíruje obsah `adresar` na `url_prefix` pouze přihlášeným uživatelům
+    (se zadaným `pravo` jen těm, kdo ho mají)."""
     url_prefix = '/' + url_prefix.strip('/')
     if url_prefix in _ZAREGISTROVANE:
         return
@@ -50,7 +66,7 @@ def chranene_soubory(url_prefix: str, adresar: str) -> None:
     def _servuj(cesta: str):
         # Nepřihlášenému hlásíme 404, ne 401 — ať se z odpovědi nedá zjistit,
         # jestli soubor existuje.
-        if not je_prihlasen():
+        if not je_prihlasen() or (pravo and not ma_pravo(pravo)):
             return PlainTextResponse('Nenalezeno', status_code=404)
         soubor = os.path.realpath(os.path.join(koren, cesta))
         if soubor != koren and not soubor.startswith(koren + os.sep):

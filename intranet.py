@@ -96,6 +96,9 @@ for _sf in _STATIC_WHITELIST:
 for _dir in ('planogram_fotos', 'ochutnavky_prilohy', 'ukol_prilohy',
              'projekt_prilohy', 'spolvecer_prilohy', 'asm_prirucka'):
     intranet_static.chranene_soubory(f'/{_dir}', _dir)
+# Instalátor desktopové aplikace (sestavuje desktop/build.cmd) – jen hlavnímu administrátorovi (právo 'vse').
+_INSTALATOR_APLIKACE = _os.path.join('desktop', 'dist', 'JIPka-setup.exe')
+intranet_static.chranene_soubory('/aplikace', _os.path.dirname(_INSTALATOR_APLIKACE), pravo='vse')
 
 # Evidence aktivních relací + „chytré" automatické odhlašování je v intranet_session
 # (GLOBAL_ACTIVE_SESSIONS, počítání živých připojení, odložené odhlášení po zavření
@@ -320,6 +323,38 @@ def _obrazovka_vynucene_zmeny_hesla(user_id, user_email, user_name):
                     ui.navigate.to('/')
                 ui.button('Odhlásit', on_click=odhlasit).props('flat no-caps unelevated').classes('flex-1 gate-btn-secondary font-bold h-12 rounded-xl')
                 ui.button('Uložit heslo', on_click=ulozit).props('no-caps unelevated').classes('flex-1 login-btn')
+
+
+def _nabidka_desktop_aplikace(client: Client, je_hlavni_admin: bool) -> None:
+    """Tlačítko „Aplikace pro Windows“ v hlavičce: stažení instalátoru desktopové aplikace.
+
+    Jen pro hlavního administrátora (právo 'vse'; stejně hlídá i cesta /aplikace/),
+    pokud je instalátor na serveru sestavený, uživatel je na Windows a nejde
+    o aplikaci samotnou (ta posílá v User-Agentu „JIPkaDesktop“, viz desktop/Program.cs).
+    """
+    if not je_hlavni_admin:
+        return
+    try:
+        ua = client.request.headers.get('user-agent', '')
+    except RuntimeError:  # klient bez HTTP requestu
+        return
+    if 'Windows' not in ua or 'JIPkaDesktop' in ua or not _os.path.isfile(_INSTALATOR_APLIKACE):
+        return
+    with ui.dialog() as dialog, ui.card().classes('max-w-md'):
+        ui.label('Moje JIPka pro Windows').classes('text-lg font-bold')
+        ui.label('Portál ve vlastním okně se zástupcem na ploše a ve Startu. '
+                 'Instalace nepotřebuje práva správce.')
+        ui.label('Instalátor není digitálně podepsaný. Pokud prohlížeč upozorní, že se soubor '
+                 'běžně nestahuje, potvrďte, že ho chcete ponechat. Pokud Windows zobrazí '
+                 '„Systém Windows ochránil váš počítač“, klikněte na Další informace → Přesto spustit.') \
+            .classes('text-sm text-gray-600')
+        with ui.row().classes('w-full justify-end'):
+            ui.button('Zavřít', on_click=dialog.close).props('flat')
+            ui.button('Stáhnout', icon='download', on_click=lambda: (
+                ui.download.from_url('/aplikace/JIPka-setup.exe'), dialog.close()))
+    ui.button(icon='desktop_windows', on_click=dialog.open) \
+        .props('flat round color=white dense').tooltip('Aplikace pro Windows')
+
 
 async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
     ui.page_title('Moje JIPka')
@@ -1515,6 +1550,7 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
                 ui.timer(30, _notif_badge.refresh)
                 # ─────────────────────────────────────────────────────────
 
+                _nabidka_desktop_aplikace(client, ma_vse)
                 ui.button(icon='settings', on_click=lambda: prepni_tab('nastaveni')) \
                     .props('flat round color=white dense') \
                     .tooltip('Osobní nastavení')

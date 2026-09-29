@@ -3228,7 +3228,8 @@ def _grid_mazani_js(tabulka: str) -> dict:
         "function zavri(){m.remove();document.removeEventListener('mousedown',ven,true);"
         "document.removeEventListener('keydown',esc,true);}"
         "function ven(e2){if(!m.contains(e2.target))zavri();}"
-        "function esc(e2){if(e2.key==='Escape')zavri();}"
+        # preventDefault: desktopová aplikace pak ESC nebere jako „ukončit aplikaci“
+        "function esc(e2){if(e2.key==='Escape'){e2.preventDefault();zavri();}}"
         "function pridej(text,payload){"
         "var it=document.createElement('div');it.textContent=text;"
         "it.style.cssText='padding:8px 12px;cursor:pointer;border-radius:7px;color:#b91c1c;"
