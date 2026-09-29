@@ -285,10 +285,28 @@ def index_page(client: Client):
         intranet_session.registruj_pripojeni(client, _token, _user_email, user_name)
 
     # Host nedědí práva uživatele, jehož jménem test píše.
-    vsechna_prava = [] if je_host else intranet_data.ziskej_prava_uzivatele(user_id)
+    _verze_prav_stranky = None
+    if je_host:
+        vsechna_prava = []
+    else:
+        _verze_prav_stranky = intranet_data.verze_prav(user_id)  # před čtením práv
+        vsechna_prava, _je_aktivni = intranet_data.ziskej_prava_a_aktivitu(user_id)
+        if not _je_aktivni:
+            # Deaktivovaný / smazaný účet — relaci ukončí stráž na hlavní stránce.
+            ui.navigate.to('/')
+            return
     is_admin = 'vse' in vsechna_prava
     ma_pristup_k_vysledkum = "vystup_osobni" in vsechna_prava or "vystup_vse" in vsechna_prava or "vse" in vsechna_prava
     muze_generovat_hosty = is_admin or 'kviz_hoste' in vsechna_prava
+
+    # Stejná podmínka jako dlaždice na přehledu – bez práva 'kviz' nejde kvíz otevřít
+    # ani přímou URL. Host má přístup daný platným odkazem.
+    if not je_host and not (is_admin or 'kviz' in vsechna_prava):
+        with ui.column().classes('w-full max-w-2xl mx-auto items-center mt-32'):
+            ui.label('🚫 NEMÁTE PŘÍSTUP').classes('text-5xl font-bold text-red-600 mb-6')
+            ui.label('K modulu Zkouškový kvíz nemáte oprávnění.').classes('text-2xl text-gray-700 text-center')
+            ui.button('Zpět na Přehled', on_click=_nav_na_prehled).classes('mt-10 bg-blue-600 text-white font-bold px-8 py-3 rounded-lg shadow-md')
+        return
 
     # Skupina kvízu je řízena globálním nastavením administrátora; hostovský odkaz
     # si ale může nést vlastní (zadavatel ji volí při generování).
@@ -981,6 +999,41 @@ def index_page(client: Client):
                 ukoncit_test()
 
     ui.timer(1.0, tik_casovace)
+
+    # --- Hlídání změn práv (obdoba kontrola_prav v intranet.py). Stav testu i obrazovka
+    # s výsledkem žijí jen v této stránce (cookie se po sestavení už nezapisuje), takže
+    # reload by je zahodil: probíhající test se nepřeruší nikdy, výsledek jen při ztrátě
+    # přístupu. Odložená změna se projeví při dalším otevření stránky.
+    if not je_host and user_id:
+        _KVIZ_PRAVA = {'vse', 'kviz', 'kviz_hoste', 'vystup_osobni', 'vystup_vse'}
+        _prava_kvizu = {p.lower() for p in vsechna_prava} & _KVIZ_PRAVA
+        _stav_prav = {'verze': _verze_prav_stranky}
+
+        async def kontrola_prav_kvizu():
+            if state.get('bezi_test') or not client.has_socket_connection:
+                return
+            verze = intranet_data.verze_prav(user_id)
+            if verze == _stav_prav['verze']:
+                return
+            try:
+                vysledek = await asyncio.get_running_loop().run_in_executor(
+                    None, intranet_data.prava_pro_kontrolu, user_id)
+            except Exception:
+                return
+            if vysledek is None or state.get('bezi_test') or not client.has_socket_connection:
+                return  # výpadek DB / test mezitím začal → zkusí se znovu
+            _stav_prav['verze'] = verze
+            prava_raw, je_aktivni = vysledek
+            nova = {p.lower() for p in prava_raw} & _KVIZ_PRAVA
+            if je_aktivni and nova == _prava_kvizu:
+                return  # změna se kvízu netýká
+            ztrata_pristupu = not je_aktivni or not ({'vse', 'kviz'} & nova)
+            if state.get('vysledek') and not ztrata_pristupu:
+                return
+            # Reload vyřeší vše: „NEMÁTE PŘÍSTUP", deaktivovaný účet → '/', nová tlačítka.
+            ui.navigate.reload()
+
+        ui.timer(5.0, kontrola_prav_kvizu)
 
     def spustit_test():
         otazky = nacti_otazky(typ=kviz_typ, pocet_otazek=int(config[kviz_typ]['pocet_otazek']))

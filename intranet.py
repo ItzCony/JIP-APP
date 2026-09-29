@@ -644,10 +644,21 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
             ui.timer(30.0, kontrola_relace)  # 5s → 30s: snížení overhead WebSocket zpráv
 
     vsechna_prava = []
+    # Verze práv PŘED jejich načtením – změnu mezi čtením a snímkem verze tak
+    # kontrola_prav nepromešká (nanejvýš jednou zbytečně ověří stejná práva).
+    _verze_prav_stranky = intranet_data.verze_prav(user_id) if user_id else None
     if user_id:
         loop = asyncio.get_running_loop()
-        prava_raw = await loop.run_in_executor(None, intranet_data.ziskej_prava_uzivatele, user_id)
+        prava_raw, je_aktivni = await loop.run_in_executor(None, intranet_data.ziskej_prava_a_aktivitu, user_id)
         if not client.has_socket_connection:
+            return
+        if not je_aktivni:
+            # Deaktivovaný / smazaný účet s uloženou relací (např. po restartu
+            # serveru, kdy se vynucené odhlášení v paměti ztratí) → ven.
+            intranet_session.vynut_odhlaseni(user_email)
+            _odhlas_vycisti_relaci()
+            app.storage.user['odhlaseni_admin'] = True
+            ui.navigate.to('/')
             return
         vsechna_prava = [p.lower() for p in prava_raw]
 
@@ -662,12 +673,13 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
         dostupne_taby.append('uzivatele')
     if ma_vse or "mysql" in vsechna_prava:
         dostupne_taby.append('mysql')
-    if ma_vse or "veletrh_admin" in vsechna_prava or "veletrh_uzivatel" in vsechna_prava or "veletrh_komentator" in vsechna_prava or "veletrh_pristup" in vsechna_prava:
-        dostupne_taby.append('veletrh')
 
     nastaveni = await asyncio.get_running_loop().run_in_executor(None, intranet_data.nacti_nastaveni_intranetu)
     if not client.has_socket_connection:
         return
+
+    if (ma_vse or "veletrh_admin" in vsechna_prava or "veletrh_uzivatel" in vsechna_prava or "veletrh_komentator" in vsechna_prava or "veletrh_pristup" in vsechna_prava) and nastaveni.get('veletrh_zapnuty', True):
+        dostupne_taby.append('veletrh')
 
     # --- Sledování změn nastavení (pro okamžitý reload při změně modulů adminem) ---
     try:
@@ -733,10 +745,46 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
         except Exception:
             pass
 
+    # --- Hlídání změn práv: admin upraví práva uživatele / oddělení / roli → otevřená
+    # stránka dotčeného uživatele se obnoví. Každý tik jen porovná verzi v paměti;
+    # do DB se jde až po změně verze a obnovuje se jen při skutečném rozdílu práv.
+    _prava_stranky = sorted(set(vsechna_prava))
+    _stav_prav = {'verze': _verze_prav_stranky}
+
+    async def kontrola_prav() -> bool:
+        """True = stránka se právě obnovuje (další kontroly nemají smysl)."""
+        if not user_id or not client.has_socket_connection:
+            return False
+        try:
+            verze = intranet_data.verze_prav(user_id)
+            if verze == _stav_prav['verze']:
+                return False
+            vysledek = await asyncio.get_running_loop().run_in_executor(
+                None, intranet_data.prava_pro_kontrolu, user_id)
+            if vysledek is None or not client.has_socket_connection:
+                return False  # výpadek DB → verzi neposouváme, zkusí se při dalším tiku
+            _stav_prav['verze'] = verze
+            prava_raw, je_aktivni = vysledek
+            if je_aktivni and sorted({p.lower() for p in prava_raw}) == _prava_stranky:
+                return False  # změna se tohoto uživatele netýkala
+            # Nové sestavení stránky vyřeší vše: záložky podle nových práv, návrat
+            # na přehled ze záložky bez práva i odhlášení deaktivovaného účtu.
+            if je_aktivni:
+                app.storage.user['prava_zmenena'] = True
+            ui.navigate.reload()
+            return True
+        except Exception:
+            return False
+
+    async def kontrola_zmen():
+        if await kontrola_prav():
+            return
+        kontrola_nastaveni_verze()
+
     if client.has_socket_connection:
-        # 5 s stačí — jde jen o reload při vypnutí modulu adminem; 1 Hz per klient
-        # zbytečně zatěžovala event loop při desítkách připojených uživatelů.
-        ui.timer(5.0, kontrola_nastaveni_verze)
+        # 5 s stačí — jde o reload po změně práv / vypnutí modulu adminem; 1 Hz per
+        # klient zbytečně zatěžovala event loop při desítkách připojených uživatelů.
+        ui.timer(5.0, kontrola_zmen)
 
     ma_prava_finance = ma_vse or any(p in vsechna_prava for p in ['nakup_uzivatel', 'nakup_schvalit', 'faktury_seznam_schvalit'])
     has_finance = ma_prava_finance and nastaveni.get('finance_zapnuty', True)
@@ -1290,6 +1338,11 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
                 app.storage.user['heslo_pripominka_den'] = time.strftime('%Y-%m-%d')
                 ui.notify(f'Heslo jste neměnili {dni_hesla} dní. Změnit si ho můžete v Osobním nastavení účtu.',
                           type='warning', position='top', timeout=12000, close_button='OK')
+
+        # Stránka se právě obnovila po změně práv adminem (viz kontrola_prav)
+        if app.storage.user.pop('prava_zmenena', False):
+            ui.notify('Vaše oprávnění byla změněna, stránka se obnovila.',
+                      type='info', position='top', timeout=6000)
 
         ui.query('body').classes(add='intranet-pozadi', remove='prihlaseni-pozadi')
 

@@ -243,6 +243,60 @@ _SORT_KOD_OK = _re.compile(r'^[a-z0-9_-]{1,30}$')
 ADMIN_ONLY_PRAVA = {k for k, v in ZAKLADNI_PRAVA.items()
                     if v.get('kategorie') == 'Administrace portálu'}
 
+# Které právo patří kterému přepínači modulu (klíč v nastavení intranetu).
+# Práva vypnutého modulu jsou ve správě uživatelů šedá a nejdou přiřadit ani
+# odebrat — v DB zůstávají, po zapnutí modulu platí dál.
+_MODUL_KATEGORIE = {
+    'Modul Kvíz':                'kviz_zapnuty',
+    'Modul Veletrh':             'veletrh_zapnuty',
+    'Modul Aprovia':             'finance_zapnuty',
+    'Modul Prodejní aktivity':   'prod_akt_zapnuty',
+    'Modul Narozeniny':          'narozeniny_zapnuty',
+    'Modul Plánování směn':      'smeny_zapnuty',
+    'Modul Komunikační portál':  'komunikace_zapnuty',
+    'Modul Plánogram tabáku':    'planogram_zapnuty',
+    'Modul Ochutnávky MO a CC':  'ochutnavky_zapnuty',
+    'Modul Porady a úkoly':      'ukolovnik_zapnuty',
+    'Modul Výsledky poboček':    'vysledky_zapnuty',
+    'Modul Sankce':              'sankce_zapnuty',
+    'Modul Monitor':             'monitor_zapnuty',
+    'Modul Zalistovací komise':  'zalistovaci_zapnuty',
+    'Modul Manuály':             'manualy_zapnuty',
+    'Modul Gastrokurzy':         'gastrokurzy_zapnuty',
+    'Modul Společenský večer':   'spolvecer_zapnuty',
+    'Modul Vizitky a podpisy':   'vizitky_zapnuty',
+    'Modul Cenopřípad':          'cenopripad_zapnuty',
+    'Modul Formuláře ASM':       'asm_zapnuty',
+    'Modul Lupou na obchod':     'lupa_zapnuty',
+}
+# Značky mají v jedné kategorii dva moduly (podskupiny).
+_MODUL_PODSKUPINA = {
+    ('Modul Značky', 'Produkt'): 'znacky_zapnuty',
+    ('Modul Značky', 'Provoz'):  'znacky_provoz_zapnuty',
+}
+# Schůzky sdílí kategorii s ASM, ale mají vlastní přepínač.
+_MODUL_PREFIX = (('schuzky_', 'schuzky_zapnuty'),)
+
+
+def modul_prava(klic, meta):
+    """Klíč přepínače modulu, pod který právo patří (None = mimo moduly)."""
+    for prefix, modul in _MODUL_PREFIX:
+        if klic.startswith(prefix):
+            return modul
+    meta = meta or {}
+    kat = meta.get('kategorie')
+    return _MODUL_PODSKUPINA.get((kat, meta.get('podskupina'))) or _MODUL_KATEGORIE.get(kat)
+
+
+def prava_vypnutych_modulu(zakladni_prava, nastaveni):
+    """Množina klíčů práv z katalogu, jejichž modul je v nastavení vypnutý."""
+    vysledek = set()
+    for k, v in zakladni_prava.items():
+        modul = modul_prava(k, v)
+        if modul and not nastaveni.get(modul, True):
+            vysledek.add(k)
+    return vysledek
+
 def ziskej_kompletni_seznam_prav(oddeleni, typy_volna, sortimenty=None):
     prava = {k: v for k, v in ZAKLADNI_PRAVA.items() if k not in ADMIN_ONLY_PRAVA}
 
@@ -277,3 +331,59 @@ def ziskej_kompletni_seznam_prav(oddeleni, typy_volna, sortimenty=None):
         prava[f'tisk_{t_id}'] = {'kategorie': 'Práva k Exportům', 'nazev': f'Tisk: {t_nazev}', 'popis': f'Umožňuje exportovat absence typu {t_nazev}.', 'ikona': 'print'}
 
     return prava
+
+
+# Práva pojmenovaná podle oddělení (prefix + název.lower()). První řada odpovídá
+# ziskej_kompletni_seznam_prav, druhá jsou staré formáty, které katalog už
+# negeneruje — ale intranet.py na „schvalovat_" pořád otevírá záložku Docházka.
+PREFIXY_PRAV_ODDELENI = (
+    'slozka_', 'kalendar_', 'tisk_odd_', 'hlavni_vedouci_', 'porovnani_odd_', 'cp_schval_odd_',
+    'schvalovat_', 'ucetni_odd_',
+)
+
+# Práva mimo katalog, která kód pořád čte — úklid je nesmí smazat.
+#   faktury_admin, nakup_admin — intranet_finance (výběr schvalovatelů faktur/nákupu)
+#   faktury_uzivatel           — zdroj migrace Aprovia (intranet_data.inicializace_faktur_db)
+#   dochazka_export            — brána záložky Docházka a exportu (intranet.py, intranet_obsah.py)
+PRAVA_MIMO_KATALOG = frozenset({'faktury_admin', 'faktury_uzivatel', 'nakup_admin', 'dochazka_export'})
+
+# Prefixy mimo katalog, podle kterých kód pořád filtruje data — úklid je vynechá.
+#   tisk_typ_, ucetni_typ_ — typy absencí v exportu (intranet_exporty.py, f'…{t_nazev.lower()}')
+#   monitor_sort_          — sortimenty Monitoru; číselník plní import, ne kód
+PREFIXY_CTENE_KODEM = ('tisk_typ_', 'ucetni_typ_', 'monitor_sort_')
+
+
+def prava_oddeleni(nazev_oddeleni):
+    """Názvy práv odvozené z oddělení — při jeho smazání musí zmizet taky.
+
+    Jinak by nově založené oddělení se stejným názvem vrátilo přístup původním
+    držitelům. Klíče statického katalogu (např. „kalendar_vse") se vynechají,
+    kdyby se oddělení jmenovalo stejně.
+    """
+    nazev = (nazev_oddeleni or '').strip().lower()
+    if not nazev:
+        return []
+    return [p + nazev for p in PREFIXY_PRAV_ODDELENI if p + nazev not in ZAKLADNI_PRAVA]
+
+
+def najdi_osirela_prava(nazvy_v_db, oddeleni, typy_volna, sortimenty=None):
+    """Práva z DB, která katalog nezná a kód nečte (kandidáti na úklid).
+
+    Vrací None, když se katalog nedá sestavit spolehlivě: prázdný seznam
+    oddělení nebo typů volna znamená spíš výpadek DB než skutečný stav, a úklid
+    by pak smazal i platná práva. Práva s prefixem z PREFIXY_CTENE_KODEM se
+    neuklízí nikdy — kód je čte, i když je katalog negeneruje.
+    """
+    if not oddeleni or not typy_volna:
+        return None
+    znama = set(ziskej_kompletni_seznam_prav(oddeleni, typy_volna, sortimenty))
+    znama |= ADMIN_ONLY_PRAVA | PRAVA_MIMO_KATALOG | {'vse'}
+    znama = {k.lower() for k in znama}
+    # privileges.name je VARCHAR(45): dlouhý klíč (oddělení s dlouhým názvem)
+    # mohl DB uložit oříznutý — takový řádek není osiřelý.
+    znama |= {k[:45] for k in znama if len(k) > 45}
+    # Kód práva porovnává malými písmeny (intranet.py: p.lower()) — stejně i tady.
+    return sorted(
+        n for n in nazvy_v_db
+        if n and n.lower() not in znama and not n.lower().startswith(PREFIXY_CTENE_KODEM)
+    )
