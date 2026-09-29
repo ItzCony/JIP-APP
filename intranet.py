@@ -917,7 +917,9 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
             'cenopripad_spravce_bez_emailu', 'cenopripad_vkladatel',
             'cenopripad_zobrazeni_oddeleni')) or
         # Schvalovatel – oddělení: dynamické právo cp_schval_odd_<oddělení>
-        any(p.startswith('cp_schval_odd_') for p in vsechna_prava)
+        any(p.startswith('cp_schval_odd_') for p in vsechna_prava) or
+        # Leták – WebPortál: vlastní práva (zadavatel / správa / nákup po kódech)
+        any(p.startswith('cenopripad_wp_') for p in vsechna_prava)
     )
     if _ma_cenopripad and nastaveni.get('cenopripad_zapnuty', True):
         dostupne_taby.append('cenopripad')
@@ -1732,12 +1734,14 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
                 # (běžíme uvnitř page builderu — kontext je tu přirozeně)
                 if _aktivni_start != 'prehled':
                     _vykresli_tab(_aktivni_start)
+                intranet_logger.log_krok('Otevření modulu', _aktivni_start, client)
 
                 # Lazy render bez pollingu: tab se dokreslí při změně hodnoty tabů.
                 # Zachytí kliknutí na tab i programové přepnutí přes binding.
                 def _zmena_tabu(e) -> None:
                     if e.value:
                         app.storage.user['intranet_tab'] = e.value
+                        intranet_logger.log_krok('Otevření modulu', e.value, client)
                     _vykresli_tab_v_kontextu(e.value)
 
                 tabs.on_value_change(_zmena_tabu)

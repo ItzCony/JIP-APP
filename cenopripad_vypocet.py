@@ -526,6 +526,8 @@ def nacti_master(zdroj_data, op_mapa, list_nazev="DATA_POROVNANI") -> dict:
                     "id": d.get(14),                # O
                     "dph": parse_cislo(d.get(16)),  # Q (Sazba DPH = text)
                     "sortiment": sort_s,
+                    # S (Nak) = kód nákupčího (DR/SK/CK…) — párování fronty Leták – WebPortál
+                    "nak": (str(d.get(18)).strip().upper() or None) if d.get(18) else None,
                     # OP: VÝHRADNĚ z OP souboru (obchodní podmínky) přes sortiment;
                     # není-li sortiment v OP souboru -> None -> engine počítá s 0.
                     "op": op_mapa.get(sort_s) if sort_s is not None else None,

@@ -467,6 +467,56 @@ def _vidi_oddeleni(p):
     return "cenopripad_zobrazeni_oddeleni" in p
 
 
+# ---------------------------------------------------------------------------
+# Leták – WebPortál: VLASTNÍ sada práv, zcela vyňatá z ostatních práv modulu
+# (žadatel/office/správce nákup na tento typ nemají vliv — jen hlavní správce „vse").
+#   Zadavatel → nahrává případy ke kontrole, nevidí OP a marže %
+#   Nákup     → vidí sekci „Fronta", jen položky svého kódu (sloupec S „Nak"), nevidí OP/marže
+#   Správa    → vidí všechny případy vč. fronty (a OP/marže)
+# ---------------------------------------------------------------------------
+WP_TYP = "webportal"
+WP_VERDIKT_FRONTA = "CHYBA"          # položky s tímto verdiktem jdou do fronty nákupčím
+WP_PRAVO_ZADATEL = "cenopripad_wp_zadatel"
+WP_PRAVO_SPRAVA = "cenopripad_wp_sprava"
+WP_PRAVO_NAKUP_PREFIX = "cenopripad_wp_nakup_"   # + kód nákupčího malými (…_dr, …_sk)
+# Kódy nákupčích ze sloupce S (Nak) v DATA_POROVNANI. Položky bez kódu / s jiným
+# kódem (např. XX) ve frontě vidí a vyřizuje jen Správa.
+WP_KODY_NAKUPCI = ["CK", "DR", "HV", "KO", "LT", "ML", "MR", "NP", "OZ", "RD", "SK",
+                   "UP", "VI"]
+
+
+def _wp_sprava(p):
+    return "vse" in p or WP_PRAVO_SPRAVA in p
+
+
+def _wp_zadatel(p):
+    return WP_PRAVO_ZADATEL in p
+
+
+def _wp_kody(p):
+    """Kódy nákupčího (DR, SK…), jejichž položky uživatel ve frontě vidí."""
+    n = len(WP_PRAVO_NAKUP_PREFIX)
+    return {x[n:].upper() for x in p if x.startswith(WP_PRAVO_NAKUP_PREFIX)}
+
+
+def _wp_vidi_frontu(p):
+    return _wp_sprava(p) or bool(_wp_kody(p))
+
+
+WP_SEKCE_FRONTA = "fronta"   # hodnota ?wp= v odkazu z e-mailu nákupčím
+
+
+def _wp_pristup(p):
+    return _wp_sprava(p) or _wp_zadatel(p) or bool(_wp_kody(p))
+
+
+def _vidi_op_typu(typ, p):
+    """OP a marže % v detailu/exportu konkrétního typu. WebPortál: jen Správa."""
+    if typ == WP_TYP:
+        return _wp_sprava(p)
+    return _vidi_op(p)
+
+
 def _kolegove_oddeleni(user_id):
     """ID uživatelů ze stejných oddělení, kterým je přiřazeno právo
     'cenopripad_zobrazeni_oddeleni'. Tzn. spolučlenové oddělení, kde toto právo
@@ -608,6 +658,10 @@ def _viditelne_typy(p):
     spravce = _vidi_op(p)   # správce nákup / správce / hlavní správce
     out = []
     for klic, cfg in TYPY.items():
+        if klic == WP_TYP:   # Leták – WebPortál: výhradně vlastní práva
+            if _wp_pristup(p):   # nákupčí taky — uvnitř vidí jen sekci Fronta
+                out.append(klic)
+            continue
         if cfg.get("jen_spravce") and not spravce:   # např. Paima — jen pro správce
             continue
         if cfg["oddeleni"] == "nakup" and (vidi_nakup or schvalovatel):
@@ -618,6 +672,8 @@ def _viditelne_typy(p):
 
 
 def _muze_zadat(typ, p):
+    if typ == WP_TYP:
+        return _wp_zadatel(p) or _wp_sprava(p)
     if _je_spravce(p):
         return True
     if TYPY[typ].get("jen_spravce"):   # Paima — zadávat smí jen správce
@@ -643,7 +699,7 @@ def inicializace_cenopripad_db():
                 sortiment_popis VARCHAR(255),
                 nazev VARCHAR(255),
                 nc DOUBLE, nc2 DOUBLE, nc3 DOUBLE, nc4 DOUBLE, nc5 DOUBLE, dnc DOUBLE,
-                dph DOUBLE, id_kod VARCHAR(40), op DOUBLE,
+                dph DOUBLE, id_kod VARCHAR(40), op DOUBLE, nak VARCHAR(10),
                 INDEX idx_sortiment (sortiment)
             ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
         """)
@@ -967,6 +1023,18 @@ def inicializace_cenopripad_db():
                     "COLUMN_NAME='neschvaleno'")
         if cur.fetchone()[0] == 0:
             cur.execute("ALTER TABLE cenopripad_radky ADD COLUMN neschvaleno TINYINT DEFAULT 0")
+        # Migrace: Leták – WebPortál — kód nákupčího (sloupec S „Nak“ z DATA_POROVNANI)
+        # v masteru i na řádku případu + vyjádření nákupčího k položce ve frontě.
+        for _t, _col, _typ in (("cenopripad_master", "nak", "VARCHAR(10)"),
+                               ("cenopripad_radky", "nak", "VARCHAR(10)"),
+                               ("cenopripad_radky", "wp_vyjadreni", "TEXT"),
+                               ("cenopripad_radky", "wp_vyjadril", "VARCHAR(255)"),
+                               ("cenopripad_radky", "wp_vyjadreno", "DATETIME")):
+            cur.execute("SELECT COUNT(*) FROM information_schema.COLUMNS WHERE "
+                        "TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s AND COLUMN_NAME=%s",
+                        (_t, _col))
+            if cur.fetchone()[0] == 0:
+                cur.execute(f"ALTER TABLE {_t} ADD COLUMN {_col} {_typ}")
         # Migrace: název případu do letákových sestav
         cur.execute("SELECT COUNT(*) FROM information_schema.COLUMNS WHERE "
                     "TABLE_SCHEMA=DATABASE() AND TABLE_NAME='letaky_pripady' AND "
@@ -1084,13 +1152,14 @@ def _importuj_sync(op_raw, data_raw, op_name, data_name, user_name):
             # DATA importována → kompletní náhrada masteru (op už dle `mapa`)
             cur.execute("DELETE FROM cenopripad_master")
             cols = ("kod", "sortiment", "sortiment_popis", "nazev", "nc", "nc2", "nc3", "nc4",
-                    "nc5", "dnc", "dph", "id_kod", "op")
+                    "nc5", "dnc", "dph", "id_kod", "op", "nak")
             sql = (f"INSERT INTO cenopripad_master ({','.join(cols)}) "
                    f"VALUES ({','.join(['%s'] * len(cols))})")
             davka = [(kod, _str(m["sortiment"], 40), _str(m["sortiment_popis"], 255),
                       _str(m["nazev"], 255),
                       m["nc"], m["nc2"], m["nc3"], m["nc4"], m["nc5"], m["dnc"],
-                      m["dph"], _str(m["id"], 40), m["op"]) for kod, m in master.items()]
+                      m["dph"], _str(m["id"], 40), m["op"], _str(m.get("nak"), 10))
+                     for kod, m in master.items()]
             for i in range(0, len(davka), 2000):
                 cur.executemany(sql, davka[i:i + 2000])
         elif op_mapa is not None:
@@ -1328,13 +1397,15 @@ def _nacti_master_pro_kody(kody):
             chunk = kody[i:i + 1000]
             ph = ",".join(["%s"] * len(chunk))
             cur.execute(f"SELECT kod, sortiment, sortiment_popis, nazev, nc, nc2, nc3, nc4, "
-                        f"nc5, dnc, dph, id_kod, op FROM cenopripad_master WHERE kod IN ({ph})", chunk)
+                        f"nc5, dnc, dph, id_kod, op, nak FROM cenopripad_master "
+                        f"WHERE kod IN ({ph})", chunk)
             for r in cur.fetchall():
                 master[r["kod"]] = {
                     "nazev": r["nazev"], "sortiment_popis": r["sortiment_popis"],
                     "nc": r["nc"], "nc2": r["nc2"], "nc3": r["nc3"],
                     "nc4": r["nc4"], "nc5": r["nc5"], "dnc": r["dnc"], "dph": r["dph"],
-                    "id": r["id_kod"], "sortiment": r["sortiment"], "op": r["op"]}
+                    "id": r["id_kod"], "sortiment": r["sortiment"], "op": r["op"],
+                    "nak": r.get("nak")}
         cur.close()
         return master
     except Exception as e:
@@ -1361,6 +1432,7 @@ def vyhodnot_pripad_z_db(typ, radky):
         if m:
             rr["nazev_master"] = m.get("nazev")
             rr["sortiment_popis"] = m.get("sortiment_popis")
+            rr["nak"] = m.get("nak")
     return vys
 
 
@@ -1795,12 +1867,13 @@ def _uloz_pripad(typ, nazev, zadavatel_id, zadavatel_jmeno, vstup_radky, vyslede
                           _str(karta, 255), _str(rr.get("sortiment_popis"), 255),
                           _str(str(kod), 40), rr["verdikt"],
                           _str(rr["duvod"], 255), rr.get("op"),
-                          json.dumps(rr, ensure_ascii=False, default=str)))
+                          json.dumps(rr, ensure_ascii=False, default=str),
+                          _str(rr.get("nak"), 10)))
         cur.executemany(
             "INSERT INTO cenopripad_radky "
             "(pripad_id, poradi, vstup_json, nazev_karty, sortiment_popis, kod, verdikt, "
-            "duvod, op, marze_json) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", davka)
+            "duvod, op, marze_json, nak) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", davka)
         if soubor_raw:
             cur.execute("INSERT INTO cenopripad_soubory (pripad_id, nazev, data) "
                         "VALUES (%s, %s, %s)", (pid, _str(soubor_nazev, 255), soubor_raw))
@@ -1833,7 +1906,19 @@ def nacti_pripady(typ, prava, user_id, filtr_pobocka=None):
         cur = conn.cursor(dictionary=True)
         # Volitelný filtr pobočky — pouze zužuje (protíná) již viditelný seznam, nikdy nerozšiřuje.
         _pob = f" AND pobocka=%s" if filtr_pobocka else ""
-        if _vidi_vsechny_pripady(prava):
+        if typ == WP_TYP:
+            # Leták – WebPortál: Správa vše, ostatní (zadavatel) jen vlastní případy.
+            # Nákupčí pracují ve „Frontě" (položky svého kódu), ne v seznamu případů.
+            sql = "SELECT * FROM cenopripad_pripady WHERE typ=%s"
+            params = [typ]
+            if not _wp_sprava(prava):
+                sql += " AND zadavatel_id=%s"
+                params.append(user_id)
+            if filtr_pobocka:
+                sql += " AND pobocka=%s"
+                params.append(filtr_pobocka)
+            cur.execute(sql + " ORDER BY id DESC", tuple(params))
+        elif _vidi_vsechny_pripady(prava):
             if filtr_pobocka:
                 cur.execute(f"SELECT * FROM cenopripad_pripady WHERE typ=%s{_pob} ORDER BY id DESC",
                             (typ, filtr_pobocka))
@@ -1880,6 +1965,97 @@ def nacti_radky(pripad_id):
         return r
     except Exception:
         return []
+    finally:
+        conn.close()
+
+
+def wp_nacti_frontu(prava, jen_otevrene=True):
+    """Fronta Leták – WebPortál: chybné položky ('CHYBA') ostrých případů ve stavu
+    „Není v pořádku". Nákupčí vidí jen položky svých kódů (sloupec S), Správa vše
+    (vč. položek bez kódu). `jen_otevrene` → jen dosud bez vyjádření."""
+    sprava = _wp_sprava(prava)
+    kody = sorted(_wp_kody(prava))
+    if not sprava and not kody:
+        return []
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return []
+    try:
+        cur = conn.cursor(dictionary=True)
+        sql = ("SELECT r.id, r.pripad_id, r.poradi, r.kod, r.nazev_karty, r.duvod, r.nak, "
+               "r.vstup_json, r.wp_vyjadreni, r.wp_vyjadril, r.wp_vyjadreno, "
+               "p.cislo, p.nazev AS pripad_nazev, p.zadavatel_jmeno, p.datum_zadani "
+               "FROM cenopripad_radky r JOIN cenopripad_pripady p ON p.id = r.pripad_id "
+               "WHERE p.typ=%s AND p.stav='vyhodnoceno_chyba' AND p.testovaci=0 "
+               "AND r.verdikt=%s AND COALESCE(r.neschvaleno,0)=0")
+        params = [WP_TYP, WP_VERDIKT_FRONTA]
+        if jen_otevrene:
+            sql += " AND r.wp_vyjadreni IS NULL"
+        if not sprava:
+            sql += f" AND UPPER(r.nak) IN ({','.join(['%s'] * len(kody))})"
+            params += kody
+        cur.execute(sql + " ORDER BY p.id, r.poradi", tuple(params))
+        out = cur.fetchall()
+        cur.close()
+        return out
+    except Exception as e:
+        print(f"[cenopripad] wp_nacti_frontu: {e}")
+        return []
+    finally:
+        conn.close()
+
+
+def wp_uloz_vyjadreni(radek_ids, text, kdo, prava):
+    """Uloží vyjádření nákupčího k položkám fronty. Nákupčí smí jen položky svých kódů.
+    Případy, kde už žádná chybná položka nečeká, přejdou do „V pořádku".
+    Vrací (pocet_ulozenych, [pripad dict — nově v pořádku], chyba|None)."""
+    text = (text or "").strip()
+    if not text:
+        return 0, [], "Vyjádření nesmí být prázdné."
+    if not radek_ids:
+        return 0, [], "Nevybrána žádná položka."
+    sprava = _wp_sprava(prava)
+    kody = {k.upper() for k in _wp_kody(prava)}
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return 0, [], "Chyba připojení k databázi."
+    try:
+        cur = conn.cursor(dictionary=True)
+        ph = ",".join(["%s"] * len(radek_ids))
+        cur.execute(f"SELECT r.id, r.pripad_id, r.nak FROM cenopripad_radky r "
+                    f"JOIN cenopripad_pripady p ON p.id=r.pripad_id "
+                    f"WHERE r.id IN ({ph}) AND p.typ=%s AND p.stav='vyhodnoceno_chyba' "
+                    f"AND r.verdikt=%s", (*radek_ids, WP_TYP, WP_VERDIKT_FRONTA))
+        povolene = [r for r in cur.fetchall()
+                    if sprava or (r["nak"] or "").upper() in kody]
+        if not povolene:
+            return 0, [], "K vybraným položkám nemáte oprávnění (nebo už nejsou ve frontě)."
+        ids = [r["id"] for r in povolene]
+        ph = ",".join(["%s"] * len(ids))
+        cur.execute(f"UPDATE cenopripad_radky SET wp_vyjadreni=%s, wp_vyjadril=%s, "
+                    f"wp_vyjadreno=NOW() WHERE id IN ({ph})",
+                    (_str(text, 4000), _str(kdo, 255), *ids))
+        # Případy, kde už nic nečeká → „V pořádku"
+        hotove = []
+        for pid in sorted({r["pripad_id"] for r in povolene}):
+            cur.execute("SELECT COUNT(*) AS n FROM cenopripad_radky WHERE pripad_id=%s "
+                        "AND verdikt=%s AND COALESCE(neschvaleno,0)=0 "
+                        "AND wp_vyjadreni IS NULL", (pid, WP_VERDIKT_FRONTA))
+            if cur.fetchone()["n"] == 0:
+                cur.execute("UPDATE cenopripad_pripady SET stav='vyhodnoceno_ok' "
+                            "WHERE id=%s AND stav='vyhodnoceno_chyba'", (pid,))
+                if cur.rowcount:
+                    cur.execute("SELECT * FROM cenopripad_pripady WHERE id=%s", (pid,))
+                    hotove.append(cur.fetchone())
+        conn.commit()
+        cur.close()
+        return len(ids), hotove, None
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return 0, [], f"Chyba uložení vyjádření: {e}"
     finally:
         conn.close()
 
@@ -2165,22 +2341,40 @@ def oprav_pripad(pripad_id, typ, vstup_radky, vysledek, soubor_raw=None, soubor_
         return None, "Chyba připojení k databázi."
     try:
         cur = conn.cursor()
+        # Leták – WebPortál: vyjádření nákupčích se přepočtem neztratí — přenesou se
+        # na řádky se stejným kódem (nákupčí se ke stejné položce nemusí vyjadřovat znovu).
+        wp_vyj = {}
+        if typ == WP_TYP:
+            cur.execute("SELECT kod, wp_vyjadreni, wp_vyjadril, wp_vyjadreno "
+                        "FROM cenopripad_radky WHERE pripad_id=%s AND wp_vyjadreni IS NOT NULL",
+                        (pripad_id,))
+            for k, t, kdo, kdy in cur.fetchall():
+                wp_vyj.setdefault(k, (t, kdo, kdy))
         cur.execute("DELETE FROM cenopripad_radky WHERE pripad_id=%s", (pripad_id,))
         davka = []
+        nevyjadreno = 0
         for i, (inp, rr) in enumerate(zip(vstup_radky, vysledek["radky"]), 1):
             karta = rr.get("nazev_master") or inp.get("nazev") or inp.get("zakaznik") or ""
-            kod = inp.get("kod") or inp.get("kod_produktu") or ""
+            kod = _str(str(inp.get("kod") or inp.get("kod_produktu") or ""), 40)
+            vyj = wp_vyj.get(kod) if rr["verdikt"] == WP_VERDIKT_FRONTA else None
+            if rr["verdikt"] == WP_VERDIKT_FRONTA and not vyj:
+                nevyjadreno += 1
             davka.append((pripad_id, i, json.dumps(inp, ensure_ascii=False, default=str),
                           _str(karta, 255), _str(rr.get("sortiment_popis"), 255),
-                          _str(str(kod), 40), rr["verdikt"],
+                          kod, rr["verdikt"],
                           _str(rr["duvod"], 255), rr.get("op"),
-                          json.dumps(rr, ensure_ascii=False, default=str)))
+                          json.dumps(rr, ensure_ascii=False, default=str),
+                          _str(rr.get("nak"), 10),
+                          vyj[0] if vyj else None, vyj[1] if vyj else None,
+                          vyj[2] if vyj else None))
         cur.executemany(
             "INSERT INTO cenopripad_radky "
             "(pripad_id, poradi, vstup_json, nazev_karty, sortiment_popis, kod, verdikt, "
-            "duvod, op, marze_json) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", davka)
+            "duvod, op, marze_json, nak, wp_vyjadreni, wp_vyjadril, wp_vyjadreno) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", davka)
         stav = "vyhodnoceno_ok" if vysledek["ok"] else "vyhodnoceno_chyba"
+        if typ == WP_TYP and nevyjadreno == 0:
+            stav = "vyhodnoceno_ok"   # všechny chybné položky už mají vyjádření nákupčího
         cur.execute("UPDATE cenopripad_pripady SET stav=%s, pocet_radku=%s, pocet_chyb=%s, "
                     "vysledek_ok=%s WHERE id=%s",
                     (stav, vysledek["pocet"], vysledek["chyby"],
@@ -2412,13 +2606,68 @@ def _odesli_emaily_zadateli(pripad, predmet, text):
         _odesli_emaily([em], predmet, text, _app_url(f"?pripad={pripad.get('id')}"))
 
 
+def _wp_notifikuj_nakupci(pripad_id, cislo, nazev, zadavatel_jmeno):
+    """E-mail nákupčím, jejichž položky (dle kódu S) přešly do fronty Leták – WebPortál.
+    Položky bez kódu / s kódem bez nákupčího → Správa."""
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT UPPER(COALESCE(nak,'')), COUNT(*) FROM cenopripad_radky "
+                    "WHERE pripad_id=%s AND verdikt=%s AND wp_vyjadreni IS NULL "
+                    "GROUP BY UPPER(COALESCE(nak,''))", (pripad_id, WP_VERDIKT_FRONTA))
+        dle_kodu = dict(cur.fetchall())
+        cur.close()
+    except Exception as e:
+        print(f"[cenopripad] _wp_notifikuj_nakupci: {e}")
+        return
+    finally:
+        conn.close()
+    # Seskupit podle PŘÍJEMCE — kdo má víc kódů (nebo „vse“), dostane jediný e-mail
+    dle_prijemce = {}
+    for kod, n in sorted(dle_kodu.items(), key=lambda kv: (kv[0] == "", kv[0])):
+        prijemci = (_emaily_s_pravy(WP_PRAVO_NAKUP_PREFIX + kod.lower())
+                    if kod in WP_KODY_NAKUPCI else [])
+        prijemci = [x for x in prijemci if x and "@" in x]
+        if not prijemci:
+            prijemci = _emaily_s_pravy(WP_PRAVO_SPRAVA)   # nikdo na kód → Správa
+        for em in dict.fromkeys(prijemci):
+            if em and "@" in em:
+                dle_prijemce.setdefault(em, []).append((kod, n))
+    odkaz = _app_url(f"?wp={WP_SEKCE_FRONTA}")   # rovnou sekce Fronta k vyjádření
+    predmet = f"Cenopřípad {cislo}: položky k vyjádření (Leták – WebPortál)"
+    uvod = f"Zadavatel {zadavatel_jmeno} nahrál případ „{nazev}“."
+    for em, kody in dle_prijemce.items():
+        if len(kody) == 1:
+            kod, n = kody[0]
+            text = (f"{uvod} {_pocet_polozek(n)} "
+                    f"{'s kódem ' + kod if kod else 'bez kódu nákupčího'} nesouhlasí a "
+                    f"{'čekají' if 2 <= n <= 4 else 'čeká'} ve Frontě na vaše vyjádření.")
+        else:
+            radky = "\n".join(f"– {'kód ' + kod if kod else 'bez kódu nákupčího'}: "
+                              f"{_pocet_polozek(n)}" for kod, n in kody)
+            text = f"{uvod} Nesouhlasící položky čekají ve Frontě na vaše vyjádření:\n{radky}"
+        _odesli_emaily([em], predmet, text, odkaz)
+
+
+def _pocet_polozek(n):
+    """„1 položka“ / „2–4 položky“ / „0, 5+ položek“ (čeština: i 21, 22 … → položek)."""
+    n = int(n)
+    return f"{n} {'položka' if n == 1 else 'položky' if 2 <= n <= 4 else 'položek'}"
+
+
 def _je_spravce_typu(typ, p):
+    if typ == WP_TYP:
+        return _wp_sprava(p)
     if _je_spravce(p):
         return True
     return TYPY[typ]["oddeleni"] == "nakup" and "cenopripad_spravce_nakup" in p
 
 
 def _je_office_typu(typ, p):
+    if typ == WP_TYP:   # WebPortál nemá office — zpracování dělá zadavatel / Správa
+        return _wp_sprava(p)
     if _je_spravce(p):
         return True
     odd = TYPY[typ]["oddeleni"]
@@ -2607,7 +2856,12 @@ def _oprava_widget(pripad, typ, user_name, po_akci):
                 pripad["id"], "Opraveno a přepočítáno", user_name,
                 ("Vše v pořádku" if vys["ok"]
                  else f"Stále NENÍ v pořádku — {vys['chyby']} z {vys['pocet']} řádků"))
-            if vys["ok"] and not pripad.get("testovaci"):   # testovací NEodesílá e-maily
+            if typ == WP_TYP:
+                # WebPortál: žádný office. Nové chybné položky (bez vyjádření) → nákupčím.
+                if not vys["ok"] and not pripad.get("testovaci"):
+                    await asyncio.to_thread(_wp_notifikuj_nakupci, pripad["id"],
+                                            pripad["cislo"], pripad["nazev"], user_name)
+            elif vys["ok"] and not pripad.get("testovaci"):   # testovací NEodesílá e-maily
                 _kontr = _kontrola_z_vysledku(typ, radky, vys)
                 _odesli_emaily(
                     _emaily_office(TYPY[typ]["oddeleni"]),
@@ -2766,7 +3020,7 @@ def _dialog_historie(pripad):
 def _dialog_detail(pripad, user_id, user_name, prava):
     klient = context.client   # stabilní reference pro notifikace po awaitech (viz _bezpecne_notify)
     radky = nacti_radky(pripad["id"])
-    vidi_op = _vidi_op(prava)
+    vidi_op = _vidi_op_typu(pripad["typ"], prava)
     typ = pripad["typ"]
     oddeleni = pripad["oddeleni"]
     stav = pripad["stav"]
@@ -2873,6 +3127,13 @@ def _dialog_detail(pripad, user_id, user_name, prava):
             else:
                 cols.append({"name": "marze", "label": "Marže", "field": "marze", "align": "left"})
             cols.append({"name": "duvod", "label": "Detail", "field": "duvod", "align": "left"})
+        if typ == WP_TYP:
+            # Leták – WebPortál: kód nákupčího (sloupec S) + jeho vyjádření z fronty.
+            cols += [
+                {"name": "wp_nak", "label": "Nákupčí", "field": "wp_nak", "align": "left"},
+                {"name": "wp_vyj", "label": "Vyjádření nákupčího", "field": "wp_vyj",
+                 "align": "left"},
+            ]
         # CostPrice (Výběrová řízení) — zcela vpravo, JEN správce modulu / Office obchod,
         # jen ind. ceny.
         vidi_costprice = (typ == "porovnani" and _vidi_costprice(prava))
@@ -2957,6 +3218,14 @@ def _dialog_detail(pripad, user_id, user_name, prava):
             if typ == "mimoletak" and (r["duvod"] or "") == cp.DUVOD_NENALEZEN:
                 d["_novy_kod"] = True
                 d.setdefault("_cpcols", {})["kod"] = "color:#dc2626;font-weight:700"
+            if typ == WP_TYP:
+                d["wp_nak"] = r.get("nak") or "—"
+                if r.get("wp_vyjadreni"):
+                    d["wp_vyj"] = r["wp_vyjadreni"]
+                elif r.get("verdikt") == WP_VERDIKT_FRONTA and not neschv:
+                    d["wp_vyj"] = "⏳ čeká na nákupčího"
+                else:
+                    d["wp_vyj"] = ""
             rows.append(d)
         pocet_novych = sum(1 for d in rows if d.get("_novy_kod"))
         if pocet_novych:
@@ -3097,7 +3366,20 @@ def _dialog_detail(pripad, user_id, user_name, prava):
                     .tooltip("Z testovacího případu udělá ostrý — projde standardním "
                              "schvalovacím procesem.")
 
-            if je_muj and stav in ("vyhodnoceno_chyba", "zamitnuto"):
+            if typ == WP_TYP and stav == "vyhodnoceno_chyba":
+                # Leták – WebPortál: chybné položky čekají ve frontě na vyjádření nákupčích;
+                # po posledním vyjádření přejde případ sám do „V pořádku".
+                fronta = [r for r in radky if r.get("verdikt") == WP_VERDIKT_FRONTA]
+                hotovo = sum(1 for r in fronta if r.get("wp_vyjadreni"))
+                ui.label(f"Případ není v pořádku — {len(fronta) - hotovo} z {len(fronta)} "
+                         "položek čeká ve frontě na vyjádření nákupčích. Po vyjádření všech "
+                         "přejde případ do stavu „V pořádku“.") \
+                    .classes("text-sm text-red-600 font-medium")
+                if je_muj or _wp_sprava(prava):
+                    with ui.expansion("Opravit a přepočítat", icon="autorenew").classes("w-full"):
+                        _oprava_widget(pripad, typ, user_name, _po_akci)
+
+            if typ != WP_TYP and je_muj and stav in ("vyhodnoceno_chyba", "zamitnuto"):
                 ui.label("Vaše žádost není v pořádku. Opravte ji, nebo požádejte o druhou kontrolu.") \
                     .classes("text-sm text-red-600 font-medium")
 
@@ -3301,13 +3583,17 @@ def _dialog_detail(pripad, user_id, user_name, prava):
                 with ui.expansion("Opravit a přepočítat (správce)", icon="autorenew").classes("w-full"):
                     _oprava_widget(pripad, typ, user_name, _po_akci)
 
-            if _je_office_typu(typ, prava) and stav in ("vyhodnoceno_ok", "schvaleno",
-                                                        "castecne_schvaleno", "delisting"):
+            # WebPortál: zpracované označuje sám zadavatel (nebo Správa), jakmile je „V pořádku".
+            _wp_zprac = typ == WP_TYP and (je_muj or _wp_sprava(prava))
+            if (_je_office_typu(typ, prava) or _wp_zprac) and stav in (
+                    "vyhodnoceno_ok", "schvaleno", "castecne_schvaleno", "delisting"):
                 async def _zprac():
                     zmen_stav(pripad["id"], "zpracovano")
-                    zaznam_historie(pripad["id"], "Zpracováno (office)", user_name,
-                                    "Případ dotažen do nastavení — finální stav.")
-                    if not je_test:
+                    zaznam_historie(pripad["id"],
+                                    "Zpracováno" if typ == WP_TYP else "Zpracováno (office)",
+                                    user_name, "Případ dotažen do nastavení — finální stav.")
+                    # WebPortál: zadavatel si zpracování označuje sám → mail jen když za něj Správa
+                    if not je_test and not (typ == WP_TYP and je_muj):
                         _odesli_emaily_zadateli(
                             pripad, f"Cenopřípad {pripad['cislo']}: zpracováno",
                             f"Váš případ „{pripad['nazev']}“ ({TYPY[typ]['nazev']}) byl zpracován "
@@ -3919,7 +4205,24 @@ def _formular_novy_pripad(typ, user_id, user_name, oddeleni):
                     duvod_in.value = ""
                 _refresh()
                 return
-            if vys["ok"]:
+            if typ == WP_TYP:
+                # Leták – WebPortál: bez office. OK → zadavatel sám označí zpracované;
+                # chyba → chybné položky jdou do fronty nákupčím dle kódu (sloupec S).
+                if vys["ok"]:
+                    ui.notify(f"Případ {cislo}: ✅ VŠE V POŘÁDKU ({vys['pocet']} řádků). "
+                              "Po dotažení ho v seznamu označte jako zpracovaný.",
+                              type="positive", position="top", timeout=8000)
+                else:
+                    if not testovaci:
+                        await asyncio.to_thread(_wp_notifikuj_nakupci, pid, cislo, nazev,
+                                                user_name)
+                    ui.notify(f"Případ {cislo}: ❌ NENÍ v pořádku — {vys['chyby']} z "
+                              f"{vys['pocet']} řádků. Chybné položky přešly do fronty "
+                              "nákupčím k vyjádření."
+                              + (" 🧪 TESTOVACÍ — do fronty nejde, e-maily se neodeslaly."
+                                 if testovaci else ""),
+                              type="negative", position="top", timeout=11000)
+            elif vys["ok"]:
                 _kontr = _kontrola_z_vysledku(typ, radky, vys)
                 if not testovaci:   # testovací případ NEodesílá žádné e-maily
                     _odesli_emaily(
@@ -4671,8 +4974,150 @@ def _sklad_soubor(radky, skupina, format="xlsx"):
 PRIPADU_NA_STRANKU = 40   # max karet případů na jednu stránku seznamu
 
 
+def _wp_fronta_panel(user_name, prava):
+    """Sekce „Fronta" (Leták – WebPortál): chybné položky čekající na vyjádření nákupčího.
+    Nákupčí vidí jen svůj kód (sloupec S), Správa vše. Bez OP a marží % — sloupec
+    Detail (obsahuje marže) vidí jen Správa."""
+    sprava = _wp_sprava(prava)
+    kody = sorted(_wp_kody(prava))
+    stav_f = {"vse": False}
+    klient = context.client   # stabilní reference pro notifikace po awaitech
+
+    def _bezpecne_notify(zprava, barva="positive", timeout=7000):
+        try:
+            with klient:
+                ui.notify(zprava, type=barva, timeout=timeout)
+        except Exception:
+            pass
+
+    with ui.card().classes("w-full p-4 border-l-4 border-indigo-400"):
+        with ui.row().classes("w-full items-center gap-2"):
+            ui.icon("inbox", size="1.6rem").classes("text-indigo-500")
+            ui.label("Fronta — položky k vyjádření").classes("text-lg font-bold text-gray-800")
+            ui.space()
+            ui.label("Správa (všechny kódy)" if sprava else f"Vaše kódy: {', '.join(kody)}") \
+                .classes("text-xs text-gray-500")
+            ui.switch("Zobrazit i vyjádřené",
+                      on_change=lambda e: (stav_f.update(vse=bool(e.value)), _fronta.refresh()))
+
+        @ui.refreshable
+        def _fronta():
+            polozky = wp_nacti_frontu(prava, jen_otevrene=not stav_f["vse"])
+            if not polozky:
+                ui.label("Ve frontě nejsou žádné položky k vyjádření. 🎉") \
+                    .classes("text-sm text-gray-400 italic")
+                return
+            cols = [
+                {"name": "pripad", "label": "Případ", "field": "pripad", "align": "left"},
+                {"name": "zadavatel", "label": "Zadavatel", "field": "zadavatel", "align": "left"},
+                {"name": "kod", "label": "Kód", "field": "kod", "align": "left"},
+                {"name": "nazev", "label": "Název", "field": "nazev", "align": "left"},
+                {"name": "akcni_pc", "label": "Akční PC", "field": "akcni_pc", "align": "right"},
+                {"name": "akcni_nc", "label": "Akční NC", "field": "akcni_nc", "align": "right"},
+                {"name": "aktualni_nc2", "label": "Aktuální NC2", "field": "aktualni_nc2",
+                 "align": "right"},
+                {"name": "nak", "label": "Nákupčí", "field": "nak", "align": "left"},
+            ]
+            if sprava:
+                cols.append({"name": "duvod", "label": "Detail", "field": "duvod",
+                             "align": "left"})
+            cols.append({"name": "vyj", "label": "Vyjádření", "field": "vyj", "align": "left"})
+            rows = []
+            for r in polozky:
+                try:
+                    vst = json.loads(r["vstup_json"]) if r["vstup_json"] else {}
+                except Exception:
+                    vst = {}
+                d = {"id": r["id"], "pripad_id": r["pripad_id"],
+                     "pripad": f"{r['cislo']} · {r['pripad_nazev'] or ''}",
+                     "zadavatel": r.get("zadavatel_jmeno") or "",
+                     "kod": r.get("kod") or "", "nazev": r.get("nazev_karty") or "",
+                     "akcni_pc": _castka(cp.parse_cislo(vst.get("akcni_pc"))),
+                     "akcni_nc": _castka(cp.parse_cislo(vst.get("akcni_nc"))),
+                     "aktualni_nc2": _castka(cp.parse_cislo(vst.get("aktualni_nc2"))),
+                     "nak": r.get("nak") or "—",
+                     "vyj": r.get("wp_vyjadreni") or "⏳ čeká"}
+                if sprava:
+                    d["duvod"] = r.get("duvod") or ""
+                rows.append(d)
+            ui.label(f"{sum(1 for r in polozky if not r.get('wp_vyjadreni'))} položek čeká "
+                     "na vyjádření. Zaškrtněte položky, napište vyjádření a uložte.") \
+                .classes("text-sm text-gray-600")
+            tbl = ui.table(columns=cols, rows=rows, row_key="id", selection="multiple",
+                           pagination={"rowsPerPage": 50}) \
+                .props("dense flat bordered wrap-cells").classes("w-full")
+            vyj_in = ui.textarea("Vyjádření nákupčího") \
+                .props("outlined autogrow").classes("w-full")
+
+            async def _uloz():
+                ids = [s["id"] for s in (tbl.selected or [])]
+                n, hotove, err = await asyncio.to_thread(
+                    wp_uloz_vyjadreni, ids, vyj_in.value, user_name, prava)
+                if err:
+                    _bezpecne_notify(err, "warning")
+                    return
+                vyber = [s for s in tbl.selected if s["id"] in set(ids)]
+                for pid in sorted({s["pripad_id"] for s in vyber}):
+                    kusy = sum(1 for s in vyber if s["pripad_id"] == pid)
+                    zaznam_historie(pid, "Vyjádření nákupčího", user_name,
+                                    f"{kusy} položek: {(vyj_in.value or '').strip()[:500]}")
+                for p in hotove:
+                    zaznam_historie(p["id"], "V pořádku", user_name,
+                                    "Všichni nákupčí se vyjádřili — případ je v pořádku.")
+                    _odesli_emaily_zadateli(
+                        p, f"Cenopřípad {p['cislo']}: v pořádku",
+                        f"K vašemu případu „{p['nazev']}“ (Leták – WebPortál) se vyjádřili "
+                        "všichni nákupčí. Případ je nyní v pořádku a můžete ho označit "
+                        "jako zpracovaný.")
+                intranet_logger.log_activity(user_name, "Cenopřípad",
+                                             f"WebPortál fronta: vyjádření k {n} položkám")
+                _bezpecne_notify(f"Vyjádření uloženo ({n} položek)"
+                                 + (f" · {len(hotove)} případů přešlo do „V pořádku“"
+                                    if hotove else ""), "positive")
+                _fronta.refresh()
+
+            with ui.row().classes("w-full justify-end"):
+                ui.button("Uložit vyjádření k vybraným", icon="send", on_click=_uloz) \
+                    .props("unelevated no-caps").classes("bg-indigo-600 text-white rounded-lg px-4")
+
+        _fronta()
+
+
+WP_SEKCE = {"pripady": "Případy", WP_SEKCE_FRONTA: "Fronta k vyjádření"}
+
+
+def _wp_sekce(prava):
+    """Aktivní sekce dlaždice Leták – WebPortál ('pripady' / 'fronta') + přepínač.
+    Přepínač vidí jen ten, kdo má obě sekce (Správa, zadavatel s kódem nákupčího);
+    čistý nákupčí má rovnou Frontu, zadavatel bez kódu rovnou Případy."""
+    pripady = _wp_sprava(prava) or _wp_zadatel(prava)
+    fronta = _wp_vidi_frontu(prava)
+    if not fronta:
+        return "pripady"
+    if not pripady:
+        return WP_SEKCE_FRONTA
+    sekce = app.storage.user.get("wp_sekce")
+    if app.storage.user.get("pripad_detail"):   # deep-link z e-mailu → detail je v Případech
+        sekce = "pripady"
+    if sekce not in WP_SEKCE:
+        sekce = "pripady"
+    app.storage.user["wp_sekce"] = sekce
+
+    def _prepni(v):
+        app.storage.user["wp_sekce"] = v
+        _refresh()
+    with ui.row().classes("w-full mb-4"):
+        ui.toggle(WP_SEKCE, value=sekce, on_change=lambda e: _prepni(e.value)) \
+            .props("unelevated no-caps toggle-color=indigo-6")
+    return sekce
+
+
 def _sub_view_typ(typ, user_id, user_name, prava):
     cfg = TYPY[typ]
+    if typ == WP_TYP and _wp_sekce(prava) == WP_SEKCE_FRONTA:
+        _wp_fronta_panel(user_name, prava)
+        return
+    # Sekce Případy: formulář pro nahrání + seznam případů
     if _muze_zadat(typ, prava):
         _formular_novy_pripad(typ, user_id, user_name, cfg["oddeleni"])
 
@@ -4719,7 +5164,9 @@ def _sub_view_typ(typ, user_id, user_name, prava):
         if _dp:
             ui.timer(0.25, lambda p=_dp: _dialog_detail(p, user_id, user_name, prava),
                      once=True)
-    nadpis = ("Historie případů" if _vidi_vsechny_pripady(prava)
+    nadpis = ("Historie případů" if (_wp_sprava(prava) if typ == WP_TYP
+                                     else _vidi_vsechny_pripady(prava))
+              else "Moje případy" if typ == WP_TYP
               else "Případy oddělení" if (_vidi_oddeleni(prava) or _schval_odd_slugs(prava)
                                           or _vedouci_odd_slugs(prava))
               else "Moje případy")
@@ -4750,7 +5197,7 @@ def _sub_view_typ(typ, user_id, user_name, prava):
 
                 ui.button("Export souhrnu (CSV)", icon="download", on_click=_export) \
                     .props("flat no-caps").classes("text-blue-600")
-                if _vidi_op(prava):
+                if _vidi_op_typu(typ, prava):
                     async def _export_det():
                         data = await asyncio.to_thread(_detailni_xlsx, items)
                         ui.download.content(data, f"cenopripady_{typ}_detail.xlsx", XLSX_MIME)
@@ -8749,6 +9196,16 @@ def vykresli_cenopripad(user_id, user_name, vsechna_prava):
             if p and p.get("typ") in _viditelne_typy(vsechna_prava):
                 app.storage.user["cenopripad_pohled"] = p["typ"]
                 app.storage.user["pripad_detail"] = int(z_emailu)
+        # „…/cenopripad?wp=fronta" — e-mail nákupčím: rovnou dlaždice Leták – WebPortál,
+        # sekce Fronta k vyjádření (i když měl uživatel naposledy otevřené Případy).
+        try:
+            z_emailu = context.client.request.query_params.get("wp")
+        except Exception:
+            z_emailu = None
+        if z_emailu == WP_SEKCE_FRONTA and _wp_vidi_frontu(vsechna_prava):
+            app.storage.user["cenopripad_pohled"] = WP_TYP
+            app.storage.user["wp_sekce"] = WP_SEKCE_FRONTA
+            app.storage.user.pop("pripad_detail", None)
 
     @ui.refreshable
     def _obsah():

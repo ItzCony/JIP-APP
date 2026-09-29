@@ -685,7 +685,8 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
             'cenopripad_office_nakup', 'cenopripad_office_obchod',
             'cenopripad_office_obchod_ovozel',
             'cenopripad_spravce_nakup', 'cenopripad_spravce',
-            'cenopripad_spravce_bez_emailu', 'cenopripad_vkladatel'))
+            'cenopripad_spravce_bez_emailu', 'cenopripad_vkladatel')) or
+        any(p.startswith('cenopripad_wp_') for p in vsechna_prava)   # Leták – WebPortál
     ) and nastaveni.get('cenopripad_zapnuty', True)
     # Schůzky s vedoucími jsou dlaždice uvnitř Formulářů ASM → kdo má právo jen
     # na ně, musí dlaždici modulu vidět taky (stejné pravidlo jako záložka vlevo).
