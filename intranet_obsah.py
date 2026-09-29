@@ -8,6 +8,7 @@ import intranet_narozeniny
 import intranet_okruhy
 import intranet_2fa
 import intranet_lupa
+import intranet_session
 import os
 import zipfile
 import pandas as pd
@@ -147,7 +148,7 @@ def _ikona_kategorie(kat: str) -> str:
     return 'widgets'
 
 
-def render_prava_kategorie(zakladni_prava, vybrana_prava_list, lazy=False):
+def render_prava_kategorie(zakladni_prava, vybrana_prava_list, lazy=False, zamcena=None):
     """Profesionální výběr práv ve stylu master–detail.
 
     Vlevo seznam kategorií s živými počítadly „vybráno/celkem", vpravo se
@@ -158,8 +159,13 @@ def render_prava_kategorie(zakladni_prava, vybrana_prava_list, lazy=False):
     ",".join(...) při ukládání, takže rozhraní zůstává zpětně kompatibilní.
     Klíče, které nejsou v katalogu (např. práva skrytých modulů), zůstávají
     v množině zachována, i když pro ně není řádek.
+
+    zamcena: klíče práv vypnutých modulů — řádky jsou šedé a nejdou přepnout,
+    kategorie zamčená celá nejde otevřít. Přiřazená zamčená práva v množině
+    zůstávají (po zapnutí modulu platí dál).
     """
     vybrane_set = set(vybrana_prava_list)
+    zamcena = set(zamcena or ()) & set(zakladni_prava)
 
     # Seskupení katalogu podle kategorií.
     kategorie: dict = {}
@@ -184,8 +190,21 @@ def render_prava_kategorie(zakladni_prava, vybrana_prava_list, lazy=False):
         if len(vp) > 1:
             podskupiny[kat] = vp
 
-    stav = {'kat': kat_nazvy[0], 'hledat': '',
-            'pod': {k: v[0] for k, v in podskupiny.items()}}
+    # Kategorie / podskupiny, ve kterých je zamčeno úplně vše (vypnutý modul).
+    zamcene_kat = {kat for kat, prava in kategorie.items()
+                   if all(k in zamcena for k in prava)}
+
+    def _pod_zamcena(kat, p):
+        return all(k in zamcena for k, v in kategorie[kat].items()
+                   if v.get('podskupina') == p)
+
+    def _prvni_pod(kat):
+        vp = podskupiny[kat]
+        return next((p for p in vp if not _pod_zamcena(kat, p)), vp[0])
+
+    stav = {'kat': next((k for k in kat_nazvy if k not in zamcene_kat), kat_nazvy[0]),
+            'hledat': '',
+            'pod': {k: _prvni_pod(k) for k in podskupiny}}
 
     def _prava_kat(kat):
         """Práva kategorie po filtru aktivní podskupiny."""
@@ -212,6 +231,11 @@ def render_prava_kategorie(zakladni_prava, vybrana_prava_list, lazy=False):
                   'select-none transition-all duration-150 flex-nowrap')
     _card_on = 'bg-emerald-50 border-emerald-300 shadow-sm'
     _card_off = 'bg-white border-gray-200 hover:bg-gray-50 hover:border-gray-300'
+    # Zamčené (vypnutý modul) — vlastní celé třídy, bez cursor-pointer (výchozí kurzor).
+    _kat_zamceno = ('w-full items-center gap-2 px-3 py-2.5 rounded-lg select-none flex-nowrap '
+                    'text-gray-400 opacity-60')
+    _card_zamceno = ('w-full items-center gap-3 p-3 rounded-xl border select-none flex-nowrap '
+                     'bg-gray-100 border-gray-200')
 
     def _pocet(kat):
         return sum(1 for kk in kategorie[kat] if kk in vybrane_set)
@@ -219,7 +243,9 @@ def render_prava_kategorie(zakladni_prava, vybrana_prava_list, lazy=False):
     def _aktualizuj_badge(kat):
         sel, tot = _pocet(kat), len(kategorie[kat])
         je_akt = (kat == stav['kat'] and not stav['hledat'])
-        if je_akt:
+        if kat in zamcene_kat:
+            cls = 'bg-gray-200 text-gray-400'
+        elif je_akt:
             cls = 'bg-emerald-400 text-white' if sel else 'bg-white text-blue-700'
         else:
             cls = 'bg-emerald-100 text-emerald-700' if sel else 'bg-gray-100 text-gray-400'
@@ -236,6 +262,9 @@ def render_prava_kategorie(zakladni_prava, vybrana_prava_list, lazy=False):
         # Pozn.: NIKDY nepoužívat classes(replace=...) na ui.row – smaže to i
         # interní třídu „nicegui-row" (display:flex) a obsah by se poskládal pod sebe.
         for k in kat_nazvy:
+            if k in zamcene_kat:          # zamčená kategorie má pevné šedé třídy
+                _aktualizuj_badge(k)
+                continue
             je = (k == stav['kat'] and not stav['hledat'])
             if je:
                 cat_row[k].classes(remove=_kat_off, add=_kat_on)
@@ -247,6 +276,19 @@ def render_prava_kategorie(zakladni_prava, vybrana_prava_list, lazy=False):
 
     def _radek_prava(kat, key, meta):
         je = key in vybrane_set
+        if key in zamcena:
+            # Vypnutý modul: šedý řádek bez click handleru (server změnu nepřijme).
+            row = ui.row().classes(_card_zamceno)
+            with row:
+                ui.icon(meta.get('ikona', 'label_important'), size='sm').classes('shrink-0 text-gray-300')
+                with ui.column().classes('flex-1 min-w-0 gap-0'):
+                    ui.label(meta.get('nazev', key)).classes('font-bold text-gray-400 text-sm leading-tight')
+                    if meta.get('popis'):
+                        ui.label(meta['popis']).classes('text-xs text-gray-400 leading-tight')
+                if je:
+                    ui.label('Přiřazeno').classes('text-[11px] font-bold text-gray-500 bg-gray-200 '
+                                                  'rounded-full px-2 py-0.5 shrink-0')
+            return
         row = ui.row().classes(_card_base + ' ' + (_card_on if je else _card_off))
         with row:
             ico = ui.icon(meta.get('ikona', 'label_important'), size='sm') \
@@ -273,21 +315,24 @@ def render_prava_kategorie(zakladni_prava, vybrana_prava_list, lazy=False):
 
     def vybrat_vse_kat(kat):
         for k in _prava_kat(kat):
-            vybrane_set.add(k)
+            if k not in zamcena:
+                vybrane_set.add(k)
         _aktualizuj_badge(kat)
         _aktualizuj_total()
         render_detail.refresh()
 
     def zrusit_kat(kat):
         for k in _prava_kat(kat):
-            vybrane_set.discard(k)
+            if k not in zamcena:
+                vybrane_set.discard(k)
         _aktualizuj_badge(kat)
         _aktualizuj_total()
         render_detail.refresh()
 
     def vycistit_vse():
         for k in zakladni_prava:          # jen klíče katalogu – skrytá práva zůstanou
-            vybrane_set.discard(k)
+            if k not in zamcena:          # …a zamčená (vypnutý modul) také
+                vybrane_set.discard(k)
         for k in kat_nazvy:
             _aktualizuj_badge(k)
         _aktualizuj_total()
@@ -337,6 +382,12 @@ def render_prava_kategorie(zakladni_prava, vybrana_prava_list, lazy=False):
             with ui.row().classes('items-center gap-1 mb-2 px-1 flex-nowrap'):
                 for p in podskupiny[kat]:
                     akt = stav['pod'].get(kat) == p
+                    if not akt and _pod_zamcena(kat, p):
+                        # Neklikací štítek místo disable tlačítka (Quasar by dal
+                        # kurzor not-allowed).
+                        ui.label(p).classes('rounded-lg px-3 py-1 text-[12px] font-medium select-none '
+                                            'border border-gray-300 text-gray-400 opacity-60')
+                        continue
                     ui.button(p, on_click=lambda _=None, p=p: _pod(p)) \
                       .props('dense no-caps size=sm ' + ('unelevated' if akt else 'flat outline')) \
                       .classes('rounded-lg px-3 ' + ('bg-blue-600 text-white' if akt
@@ -388,13 +439,15 @@ def render_prava_kategorie(zakladni_prava, vybrana_prava_list, lazy=False):
                 with ui.column().classes('w-full md:w-72 md:shrink-0 gap-1 max-h-[40vh] md:max-h-[60vh] '
                                          'overflow-y-auto p-2 bg-gray-50 border border-gray-200 rounded-xl'):
                     for kat in kat_nazvy:
-                        r = ui.row().classes(_kat_base + ' ' + _kat_off)
+                        zam = kat in zamcene_kat
+                        r = ui.row().classes(_kat_zamceno if zam else _kat_base + ' ' + _kat_off)
                         with r:
                             ic = ui.icon(_ikona_kategorie(kat), size='sm').classes('shrink-0 text-gray-400')
                             ui.label(kat).classes('flex-1 text-sm font-bold leading-tight min-w-0')
                             bd = ui.label('0/0').classes('text-[11px] font-extrabold rounded-full px-2 py-0.5 '
                                                          'shrink-0 bg-gray-100 text-gray-400')
-                        r.on('click', lambda e=None, k=kat: vyber_kat(k))
+                        if not zam:
+                            r.on('click', lambda e=None, k=kat: vyber_kat(k))
                         cat_row[kat], cat_icon[kat], cat_badge[kat] = r, ic, bd
 
                 with ui.element('div').classes('flex-1 min-w-0 w-full'):
@@ -427,14 +480,16 @@ def render_prava_kategorie(zakladni_prava, vybrana_prava_list, lazy=False):
 
     return vybrane_set
 
-def vykresli_prirazena_prava(prava_keys, zakladni_prava, varianta='osobni'):
+def vykresli_prirazena_prava(prava_keys, zakladni_prava, varianta='osobni', zamcena=None):
     """Přehledně vykreslí přiřazená práva uživatele — seskupená podle kategorií,
     s ikonou a celým popisem v tooltipu.
 
     prava_keys:     iterovatelná množina klíčů práv (např. {'kviz', 'smeny_admin'})
     zakladni_prava: katalog z intranet_prava.ziskej_kompletni_seznam_prav
     varianta:       'osobni' (zelená) | 'zdedena' (fialová) | 'oddeleni' (modrá)
+    zamcena:        klíče práv vypnutých modulů — vykreslí se šedě
     """
+    zamcena = set(zamcena or ())
     if varianta == 'zdedena':
         chip_cls, ico_cls, kat_cls = (
             'bg-violet-50 text-violet-800 border-violet-200', 'text-violet-500', 'text-violet-400')
@@ -465,20 +520,26 @@ def vykresli_prirazena_prava(prava_keys, zakladni_prava, varianta='osobni'):
 
     with ui.column().classes('w-full gap-2 mt-1'):
         for kat in sorted(skupiny):
+            cela_zamcena = all(k in zamcena for k, _ in skupiny[kat])
             with ui.column().classes('w-full gap-1'):
-                ui.label(kat).classes(f'text-[10px] font-bold uppercase tracking-wider {kat_cls}')
+                with ui.row().classes('items-center gap-1'):
+                    ui.label(kat).classes('text-[10px] font-bold uppercase tracking-wider '
+                                          + ('text-gray-400' if cela_zamcena else kat_cls))
+                    if cela_zamcena:
+                        ui.label('· modul vypnut').classes('text-[10px] font-medium text-gray-400')
                 with ui.element('div').classes('flex flex-wrap gap-1.5'):
                     for k, meta in sorted(skupiny[kat], key=lambda x: ((x[1] or {}).get('nazev') or x[0]).lower()):
                         nazev = (meta or {}).get('nazev') or k
                         popis = (meta or {}).get('popis') or ''
                         ikona = (meta or {}).get('ikona') or 'label_important'
+                        zam = k in zamcena
                         chip = ui.element('div').classes(
-                            f'inline-flex items-center gap-1 {chip_cls} border '
-                            'text-xs font-medium px-2 py-1 rounded-md')
+                            'inline-flex items-center gap-1 border text-xs font-medium px-2 py-1 rounded-md '
+                            + ('bg-gray-100 text-gray-400 border-gray-200' if zam else chip_cls))
                         with chip:
-                            ui.icon(ikona, size='16px').classes(ico_cls)
+                            ui.icon(ikona, size='16px').classes('text-gray-300' if zam else ico_cls)
                             ui.label(nazev)
-                        if popis:
+                        if popis and not zam:
                             chip.tooltip(popis)
 
 
@@ -2899,23 +2960,11 @@ def vykresli_spravu_uzivatelu(user_email, user_name, vsechna_prava=None):
     sortimenty = intranet_data.ziskej_sortimenty_monitoru()
     zakladni_prava = intranet_prava.ziskej_kompletni_seznam_prav(oddeleni, typy_v, sortimenty)
 
+    # Práva vypnutých modulů: ve výběru šedá a nepřepínatelná, u uživatele šedá.
+    # Nabídka „Kdo má právo" je nevidí (export je jen převádí na názvy).
     _nast = intranet_data.nacti_nastaveni_intranetu()
-    _skryte_kategorie = set()
-    if not _nast.get('kviz_zapnuty', True):       _skryte_kategorie.add('Modul Kvíz')
-    if not _nast.get('finance_zapnuty', True):    _skryte_kategorie.add('Modul Aprovia')
-    if not _nast.get('veletrh_zapnuty', True):    _skryte_kategorie.add('Modul Veletrh')
-    if not _nast.get('planogram_zapnuty', True):  _skryte_kategorie.add('Modul Plánogram tabáku')
-    if not _nast.get('ochutnavky_zapnuty', True): _skryte_kategorie.add('Modul Ochutnávky MO a CC')
-    # Značky mají jednu kategorii se dvěma podskupinami → skrývá se podskupina.
-    _skryte_podskupiny = set()
-    if not _nast.get('znacky_zapnuty', True):        _skryte_podskupiny.add(('Modul Značky', 'Produkt'))
-    if not _nast.get('znacky_provoz_zapnuty', True): _skryte_podskupiny.add(('Modul Značky', 'Provoz'))
-    if _skryte_kategorie or _skryte_podskupiny:
-        zakladni_prava = {
-            k: v for k, v in zakladni_prava.items()
-            if v.get('kategorie') not in _skryte_kategorie
-            and (v.get('kategorie'), v.get('podskupina')) not in _skryte_podskupiny
-        }
+    _zamcena = intranet_prava.prava_vypnutych_modulu(zakladni_prava, _nast)
+    zakladni_prava_aktivni = {k: v for k, v in zakladni_prava.items() if k not in _zamcena}
 
     spolecnosti_db = intranet_data.ziskej_vsechny_spolecnosti()
     spolecnosti_options = {s['id']: s['nazev'] for s in spolecnosti_db}
@@ -3052,7 +3101,7 @@ def vykresli_spravu_uzivatelu(user_email, user_name, vsechna_prava=None):
             input_prevod = ui.number('Převod z loňska (h)', value=0.0).classes('flex-1').props('outlined dense')
 
         ui.label('Osobní práva navíc (Přepíší výchozí práva oddělení)').classes('text-xs font-bold text-slate-400 uppercase tracking-wider mb-2')
-        vybrane_prava_novy = render_prava_kategorie(zakladni_prava, [], lazy=True)
+        vybrane_prava_novy = render_prava_kategorie(zakladni_prava, [], lazy=True, zamcena=_zamcena)
 
         async def pridat_uzivatele():
             em, jm, pr, heslo = input_email.value.strip(), input_jmeno.value.strip(), input_prijmeni.value.strip(), input_heslo.value
@@ -3721,9 +3770,10 @@ def vykresli_spravu_uzivatelu(user_email, user_name, vsechna_prava=None):
                             _u.get('datum_narozeni') or None,
                             _u.get('priznak_id') or None,
                         )
-                        if isinstance(out, tuple) and len(out) == 2:
-                            return out
-                        return bool(out), ''
+                        ok, msg = out if isinstance(out, tuple) and len(out) == 2 else (bool(out), '')
+                        if ok and not nova_aktivita:
+                            intranet_session.vynut_odhlaseni(email)
+                        return ok, msg
 
                     async def _refresh_po_akci():
                         intranet_data.invaliduj_cache_sprava()
@@ -4388,7 +4438,7 @@ def vykresli_spravu_uzivatelu(user_email, user_name, vsechna_prava=None):
             _opts = {
                 k: f"{v.get('nazev', k)}  ·  {v.get('kategorie', '')}"
                 for k, v in sorted(
-                    zakladni_prava.items(),
+                    zakladni_prava_aktivni.items(),
                     key=lambda kv: (kv[1].get('kategorie', ''), kv[1].get('nazev', '')),
                 )
             }
@@ -4583,6 +4633,75 @@ def vykresli_spravu_uzivatelu(user_email, user_name, vsechna_prava=None):
                       .props('color=indigo-7 unelevated')
             dlg.open()
 
+        # ── Dialog: Úklid neznámých práv (jen superadmin) ─────────────────
+        # Práva, která katalog nezná (smazaná oddělení, staré formáty, zrušené
+        # moduly), v editoru nejdou nastavit ani odebrat — prefixové kontroly
+        # („schvalovat_", „slozka_", „ukolovnik_"…) jim ale pořád otevírají záložky.
+        async def _dialog_uklid_prav():
+            if not _je_superadmin:
+                ui.notify('Úklid práv smí spustit jen administrátor.', type='negative')
+                return
+            osirela = await asyncio.to_thread(intranet_data.ziskej_osirela_prava)
+            if osirela is None:
+                ui.notify('Katalog práv se nepodařilo spolehlivě načíst — úklid se nespustí.', type='negative')
+                return
+            if not osirela:
+                ui.notify('Žádná neznámá práva — není co uklízet.', type='positive')
+                return
+            with ui.dialog() as dlg, ui.card().classes('w-[640px] max-w-full p-5 gap-3'):
+                ui.label('Úklid neznámých práv').classes('text-lg font-bold text-gray-800')
+                ui.label('Práva v databázi, která katalog nezná (smazaná oddělení, staré formáty, '
+                         'zrušené moduly). V editoru je nejde nastavit ani odebrat, ale některá '
+                         'pořád otevírají záložky. Smazáním zmizí i jejich přiřazení uživatelům, '
+                         'rolím a oddělením. Nelze vrátit.').classes('text-xs text-gray-500')
+                cols = [
+                    {'name': 'nazev', 'label': 'Právo', 'field': 'nazev', 'align': 'left', 'sortable': True},
+                    {'name': 'uzivatele', 'label': 'Uživatelé', 'field': 'uzivatele', 'sortable': True},
+                    {'name': 'role', 'label': 'Role', 'field': 'role', 'sortable': True},
+                    {'name': 'oddeleni', 'label': 'Oddělení', 'field': 'oddeleni', 'sortable': True},
+                ]
+
+                def _popis_tlacitka():
+                    btn.text = f'Smazat vybraná ({len(tbl.selected or [])})'
+
+                tbl = ui.table(columns=cols, rows=osirela, row_key='nazev', selection='multiple',
+                               on_select=lambda _: _popis_tlacitka()) \
+                        .props('dense flat bordered hide-bottom :pagination="{rowsPerPage: 0}"') \
+                        .classes('w-full max-h-[50vh]')
+                # Předvybraná jen práva bez vazeb (čistý balast). Přiřazená mohou
+                # držitelům otevírat záložky (Docházka, Úkolovník) — ta ať admin
+                # zaškrtne vědomě.
+                tbl.selected = [r for r in osirela
+                                if not (r['uzivatele'] or r['role'] or r['oddeleni'])]
+
+                async def _smaz():
+                    nazvy = [r['nazev'] for r in (tbl.selected or [])]
+                    if not nazvy:
+                        ui.notify('Nic není vybráno.', type='warning')
+                        return
+                    btn.disable()
+                    smazana = await asyncio.to_thread(intranet_data.smaz_osirela_prava, nazvy)
+                    if smazana is None:
+                        btn.enable()
+                        ui.notify('Mazání se nepovedlo — nic se nezměnilo.', type='negative')
+                        return
+                    intranet_logger.log_activity(
+                        user_name, 'Správa uživatelů',
+                        f'Úklid neznámých práv: smazáno {len(smazana)} — {", ".join(smazana)}')
+                    zbylo = len(nazvy) - len(smazana)
+                    ui.notify(f'Smazáno {len(smazana)} práv.'
+                              + (f' {zbylo} mezitím katalog začal znát, zůstala.' if zbylo else ''),
+                              type='positive')
+                    dlg.close()
+                    ui.timer(0, vykresli_seznam_uzivatelu.refresh, once=True)
+
+                with ui.row().classes('w-full justify-end gap-2 mt-1'):
+                    ui.button('Zrušit', on_click=dlg.close).props('flat color=grey')
+                    btn = ui.button('', icon='delete_sweep', on_click=_smaz) \
+                            .props('color=red-7 unelevated')
+                _popis_tlacitka()
+            dlg.open()
+
         # ── Řádek: filtr + tlačítka ───────────────────────────────────────
         with ui.row().classes('w-full items-center gap-3 mb-6'):
             filtr_input = ui.input('Hledat uživatele...').classes('flex-1 max-w-md').props('outlined dense clearable debounce=400').props('prepend-icon=search')
@@ -4595,6 +4714,8 @@ def vykresli_spravu_uzivatelu(user_email, user_name, vsechna_prava=None):
               .props('outline no-caps').classes('text-slate-700 font-semibold rounded-lg')
             if _je_superadmin:
                 ui.button('Matice práv', icon='grid_on', on_click=_dialog_export_matice) \
+                  .props('outline no-caps').classes('text-slate-700 font-semibold rounded-lg')
+                ui.button('Úklid práv', icon='delete_sweep', on_click=_dialog_uklid_prav) \
                   .props('outline no-caps').classes('text-slate-700 font-semibold rounded-lg')
 
         # Bez hledání se vykreslí jen prvních _LIMIT_UZIV uživatelů — jinak by se
@@ -4645,7 +4766,7 @@ def vykresli_spravu_uzivatelu(user_email, user_name, vsechna_prava=None):
                                     ui.icon('groups', size='18px').classes('text-violet-500')
                                     ui.label('Práva zděděná z oddělení').classes('text-sm font-bold text-gray-600')
                                     ui.label(str(len(inherited_odd_prava))).classes('text-xs font-bold text-violet-700 bg-violet-100 rounded-full px-2 py-0.5')
-                                vykresli_prirazena_prava(inherited_odd_prava, zakladni_prava, varianta='zdedena')
+                                vykresli_prirazena_prava(inherited_odd_prava, zakladni_prava, varianta='zdedena', zamcena=_zamcena)
 
                             osobni_prava_list = [p.strip() for p in d['prava'].split(',') if p.strip()] if d['prava'] else []
                             with ui.row().classes('items-center gap-2 mt-4'):
@@ -4656,7 +4777,7 @@ def vykresli_spravu_uzivatelu(user_email, user_name, vsechna_prava=None):
                             if not osobni_prava_list:
                                 ui.label('Žádná').classes('text-sm font-bold text-gray-400 italic')
                             else:
-                                vykresli_prirazena_prava(osobni_prava_list, zakladni_prava, varianta='osobni')
+                                vykresli_prirazena_prava(osobni_prava_list, zakladni_prava, varianta='osobni', zamcena=_zamcena)
 
                             ui.label('Dovolená:').classes('text-sm text-gray-500 mt-4')
                             ui.label(f"Základ: {d.get('base_vacation', 0)} h | Převod: {d.get('carried_over_vacation', 0)} h").classes('font-bold text-gray-700')
@@ -4713,7 +4834,7 @@ def vykresli_spravu_uzivatelu(user_email, user_name, vsechna_prava=None):
 
                                     ui.label('Osobní práva navíc').classes('text-xs font-bold text-slate-400 uppercase tracking-wider mt-2 mb-2')
                                     a_prv = [p.strip() for p in uzivatel_db[cil_mail]['prava'].split(',')] if uzivatel_db[cil_mail]['prava'] else []
-                                    vybrane_prava_edit = render_prava_kategorie(zakladni_prava, a_prv)
+                                    vybrane_prava_edit = render_prava_kategorie(zakladni_prava, a_prv, zamcena=_zamcena)
 
                                     vykresli_zastupy_sekce(uzivatel_db[cil_mail]['id'], uzivatel_db,
                                                            log_kdo=user_name, log_koho=cil_mail)
@@ -4755,6 +4876,8 @@ def vykresli_spravu_uzivatelu(user_email, user_name, vsechna_prava=None):
                                         _u.get('carried_over_vacation', 0.0), None, _u.get('manager_id', []),
                                         [s['id'] for s in _u.get('spolecnosti', [])]
                                     )
+                                    if not a:
+                                        intranet_session.vynut_odhlaseni(cil_mail)
                                     intranet_logger.log_activity(user_name, "Správa uživatelů", f"{'Aktivován' if a else 'Deaktivován'} uživatel: {cil_mail}")
                                     ui.notify(f"Účet {'aktivován' if a else 'deaktivován'}.", type='info', position='top')
                                     intranet_data.invaliduj_cache_sprava()
@@ -4770,6 +4893,7 @@ def vykresli_spravu_uzivatelu(user_email, user_name, vsechna_prava=None):
                                     ui.label('Trvalé smazání uživatele i jeho přiřazení. Nelze vrátit zpět.').classes('text-sm text-slate-500 mb-4')
                                     async def potvrdit():
                                         await asyncio.to_thread(intranet_data.smaz_uzivatele, cil_mail)
+                                        intranet_session.vynut_odhlaseni(cil_mail)
                                         intranet_logger.log_activity(user_name, "Správa uživatelů", f"Trvale smazán uživatel: {cil_mail}")
                                         ui.notify(f'Smazáno.', type='positive', position='top')
                                         dlg.close()
@@ -4910,7 +5034,7 @@ def vykresli_spravu_uzivatelu(user_email, user_name, vsechna_prava=None):
                 is_maj = ui.switch('Oddělení Majitelů (oranžová barva s výběrem sledovaných lidí v kalendáři)').classes('mb-4 font-semibold text-orange-600')
 
                 ui.label('Základní práva pro toto oddělení').classes('text-xs font-bold text-slate-400 uppercase tracking-wider mb-2')
-                vybrane_prava_odd = render_prava_kategorie(zakladni_prava, [])
+                vybrane_prava_odd = render_prava_kategorie(zakladni_prava, [], zamcena=_zamcena)
 
                 async def potvrdit_o():
                     if not n_o.value: return ui.notify('Zadejte název!', type='warning')
@@ -4976,7 +5100,7 @@ def vykresli_spravu_uzivatelu(user_email, user_name, vsechna_prava=None):
                                             ui.label('Základní práva oddělení').classes('text-xs font-bold text-slate-400 uppercase tracking-wider mb-2')
 
                                             p_list = [x.strip() for x in p.split(',')] if p else []
-                                            vybrane_prava_odd_edit = render_prava_kategorie(zakladni_prava, p_list)
+                                            vybrane_prava_odd_edit = render_prava_kategorie(zakladni_prava, p_list, zamcena=_zamcena)
 
                                             async def potvrdit_edit_odd():
                                                 pr_str = ",".join(vybrane_prava_odd_edit)
@@ -5064,6 +5188,6 @@ def vykresli_spravu_uzivatelu(user_email, user_name, vsechna_prava=None):
                                 if not pr_list:
                                     ui.label('Žádná zvláštní práva.').classes('text-sm text-gray-400 italic')
                                 else:
-                                    vykresli_prirazena_prava(pr_list, zakladni_prava, varianta='oddeleni')
+                                    vykresli_prirazena_prava(pr_list, zakladni_prava, varianta='oddeleni', zamcena=_zamcena)
 
         vykresli_oddeleni_vnitrni()

@@ -39,7 +39,7 @@ def vykresli_nastaveni_portalu(user_name):
 
         # --- ZÁLOŽKY ---
         # Moduly se zapínají výhradně příkazem /modul v audit konzoli
-        # (intranet_logger._prepni_modul_prikazem → prepni_modul výše).
+        # (dialog intranet_logger._dialog_moduly → prepni_modul výše).
         with ui.tabs().classes('w-full') as tabs:
             tab_narozeniny  = ui.tab('Narozeniny',  icon='cake')
 
@@ -65,11 +65,11 @@ def vykresli_nastaveni_portalu(user_name):
                                 ).classes('text-sm text-gray-500')
 
                             def toggle_narozeniny_modul(e):
-                                n = intranet_data.nacti_nastaveni_intranetu()
-                                n['narozeniny_zapnuty'] = e.value
-                                intranet_data.uloz_nastaveni_intranetu(n)
-                                intranet_logger.log_activity(user_name, 'Narozeniny', f"Modul {'ZAPNUT' if e.value else 'VYPNUT'}")
-                                ui.notify('Uloženo. Projeví se po obnovení stránky.', type='info')
+                                # Přes prepni_modul (jako /modul v konzoli) — zvýší verzi
+                                # nastavení, takže ostatním se modul schová/ukáže do ~5 s.
+                                prepni_modul('narozeniny_zapnuty', e.value, user_name)
+                                ui.notify(f"Modul Narozeniny — {'ZAPNUTO' if e.value else 'VYPNUTO'}",
+                                          type='positive' if e.value else 'warning', position='top')
 
                             ui.switch(
                                 value=nast_nar.get('narozeniny_zapnuty', True),

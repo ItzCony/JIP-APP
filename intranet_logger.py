@@ -31,18 +31,8 @@ PRIKAZY = {
     '/reboot': 'Bezpečně vypne a znovu spustí celou aplikaci (uzavře DB spojení)',
     '/dark-mode on': 'Zapne tmavý režim (testovací fáze) pro tvůj účet',
     '/dark-mode off': 'Vypne tmavý režim pro tvůj účet',
-    '/moduly': 'Vypíše aktuální stav všech modulů portálu',
+    '/modul': 'Otevře přepínač modulů portálu (zapnutí / vypnutí)',
 }
-
-
-def _prikazy_modulu():
-    """Konkrétní varianty „/modul <alias> on|off" do našeptávače konzole.
-
-    Registr modulů žije v intranet_data.MODULY — odsud se jen odvozují aliasy,
-    aby seznam nebyl druhou kopií, která se s Nastavením portálu rozejde.
-    """
-    return [f'/modul {klic.removesuffix("_zapnuty")} {stav}'
-            for klic in intranet_data.MODULY for stav in ('on', 'off')]
 
 # ==========================================
 # --- GLOBÁLNÍ PAMĚŤ PRO LOGY (RAM CACHE) ---
@@ -807,7 +797,7 @@ def vykresli_logy(user_name, vsechna_prava):
         'px-5 py-2.5 bg-white border-x border-t border-gray-200'
     ):
         hledat_input = ui.input(placeholder='Hledat: uživatel, IP, událost, zpráva…  ·  „/" pro příkazy',
-                                autocomplete=list(PRIKAZY) + _prikazy_modulu()) \
+                                autocomplete=list(PRIKAZY)) \
             .props('dense clearable outlined debounce=200 input-class=text-sm') \
             .classes('w-full sm:w-80')
 
@@ -1077,37 +1067,60 @@ def vykresli_logy(user_name, vsechna_prava):
                   type='info', position='top', timeout=2000)
         ui.navigate.reload()  # přímo, bez ui.timer — konzole si přestavuje slot (padal parent slot)
 
-    def _stav_modulu():
-        nast = intranet_data.nacti_nastaveni_intranetu()
-        with ui.dialog() as dlg, ui.card().classes('p-6 gap-2 max-w-lg'):
-            ui.label('Stav modulů portálu').classes('text-lg font-bold mb-1')
-            for klic, (popisek, _) in intranet_data.MODULY.items():
-                zapnuty = nast.get(klic, True)
-                with ui.row().classes('items-center gap-2 w-full'):
-                    ui.icon('check_circle' if zapnuty else 'cancel', size='xs',
-                            color='green-600' if zapnuty else 'red-600')
-                    ui.label(klic.removesuffix('_zapnuty')).classes('text-xs font-mono w-40 text-gray-700')
-                    ui.label(popisek).classes('text-xs text-gray-500 flex-1')
-            ui.button('Zavřít', on_click=dlg.close).props('flat no-caps color=grey-8').classes('self-end mt-2')
-        dlg.open()
-
-    def _prepni_modul_prikazem(alias, zapnout):
+    def _muze_menit_moduly():
         # Konzoli vidí i právo admin_logy, ale moduly patří pod „Nastavení portálu"
-        # (právo mysql). Bez téhle kontroly by příkaz obešel oprávnění z UI.
-        if 'vse' not in vsechna_prava and 'mysql' not in vsechna_prava:
-            log_activity(user_name, 'Přepnutí modulu',
-                         f'ODMÍTNUTO — příkaz /modul {alias} {"on" if zapnout else "off"} '
-                         f'bez práva „Nastavení portálu"')
-            ui.notify('Nemáte oprávnění měnit moduly portálu.', type='negative')
+        # (právo mysql). Bez téhle kontroly by konzole obešla oprávnění z UI.
+        return 'vse' in vsechna_prava or 'mysql' in vsechna_prava
+
+    def _barva_prepinace(zapnuty):
+        return f'toggle-color={"green-7" if zapnuty else "red-7"}'
+
+    def _prepni_modul(klic, zapnout, prepinac):
+        if zapnout is None:
             return
-        klic = f'{alias}_zapnuty'
-        if klic not in intranet_data.MODULY:
-            ui.notify(f'Neznámý modul: {alias}. Seznam vypíše /moduly.', type='negative')
+        # Tlačítka jsou pro ostatní disabled, ale kontrola patří i na server.
+        if not _muze_menit_moduly():
+            log_activity(user_name, 'Přepnutí modulu',
+                         f'ODMÍTNUTO — {klic} {"on" if zapnout else "off"} '
+                         f'z audit konzole bez práva „Nastavení portálu"')
+            ui.notify('Nemáte oprávnění měnit moduly portálu.', type='negative')
             return
         import intranet_nastaveni  # lazy — intranet_nastaveni importuje tenhle modul
         intranet_nastaveni.prepni_modul(klic, zapnout, user_name)
-        ui.notify(f'{intranet_data.MODULY[klic][0]} — {"ZAPNUTO" if zapnout else "VYPNUTO"}. '
-                  'Změna se projeví všem uživatelům do 10 sekund.', type='positive')
+        prepinac.props(_barva_prepinace(zapnout))
+        ui.notify(f'{intranet_data.MODULY[klic][0]} — {"ZAPNUTO" if zapnout else "VYPNUTO"}',
+                  type='positive' if zapnout else 'warning', position='top')
+
+    def _dialog_moduly():
+        """/modul — přepínač modulů portálu.
+
+        Každé kliknutí na Zapnuto/Vypnuto se uloží hned (prepni_modul), proto
+        dialog nemá „Uložit", jen „Zavřít". Bez práva „Nastavení portálu" jde
+        dialog jen číst.
+        """
+        muze_menit = _muze_menit_moduly()
+        nast = intranet_data.nacti_nastaveni_intranetu()
+        with ui.dialog() as dlg, ui.card().classes('p-6 gap-1 w-full max-w-xl'):
+            ui.label('Moduly portálu').classes('text-lg font-bold')
+            ui.label('Změna se uloží hned po kliknutí a všem uživatelům se projeví do 10 sekund.'
+                     if muze_menit else
+                     'Jen pro čtení. Moduly může měnit jen právo „Nastavení portálu".') \
+                .classes('text-xs text-gray-500 mb-2')
+            with ui.column().classes('w-full gap-0 max-h-[60vh] overflow-y-auto'):
+                for klic, (popisek, _) in intranet_data.MODULY.items():
+                    zapnuty = bool(nast.get(klic, True))
+                    with ui.row().classes('items-center gap-3 w-full py-1.5 border-b border-gray-100 no-wrap'):
+                        # Popisky v MODULY nesou emoji ikonu (kvůli Nastavení) — tady bez ní
+                        ui.label(re.sub(r'^\W+', '', popisek)).classes('text-sm text-gray-800 flex-1')
+                        prepinac = ui.toggle(
+                            {True: 'Zapnuto', False: 'Vypnuto'}, value=zapnuty,
+                            on_change=(lambda e, k=klic: _prepni_modul(k, e.value, e.sender))
+                            if muze_menit else None,
+                        ).props(f'dense no-caps unelevated {_barva_prepinace(zapnuty)}')
+                        if not muze_menit:
+                            prepinac.props('disable')
+            ui.button('Zavřít', on_click=dlg.close).props('flat no-caps color=grey-8').classes('self-end mt-3')
+        dlg.open()
 
     def _zpracuj_prikaz():
         prikaz = (hledat_input.value or '').strip()
@@ -1120,10 +1133,8 @@ def vykresli_logy(user_name, vsechna_prava):
             _nastav_dark(True)
         elif prikaz == '/dark-mode off':
             _nastav_dark(False)
-        elif prikaz == '/moduly':
-            _stav_modulu()
-        elif (m := re.fullmatch(r'/modul\s+([\w-]+)\s+(on|off)', prikaz)):
-            _prepni_modul_prikazem(m.group(1), m.group(2) == 'on')
+        elif prikaz in ('/modul', '/moduly'):
+            _dialog_moduly()
         else:
             ui.notify(f'Neznámý příkaz: {prikaz}', type='negative')
     hledat_input.on('keydown.enter', _zpracuj_prikaz)

@@ -234,6 +234,16 @@ DB_ZAKLAD_INICIALIZOVAN = False
 # Per-user permission cache: {user_id: (prava_list, timestamp)}
 _CACHE_PRAVA = {}
 _CACHE_PRAVA_TTL = 600  # 10 minut (bylo 5) — invaliduje vymazat_cache_prav() při změně práv
+# user_id deaktivovaných / smazaných účtů — plní ziskej_prava_uzivatele při každém
+# čtení z DB, takže je stejně čerstvá jako _CACHE_PRAVA (a sdílí její invalidaci).
+_NEAKTIVNI_UZIVATELE = set()
+# Verze práv – zvyšuje ji každá invalidace (vymazat_cache_prav). Otevřené stránky si
+# ji pamatují; když se změní, načtou práva znovu a při rozdílu se obnoví (intranet.py).
+_PRAVA_VERZE_VSICHNI = 0
+_PRAVA_VERZE_UZIVATEL = {}  # {user_id: verze}
+# Chrání dvojici „zvýšit verzi + vyčistit cache" proti souběžnému zápisu do cache:
+# čtení, které začalo před změnou práv, nesmí po invalidaci uložit stará práva.
+_PRAVA_ZAMEK = _threading.Lock()
 
 # Krátkodobá cache pro těžké dotazy (zamezuje blokování event loop při refresh)
 _CACHE_UZIVATELE = {'data': None, 'ts': 0.0}
@@ -480,9 +490,10 @@ def import_realnych_zustatku_dovolene(mapa_zustatku, datum_ke_dni=None, nahled=F
 def vycistit_stare_cache_prava(max_vek_sekund=7200):
     """Odstraní zastaralé záznamy z per-user cache práv (ochrana před memory leak)."""
     now = time.time()
-    stare = [uid for uid, (_, ts) in _CACHE_PRAVA.items() if now - ts > max_vek_sekund]
-    for uid in stare:
-        del _CACHE_PRAVA[uid]
+    with _PRAVA_ZAMEK:
+        stare = [uid for uid, (_, ts) in _CACHE_PRAVA.items() if now - ts > max_vek_sekund]
+        for uid in stare:
+            del _CACHE_PRAVA[uid]
 
 # Moduly portálu: klíč v nastavení → (popisek v UI, název do audit logu).
 # Jediný zdroj pravdy pro příkaz /modul v audit konzoli (v UI se moduly
@@ -913,6 +924,29 @@ def _vycisti_admin_prava(cursor):
     except Exception as e:
         print(f"Chyba čištění admin práv: {e}")
 
+def _smaz_prava_podle_nazvu(cursor, nazvy):
+    """Smaže práva i všechny jejich vazby (uživatelé, role, oddělení).
+
+    Nespoléhá na ON DELETE CASCADE — ostré tabulky mohly vzniknout dřív než FK.
+    Kolace DB je case/accent-insensitive, proto se nalezené řádky ještě
+    porovnají přesně, aby se nesmazalo podobně pojmenované jiné právo.
+    Commit nechává na volajícím. Vrací seznam skutečně smazaných názvů.
+    """
+    chtena = set(nazvy or [])
+    if not chtena:
+        return []
+    misto = ",".join(["%s"] * len(chtena))
+    cursor.execute(f"SELECT idprivileges, name FROM privileges WHERE name IN ({misto})", tuple(sorted(chtena)))
+    radky = [(i, n) for i, n in cursor.fetchall() if n in chtena]
+    if not radky:
+        return []
+    ids = tuple(i for i, _ in radky)
+    id_misto = ",".join(["%s"] * len(ids))
+    for tab in ("user_To_privileges", "jobPosition_To_privileges", "department_To_privileges"):
+        cursor.execute(f"DELETE FROM {tab} WHERE privileges_idprivileges IN ({id_misto})", ids)
+    cursor.execute(f"DELETE FROM privileges WHERE idprivileges IN ({id_misto})", ids)
+    return sorted(n for _, n in radky)
+
 # ========================================================
 # INICIALIZACE DB (VČETNĚ NOVÝCH RELAČNÍCH TABULEK)
 # ========================================================
@@ -1307,12 +1341,29 @@ def overit_prihlaseni(email, heslo):
         if conn: conn.close()
 
 def vymazat_cache_prav(user_id=None):
-    """Invaliduje cache práv – pro konkrétního uživatele nebo celou cache."""
-    global _CACHE_PRAVA
-    if user_id is None:
-        _CACHE_PRAVA = {}
-    else:
-        _CACHE_PRAVA.pop(user_id, None)
+    """Invaliduje cache práv – pro konkrétního uživatele nebo celou cache.
+
+    Zároveň zvýší verzi práv, podle které otevřené stránky dotčených uživatelů
+    poznají změnu a obnoví se (viz verze_prav, prava_pro_kontrolu).
+    """
+    global _CACHE_PRAVA, _PRAVA_VERZE_VSICHNI
+    with _PRAVA_ZAMEK:
+        if user_id is None:
+            _PRAVA_VERZE_VSICHNI += 1
+            _CACHE_PRAVA = {}
+        else:
+            _PRAVA_VERZE_UZIVATEL[user_id] = _PRAVA_VERZE_UZIVATEL.get(user_id, 0) + 1
+            _CACHE_PRAVA.pop(user_id, None)
+
+def verze_prav(user_id):
+    """Verze práv uživatele – změní se s každou invalidací jeho (nebo všech) práv."""
+    return (_PRAVA_VERZE_VSICHNI, _PRAVA_VERZE_UZIVATEL.get(user_id, 0))
+
+def _uloz_prava_do_cache(user_id, prava, verze_pred_ctenim):
+    """Uloží práva do cache jen tehdy, když je mezitím nikdo neinvalidoval."""
+    with _PRAVA_ZAMEK:
+        if verze_prav(user_id) == verze_pred_ctenim:
+            _CACHE_PRAVA[user_id] = (prava, time.time())
 
 def heslo_je_silne(heslo: str) -> bool:
     """Min. 8 znaků, velké i malé písmeno a číslice. Jediný zdroj pravdy pro UI i backend."""
@@ -1357,7 +1408,8 @@ def nastav_heslo_a_zrus_priznak(user_id, nove_heslo) -> bool:
         if cursor: cursor.close()
         if conn: conn.close()
 
-def ziskej_prava_uzivatele(user_id):
+def _nacti_prava(user_id):
+    """Práva uživatele (cache → DB). None = DB neodpověděla; nic se neukládá."""
     if user_id == 999999: return ['vse']
 
     # Kontrola cache
@@ -1367,13 +1419,24 @@ def ziskej_prava_uzivatele(user_id):
         if time.time() - ts < _CACHE_PRAVA_TTL:
             return prava_list
 
+    verze = verze_prav(user_id)  # před čtením – viz _uloz_prava_do_cache
     inicializace_db()
     conn = get_db_connection()
-    if not conn: return []
+    if not conn: return None
 
     cursor = None
     try:
         cursor = conn.cursor(buffered=True)
+        # Deaktivovaný nebo smazaný účet nemá žádná práva — ani když mu zůstala
+        # otevřená relace (is_active se jinak kontroluje jen při přihlášení).
+        cursor.execute("SELECT is_active FROM user WHERE iduser=%s", (user_id,))
+        row = cursor.fetchone()
+        if not row or not row[0]:
+            _NEAKTIVNI_UZIVATELE.add(user_id)
+            _uloz_prava_do_cache(user_id, [], verze)
+            return []
+        _NEAKTIVNI_UZIVATELE.discard(user_id)
+
         # 3 jednoduché UNION větve místo 5 LEFT JOINů s OR — každá větev projde
         # jen svůj index (user_iduser), žádný full-scan tabulky privileges.
         query = """
@@ -1396,13 +1459,37 @@ def ziskej_prava_uzivatele(user_id):
         """
         cursor.execute(query, (user_id, user_id, user_id))
         prava = [row[0] for row in cursor.fetchall()]
-        _CACHE_PRAVA[user_id] = (prava, time.time())
+        _uloz_prava_do_cache(user_id, prava, verze)
         return prava
     except Exception:
-        return []
+        return None
     finally:
         if cursor: cursor.close()
         if conn: conn.close()
+
+def ziskej_prava_uzivatele(user_id):
+    prava = _nacti_prava(user_id)
+    return [] if prava is None else prava
+
+def prava_pro_kontrolu(user_id):
+    """(práva, aktivní) pro hlídání změn na otevřené stránce, nebo None při výpadku DB.
+
+    Na rozdíl od ziskej_prava_a_aktivitu nezaměňuje výpadek za „žádná práva" –
+    stránka se kvůli výpadku DB nesmí obnovit s prázdnými právy.
+    """
+    prava = _nacti_prava(user_id)
+    if prava is None:
+        return None
+    return prava, user_id not in _NEAKTIVNI_UZIVATELE
+
+def ziskej_prava_a_aktivitu(user_id):
+    """(práva, aktivní) jedním voláním — pro stráž při sestavení stránky.
+
+    aktivní=False pro deaktivovaný nebo smazaný účet. Při výpadku DB se účet
+    bere jako aktivní (nevyhazujeme kvůli tomu všechny); práva jsou pak prázdná.
+    """
+    prava = ziskej_prava_uzivatele(user_id)
+    return prava, user_id not in _NEAKTIVNI_UZIVATELE
 
 def ziskej_uzivatele_s_pravem(*prava, pouze_jmena=False):
     """Vrátí uživatele, kteří mají alespoň jedno z požadovaných práv (přes přímé, role nebo oddělení).
@@ -1770,12 +1857,91 @@ def smaz_oddeleni(nazev):
     cursor = None
     try:
         cursor = conn.cursor(buffered=True)
+        # S oddělením zmizí i práva pojmenovaná podle něj (slozka_x, hlavni_vedouci_x…).
+        # Jinak by nové oddělení se stejným názvem vrátilo přístup původním držitelům.
+        _smaz_prava_podle_nazvu(cursor, intranet_prava.prava_oddeleni(nazev))
         cursor.execute("DELETE FROM department WHERE name=%s", (nazev,))
         conn.commit()
-    except Exception: pass
+        # Kaskáda smaže práva i členství oddělení – členové nesmí držet stará práva z cache.
+        vymazat_cache_prav()
+    except Exception as e:
+        print(f"Chyba mazání oddělení {nazev!r}: {e}")
+        try: conn.rollback()
+        except Exception: pass
     finally:
         if cursor: cursor.close()
         if conn: conn.close()
+
+
+def ziskej_osirela_prava():
+    """Práva v DB, která katalog nezná a kód nečte — kandidáti na úklid.
+
+    [{'nazev', 'uzivatele', 'role', 'oddeleni'}] (počty vazeb) seřazené podle
+    názvu. None = katalog nejde spolehlivě sestavit nebo DB neodpovídá —
+    pak se nic mazat nesmí (viz intranet_prava.najdi_osirela_prava).
+    """
+    oddeleni = ziskej_vsechna_oddeleni()
+    typy = ziskej_typy_volna()
+    sortimenty = ziskej_sortimenty_monitoru()
+    conn = get_db_connection()
+    if not conn: return None
+    cursor = None
+    try:
+        cursor = conn.cursor(buffered=True)
+        cursor.execute(
+            "SELECT p.name,"
+            " (SELECT COUNT(*) FROM user_To_privileges x WHERE x.privileges_idprivileges = p.idprivileges),"
+            " (SELECT COUNT(*) FROM jobPosition_To_privileges x WHERE x.privileges_idprivileges = p.idprivileges),"
+            " (SELECT COUNT(*) FROM department_To_privileges x WHERE x.privileges_idprivileges = p.idprivileges)"
+            " FROM privileges p")
+        radky = {n: (u, r, o) for n, u, r, o in cursor.fetchall()}
+    except Exception as e:
+        print(f"Chyba čtení osiřelých práv: {e}")
+        return None
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
+    osirela = intranet_prava.najdi_osirela_prava(radky.keys(), oddeleni, typy, sortimenty)
+    if osirela is None:
+        return None
+    return [{'nazev': n, 'uzivatele': radky[n][0], 'role': radky[n][1], 'oddeleni': radky[n][2]}
+            for n in osirela]
+
+
+def smaz_osirela_prava(nazvy):
+    """Smaže vybraná osiřelá práva i s vazbami. Vrací smazané názvy (None = chyba).
+
+    Seznam se těsně před mazáním sestaví znovu z čerstvých dat — co katalog
+    mezitím začal znát (třeba se založilo oddělení stejného názvu), zůstane.
+    """
+    invaliduj_cache_sprava()
+    zneplatni_cache_sortimentu()
+    aktualni = ziskej_osirela_prava()
+    if aktualni is None:
+        return None
+    povolena = {r['nazev'] for r in aktualni} & set(nazvy or [])
+    if not povolena:
+        return []
+    conn = get_db_connection()
+    if not conn: return None
+    cursor = None
+    try:
+        cursor = conn.cursor(buffered=True)
+        smazana = _smaz_prava_podle_nazvu(cursor, povolena)
+        conn.commit()
+    except Exception as e:
+        print(f"Chyba mazání osiřelých práv: {e}")
+        try: conn.rollback()
+        except Exception: pass
+        return None
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
+    # Oddělení nesou v cache svůj seznam práv; otevřené stránky dotčených lidí
+    # se podle nové verze práv samy obnoví (viz verze_prav).
+    invaliduj_cache_sprava()
+    vymazat_cache_prav()
+    return smazana
 
 def ziskej_vsechny_role():
     if _CACHE_ROLE['data'] is not None and (time.time() - _CACHE_ROLE['ts']) < _CACHE_SPRAVA_TTL:
@@ -1816,6 +1982,8 @@ def smaz_roli(nazev):
         cursor = conn.cursor(buffered=True)
         cursor.execute("DELETE FROM jobPosition WHERE name=%s", (nazev,))
         conn.commit()
+        # Kaskáda smaže práva i přiřazení role – držitelé nesmí mít stará práva z cache.
+        vymazat_cache_prav()
     except Exception: pass
     finally:
         if cursor: cursor.close()
