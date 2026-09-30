@@ -734,18 +734,42 @@ def vymaz_cache():
     _CACHE['cas'] = 0.0
 
 
+# Úprava / deaktivace / smazání účtu ve správě uživatelů → Lupa hned přepočítá mapy.
+intranet_data.PO_ZMENE_UZIVATELU.append(vymaz_cache)
+
+_MAZANI = set()   # ASM, jejichž smazání právě běží ve vlákně (ať se nespustí dvakrát)
+
+
 def _mapy():
-    """{asm: user_id}, {user_id: {oddělení}}, {oddělení: {user_id}} — 10min cache."""
+    """{asm: user_id}, {user_id: {oddělení}}, {oddělení: {user_id}} — 10min cache.
+
+    Stav účtu spárovaného obchodníka:
+      deaktivovaný → ASM v asm_user není (nikdo ho nevidí ani neotevře), data
+                     zůstávají; šedou dlaždici vidí jen SKRYTY_ADMIN_ID
+      smazaný      → ASM se smaže celé i s daty (_smaz_asm)"""
     if time.time() - _CACHE['cas'] < _CACHE_TTL and _CACHE['asm_user']:
         return _CACHE['asm_user'], _CACHE['user_odd'], _CACHE['odd_users']
     inicializace_db()
-    asm_user, user_odd, odd_users = {}, {}, {}
+    asm_user, user_odd, odd_users, neaktivni, smazana = {}, {}, {}, [], []
     conn = intranet_data.get_db_connection()
     if conn:
         try:
             cur = conn.cursor()
-            cur.execute('SELECT asm, user_id FROM lupa_asm')
-            asm_user = {r[0]: r[1] for r in cur.fetchall()}
+            cur.execute('SELECT a.asm, a.user_id, u.iduser IS NULL, u.is_active = 0 '
+                        'FROM lupa_asm a LEFT JOIN user u ON u.iduser = a.user_id')
+            for asm, uid, chybi, vypnuty in cur.fetchall():
+                if uid and chybi:
+                    smazana.append(asm)
+                elif uid and vypnuty:
+                    neaktivni.append(asm)
+                else:
+                    asm_user[asm] = uid
+            sparovana = len(smazana) + len(neaktivni) + sum(1 for u in asm_user.values() if u)
+            if len(smazana) > 1 and len(smazana) == sparovana:
+                # Všichni obchodníci naráz smazaní = rozbitá tabulka user, ne odchody.
+                print(f'[lupa] mazání přeskočeno — smazaní by byli všichni: {sorted(smazana)}')
+            elif smazana:
+                _smaz_asm_na_pozadi(smazana)
             cur.execute('SELECT dtu.user_iduser, LOWER(d.name) FROM department_To_user dtu '
                         'JOIN department d ON d.iddepartment = dtu.department_iddepartment')
             for uid, odd in cur.fetchall():
@@ -756,9 +780,62 @@ def _mapy():
             print(f'[lupa] _mapy: {e}')
         finally:
             conn.close()
-    _CACHE.update({'cas': time.time(), 'asm_user': asm_user,
-                   'user_odd': user_odd, 'odd_users': odd_users})
+    _CACHE.update({'cas': time.time(), 'asm_user': asm_user, 'user_odd': user_odd,
+                   'odd_users': odd_users, 'neaktivni': neaktivni})
     return asm_user, user_odd, odd_users
+
+
+def neaktivni_asm(user_id):
+    """Šedé dlaždice — ASM deaktivovaných účtů. Vidí je jen SKRYTY_ADMIN_ID."""
+    if user_id != intranet_data.SKRYTY_ADMIN_ID:
+        return []
+    _mapy()
+    return sorted(_CACHE.get('neaktivni', []))
+
+
+def _smaz_asm_na_pozadi(asmy):
+    """Mazání obratů jsou desítky tisíc řádků — mimo event loop."""
+    nova = [a for a in asmy if a not in _MAZANI]
+    if nova:
+        _MAZANI.update(nova)
+        threading.Thread(target=_smaz_asm, args=(nova,), daemon=True).start()
+
+
+def _smaz_asm(asmy):
+    """Úplné smazání ASM smazaného uživatele: dlaždice, obraty, poznámky, komentáře.
+
+    Zákazníci a dealeři nesou sloupec asm, ale sdílí je víc ASM — maže se jen to,
+    na co už žádný obrat neukazuje. Produkty a karty zboží jsou společné, zůstávají."""
+    conn = intranet_data.get_db_connection()
+    try:
+        if not conn:
+            return
+        cur = conn.cursor()
+        for asm in asmy:
+            try:
+                cur.execute('DELETE FROM lupa_komentar WHERE poznamka_id IN '
+                            '(SELECT id FROM lupa_poznamka WHERE asm=%s)', (asm,))
+                cur.execute('DELETE FROM lupa_poznamka WHERE asm=%s', (asm,))
+                cur.execute('DELETE FROM lupa_obrat WHERE asm=%s', (asm,))
+                cur.execute('DELETE FROM lupa_asm WHERE asm=%s', (asm,))
+                conn.commit()
+                with _DIMENZE_ZAMEK:   # import zapisuje dimenze pod stejným zámkem
+                    cur.execute('DELETE z FROM lupa_zakaznik z WHERE z.asm=%s AND NOT EXISTS '
+                                '(SELECT 1 FROM lupa_obrat o WHERE o.ico = z.ico)', (asm,))
+                    cur.execute('DELETE d FROM lupa_dealer d WHERE d.asm=%s AND NOT EXISTS '
+                                '(SELECT 1 FROM lupa_obrat o WHERE o.dealer = d.dealer)', (asm,))
+                    conn.commit()
+                intranet_logger.log_activity('Systém', 'Lupou na obchod',
+                                             f'Smazáno ASM {asm} i s daty — uživatel byl smazán')
+            except Exception as e:
+                conn.rollback()
+                print(f'[lupa] smazání ASM {asm}: {e}')
+        cur.close()
+    finally:
+        if conn:
+            conn.close()
+        _MAZANI.difference_update(asmy)
+        vymaz_cache()
 
 
 def je_admin(prava):
@@ -852,6 +929,8 @@ def _adminska_id():
 _KARTA = ('w-72 h-56 items-center justify-center shadow-xl hover:scale-105 '
           'transition-transform duration-300 cursor-pointer bg-white rounded-2xl '
           'border border-indigo-200')
+_KARTA_SEDA = ('w-72 h-56 items-center justify-center cursor-default bg-gray-100 '
+               'rounded-2xl border border-gray-300 opacity-60')
 
 
 def _kc(hodnota):
@@ -1009,7 +1088,8 @@ def vykresli_lupa(user_id, user_name, vsechna_prava):
         _vykresli_uzavrene_mesice(user_name, je_vkladatel(vsechna_prava))
 
         souhrny = _nacti_souhrny(moje)
-        if not souhrny and not je_vkladatel(vsechna_prava):
+        sede = _nacti_souhrny(neaktivni_asm(user_id))
+        if not souhrny and not sede and not je_vkladatel(vsechna_prava):
             with ui.column().classes('items-center py-20 gap-3 w-full'):
                 ui.icon('insights', size='5rem', color='grey-3')
                 ui.label('Žádná data').classes('text-xl font-semibold text-gray-400')
@@ -1019,6 +1099,8 @@ def vykresli_lupa(user_id, user_name, vsechna_prava):
         with ui.row().classes('gap-6 flex-wrap items-stretch'):
             for s in souhrny:
                 _dlazdice_asm(s, stav_klic, obsah)
+            for s in sede:
+                _dlazdice_neaktivni(s)
             if je_vkladatel(vsechna_prava):
                 _dlazdice_import(stav_klic, obsah)
 
@@ -1080,6 +1162,14 @@ def _dlazdice_asm(s, stav_klic, refreshable):
         ui.label('🔍').classes('text-5xl mb-2')
         ui.label(s['asm'].capitalize()) \
             .classes('text-xl font-bold text-gray-800 text-center w-full')
+
+
+def _dlazdice_neaktivni(s):
+    """ASM deaktivovaného účtu — data drží pro případnou reaktivaci, otevřít nejde."""
+    with ui.card().classes(_KARTA_SEDA):
+        ui.label('🔍').classes('text-5xl mb-2 grayscale')
+        ui.label(s['asm'].capitalize()) \
+            .classes('text-xl font-bold text-gray-500 text-center w-full')
 
 
 def _dlazdice_import(stav_klic, refreshable):
