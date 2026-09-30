@@ -263,6 +263,10 @@ def invaliduj_cache_dochazky():
     _CACHE_ZADOSTI_ALL['ts'] = 0.0
     _CACHE_VOLNA_KALENDAR_ALL['ts'] = 0.0
 
+# Moduly s vlastní cache nad uživateli (např. Lupa) se sem zapíšou; data je
+# importovat nesmí (cyklický import), tak se volají zpátky odsud.
+PO_ZMENE_UZIVATELU = []
+
 def invaliduj_cache_sprava():
     """Zneplatní cache správy (oddělení, role, volna) — volat po mutacích v admin sekci."""
     _CACHE_UZIVATELE['ts'] = 0.0
@@ -270,6 +274,8 @@ def invaliduj_cache_sprava():
     _CACHE_ROLE['ts'] = 0.0
     _CACHE_TYPY_VOLNA['ts'] = 0.0
     _CACHE_VOLNA_KALENDAR_ALL['ts'] = 0.0
+    for fn in PO_ZMENE_UZIVATELU:
+        fn()
 
 def _prehraj_cache_sync():
     """Přetáhne všechna sdílená data z DB do cache. Běží ve vlákně, ne v event-loopu.
