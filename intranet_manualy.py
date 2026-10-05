@@ -1184,11 +1184,52 @@ document.addEventListener('mouseup',e=>{
 document.addEventListener('mousedown',e=>{
  if(!panel.contains(e.target))panel.style.display='none';
 });
+
+// Šipky ←/→ při fokusu uvnitř iframe: keydown k rodiči nedoputuje, tak ho přepošleme.
+document.addEventListener('keydown',e=>{
+ if(window.parent===window||e.defaultPrevented||e.repeat
+    ||e.altKey||e.ctrlKey||e.metaKey||e.shiftKey)return;
+ const d=e.key==='ArrowLeft'?-1:e.key==='ArrowRight'?1:0;
+ const a=document.activeElement;
+ if(!d||(a&&(a.isContentEditable||/^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName))))return;
+ e.preventDefault();
+ window.parent.postMessage({typ:'manual-sipka',smer:d},location.origin);
+});
+'''
+
+# Globální posluchač šipek ←/→ (instaluje se jednou na okno). Událost dostane
+# kořen viditelného modulu (.manual-sipky) jako DOM událost 'sipka' — handler
+# v Pythonu tak zaniká spolu s prvkem a při překreslení se nehromadí.
+_SKRIPT_SIPKY = '''
+if(!window.__manualSipky){window.__manualSipky=true;
+ const posli=d=>{
+  const el=document.querySelector('.manual-sipky');
+  if(!el||!el.getClientRects().length||document.querySelector('.q-dialog'))return false;
+  el.dispatchEvent(new CustomEvent('sipka',{detail:d}));
+  return true;
+ };
+ document.addEventListener('keydown',e=>{
+  if(e.defaultPrevented||e.repeat||e.altKey||e.ctrlKey||e.metaKey||e.shiftKey)return;
+  const d=e.key==='ArrowLeft'?-1:e.key==='ArrowRight'?1:0;
+  const a=document.activeElement;
+  if(!d||(a&&(a.isContentEditable||/^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName))))return;
+  if(posli(d))e.preventDefault();
+ });
+ window.addEventListener('message',e=>{
+  if(e.origin===location.origin&&e.data&&e.data.typ==='manual-sipka')posli(e.data.smer);
+ });
+}
 '''
 
 _CSS = '''
 .manual-editor { display: flex; flex-direction: column; min-height: 0; }
 .manual-editor .q-editor__content { flex: 1; overflow-y: auto; }
+.manual-ramec:fullscreen { background: #fff; padding: 8px; }
+/* rám má výšku v inline stylu → bez !important nepřebijeme */
+.manual-ramec:fullscreen iframe { height: calc(100vh - 64px) !important; }
+.manual-ramec:fullscreen .fs-zap,
+.manual-ramec:fullscreen .jen-mimo-fs,
+.manual-ramec:not(:fullscreen) .fs-vyp { display: none; }
 '''
 
 
@@ -1284,7 +1325,7 @@ def vykresli_manualy(user_id, user_name, vsechna_prava):
     # věšíme na stabilní kotvu mimo něj, jinak zůstanou neviditelné.
     kotva_dialogu = ui.element('div')
 
-    with ui.row().classes('w-full no-wrap gap-4 items-start'):
+    with ui.row().classes('w-full no-wrap gap-4 items-start manual-sipky') as koren:
 
         # ---------- levý panel: hledání + části manuálu ----------
         with ui.column().classes('w-72 shrink-0 gap-2'):
@@ -1297,7 +1338,7 @@ def vykresli_manualy(user_id, user_name, vsechna_prava):
                 panel = ui.column().classes('w-full gap-0 p-0')
 
         # ---------- pravá část: lišta + stránka kapitoly v rámu ----------
-        with ui.column().classes('flex-1 min-w-0 gap-2'):
+        with ui.column().classes('manual-ramec flex-1 min-w-0 gap-2') as ramec:
             with ui.row().classes('w-full items-center no-wrap gap-2 '
                                   'rounded-lg bg-emerald-700 text-white px-3 py-1'):
                 ui.icon('menu_book')
@@ -1308,16 +1349,27 @@ def vykresli_manualy(user_id, user_name, vsechna_prava):
                     .props('flat dense round color=white').tooltip('Předchozí kapitola')
                 ui.button(icon='chevron_right', on_click=lambda: _skoc(1)) \
                     .props('flat dense round color=white').tooltip('Další kapitola')
+                # Celá obrazovka čistě v prohlížeči — requestFullscreen() chce
+                # čerstvý klik, cesta přes server by ho mohla promeškat.
+                ui.button(icon='fullscreen').props('flat dense round color=white') \
+                    .classes('fs-zap').tooltip('Celá obrazovka') \
+                    .on('click', js_handler=f'() => getHtmlElement({ramec.id}).requestFullscreen()')
+                ui.button(icon='fullscreen_exit').props('flat dense round color=white') \
+                    .classes('fs-vyp') \
+                    .on('click', js_handler='() => document.exitFullscreen()')
                 if je_admin:
-                    ui.separator().props('vertical dark')
-                    ui.button(icon='edit', on_click=lambda: _dialog_editace(stav['index'])) \
-                        .props('flat dense round color=white').tooltip('Upravit kapitolu')
-                    ui.button(icon='playlist_add', on_click=lambda: _dialog_nova_kapitola()) \
-                        .props('flat dense round color=white').tooltip('Nová kapitola')
-                    ui.button(icon='history', on_click=lambda: _dialog_verze(user_name)) \
-                        .props('flat dense round color=white').tooltip('Historie verzí')
-                    ui.button(icon='upload_file', on_click=lambda: _dialog_nahrani(user_name)) \
-                        .props('flat dense round color=white').tooltip('Nahrát nový DOCX')
+                    # Dialogy se vykreslují mimo rám → ve fullscreenu by nebyly
+                    # vidět, proto tam admin tlačítka schováme.
+                    with ui.row().classes('jen-mimo-fs items-center no-wrap gap-2'):
+                        ui.separator().props('vertical dark')
+                        ui.button(icon='edit', on_click=lambda: _dialog_editace(stav['index'])) \
+                            .props('flat dense round color=white').tooltip('Upravit kapitolu')
+                        ui.button(icon='playlist_add', on_click=lambda: _dialog_nova_kapitola()) \
+                            .props('flat dense round color=white').tooltip('Nová kapitola')
+                        ui.button(icon='history', on_click=lambda: _dialog_verze(user_name)) \
+                            .props('flat dense round color=white').tooltip('Historie verzí')
+                        ui.button(icon='upload_file', on_click=lambda: _dialog_nahrani(user_name)) \
+                            .props('flat dense round color=white').tooltip('Nahrát nový DOCX')
             telo = ui.column().classes('w-full gap-0')
 
     # ---------- vykreslování ----------
@@ -1513,6 +1565,15 @@ def vykresli_manualy(user_id, user_name, vsechna_prava):
             return
         ui.notify('Verze obnovena.', type='positive')
         ui.navigate.reload()
+
+    def _sipka(e):
+        # Na krajích nic nedělat — _otevri by jen ořízl index a zbytečně překreslil.
+        novy = stav['index'] + int((e.args or {}).get('detail') or 0)
+        if 0 <= novy < len(kapitoly) and novy != stav['index']:
+            _otevri(novy)
+
+    koren.on('sipka', _sipka, ['detail'])
+    ui.run_javascript(_SKRIPT_SIPKY)
 
     _vykresli_telo()
     _vykresli_panel()

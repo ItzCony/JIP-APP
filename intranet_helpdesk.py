@@ -7,7 +7,12 @@ from intranet_ui_utils import refreshable_na_klienta
 # =========================================================
 # INICIALIZACE DATABÁZE PRO HELPDESK
 # =========================================================
+_HELPDESK_DB_INIT_HOTOVO = False  # schéma jen jednou za běh procesu
+
+
 def inicializace_helpdesk_db():
+    global _HELPDESK_DB_INIT_HOTOVO
+    if _HELPDESK_DB_INIT_HOTOVO: return
     conn = intranet_data.get_db_connection()
     if not conn: return
     try:
@@ -43,6 +48,7 @@ def inicializace_helpdesk_db():
         """)
         conn.commit()
         cur.close()
+        _HELPDESK_DB_INIT_HOTOVO = True
     except Exception as e:
         print(f"Chyba při inicializaci DB Helpdesku: {e}")
     finally:

@@ -666,7 +666,7 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
     ) and nastaveni.get('monitor_zapnuty', True)
     ma_pristup_zalistovaci = (
         'vse' in vsechna_prava or
-        any(p.startswith('zalistovaci_') for p in vsechna_prava)
+        intranet_prava.ma_pristup_zalistovaci(vsechna_prava)
     ) and nastaveni.get('zalistovaci_zapnuty', True)
     ma_pristup_spolvecer = (
         'vse' in vsechna_prava or
@@ -3094,6 +3094,7 @@ def vykresli_spravu_uzivatelu(user_email, user_name, vsechna_prava=None):
             _pr_options_novy = {pz['id']: pz['nazev'] for pz in uznaky_db} if (uznaky_db := intranet_data.ziskej_vsechny_priznaky()) else {}
             vyber_priznak_novy = ui.select({None: '— bez příznaku —', **_pr_options_novy}, value=None, label='Příznak').classes('flex-1').props('outlined dense')
             vyber_pobocka_novy = ui.select({None: '— bez pobočky —', **{_pb: _pb for _pb in intranet_data.POBOCKY}}, value=None, label='Pobočka').classes('flex-1').props('outlined dense')
+            vyber_pobocky_navic_novy = ui.select({_pb: _pb for _pb in intranet_data.POBOCKY}, value=[], label='Další pobočky (ASM)', multiple=True).classes('flex-1').props('outlined dense use-chips clearable')
 
         with ui.row().classes('w-full gap-4 mb-6'):
             manazeri = {u['id']: f"{u['jmeno_cele']} ({u.get('oddeleni', '')})" for u in sorted((u for u in db.values() if u['aktivni']), key=lambda u: (cz_razeni(u.get('prijmeni', '')), cz_razeni(u.get('jmeno_cele', ''))))}
@@ -3124,7 +3125,8 @@ def vykresli_spravu_uzivatelu(user_email, user_name, vsechna_prava=None):
                 em, jm, pr, heslo, vyber_role.value, vyber_oddeleni.value,
                 ",".join(vybrane_prava_novy), True, input_zaklad.value, input_prevod.value, oc,
                 manazer_ids, spol_ids, input_datum_narozeni.value or None,
-                vyber_priznak_novy.value, vyber_pobocka_novy.value
+                vyber_priznak_novy.value, vyber_pobocka_novy.value,
+                pobocky_navic=list(vyber_pobocky_navic_novy.value or [])
             )
 
             if status:
@@ -3147,6 +3149,7 @@ def vykresli_spravu_uzivatelu(user_email, user_name, vsechna_prava=None):
                 vyber_manazera.set_value([])
                 input_datum_narozeni.set_value('')
                 vyber_pobocka_novy.set_value(None)
+                vyber_pobocky_navic_novy.set_value([])
             else:
                 ui.notify(msg, type='negative', position='top')
 
@@ -4832,6 +4835,14 @@ def vykresli_spravu_uzivatelu(user_email, user_name, vsechna_prava=None):
                                             value=uzivatel_db[cil_mail].get('pobocka'),
                                             label='Pobočka'
                                         ).classes('flex-1').props('outlined dense')
+                                        # Další pobočky navíc k hlavní — rozšiřují viditelnost IČO v ASM
+                                        n_pobocky_navic = ui.select(
+                                            {_pb: _pb for _pb in intranet_data.POBOCKY},
+                                            value=[_pb for _pb in uzivatel_db[cil_mail].get('pobocky_navic', [])
+                                                   if _pb in intranet_data.POBOCKY],
+                                            label='Další pobočky (ASM)',
+                                            multiple=True
+                                        ).classes('flex-1').props('outlined dense use-chips clearable')
 
                                     ui.label('Osobní práva navíc').classes('text-xs font-bold text-slate-400 uppercase tracking-wider mt-2 mb-2')
                                     a_prv = [p.strip() for p in uzivatel_db[cil_mail]['prava'].split(',')] if uzivatel_db[cil_mail]['prava'] else []
@@ -4851,7 +4862,9 @@ def vykresli_spravu_uzivatelu(user_email, user_name, vsechna_prava=None):
                                             cil_mail, n_j.value, n_p.value, None, uzivatel_db[cil_mail]['role'],
                                             od_str, pr_str, uzivatel_db[cil_mail]['aktivni'], n_zaklad.value, n_prevod.value,
                                             None, m_ids, s_ids, n_datum_narozeni.value or None,
-                                            n_priznak.value, n_pobocka.value
+                                            # '' (ne None) — jinak by „— bez pobočky —" pobočku nesmazalo
+                                            n_priznak.value, n_pobocka.value or '',
+                                            pobocky_navic=list(n_pobocky_navic.value or [])
                                         )
                                         intranet_logger.log_activity(user_name, "Správa uživatelů", f"Upraveny údaje uživatele: {cil_mail}")
 

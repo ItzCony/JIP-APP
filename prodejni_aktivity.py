@@ -119,8 +119,14 @@ def _muze_smazat(prava: list) -> bool:
 
 # ── Databázové funkce ─────────────────────────────────────────────────────────
 
+_PROD_AKT_DB_INIT_HOTOVO = False  # schéma jen jednou za běh procesu
+
+
 def inicializace_db():
-    """Vytvoří tabulky, pokud neexistují."""
+    """Vytvoří tabulky, pokud neexistují (jednou za běh procesu)."""
+    global _PROD_AKT_DB_INIT_HOTOVO
+    if _PROD_AKT_DB_INIT_HOTOVO:
+        return
     conn = intranet_data.get_db_connection()
     if not conn:
         return
@@ -188,6 +194,7 @@ def inicializace_db():
         except Exception:
             pass  # Sloupec už existuje nebo tabulka neexistuje
         conn.commit()
+        _PROD_AKT_DB_INIT_HOTOVO = True
     except Exception as e:
         print(f"[prodejni_aktivity.inicializace_db] {e}")
     finally:

@@ -143,7 +143,13 @@ def _cas(dt) -> str:
 # =========================================================
 # INICIALIZACE DATABÁZE + SEED ČÍSELNÍKŮ
 # =========================================================
+_VIZITKY_DB_INIT_HOTOVO = False  # schéma + seed jen jednou za běh procesu
+
+
 def inicializace_vizitky_db():
+    global _VIZITKY_DB_INIT_HOTOVO
+    if _VIZITKY_DB_INIT_HOTOVO:
+        return
     conn = intranet_data.get_db_connection()
     if not conn:
         return
@@ -227,6 +233,7 @@ def inicializace_vizitky_db():
         """)
         conn.commit()
         cur.close()
+        _VIZITKY_DB_INIT_HOTOVO = True
     except Exception as e:
         print(f'Chyba při inicializaci DB Vizitky: {e}')
     finally:

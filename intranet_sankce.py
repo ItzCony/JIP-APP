@@ -1053,6 +1053,24 @@ _PINNED_TOTAL_STYLE = (
     "return null;}"
 )
 
+
+def _grid_bez_prestavby(g):
+    """NiceGUI při každé změně `options` i při skrytí/zobrazení gridu volá v prohlížeči
+    update_grid(), který grid zahodí a postaví znovu — zmizí filtry v hlavičkách,
+    řazení i posun. Takový grid se po prvním vykreslení už nepřestavuje; nová data
+    se mu posílají přes `_nastav_grid`."""
+    g._update_method = None
+    return g
+
+
+def _nastav_grid(g, **volby) -> None:
+    """Pošle volby běžícímu gridu (setGridOption — filtry zůstanou) a potichu je
+    zapíše i do `g.options`, ať server drží aktuální stav."""
+    with g._props.suspend_updates():
+        g.options.update(volby)
+    for klic, hodnota in volby.items():
+        g.run_grid_method('setGridOption', klic, hodnota)
+
 # Indikátor diskuze (chat) k řádku: ikona 💬 + odznáček s počtem zpráv.
 # Nepřečtené „svítí" červeně, přečtené jsou šedé, prázdné vlákno je decentní.
 _CHAT_RENDERER = (
@@ -1177,7 +1195,15 @@ _FILTER_RECALC_NEDOD_SOUHRN = (
 # =========================================================
 # INICIALIZACE DATABÁZE
 # =========================================================
+# Schéma + migrace jen jednou za běh procesu (dřív ~27 dotazů vč. information_schema
+# při každém otevření Sankcí). Dočíslování po obnově zálohy řeší _obnov_zalohu.
+_SANKCE_DB_INIT_HOTOVO = False
+
+
 def inicializace_sankce_db():
+    global _SANKCE_DB_INIT_HOTOVO
+    if _SANKCE_DB_INIT_HOTOVO:
+        return
     conn = intranet_data.get_db_connection()
     if not conn:
         return
@@ -1431,6 +1457,7 @@ def inicializace_sankce_db():
         cur.close()
         for _t in ('sankce_zamitnute', 'sankce_vystaveni', 'sankce_nedodavky'):
             _backfill_cisla(_t)
+        _SANKCE_DB_INIT_HOTOVO = True
     except Exception as e:
         print(f'Chyba při inicializaci DB Sankcí: {e}')
     finally:
@@ -1475,19 +1502,28 @@ def _backfill_cisla(tabulka: str):
 # AUDIT (očičko)
 # =========================================================
 def zapis_audit(tabulka, row_hash, radek_id, pole, stara, nova, user_id, jmeno):
+    zapis_audit_hromadne(tabulka, [(row_hash, radek_id, pole, stara, nova)], user_id, jmeno)
+
+
+def zapis_audit_hromadne(tabulka, zaznamy, user_id, jmeno):
+    """Více auditních záznamů jedním spojením a commitem (hromadné vložení hodnot).
+    zaznamy = [(row_hash, radek_id, pole, stara, nova)]."""
+    if not zaznamy:
+        return
     conn = intranet_data.get_db_connection()
     if not conn:
         return
     try:
         cur = conn.cursor()
-        cur.execute(
+        cur.executemany(
             'INSERT INTO sankce_audit '
             '(tabulka,row_hash,radek_id,pole,stara_hodnota,nova_hodnota,user_id,jmeno) '
             'VALUES (%s,%s,%s,%s,%s,%s,%s,%s)',
-            (tabulka, row_hash, radek_id, pole,
-             None if stara is None else str(stara),
-             None if nova is None else str(nova),
-             user_id, jmeno or ''),
+            [(tabulka, row_hash, radek_id, pole,
+              None if stara is None else str(stara),
+              None if nova is None else str(nova),
+              user_id, jmeno or '')
+             for row_hash, radek_id, pole, stara, nova in zaznamy],
         )
         conn.commit(); cur.close()
     except Exception as e:
@@ -1963,6 +1999,8 @@ def _obnov_zalohu(zaloha_id: int, vytvoril: str):
                 f'INSERT INTO {tabulka} ({col_sql}) VALUES ({ph})', vals)
         conn.commit()
         cur.close()
+        # Stará záloha nemusí mít nase_cislo → dočíslovat hned (init už běží jen jednou).
+        _backfill_cisla(tabulka)
         return True, len(rows), None
     except Exception as e:
         try:
@@ -5080,10 +5118,16 @@ def _tiket_prava(t: dict) -> tuple:
     return (p,) if p else ()
 
 
+# Práva, která vidí všechny tikety bez ohledu na směrování.
+_TIKETY_VIDI_VSE = {'vse', 'sankce_ucetni', 'sankce_analytik', 'sankce_ctenar'}
+# Práva, na která může být tiket směrovaný (viz _tiket_prava) → „Moje fronta".
+_TIKETY_RESITELSKA = {'sankce_tiket_kontrola', 'sankce_tiket_provoz'} | set(KOD_PRAVO.values())
+
+
 def _viditelne_tikety(tikety: list, vsechna_prava) -> list:
     """Účtárna, analytik, čtenář a admin vidí všechno; ostatní jen tikety, které
     jsou směrované na jejich právo (nákupčí vidí i své storno u kontroly)."""
-    if {'vse', 'sankce_ucetni', 'sankce_analytik', 'sankce_ctenar'} & set(vsechna_prava):
+    if _TIKETY_VIDI_VSE & set(vsechna_prava):
         return list(tikety)
     out = []
     for t in tikety:
@@ -5960,9 +6004,19 @@ async def _vykresli_tikety(user_id, user_name, vsechna_prava):
         t['_chat_pocet'] = st['pocet'] if st else 0
         t['_chat_unread'] = st['unread'] if st else False
 
-    filtr = {'jen_otevrene': True}
+    filtr = {'jen_otevrene': True, 'moje': False}
+
+    # „Moje fronta" jen pro ty, kdo vidí všechno a zároveň něco řeší — ostatní
+    # už v seznamu mají jen svoje tikety. Admin ('vse') se počítá jen s explicitními
+    # řešitelskými právy, jinak by fronta = všechny otevřené.
+    moje_prava = _TIKETY_RESITELSKA & set(vsechna_prava)
+    ukaz_frontu = bool(_TIKETY_VIDI_VSE & set(vsechna_prava)) and bool(moje_prava)
+    moje_fronta = [t for t in vsechny if t.get('stav') in TIKET_STAV_OTEVRENE
+                   and set(_tiket_prava(t)) & moje_prava] if ukaz_frontu else []
 
     def _zobrazene():
+        if filtr['moje']:
+            return list(moje_fronta)
         if filtr['jen_otevrene']:
             return [t for t in vsechny if t.get('stav') in TIKET_STAV_OTEVRENE]
         return list(vsechny)
@@ -5971,6 +6025,11 @@ async def _vykresli_tikety(user_id, user_name, vsechna_prava):
         sw = ui.switch('Jen otevřené', value=True) \
             .tooltip('Skryje uzavřené a vyřešené tikety (stornováno / k fakturaci / uzavřeno). '
                      'Předané tikety jsou v archivu — v seznamu nejsou vůbec.')
+        sw_moje = None
+        if ukaz_frontu:
+            sw_moje = ui.switch(f'Moje fronta ({len(moje_fronta)})', value=False) \
+                .tooltip('Jen otevřené tikety, které teď čekají na vás — podle vašich práv '
+                         '(druhotná kontrola / provoz / kód nákupčího).')
         ui.space()
         info = ui.label('').classes('text-sm text-gray-500')
 
@@ -5996,6 +6055,12 @@ async def _vykresli_tikety(user_id, user_name, vsechna_prava):
         grid.run_grid_method('setGridOption', 'rowData', data)
         info.set_text(_info(data))
     sw.on_value_change(lambda e: (filtr.__setitem__('jen_otevrene', bool(e.value)), _aplikuj()))
+    if sw_moje is not None:
+        def _on_moje(e):
+            filtr['moje'] = bool(e.value)
+            sw.set_enabled(not filtr['moje'])  # fronta je vždy jen otevřené
+            _aplikuj()
+        sw_moje.on_value_change(_on_moje)
     info.set_text(_info(_zobrazene()))
 
     def _chat_badge(t):
@@ -6049,7 +6114,33 @@ def _nedod_edit_js(moje_kody, vse_kody: bool) -> str:
             % json.dumps(sorted(moje_kody)))
 
 
-def _col_defs_nedodavky(edit_js: str) -> list:
+# Detail nedodávek: sloupce ukotvené vlevo si volí každý uživatel sám (tlačítko
+# „Ukotvit sloupce"). Výchozí = nic ukotveného. 👁 a Poř. č. jsou ukotvené vždy.
+_NEDOD_KOTVA_VYCHOZI = ()
+_NEDOD_KOTVA_KLIC = 'sankce_nedod_kotva'   # app.storage.user → seznam polí
+_NEDOD_KOTVA_PEVNE = ('_eye', '_poradi')
+
+
+def _nedod_kotvitelne() -> list:
+    """[(pole, název)] sloupců detailu, které jde ukotvit — v pořadí sloupců."""
+    return [(c['field'], c['headerName']) for c in _col_defs_nedodavky('false')
+            if c.get('colId', c['field']) not in _NEDOD_KOTVA_PEVNE]
+
+
+def _col_defs_nedodavky(edit_js: str, kotva=_NEDOD_KOTVA_VYCHOZI) -> list:
+    defs = _col_defs_nedodavky_zaklad(edit_js)
+    kotva = set(kotva)
+    for c in defs:
+        if c.get('colId', c['field']) in _NEDOD_KOTVA_PEVNE:
+            continue
+        if c['field'] in kotva:
+            c['pinned'] = 'left'
+        else:
+            c.pop('pinned', None)
+    return defs
+
+
+def _col_defs_nedodavky_zaklad(edit_js: str) -> list:
     return [
         {'headerName': '', 'field': '_eye', 'width': 46, 'minWidth': 46, 'maxWidth': 46,
          'pinned': 'left', 'sortable': False, 'editable': False, 'resizable': False,
@@ -6058,15 +6149,18 @@ def _col_defs_nedodavky(edit_js: str) -> list:
          'cellStyle': {'textAlign': 'center', 'cursor': 'pointer', 'padding': '0'},
          'headerTooltip': 'Historie změn řádku'},
         _col_poradi(),
-        {'headerName': 'Období', 'field': 'obdobi', 'width': 150, 'pinned': 'left',
+        {'headerName': 'Období', 'field': 'obdobi', 'width': 150,
          'sortable': True, 'cellStyle': {'fontSize': '12px', 'color': '#475569'}},
         {'headerName': 'IČO', 'field': 'ico', 'width': 95, 'sortable': True,
          'cellStyle': {'fontFamily': 'monospace', 'fontSize': '12px'}},
         {'headerName': 'Dodavatel', 'field': 'jmeno_dodavatele', 'width': 200, 'sortable': True},
-        {'headerName': 'Dodavatel-popis', 'field': 'dodavatel_popis', 'width': 180},
-        {'headerName': 'Kód zboží', 'field': 'kod_zbozi', 'width': 100,
+        # Ukotvení řeší _col_defs_nedodavky (volba uživatele, viz _NEDOD_KOTVA_VYCHOZI).
+        {'headerName': 'Dodavatel-popis', 'field': 'dodavatel_popis', 'width': 180,
+         'maxWidth': 220},
+        {'headerName': 'Kód zboží', 'field': 'kod_zbozi', 'width': 100, 'maxWidth': 130,
          'cellStyle': {'fontFamily': 'monospace', 'fontSize': '12px'}},
-        {'headerName': 'Název zboží', 'field': 'nazev_zbozi', 'width': 260, 'sortable': True},
+        {'headerName': 'Název zboží', 'field': 'nazev_zbozi', 'width': 260, 'maxWidth': 320,
+         'sortable': True},
         {'headerName': 'KOD 2', 'field': 'kod2', 'width': 90},
         {'headerName': 'Č.obj.', 'field': 'cislo_obj', 'width': 110},
         {'headerName': 'Pobočka', 'field': 'pobocka', 'width': 100, 'sortable': True},
@@ -6106,7 +6200,7 @@ def _col_defs_nedod_souhrn(edit_js: str) -> list:
         {'headerName': 'Odmítnuto MJ', 'field': 'odmitnuto_mj', 'width': 125,
          'type': 'numericColumn', ':valueFormatter': _NUM_FMT},
         {'headerName': 'Rozdíl dodáno Kč', 'field': 'rozdil_dodano_kc', 'width': 150,
-         'type': 'numericColumn', ':valueFormatter': _MONEY_FMT,
+         'type': 'numericColumn', ':valueFormatter': _MONEY_FMT, 'sortable': True,
          'cellStyle': {'fontWeight': 'bold'}},
         {'headerName': 'Vyjádření nákupčího', 'field': 'vyjadreni', 'width': 420,
          ':editable': edit_js, 'cellEditor': 'agLargeTextCellEditor',
@@ -6138,6 +6232,35 @@ _KT_ROW_STYLE = (
     "if(p.data&&p.data._sub)return{fontWeight:'700',backgroundColor:'#eef2ff'};"
     "return null;}"
 )
+# Filtry v hlavičkách KT. Mezisoučty „… Celkem" platí pro celého dodavatele, ne pro
+# vyfiltrované řádky — při aktivním filtru se proto schovají (příznak `_skryt` →
+# externí filtr) a „Celkový součet" se přepočte z viditelných řádků. Mezisoučty
+# s `_det` mají pod sebou detail; bez něj („Jen součty dodavatelů", přes limit)
+# jsou jedinými řádky tabulky, takže zůstávají a sčítají se.
+_KT_EXT_FILTR = {
+    ':isExternalFilterPresent': 'function(){return true;}',
+    ':doesExternalFilterPass': 'function(n){return !(n.data&&n.data._skryt);}',
+}
+_FILTER_RECALC_KT = (
+    "function(p){var api=p.api;if(!api||!api.forEachNodeAfterFilter)return;"
+    "var f=api.isColumnFilterPresent(),zmena=false;"
+    "api.forEachNode(function(n){var d=n.data;"
+    "if(d&&d._det&&!!d._skryt!==f){d._skryt=f;zmena=true;}});"
+    "if(zmena){api.onFilterChanged();return;}"
+    f"var COLS={json.dumps(list(_KT_HODNOTY))};"
+    "var tot={id:'C',ico:'Celkový součet'},n=0;COLS.forEach(function(k){tot[k]=0;});"
+    "api.forEachNodeAfterFilter(function(x){var d=x.data||{};"
+    "if(x.rowPinned||(d._sub&&d._det))return;n++;"
+    "COLS.forEach(function(k){var v=parseFloat(d[k]);if(!isNaN(v))tot[k]+=v;});});"
+    "api.setGridOption('pinnedBottomRowData',n?[tot]:[]);}"
+)
+
+
+def _klic_jako_excel(r: dict) -> tuple:
+    """Pořadí řádků jako v kontingenční tabulce Excelu (list „Souhrn"): IČO jako
+    text, pak další řádková pole (proto je FRoSTA s IČO 0000060990 první)."""
+    return tuple(str(r.get(p) or '').casefold() for p in _KT_RADKY
+                 if p not in ('pozadovano', 'datum_zalozeni'))
 
 
 # Vyjádření v kontingenční tabulce: jen na řádcích, které jsou v sestavě Nedodávek
@@ -6231,9 +6354,11 @@ def _kt_souhrn(obdobi: str, filtry: dict, sbalit: bool, jen_nak, jen_unibrands: 
                 detail.setdefault(r['ico'], []).append(r)
         radky = []
         for d in dod:
-            radky += detail.get(d['ico'], [])
+            det = detail.get(d['ico'], [])
+            radky += det
             radky.append({'ico': f"{d['ico']} Celkem", 'jmeno_dodavatele': d['jmeno_dodavatele'],
-                          '_sub': True, **{p: d[p] for p in _KT_HODNOTY}})
+                          '_sub': True, '_det': bool(det),
+                          **{p: d[p] for p in _KT_HODNOTY}})
         celkem = {'ico': 'Celkový součet',
                   **{p: sum(d[p] or 0 for d in dod) for p in _KT_HODNOTY}}
         return {'radky': radky, 'celkem': celkem, 'dodavatelu': len(dod),
@@ -6264,6 +6389,12 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
                    if 'UNIBRANDS' in (r.get('jmeno_dodavatele') or '').upper()]
     elif not vidi_vse:
         vsechny = [r for r in vsechny if (r.get('nak') or '') in moje_kody]
+    # Pořadí 1:1 s kontingenční tabulkou v Excelu; období zůstávají seskupená
+    # (nejnovější nahoře), uvnitř období řadí _klic_jako_excel.
+    _por_obd = {}
+    for r in vsechny:
+        _por_obd.setdefault(r.get('obdobi'), len(_por_obd))
+    vsechny.sort(key=lambda r: (_por_obd[r.get('obdobi')], _klic_jako_excel(r)))
 
     if not vsechny:
         if je_analytik:
@@ -6348,7 +6479,8 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
             vyj = g.pop('_vyj')
             g['vyjadreni'] = next(iter(vyj)) if len(vyj) == 1 else _MIX_LABEL
             out.append(g)
-        out.sort(key=lambda x: x['rozdil_dodano_kc'])
+        # Podle IČO jako text — 1:1 s Excelem (řazení podle Rozdílu Kč jde hlavičkou).
+        out.sort(key=lambda x: str(x['ico']).casefold())
         return out
 
     def _souhrn_celkem(rows):
@@ -6373,7 +6505,18 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
                 ui.notify('Kontingenční tabulka je prázdná — není co exportovat.',
                           type='warning', position='top', timeout=6000)
                 return
-            await _export_xlsx(_EXP_NEDOD_KT, d['radky'], d['celkem'],
+            radky, dle_gridu = _serad_dle_ids(d['radky'], await _viditelne_ids(kt_grid))
+            celkem = d['celkem']
+            if dle_gridu and len(radky) != len(d['radky']):   # filtr v hlavičce
+                # jako v gridu: mezisoučty s detailem jsou skryté, sčítá se, co je vidět
+                radky = [r for r in radky if not (r.get('_sub') and r.get('_det'))]
+                celkem = {'ico': 'Celkový součet',
+                          **{p: sum(_f(r.get(p)) or 0 for r in radky) for p in _KT_HODNOTY}}
+            if not radky:
+                ui.notify('Aktuální filtr nevrací žádné řádky — není co exportovat.',
+                          type='warning', position='top', timeout=6000)
+                return
+            await _export_xlsx(_EXP_NEDOD_KT, radky, celkem,
                                'nedodavky_kontingencni', 'Souhrn')
             return
         je_souhrn = pohled['v'] == 'souhrn'
@@ -6395,19 +6538,17 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
             await _export_xlsx(_EXP_NEDODAVKY, data, _celkem_row(data),
                                'nedodavky', 'Nedodávky')
 
+    # Data jen přes _nastav_grid (setGridOption) — filtry v hlavičkách, řazení
+    # i posun zůstanou; přestavba gridu by je zahodila.
     def _aplikuj_souhrn(data=None):
         s = _souhrn_data(data)
-        souhrn.options['rowData'] = s
-        souhrn.options['pinnedBottomRowData'] = [_souhrn_celkem(s)]
-        souhrn.run_grid_method('setGridOption', 'rowData', s)
+        _nastav_grid(souhrn, rowData=s, pinnedBottomRowData=[_souhrn_celkem(s)])
         souhrn.run_grid_method('onFilterChanged')
         return s
 
     def _aplikuj():
         data = _zobrazene()
-        grid.options['rowData'] = data
-        grid.options['pinnedBottomRowData'] = [_celkem_row(data)]
-        grid.update()
+        _nastav_grid(grid, rowData=data, pinnedBottomRowData=[_celkem_row(data)])
         grid.run_grid_method('onFilterChanged')
         _aplikuj_souhrn(data)
         info.set_text(_info_text(data))
@@ -6454,6 +6595,54 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
             .props('flat round dense color=grey-7').tooltip('Zrušit filtr na dodavatele')
         btn_zrus_dod.set_visibility(False)
 
+        # ── Ukotvení sloupců detailu (volba se uživateli pamatuje) ──
+        kotvitelne = _nedod_kotvitelne()
+        _ulozena = app.storage.user.get(_NEDOD_KOTVA_KLIC)
+        kotva = {'v': [f for f, _ in kotvitelne
+                       if f in set(_ulozena if isinstance(_ulozena, list)
+                                   else _NEDOD_KOTVA_VYCHOZI)],
+                 'ticho': False}
+
+        def _kotva_nastav(nove):
+            kotva['v'] = [f for f, _ in kotvitelne if f in set(nove)]   # pořadí sloupců
+            app.storage.user[_NEDOD_KOTVA_KLIC] = kotva['v']
+            # Server drží aktuální columnDefs; do běžícího gridu jen stav sloupců
+            # (bez přestavby — filtry, řazení i posun zůstanou).
+            with grid._props.suspend_updates():
+                grid.options['columnDefs'] = _col_defs_nedodavky(edit_js, kotva['v'])
+            grid.run_grid_method('applyColumnState', {'state': [
+                {'colId': f, 'pinned': 'left' if f in kotva['v'] else None}
+                for f, _ in kotvitelne]})
+
+        def _kotva_chk(pole, zapnuto):
+            if kotva['ticho']:
+                return
+            _kotva_nastav([f for f in kotva['v'] if f != pole] + ([pole] if zapnuto else []))
+
+        def _kotva_vychozi():
+            kotva['ticho'] = True
+            try:
+                for f, ch in kotva_chk.items():
+                    ch.set_value(f in _NEDOD_KOTVA_VYCHOZI)
+            finally:
+                kotva['ticho'] = False
+            _kotva_nastav(_NEDOD_KOTVA_VYCHOZI)
+
+        with ui.button(icon='push_pin', text='Ukotvit sloupce') \
+                .props('flat dense no-caps color=grey-8') as btn_kotva:
+            btn_kotva.tooltip('Zvolte sloupce, které zůstanou vlevo vidět při posunu doprava')
+            with ui.menu():
+                ui.label('Ukotvené sloupce (vlevo)').classes('text-xs text-gray-500 px-3 pt-2')
+                kotva_chk = {}
+                for f, nazev in kotvitelne:
+                    kotva_chk[f] = ui.checkbox(
+                        nazev, value=f in kotva['v'],
+                        on_change=lambda e, f=f: _kotva_chk(f, e.value)) \
+                        .props('dense').classes('px-3')
+                ui.separator()
+                ui.menu_item('↺ Zrušit ukotvení', on_click=_kotva_vychozi, auto_close=False)
+        btn_kotva.set_visibility(False)   # jen v pohledu Řádky (viz _prepni)
+
         ui.space()
         info = ui.label('').classes('text-sm text-gray-500')
         # Filtry sestavy — v kontingenční tabulce se schovají (ta má vlastní lištu).
@@ -6480,7 +6669,7 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
                  'vyjádření píší nákupčí podle kódu NAK.').classes('text-xs text-gray-500 mb-1')
 
     _opts = {
-        'columnDefs': _col_defs_nedodavky(edit_js),
+        'columnDefs': _col_defs_nedodavky(edit_js, kotva['v']),
         'rowData': _zobrazene(),
         'pinnedBottomRowData': [_celkem_row(_zobrazene())],
         'defaultColDef': {'resizable': True, 'sortable': False, 'filter': True},
@@ -6496,7 +6685,7 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
     }
     if je_analytik:
         _opts.update(_grid_mazani_js(_NEDOD_TABULKA))
-    grid = ui.aggrid(_opts).classes('w-full').style(_GRID_STYLE)
+    grid = _grid_bez_prestavby(ui.aggrid(_opts).classes('w-full').style(_GRID_STYLE))
 
     _s0 = _souhrn_data()
     souhrn = ui.aggrid({
@@ -6516,6 +6705,7 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
         ':onFilterChanged': _FILTER_RECALC_NEDOD_SOUHRN,
         ':getRowId': _GET_ROW_ID,
     }).classes('w-full').style(_GRID_STYLE)
+    _grid_bez_prestavby(souhrn)
 
     # ── Kontingenční tabulka: list „Souhrn" nad celým nahraným listem „data" ──
     # Výchozí filtry = pevný filtr sestavy (Příjemka, DCERA=NE, STATUS=Nedodáno), jako v Excelu.
@@ -6523,7 +6713,10 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
     kt_omez = {'jen_nak': None if vidi_vse else sorted(moje_kody), 'jen_unibrands': jen_unibrands}
     kt = {'obdobi': obdobi_list[0] if obdobi_list else None, 'data': None,
           'nacteno': False, 'ticho': False, 'seq': 0, 'prazdne': False,
-          'hashe': {}}   # id řádku tabulky → otisky jeho řádků sestavy (jen na serveru)
+          'hashe': {},   # id řádku tabulky → otisky jeho řádků sestavy (jen na serveru)
+          # Zamýšlený výběr filtrů {pole: [hodnoty]}; None = výchozí jako v Excelu.
+          # Mění ho jen uživatel — přepnutí na období bez těch hodnot ho nesmaže.
+          'vyber': None}
 
     with ui.column().classes('w-full gap-2') as kt_box:
         with ui.row().classes('w-full items-center gap-3 flex-wrap'):
@@ -6538,7 +6731,9 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
         kt_grid = ui.aggrid({
             'columnDefs': _col_defs_nedod_kt(),
             'rowData': [],
-            'defaultColDef': {'resizable': True, 'sortable': False, 'filter': False},
+            # Filtry v hlavičkách jako v ostatních sestavách (řazení ne — pořadí
+            # drží strukturu Excelu: detail dodavatele, pod ním jeho „Celkem").
+            'defaultColDef': {'resizable': True, 'sortable': False, 'filter': True},
             'rowHeight': 32,
             'suppressMovableColumns': True,
             ':getRowStyle': _KT_ROW_STYLE,
@@ -6547,7 +6742,10 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
             'stopEditingWhenCellsLoseFocus': True,
             ':onFirstDataRendered': _AUTOSIZE_FIT,
             ':onGridSizeChanged': _AUTOSIZE_FIT,
+            ':onFilterChanged': _FILTER_RECALC_KT,
+            **_KT_EXT_FILTR,
         }).classes('w-full').style(_GRID_STYLE)
+        _grid_bez_prestavby(kt_grid)
 
     def _kt_zdroj(rid) -> list:
         """Řádky sestavy, ze kterých vznikl řádek kontingenční tabulky `rid`."""
@@ -6582,10 +6780,10 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
             try:
                 for pole, sel in kt_sel.items():
                     hodn = mo.get(pole, [])
-                    if kt['nacteno']:   # jiné období: výběr ponech, co jde
-                        vyber = [h for h in (sel.value or []) if h in hodn]
-                    else:               # první načtení: výchozí filtry jako v Excelu
+                    if kt['vyber'] is None:   # výchozí filtry jako v Excelu
                         vyber = [h for h in hodn if _norm(h) == kt_vychozi.get(pole)]
+                    else:                     # výběr uživatele, co v období existuje
+                        vyber = [h for h in kt['vyber'].get(pole, []) if h in hodn]
                     sel.set_options({h: h or '(prázdné)' for h in hodn}, value=vyber)
                     _kt_popisek(sel)
             finally:
@@ -6605,9 +6803,9 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
         kt['hashe'] = {r['id']: r.pop('_hashe') for r in d['radky'] if '_hashe' in r}
         kt['data'] = d
         _kt_vyjadreni()
-        kt_grid.options['rowData'] = d['radky']
-        kt_grid.options['pinnedBottomRowData'] = [d['celkem']] if d['pocet'] else []
-        kt_grid.update()
+        _nastav_grid(kt_grid, rowData=d['radky'],
+                     pinnedBottomRowData=[d['celkem']] if d['pocet'] else [])
+        kt_grid.run_grid_method('onFilterChanged')   # filtr v hlavičce → mezisoučty, součet
         if kt['prazdne']:
             kt_info.set_text('Pro toto období chybí data kontingenční tabulky — '
                              'nahrajte soubor období znovu.')
@@ -6635,8 +6833,21 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
         kt['obdobi'] = e.value
         await _kt_obnov(moznosti=True)
 
-    for s in kt_sel.values():
-        s.on_value_change(_kt_zmena)
+    def _kt_zmena_filtru(pole, sel):
+        """Změna filtru uživatelem → zapamatovat zamýšlený výběr. Hodnoty, které
+        v aktuálním období nejsou (nejdou ani odznačit), ve výběru zůstanou."""
+        def _on(e):
+            if not kt['ticho']:
+                if kt['vyber'] is None:
+                    kt['vyber'] = {p: list(s.value or []) for p, s in kt_sel.items()}
+                else:
+                    mimo = [h for h in kt['vyber'].get(pole, []) if h not in sel.options]
+                    kt['vyber'][pole] = list(sel.value or []) + mimo
+            return _kt_zmena(e)
+        return _on
+
+    for pole, s in kt_sel.items():
+        s.on_value_change(_kt_zmena_filtru(pole, s))
     kt_sbal.on_value_change(_kt_zmena)
     kt_obd.on_value_change(_kt_zmena_obd)
 
@@ -6650,20 +6861,54 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
         for w in jen_sestava:
             w.set_visibility(not je_kt)
         btn_zrus_dod.set_visibility(not je_kt and bool(stav['ico']))
+        btn_kotva.set_visibility(v == 'radky')
         if je_kt:
             if not kt['nacteno']:
                 await _kt_obnov(moznosti=True)
             elif kt['data']:   # vyjádření mohlo přibýt v detailu / souhrnu
                 _kt_vyjadreni()
                 # znovu přiřadit: options drží KOPII řádků (NiceGUI observable)
-                kt_grid.options['rowData'] = kt['data']['radky']
-                kt_grid.update()
+                _nastav_grid(kt_grid, rowData=kt['data']['radky'])
+                kt_grid.run_grid_method('onFilterChanged')
         else:
             (souhrn if v == 'souhrn' else grid).run_grid_method('sizeColumnsToFit')
-    prep.on_value_change(lambda e: _prepni(e.value or 'radky'))
+
+    # ── Historie kroků pro šipku Zpět v hlavičce ──
+    # Krok = (pohled, dodavatel). Zpět vrací poslední krok (např. z detailu
+    # dodavatele na souhrn); teprve když žádný není, jde na přehled Sankcí.
+    kroky: list = []
+    obnova = {'bezi': False}
+
+    def _uloz_krok():
+        if not obnova['bezi']:
+            kroky.append((pohled['v'], stav['ico']))
+
+    def _on_prep(e):
+        v = e.value or 'radky'
+        if v != pohled['v']:
+            _uloz_krok()   # synchronně — _prepni doběhne až v tasku
+        return _prepni(v)
+    prep.on_value_change(_on_prep)
+
+    def _zpet_o_krok() -> bool:
+        if not kroky:
+            return False
+        v, ico = kroky.pop()
+        obnova['bezi'] = True
+        try:
+            stav['ico'] = ico
+            if v != pohled['v']:
+                prep.set_value(v)
+        finally:
+            obnova['bezi'] = False
+        _aplikuj()
+        return True
+    app.storage.client['sankce_zpet_krok'] = _zpet_o_krok
+
     await _prepni(pohled['v'])
 
     def _zrus_dodavatele():
+        _uloz_krok()
         stav['ico'] = None
         _aplikuj()
 
@@ -6811,8 +7056,13 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
         ico = (a.get('data') or {}).get('ico')
         if not ico or ico == 'CELKEM':
             return
-        stav['ico'] = str(ico)
-        prep.set_value('radky')
+        _uloz_krok()   # návrat na souhrn bez filtru dodavatele
+        obnova['bezi'] = True   # přepnutí níž je součást téhož kroku
+        try:
+            stav['ico'] = str(ico)
+            prep.set_value('radky')
+        finally:
+            obnova['bezi'] = False
         _aplikuj()
     souhrn.on('cellClicked', _on_click_souhrn)
 
@@ -6866,10 +7116,15 @@ async def vykresli_sankce(user_id, user_name, vsechna_prava):
     with ui.row().classes('w-full items-center gap-3 mb-6'):
         if pohled:
             def _zpet():
+                # V Nedodávkách nejdřív o krok zpět (detail → souhrn …).
+                krok = app.storage.client.get('sankce_zpet_krok')
+                if pohled == 'nedodavky' and krok and krok():
+                    return
                 app.storage.user['sankce_pohled'] = None
                 vykresli_sankce.refresh()
             ui.button(icon='arrow_back', on_click=_zpet).props('flat round color=grey-7') \
-                .tooltip('Zpět na přehled Sankcí')
+                .tooltip('Zpět o krok (nakonec na přehled Sankcí)' if pohled == 'nedodavky'
+                         else 'Zpět na přehled Sankcí')
         ui.icon('gavel', size='2.2rem').classes('text-rose-600')
         with ui.column().classes('gap-0'):
             ui.label('Sankce').classes('text-3xl font-extrabold text-gray-800')

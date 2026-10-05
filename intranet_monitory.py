@@ -303,8 +303,14 @@ def _sablona_a_styly(raw: bytes):
     return data, styly
 
 
+_MONITORY_DB_INIT_HOTOVO = False  # schéma jen jednou za běh procesu
+
+
 def inicializace_monitor_db():
     """Čtyři tabulky monitorů + tabulka hlaviček. Volá se při startu."""
+    global _MONITORY_DB_INIT_HOTOVO
+    if _MONITORY_DB_INIT_HOTOVO:
+        return
     conn = intranet_data.get_db_connection()
     if not conn:
         return
@@ -370,7 +376,9 @@ def inicializace_monitor_db():
         prazdny = cur.fetchone()[0] == 0
         cur.close()
         if prazdny:
-            _backfill_sortimenty(conn)
+            _backfill_sortimenty(conn)   # chyby polyká → příznak nastaví až další volání s daty
+        else:
+            _MONITORY_DB_INIT_HOTOVO = True
     except Exception as e:
         print(f'Chyba při inicializaci DB Monitorů: {e}')
     finally:
