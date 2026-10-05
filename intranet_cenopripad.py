@@ -686,7 +686,15 @@ def _muze_zadat(typ, p):
 # ============================================================================
 # DB
 # ============================================================================
+# Schéma + migrace jen jednou za běh procesu. Dřív ~40 dotazů (CREATE TABLE,
+# information_schema, ALTER) při KAŽDÉM otevření modulu — navíc v event loopu.
+_CENOPRIPAD_DB_INIT_HOTOVO = False
+
+
 def inicializace_cenopripad_db():
+    global _CENOPRIPAD_DB_INIT_HOTOVO
+    if _CENOPRIPAD_DB_INIT_HOTOVO:
+        return
     conn = intranet_data.get_db_connection()
     if not conn:
         return
@@ -1066,6 +1074,7 @@ def inicializace_cenopripad_db():
                 cur.execute(f"ALTER TABLE cenopripad_import ADD COLUMN {_col} {_typ}")
         conn.commit()
         cur.close()
+        _CENOPRIPAD_DB_INIT_HOTOVO = True
     except Exception as e:
         print(f"Chyba při inicializaci DB Cenopřípad: {e}")
     finally:
@@ -1681,6 +1690,8 @@ def _zpracuj_rows(rows, typ):
     # 3) datové řádky pod hlavičkou
     radky = []
     spatne_pc = []          # (číslo řádku v Excelu, původní text) – jen typ porovnani
+    spatne_terminy = []     # (číslo řádku v Excelu, od, do) – jen typ porovnani
+    dnes = datetime.date.today()
     for _j, r in enumerate(rows[hdr_idx + 1:]):
         if r is None or all(c is None or str(c).strip() == "" for c in r):
             continue
@@ -1695,6 +1706,12 @@ def _zpracuj_rows(rows, typ):
             _pc = radek.get("pc_bez_dph")
             if str(_pc or "").strip() and cp.parse_cena_kc(_pc) is None:
                 spatne_pc.append((hdr_idx + _j + 2, str(_pc).strip()))
+            # Termín do v minulosti (nebo před Termín od) = případ by hned
+            # po nahrání skončil v archivu (platnost = nejzazší termín do).
+            _od = _parse_datum(radek.get("termin_od"))
+            _do = _parse_datum(radek.get("termin_do"))
+            if _do and (_do < dnes or (_od and _do < _od)):
+                spatne_terminy.append((hdr_idx + _j + 2, _od, _do))
         if typ in ("porovnani", "mimoletak"):
             # Vodicí nuly hned při nahrání (Excel je z čísel utrhne): kód vždy
             # 8 míst, IČ dle pravidla „8 číslic před případným písmenem".
@@ -1711,6 +1728,15 @@ def _zpracuj_rows(rows, typ):
         return None, ("Sloupec „PC bez DPH“ musí obsahovat cenu v Kč (číslo), "
                       "ne procento ani text. Opravte a nahrajte znovu – "
                       f"{ukazka}{zbytek}.")
+    if spatne_terminy:
+        _f = lambda d: d.strftime("%d.%m.%Y") if d else "—"
+        ukazka = "; ".join(f"řádek {n}: {_f(od)} – {_f(do)}"
+                           for n, od, do in spatne_terminy[:10])
+        zbytek = (f" … a dalších {len(spatne_terminy) - 10}"
+                  if len(spatne_terminy) > 10 else "")
+        return None, ("Sloupec „Termín do“ nesmí být v minulosti ani dřív než "
+                      "„Termín od“ – případ by skončil rovnou v archivu. "
+                      f"Opravte a nahrajte znovu – {ukazka}{zbytek}.")
     if not radky:
         return None, "Žádné datové řádky (s vyplněným kódem)."
     return radky, None

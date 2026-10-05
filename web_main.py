@@ -155,6 +155,18 @@ if __name__ == "__main__":
     intranet_static.chranene_soubory('/kom_prilohy', 'kom_prilohy')
     intranet_static.chranene_soubory('/spolvecer_prilohy', 'spolvecer_prilohy')
 
+    # Jak dlouho server drží klienta po výpadku spojení (F5, zavření karty,
+    # blokující JS) — do té doby mu běží elementy i timery. NiceGUI z hodnoty
+    # odvozuje i heartbeat socket.io (ping_interval 0,8×, ping_timeout 0,4×),
+    # zablokovaný prohlížeč (PDF export mapy) tedy vydrží ~1,4×. 15 s = polovina
+    # dřívějších 30 s, export má pořád ~21 s rezervu. Strop 30 s: musí zůstat
+    # pod intranet_session.ODHLASENI_PO_S (35 s). Ladění: JIPKA_RECONNECT_TIMEOUT.
+    try:
+        _reconnect_s = float(os.environ.get('JIPKA_RECONNECT_TIMEOUT', '15'))
+    except ValueError:
+        _reconnect_s = 15.0
+    _reconnect_s = min(max(_reconnect_s, 3.0), 30.0)
+
     try:
         ui.run(
             title="Moje JIPka",
@@ -163,7 +175,7 @@ if __name__ == "__main__":
             favicon="favicon.ico",
             storage_secret=_STORAGE_SECRET,
             reload=False,
-            reconnect_timeout=30,  # tolerance pro déle trvající JS operace (PDF export mapy apod.)
+            reconnect_timeout=_reconnect_s,  # viz komentář nad try
             # JIP_DEV_VUE=1 => nemíněný (dev) Vue/Quasar: chyby v konzoli hlásí jméno
             # komponenty a vadný prop místo minifikovaného `u.match is not a function`.
             # Jen pro ladění na testu — dev build je větší a pomalejší.

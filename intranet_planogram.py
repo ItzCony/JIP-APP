@@ -5,6 +5,7 @@
 import os
 import json
 import uuid
+import time
 import base64
 import asyncio
 import threading
@@ -699,7 +700,7 @@ def _build_edit_dialog(je_admin):
     with ui.dialog().props('maximized transition-show=slide-up transition-hide=slide-down') as dlg_sub:
         with ui.column().classes('w-full h-full bg-white gap-0'):
 
-            async def _nahled_pdf_sub():
+            async def _nahled_pdf_sub(stahnout=False):
                 vnorena_id = ctx.get('vnorena_id')
                 if not vnorena_id:
                     return
@@ -715,6 +716,9 @@ def _build_edit_dialog(je_admin):
                     vyska     = SUB_V,
                     show_foto = True,
                 )
+                if stahnout:
+                    await _stahni_pdf(html, nazev_sub)
+                    return
                 html_b64 = base64.b64encode(html.encode('utf-8')).decode('ascii')
                 await ui.run_javascript(f'''
                     var b64  = "{html_b64}";
@@ -736,10 +740,15 @@ def _build_edit_dialog(je_admin):
                     sub_title = ui.label('').classes('text-2xl font-black text-blue-900')
                     ui.label('Rozmístění výrobků v pobočce').classes('text-sm text-gray-500')
                 with ui.row().classes('items-center gap-2'):
-                    ui.button(icon='picture_as_pdf', on_click=_nahled_pdf_sub) \
+                    ui.button(icon='print', on_click=_nahled_pdf_sub) \
+                        .props('flat round') \
+                        .classes('text-blue-700 hover:bg-blue-50') \
+                        .tooltip('Tisk')
+                    ui.button(icon='picture_as_pdf',
+                              on_click=lambda: _nahled_pdf_sub(stahnout=True)) \
                         .props('flat round') \
                         .classes('text-red-500 hover:bg-red-50') \
-                        .tooltip('Tisk / Export do PDF')
+                        .tooltip('Stáhnout PDF')
 
                     @ui.refreshable
                     def _zoom_bar_sub():
@@ -1540,6 +1549,63 @@ def _foto_base64_data_url(cesta):
         return None
 
 
+# ── PDF ke stažení: server-side render přes Playwright/Chromium ──────────────
+# Stejný vzor jako intranet_ochutnavky.py: max 1 Chromium naráz (semafor),
+# soubor jde po HTTP (ui.download.file, ne přes WS), exporty starší 1 h se mažou.
+EXPORT_DIR = 'Exporty_Planogram'
+_PDF_LOCK  = asyncio.Semaphore(1)
+
+
+async def _html_na_pdf(html):
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError as e:
+        raise RuntimeError(
+            'Knihovna Playwright není nainstalovaná na serveru.\n'
+            'Doinstalujte:\n  pip install playwright\n  playwright install chromium\n'
+            f'Detail: {e}')
+    async with _PDF_LOCK:
+        async with async_playwright() as p:
+            try:
+                browser = await p.chromium.launch()
+            except Exception as e:
+                raise RuntimeError(f'Nepodařilo se spustit Chromium: {e}\n'
+                                   'Spusťte na serveru: playwright install chromium')
+            try:
+                page = await browser.new_page()
+                await page.set_content(html, wait_until='load')
+                # A4 na výšku/šířku a okraje určuje @page v HTML (_build_planogram_html)
+                return await page.pdf(print_background=True, prefer_css_page_size=True)
+            finally:
+                await browser.close()
+
+
+async def _stahni_pdf(html, nazev):
+    """Vyrenderuje HTML plánogramu do PDF na serveru a pošle ho ke stažení."""
+    notif = ui.notification('Připravuji PDF…', type='ongoing',
+                            position='top-right', spinner=True, timeout=None)
+    try:
+        pdf = await _html_na_pdf(html)
+        os.makedirs(EXPORT_DIR, exist_ok=True)
+        ted = time.time()
+        for f in os.listdir(EXPORT_DIR):
+            cesta_f = os.path.join(EXPORT_DIR, f)
+            try:
+                if ted - os.path.getmtime(cesta_f) > 3600:
+                    os.remove(cesta_f)
+            except OSError:
+                pass
+        cesta = os.path.join(EXPORT_DIR, f'{uuid.uuid4().hex}.pdf')
+        with open(cesta, 'wb') as fh:
+            fh.write(pdf)
+        ui.download.file(cesta, f'{nazev}.pdf')
+    except Exception as e:
+        ui.notify(f'Nepodařilo se vytvořit PDF: {e}', type='negative',
+                  position='top', timeout=15000, multi_line=True)
+    finally:
+        notif.dismiss()
+
+
 def _build_planogram_html(titulek, popis_str, fochy, absorbed,
                            sirka=None, vyska=None, show_foto=False):
     """
@@ -1907,7 +1973,7 @@ def _vykresli_layout(lay, user_id, user_name, je_admin,
         _zoom_bar.refresh()
         _grid.refresh()
 
-    async def _nahled_pdf():
+    async def _nahled_pdf(stahnout=False):
         fochy_pdf, _ = _nacti_fochy(layout_id)
         absorbed_pdf  = _absorbovane(fochy_pdf, GRID_S, GRID_V)
         html     = _build_planogram_html(
@@ -1916,6 +1982,9 @@ def _vykresli_layout(lay, user_id, user_name, je_admin,
             fochy     = fochy_pdf,
             absorbed  = absorbed_pdf,
         )
+        if stahnout:
+            await _stahni_pdf(html, f'Plánogram – {lay["nazev"]}')
+            return
         html_b64 = base64.b64encode(html.encode('utf-8')).decode('ascii')
         await ui.run_javascript(f'''
             var b64  = "{html_b64}";
@@ -1939,11 +2008,16 @@ def _vykresli_layout(lay, user_id, user_name, je_admin,
                     'bg-blue-50 border border-blue-200 px-4 py-2 rounded-lg')
 
             with ui.row().classes('items-center gap-2'):
-                # PDF tlačítko
-                ui.button(icon='picture_as_pdf', on_click=_nahled_pdf) \
+                # Tisk + PDF tlačítka
+                ui.button(icon='print', on_click=_nahled_pdf) \
+                    .props('flat round') \
+                    .classes('text-blue-700 hover:bg-blue-50') \
+                    .tooltip('Tisk')
+                ui.button(icon='picture_as_pdf',
+                          on_click=lambda: _nahled_pdf(stahnout=True)) \
                     .props('flat round') \
                     .classes('text-red-500 hover:bg-red-50') \
-                    .tooltip('Tisk / Export do PDF')
+                    .tooltip('Stáhnout PDF')
 
             # Zoom tlačítka (refreshable kvůli aktualizaci procent)
             @ui.refreshable

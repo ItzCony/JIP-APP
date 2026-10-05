@@ -24,6 +24,16 @@ except ImportError:
 # Pevný, neměnný seznam poboček — sdílená konstanta, používá se v UI i denormalizaci
 POBOCKY = ["010", "011", "012", "013", "014", "017", "019", "020", "026", "028", "032", "033", "034", "037"]
 
+
+def rozloz_pobocky(hodnota):
+    """CSV ('032,026') nebo seznam kódů poboček → seznam 3místných kódů bez duplicit.
+    Legacy hodnoty bez nuly ('10') se doplní na '010'."""
+    if not hodnota:
+        return []
+    casti = hodnota.split(",") if isinstance(hodnota, str) else hodnota
+    kody = (str(c).strip() for c in casti)
+    return list(dict.fromkeys(k.zfill(3) for k in kody if k))
+
 # Číselník nákupních sortimentů monitorů. Tabulku zakládá a plní modul
 # Monitor (intranet_monitory) při importu; tady je jen čtení pro katalog
 # práv — intranet_obsah modul Monitor neimportuje a cyklus nechceme.
@@ -1006,6 +1016,9 @@ def inicializace_db():
             ("totp_aktivni", "BOOLEAN DEFAULT 0"),
             ("totp_zalozni_kody", "TEXT DEFAULT NULL"),
             ("pobocka", "VARCHAR(3) DEFAULT NULL"),
+            # Další pobočky navíc k hlavní (CSV, např. '026,033') — rozšiřují viditelnost
+            # IČO v ASM. Hlavní `pobocka` zůstává jedna (Cenopřípad z ní dělá snapshot).
+            ("pobocky_navic", "VARCHAR(64) DEFAULT NULL"),
             # Vynucená změna hesla — 1 u nově založených účtů a po admin resetu.
             # Stávající uživatelé zůstávají na 0 (DEFAULT), takže je to neotravuje.
             ("zmena_hesla_nutna", "BOOLEAN DEFAULT 0"),
@@ -2295,7 +2308,7 @@ def ziskej_vsechny_uzivatele():
                 u.base_vacation, u.carried_over_vacation, u.osobni_cislo,
                 u.realny_zustatek_dovolene, u.realny_zustatek_dovolene_datum,
                 u.email_nova_zadost, u.email_vyrizeni_zadosti, u.email_narozeniny,
-                u.datum_narozeni, u.priznak_id, u.auto_odhlaseni_minuty, u.pobocka,
+                u.datum_narozeni, u.priznak_id, u.auto_odhlaseni_minuty, u.pobocka, u.pobocky_navic,
                 pr.nazev AS priznak_nazev, pr.barva AS priznak_barva,
                 MAX(jp.name) AS role,
                 GROUP_CONCAT(DISTINCT d.name SEPARATOR ',') AS oddeleni,
@@ -2366,6 +2379,7 @@ def ziskej_vsechny_uzivatele():
                 "priznak_barva": u.get('priznak_barva') or '',
                 "auto_odhlaseni_minuty": u.get('auto_odhlaseni_minuty'),
                 "pobocka": u.get('pobocka'),
+                "pobocky_navic": rozloz_pobocky(u.get('pobocky_navic')),
             }
         _CACHE_UZIVATELE['data'] = vysledek
         _CACHE_UZIVATELE['ts'] = time.time()
@@ -2377,7 +2391,9 @@ def ziskej_vsechny_uzivatele():
         if cursor: cursor.close()
         if conn: conn.close()
 
-def pridej_uprav_uzivatele(email, jmeno, prijmeni, heslo_raw, nazev_role, nazev_oddeleni, prava_str, aktivni, base_vacation, carried_over_vacation, osobni_cislo=None, manager_ids=None, spolecnost_ids=None, datum_narozeni=None, priznak_id=None, pobocka=None):
+def pridej_uprav_uzivatele(email, jmeno, prijmeni, heslo_raw, nazev_role, nazev_oddeleni, prava_str, aktivni, base_vacation, carried_over_vacation, osobni_cislo=None, manager_ids=None, spolecnost_ids=None, datum_narozeni=None, priznak_id=None, pobocka=None, pobocky_navic=None):
+    # pobocka / pobocky_navic: None = ponech beze změny (chrání call-sites, které je
+    # nepředávají); '' / [] = smaž. Volající s „— bez pobočky —" musí poslat '', ne None.
     if manager_ids is None: manager_ids = []
     if spolecnost_ids is None: spolecnost_ids = []
 
@@ -2409,6 +2425,10 @@ def pridej_uprav_uzivatele(email, jmeno, prijmeni, heslo_raw, nazev_role, nazev_
             else:
                 cursor.execute("INSERT INTO user (email, name, surname, password_hash, is_active, base_vacation, carried_over_vacation, datum_narozeni, priznak_id, pobocka, zmena_hesla_nutna, heslo_zmeneno) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 1, NOW())", (email, jmeno, prijmeni, hash_heslo(heslo_raw) if heslo_raw else "", 1 if aktivni else 0, base_vacation, carried_over_vacation, dn, priznak_id or None, pobocka or None))
                 user_id = cursor.lastrowid
+
+        if pobocky_navic is not None:
+            cursor.execute("UPDATE user SET pobocky_navic=%s WHERE iduser=%s",
+                           (",".join(rozloz_pobocky(pobocky_navic)) or None, user_id))
 
         cursor.execute("DELETE FROM user_To_jobPosition WHERE user_iduser=%s", (user_id,))
         if nazev_role and nazev_role != "Bez role":
@@ -2822,7 +2842,12 @@ def smaz_smlouvu_veletrh(smlouva_id):
         if cursor: cursor.close()
         if conn: conn.close()
 
+_FAKTURY_DB_INIT_HOTOVO = False  # schéma + migrace jen jednou za běh procesu
+
+
 def inicializace_faktur_db():
+    global _FAKTURY_DB_INIT_HOTOVO
+    if _FAKTURY_DB_INIT_HOTOVO: return
     conn = get_db_connection()
     if not conn: return
     cursor = None
@@ -2896,6 +2921,7 @@ def inicializace_faktur_db():
         except Exception: pass
 
         conn.commit()
+        _FAKTURY_DB_INIT_HOTOVO = True
     except Exception as e:
         print(f"Chyba při inicializaci DB faktur: {e}")
     finally:

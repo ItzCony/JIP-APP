@@ -192,7 +192,13 @@ def mapuj_hlavicky(hlavicka: list) -> dict:
 
 # ─── DB ───────────────────────────────────────────────────────────────────────
 
+_BONUSY_DB_INIT_HOTOVO = False  # schéma jen jednou za běh procesu
+
+
 def inicializace_bonusy_ao_db():
+    global _BONUSY_DB_INIT_HOTOVO
+    if _BONUSY_DB_INIT_HOTOVO:
+        return
     conn = intranet_data.get_db_connection()
     if not conn:
         return
@@ -211,6 +217,7 @@ def inicializace_bonusy_ao_db():
         """)
         conn.commit()
         cur.close()
+        _BONUSY_DB_INIT_HOTOVO = True
     except Exception as e:
         print(f'[bonusy_ao] Chyba inicializace DB: {e}')
     finally:
@@ -1095,7 +1102,13 @@ class _XlsxZapis:
 
 # ─── Zpracování souboru ──────────────────────────────────────────────────────
 
+_BONUSY_DATA_DB_INIT_HOTOVO = False  # schéma jen jednou za běh procesu
+
+
 def inicializace_bonusy_data_db():
+    global _BONUSY_DATA_DB_INIT_HOTOVO
+    if _BONUSY_DATA_DB_INIT_HOTOVO:
+        return
     conn = intranet_data.get_db_connection()
     if not conn:
         return
@@ -1122,6 +1135,7 @@ def inicializace_bonusy_data_db():
         """)
         conn.commit()
         cur.close()
+        _BONUSY_DATA_DB_INIT_HOTOVO = True
     except Exception as e:
         print(f'[bonusy_ao] Chyba inicializace DB dat: {e}')
     finally:

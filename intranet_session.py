@@ -46,7 +46,7 @@ PENDING_LOGOUTS: dict[str, asyncio.Task] = {}
 FORCE_LOGOUT_EMAILS: set[str] = set()
 
 # Kolik sekund po ztrátě POSLEDNÍHO připojení čekáme, než relaci zrušíme.
-# Musí být VÍC než reconnect_timeout v ui.run() (aktuálně 30 s ve web_main.py),
+# Musí být VÍC než reconnect_timeout v ui.run() (web_main.py: 15 s, strop 30 s),
 # ať se stihne tichý reconnect prohlížeče.
 ODHLASENI_PO_S = 35
 

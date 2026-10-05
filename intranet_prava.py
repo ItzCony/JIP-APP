@@ -154,12 +154,12 @@ ZAKLADNI_PRAVA = {
     'monitor_tamda_admin':   {'kategorie': 'Modul Monitor', 'podskupina': 'TAMDA', 'nazev': 'Správce - TAMDA', 'popis': 'Vše co Vyjádření + nahrává sestavu TAMDA a smí mazat data (nevratné, včetně vyjádření).', 'ikona': 'local_police'},
     'monitor_tamda_vkladatel': {'kategorie': 'Modul Monitor', 'podskupina': 'TAMDA', 'nazev': 'Vkladatel dat - TAMDA', 'popis': 'Smí POUZE nahrát sestavu TAMDA. NEVIDÍ žádná data — nefiltruje, neexportuje, nepíše vyjádření a nemaže.', 'ikona': 'upload_file'},
 
-    # -- Modul Zalistovací komise - dvě kola vyjádření (nákup → kontrola) --
-    'zalistovaci_ctenar':     {'kategorie': 'Modul Zalistovací komise', 'nazev': 'Čtenář', 'popis': 'Vidí zápis komise, může filtrovat, řadit a exportovat. NEsmí psát vyjádření ani nahrávat data.', 'ikona': 'visibility'},
-    'zalistovaci_nakup':      {'kategorie': 'Modul Zalistovací komise', 'nazev': 'Vyjádření nákupu', 'popis': 'Vše co čtenář + píše první kolo vyjádření (stanovisko nákupu k položce).', 'ikona': 'edit_note'},
-    'zalistovaci_kontrola':   {'kategorie': 'Modul Zalistovací komise', 'nazev': 'Potvrzení zalistování', 'popis': 'Vše co čtenář + druhé kolo: potvrzuje ANO/NE, že k zalistování došlo, a píše komentář. Buňka jde vyplnit až poté, co se vyjádřil nákup.', 'ikona': 'fact_check'},
-    'zalistovaci_vkladatel':  {'kategorie': 'Modul Zalistovací komise', 'nazev': 'Vkladatel dat', 'popis': 'Smí POUZE nahrát zápis komise. NEVIDÍ žádná data — nefiltruje, neexportuje, nevyjadřuje se.', 'ikona': 'upload_file'},
-    'zalistovaci_admin':      {'kategorie': 'Modul Zalistovací komise', 'nazev': 'Správce', 'popis': 'Obě kola vyjádření + nahrává zápisy a smí mazat celé období (nevratné, včetně vyjádření).', 'ikona': 'local_police'},
+    # -- Modul Zalistovací komise - listy Sumarizace / Změna K2 / Delist, zápis jen do zelených sloupců --
+    'zalistovaci_offnakup':   {'kategorie': 'Modul Zalistovací komise', 'podskupina': 'Role komise', 'nazev': 'Komise – OffNákup', 'popis': 'Vidí list „Sumarizace“ a zapisuje do zeleného sloupce F (ID listing). Může filtrovat a exportovat.', 'ikona': 'edit_note'},
+    'zalistovaci_offobchod':  {'kategorie': 'Modul Zalistovací komise', 'podskupina': 'Role komise', 'nazev': 'Komise – OffObchod', 'popis': 'Vidí listy „Změna K2“ a „Delist“ a zapisuje do zeleného sloupce P (ID změny). Může filtrovat a exportovat.', 'ikona': 'edit_note'},
+    'zalistovaci_ctenar':     {'kategorie': 'Modul Zalistovací komise', 'podskupina': 'Role komise', 'nazev': 'Komise – Čtenář', 'popis': 'Vidí všechny listy, může filtrovat a exportovat, nic nezapisuje. Na listu „Sumarizace“ vidí jen řádky svých zkratek nákupčího (sloupec A) — přiřazují se v podsekci „Rozdělení nákupčích“.', 'ikona': 'visibility'},
+    'zalistovaci_vkladatel':  {'kategorie': 'Modul Zalistovací komise', 'podskupina': 'Role komise', 'nazev': 'Komise – Import', 'popis': 'Smí POUZE nahrát soubor zápisu komise. NEVIDÍ žádná data a nechodí mu e-mail o nahrání.', 'ikona': 'upload_file'},
+    'zalistovaci_admin':      {'kategorie': 'Modul Zalistovací komise', 'podskupina': 'Role komise', 'nazev': 'Komise – Správce', 'popis': 'Veškerá práva k modulu: vidí a zapisuje všechny listy, nahrává zápisy a smí mazat celé období (nevratné).', 'ikona': 'local_police'},
 
     # -- Modul Manuály - online čtečka firemních manuálů --
     'manualy_ctenar': {'kategorie': 'Modul Manuály', 'nazev': 'Čtenář', 'popis': 'Čte manuál online — listuje kapitolami, hledá v textu. Nesmí nahrávat novou verzi.', 'ikona': 'menu_book'},
@@ -245,6 +245,26 @@ for _k in ('CK', 'DR', 'HV', 'KO', 'LT', 'ML', 'MR', 'NP', 'OZ', 'RD', 'SK', 'UP
         'popis': f'Vidí sekci „Fronta“ — jen nesouhlasící položky s kódem nákupčího {_k} '
                  f'(sloupec S v DATA_POROVNANI) — a vyjadřuje se k nim. NEVIDÍ OP a marže %.',
         'ikona': 'assignment_ind'}
+
+# Zalistovací komise: zkratky nákupčích (sloupec A „Nákupčí“ listu Sumarizace).
+# Nejsou to role — jen zúží Čtenáři list Sumarizace na řádky jeho zkratek.
+# Přiřazují se jako běžná práva — editor práv je ukáže v podsekci „Rozdělení nákupčích“.
+ZALISTOVACI_ROLE = ('zalistovaci_offnakup', 'zalistovaci_offobchod', 'zalistovaci_ctenar',
+                    'zalistovaci_vkladatel', 'zalistovaci_admin')
+ZALISTOVACI_KOD_PREFIX = 'zalistovaci_kod_'
+ZALISTOVACI_KODY = ('CK', 'DR', 'HV', 'KO', 'LT', 'ML', 'MR', 'NP', 'OZ', 'RD', 'SK', 'UP', 'VI')
+for _k in ZALISTOVACI_KODY:
+    ZAKLADNI_PRAVA[f'{ZALISTOVACI_KOD_PREFIX}{_k.lower()}'] = {
+        'kategorie': 'Modul Zalistovací komise', 'podskupina': 'Rozdělení nákupčích', 'nazev': f'Nákupčí: {_k}',
+        'popis': f'Čtenář uvidí na listu „Sumarizace“ řádky se zkratkou {_k} ve sloupci A. Samo o sobě přístup do modulu nedává.',
+        'ikona': 'assignment_ind'}
+
+
+def ma_pristup_zalistovaci(prava) -> bool:
+    """Vstup do modulu dává jen role (ne samotná zkratka nákupčího)."""
+    prava = prava or ()
+    return 'vse' in prava or any(p in prava for p in ZALISTOVACI_ROLE)
+
 
 # Práva kategorie „Administrace portálu" — nikdy se nepřidělují přes UI ani
 # se neukládají komukoliv jinému než skrytému hlavnímu adminovi (iduser=1).

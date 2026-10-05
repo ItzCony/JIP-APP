@@ -456,7 +456,13 @@ _TN_CSS = (
 
 # ─── DB funkce ────────────────────────────────────────────────────────────────
 
+_VYSLEDKY_DB_INIT_HOTOVO = False  # schéma + migrace jen jednou za běh procesu
+
+
 def inicializace_vysledky_db():
+    global _VYSLEDKY_DB_INIT_HOTOVO
+    if _VYSLEDKY_DB_INIT_HOTOVO:
+        return
     conn = intranet_data.get_db_connection()
     if not conn:
         return
@@ -626,6 +632,7 @@ def inicializace_vysledky_db():
             cur.execute("UPDATE vysledky_oz_data SET skupina='zalozni_sklad' "
                         "WHERE skupina='zalozni_sk'")
         conn.commit()
+        _VYSLEDKY_DB_INIT_HOTOVO = True
     except Exception as exc:
         print(f'[vysledky] DB init error: {exc}')
     finally:

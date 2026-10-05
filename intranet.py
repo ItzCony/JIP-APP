@@ -916,8 +916,9 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
     if _ma_monitor and nastaveni.get('monitor_zapnuty', True):
         dostupne_taby.append('monitor')
 
-    # Zalistovací komise: čtenář, nákup, kontrola, vkladatel i správce.
-    _ma_zalistovaci = ma_vse or any(p.startswith('zalistovaci_') for p in vsechna_prava)
+    # Zalistovací komise: OffNákup, OffObchod, Čtenář, Import i Správce (zkratka nákupčího sama nestačí).
+    import intranet_prava
+    _ma_zalistovaci = ma_vse or intranet_prava.ma_pristup_zalistovaci(vsechna_prava)
     if _ma_zalistovaci and nastaveni.get('zalistovaci_zapnuty', True):
         dostupne_taby.append('zalistovaci')
 

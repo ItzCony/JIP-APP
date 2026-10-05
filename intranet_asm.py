@@ -28,6 +28,7 @@ import io
 import json
 import os
 import re
+import time
 import uuid
 
 from nicegui import ui, app, context
@@ -356,6 +357,24 @@ def _ma_pristup(p):
 
 
 # ============================================================================
+# Verze dat ASM (v RAM) pro auto-obnovu front
+# ============================================================================
+# Zvedá se po KAŽDÉM commitu v tomto modulu (_commit). _auto_obnova podle ní
+# pozná změnu a teprve pak načte celou frontu z DB — dřív plný dotaz + otisk
+# každých 10 s na každé otevřené záložce. Tabulky ASM se zapisují jen odsud;
+# ruční zásah do DB / jiná instance nad stejnou DB se projeví nejpozději po
+# _AUTO_OBNOVA_POJISTKA_S.
+_DATA_VERZE = 0
+_AUTO_OBNOVA_POJISTKA_S = 60.0
+
+
+def _commit(spojeni):
+    global _DATA_VERZE
+    spojeni.commit()
+    _DATA_VERZE += 1
+
+
+# ============================================================================
 # Inicializace DB
 # ============================================================================
 # Schéma + migrace se řeší jen JEDNOU za běh procesu. Bez toho běžely desítky
@@ -674,7 +693,7 @@ def inicializace_asm_db():
                 INDEX idx_ozlog_zaznam (zaznam_id)
             ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
         """)
-        conn.commit()
+        _commit(conn)
         cur.close()
         _ASM_DB_INIT_HOTOVO = True   # migrace proběhly → příště přeskoč (výkon)
     except Exception as e:
@@ -1092,7 +1111,7 @@ def _importuj_sync(dealer_raw, dealer_name, kontakty_raw, kontakty_name, user_na
              (dealer_name or None) if dealer_rows is not None else None,
              (kontakty_name or None) if kontakt_rows is not None else None,
              (gist_name or None) if gist_map is not None else None))
-        conn.commit()
+        _commit(conn)
         cur.close()
         return pd, pk, po, None
     except Exception as e:
@@ -1228,20 +1247,23 @@ def _kod_pobocky(prodejni_doba):
     return kod if len(kod) == 3 and kod.isdigit() else ""
 
 
-def _pobocka_uzivatele(user_id):
-    """Pobočka přihlášeného uživatele (user.pobocka, VARCHAR(3)) nebo None."""
+def _pobocky_uzivatele(user_id):
+    """Pobočky přihlášeného uživatele jako 3místné kódy: hlavní (user.pobocka)
+    + další (user.pobocky_navic). Bez pobočky / při chybě → []."""
     conn = intranet_data.get_db_connection()
     if not conn:
-        return None
+        return []
     try:
         cur = conn.cursor()
-        cur.execute("SELECT pobocka FROM user WHERE iduser=%s", (user_id,))
+        cur.execute("SELECT pobocka, pobocky_navic FROM user WHERE iduser=%s", (user_id,))
         r = cur.fetchone()
         cur.close()
-        return (r[0] or None) if r else None
+        if not r:
+            return []
+        return intranet_data.rozloz_pobocky([r[0] or ""] + intranet_data.rozloz_pobocky(r[1]))
     except Exception as e:
-        print(f"[asm] _pobocka_uzivatele: {e}")
-        return None
+        print(f"[asm] _pobocky_uzivatele: {e}")
+        return []
     finally:
         conn.close()
 
@@ -1572,7 +1594,7 @@ def zaznam_historie(pripad_id, akce, kdo, detail=None):
         cur.execute("INSERT INTO asm_historie (pripad_id, akce, detail, kdo) "
                     "VALUES (%s,%s,%s,%s)",
                     (pripad_id, akce[:80], (detail or "")[:1000], (kdo or "")[:255]))
-        conn.commit()
+        _commit(conn)
         cur.close()
     except Exception as e:
         print(f"[asm] zaznam_historie: {e}")
@@ -1654,7 +1676,7 @@ def zaloz_pripad(hlavicka, radky, user_id, user_name):
                      cislo_novy_oz, jmeno_novy_oz)
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             """, data)
-        conn.commit()
+        _commit(conn)
         cur.close()
         return pid, cislo
     except Exception as e:
@@ -1704,7 +1726,7 @@ def zaloz_pripad_formular(formular, data, user_id, user_name):
         pid = cur.lastrowid
         cislo = f"ASM{pid:05d}"
         cur.execute("UPDATE asm_pripady SET cislo=%s WHERE id=%s", (cislo, pid))
-        conn.commit()
+        _commit(conn)
         cur.close()
         return pid, cislo
     except Exception as e:
@@ -1724,7 +1746,7 @@ def uloz_data_formular(pid, data):
         cur = conn.cursor()
         cur.execute("UPDATE asm_pripady SET data_json=%s WHERE id=%s",
                     (json.dumps(data, ensure_ascii=False), pid))
-        conn.commit()
+        _commit(conn)
         cur.close()
         return True
     except Exception as e:
@@ -1798,7 +1820,7 @@ def uloz_radky(pid, radky):
             ))
         cur.execute("UPDATE asm_pripady SET pocet_radku=("
                     "SELECT COUNT(*) FROM asm_radky WHERE pripad_id=%s) WHERE id=%s", (pid, pid))
-        conn.commit()
+        _commit(conn)
         cur.close()
         return True
     except Exception as e:
@@ -1819,7 +1841,7 @@ def smaz_pripad(pid):
         cur.execute("DELETE FROM asm_radky WHERE pripad_id=%s", (pid,))
         cur.execute("DELETE FROM asm_historie WHERE pripad_id=%s", (pid,))
         cur.execute("DELETE FROM asm_pripady WHERE id=%s", (pid,))
-        conn.commit()
+        _commit(conn)
         cur.close()
         return True
     except Exception as e:
@@ -1852,7 +1874,7 @@ def zmen_stav(pid, novy_stav, poznamka=None, zamitnuti_duvod=None, storno_duvod=
             params.append(spravce_pozn[:1000])
         params.append(pid)
         cur.execute(f"UPDATE asm_pripady SET {','.join(sety)} WHERE id=%s", params)
-        conn.commit()
+        _commit(conn)
         cur.close()
         return True
     except Exception as e:
@@ -2497,7 +2519,7 @@ def uloz_oz(data: dict, user_id, user_name, zaznam_id=None) -> int:
                 _oz_log(cur, vals["stav_oz_id"], user_name, "automat", "Ukončení", None,
                         f"{konec} (nahrazen záznamem #{novy_id})")
                 cur.execute("UPDATE asm_oz SET stav_ukonceni=%s WHERE id=%s", (konec, novy_id))
-        conn.commit()
+        _commit(conn)
         cur.close()
         return novy_id
     except Exception as e:
@@ -2523,7 +2545,7 @@ def smaz_oz(zaznam_id) -> bool:
         cur.execute("DELETE FROM asm_oz_prilohy WHERE zaznam_id=%s", (zaznam_id,))
         cur.execute("DELETE FROM asm_oz_log WHERE zaznam_id=%s", (zaznam_id,))
         cur.execute("DELETE FROM asm_oz WHERE id=%s", (zaznam_id,))
-        conn.commit()
+        _commit(conn)
         cur.close()
         return True
     except Exception as e:
@@ -2570,7 +2592,7 @@ def _oz_oznac_davku(ids, davka) -> None:
         misto = ",".join(["%s"] * len(ids))
         cur.execute(f"UPDATE asm_oz SET import_davka=%s WHERE id IN ({misto})",
                     (davka, *ids))
-        conn.commit()
+        _commit(conn)
         cur.close()
     except Exception as e:
         print(f"[asm] _oz_oznac_davku: {e}")
@@ -2605,7 +2627,7 @@ def smaz_import_davku(davka) -> int:
         # ať nezůstane ukazovat na neexistující id.
         cur.execute(f"UPDATE asm_oz SET stav_oz_id=NULL WHERE stav_oz_id IN ({misto})", klic)
         cur.execute(f"DELETE FROM asm_oz WHERE id IN ({misto})", klic)
-        conn.commit()
+        _commit(conn)
         cur.close()
         for c in cesty:
             _smaz_soubor_oz(c)
@@ -2640,7 +2662,7 @@ def prepocet_aktivnich_oz() -> int:
                 ELSE 1 END
         """)
         n = cur.rowcount
-        conn.commit()
+        _commit(conn)
         cur.close()
         return n or 0
     except Exception as e:
@@ -2688,7 +2710,7 @@ def kontrola_oz_proti_kartam() -> dict:
                     f"{cislo}: formulář „{r.get('jmeno_oz') or ''}\" × karty „{jmeno_karta}\"")
             cur.execute("UPDATE asm_oz SET dealer_stav=%s, dealer_jmeno=%s, dealer_kdy=NOW() "
                         "WHERE id=%s", (stav, jmeno_karta, r["id"]))
-        conn.commit()
+        _commit(conn)
         cur.close()
         return souhrn
     except Exception as e:
@@ -2776,7 +2798,7 @@ def pridej_prilohu_oz(zaznam_id, nazev, cesta, kdo) -> int:
                     "VALUES (%s,%s,%s,%s)", (zaznam_id, nazev, cesta, kdo))
         pid = cur.lastrowid          # ještě před logem — jinak přebije lastrowid
         _oz_log(cur, zaznam_id, kdo, "priloha", "Příloha", None, nazev)
-        conn.commit()
+        _commit(conn)
         cur.close()
         return pid
     except Exception as e:
@@ -2810,7 +2832,7 @@ def smaz_prilohu_oz(priloha_id, kdo) -> bool:
             return False
         cur.execute("DELETE FROM asm_oz_prilohy WHERE id=%s", (priloha_id,))
         _oz_log(cur, pr["zaznam_id"], kdo, "priloha", "Příloha", pr["soubor_nazev"], None)
-        conn.commit()
+        _commit(conn)
         cur.close()
         _smaz_soubor_oz(pr.get("soubor_cesta"))
         return True
@@ -3163,13 +3185,10 @@ def _oz_formular(user_id, user_name, vsechna_prava, po_ulozeni=None):
 
 
 def _oz_pobocky_uzivatele(user_id):
-    """Žadatel vidí záznamy svých poboček (u uživatele je jedna, ale držíme seznam)."""
-    kod = _pobocka_uzivatele(user_id)
-    if not kod:
-        return []
-    kod = str(kod).strip()
-    # V DB user.pobocka bývá '10' i '010' — ber obě podoby.
-    return list(dict.fromkeys([kod, kod.zfill(3), kod.lstrip("0")]))
+    """Žadatel vidí záznamy svých poboček (hlavní + další)."""
+    # V asm_oz.pobocka může být '10' i '010' — ber obě podoby každého kódu.
+    return list(dict.fromkeys(v for kod in _pobocky_uzivatele(user_id)
+                              for v in (kod, kod.lstrip("0"))))
 
 
 # ============================================================================
@@ -3804,7 +3823,7 @@ def _oz_denni_zabral() -> bool:
             cur.close()
             return False
         _oz_log(cur, 0, "systém", "denni_kontrola")
-        conn.commit()
+        _commit(conn)
         cur.close()
         return True
     except Exception as e:
@@ -3832,7 +3851,7 @@ def _oz_otisk_zmenen(problemy: list) -> bool:
         r = cur.fetchone()
         _oz_log(cur, 0, "systém", "denni_otisk", pole=f"{len(problemy)} neshod",
                 nova=otisk)
-        conn.commit()
+        _commit(conn)
         cur.close()
         return not r or r[0] != otisk
     except Exception as e:
@@ -4288,10 +4307,16 @@ async def _view_zmena(user_id, user_name, prava):
     # Auto-obnova fronty à 10 s: otisk dat se počítá ve vlákně a tabulka se
     # překreslí JEN při skutečné změně dat (dřív plný re-render každých 10 s).
     # Refreshuje JEN tabulku (ne celou stránku) → neruší filtry, otevřený formulář ani dialog.
-    _fronta_otisk = {'v': None}
+    # Z DB se fronta tahá jen po commitu v ASM (_DATA_VERZE), jinak nejvýš
+    # jednou za _AUTO_OBNOVA_POJISTKA_S.
+    _fronta_otisk = {'v': None, 'verze': None, 'cas': 0.0}
 
     async def _auto_obnova():
+        verze, ted = _DATA_VERZE, time.monotonic()
+        if verze == _fronta_otisk['verze'] and ted - _fronta_otisk['cas'] < _AUTO_OBNOVA_POJISTKA_S:
+            return
         novy = await asyncio.to_thread(lambda: hash(repr(nacti_pripady(user_id, prava))))
+        _fronta_otisk['verze'], _fronta_otisk['cas'] = verze, ted
         if _fronta_otisk['v'] is None:
             _fronta_otisk['v'] = novy
             return
@@ -4320,8 +4345,9 @@ def _render_form_pole(formular, hodnoty, editable, auto_editovatelne=False,
       • editable=False → jen popisky (read-only); vrací None.
       • auto_editovatelne=True → i „auto" pole (dotažená dle IČO) jsou ručně editovatelná
         (pro režim opravy — když auto-dotažené hodnoty výjimečně nesedí).
-      • pobocka_filtr="012" → při dotažení dle IČO se nabídnou jen IČ 10 té pobočky
-        (dle „Prod. kanál 6"); None = bez omezení (office/správce, uživatel bez pobočky).
+      • pobocka_filtr=["012", "026"] → při dotažení dle IČO se nabídnou jen IČ 10 těch
+        poboček (dle „Prod. kanál 6"); None / [] = bez omezení (office/správce, uživatel
+        bez pobočky).
     Sekce 5 (administrativní schválení) se needituje — odvozuje se z fronty (žadatel + datum)."""
     widgets, auto_refs = {}, {}
     # Obraty se nikde nezobrazují jako částka (formulář ani detail) — jen porovnání
@@ -4567,8 +4593,13 @@ def _render_form_pole(formular, hodnoty, editable, auto_editovatelne=False,
         varianty_vse = len(varianty)
         if pobocka_filtr:
             varianty = [v for v in varianty
-                        if _kod_pobocky(v.get("prodejni_doba")) in ("", pobocka_filtr)]
+                        if _kod_pobocky(v.get("prodejni_doba")) in ("", *pobocka_filtr)]
             fakt = varianty[0] if varianty else None   # auto-pole z povoleného řádku
+        # Zadané plné IČ 10 (např. 26809630N) má přednost před prvním řádkem dle
+        # abecedy — jinak by hlavička/provozovna byla z jiného IČ 10 (26809630-1).
+        _zadane = (ico_w.value or "").strip().upper()
+        fakt = next((v for v in varianty
+                     if str(v.get("ico") or "").strip().upper() == _zadane), fakt)
         o = _obrat_dle_ico([ic8]).get(ic8) if ic8 else None
         auto = _ico_auto_hodnoty(fakt, o, maskovat_obrat=True)   # žadatel vidí maskovaný obrat
         for kk, w in auto_refs.items():
@@ -4610,7 +4641,9 @@ def _render_form_pole(formular, hodnoty, editable, auto_editovatelne=False,
         _bublina.refresh()
         _aktualizuj_dle_vyberu()
         if ic8 and not fakt and varianty_vse:
-            ui.notify(f"IČO nepatří vaší pobočce {pobocka_filtr} "
+            _pf = list(pobocka_filtr or [])
+            _komu = ("vaší pobočce" if len(_pf) == 1 else "vašim pobočkám")
+            ui.notify(f"IČO nepatří {_komu} {', '.join(_pf)} "
                       f"(0 z {varianty_vse} IČ 10).", type="warning", position="top-right")
         elif ic8 and not fakt:
             ui.notify("IČ 8 nenalezeno v kontaktech.", type="warning", position="top-right")
@@ -4619,7 +4652,9 @@ def _render_form_pole(formular, hodnoty, editable, auto_editovatelne=False,
             msg = (f"Údaje dotaženy ({n}× IČ 10)." if o
                    else f"Údaje dotaženy ({n}× IČ 10; obraty GIST chybí).")
             if pobocka_filtr and n < varianty_vse:
-                msg += f" Zobrazena jen pobočka {pobocka_filtr} ({varianty_vse - n} skryto)."
+                _co = ("pobočka" if len(pobocka_filtr) == 1 else "pobočky")
+                msg += (f" Zobrazeny jen IČ 10 ({_co} {', '.join(pobocka_filtr)}; "
+                        f"{varianty_vse - n} skryto).")
             ui.notify(msg, type="positive", position="top-right")
     if ico_w:
         ico_w.on("blur", _dotahni)
@@ -4721,9 +4756,9 @@ def _formular_novy_obecny(formular, user_id, user_name, prava, zpet_fn):
                  "schválení“ se doplní automaticky (žadatel + datum) a uvidíte ji ve frontě.") \
             .classes("text-xs text-gray-500")
 
-        # Žadatel vidí jen IČ 10 své pobočky (dle „Prod. kanál 6"). Office/správce
-        # a uživatel bez nastavené pobočky vidí všechna.
-        _pob = None if _je_office(prava, formular) else _pobocka_uzivatele(user_id)
+        # Žadatel vidí jen IČ 10 svých poboček — hlavní + další (dle „Prod. kanál 6").
+        # Office/správce a uživatel bez nastavené pobočky vidí všechna.
+        _pob = None if _je_office(prava, formular) else _pobocky_uzivatele(user_id)
         cti = _render_form_pole(formular, {}, editable=True, pobocka_filtr=_pob)
 
         async def _odeslat():
@@ -4830,10 +4865,15 @@ async def _view_formular(formular, user_id, user_name, prava):
 
     # Auto-obnova fronty à 10 s (viz _view_zmena) — otisk ve vlákně, překreslení
     # jen při skutečné změně dat; neruší filtry/formulář/dialog.
-    _fronta_otisk = {'v': None}
+    # Z DB jen po commitu v ASM (_DATA_VERZE), jinak nejvýš jednou za pojistku.
+    _fronta_otisk = {'v': None, 'verze': None, 'cas': 0.0}
 
     async def _auto_obnova():
+        verze, ted = _DATA_VERZE, time.monotonic()
+        if verze == _fronta_otisk['verze'] and ted - _fronta_otisk['cas'] < _AUTO_OBNOVA_POJISTKA_S:
+            return
         novy = await asyncio.to_thread(lambda: hash(repr(nacti_pripady(user_id, prava, formular))))
+        _fronta_otisk['verze'], _fronta_otisk['cas'] = verze, ted
         if _fronta_otisk['v'] is None:
             _fronta_otisk['v'] = novy
             return
@@ -5644,12 +5684,12 @@ def _detail_dialog(pid, user_id, user_name, prava):
                     _var.append(_v)
                 _fdata["ico10_varianty"] = _var
             # Read-only detail ukazuje uložený výběr (filtr se neuplatní); při opravě
-            # žadatelem se re-dotažení dle IČO omezí na jeho pobočku stejně jako v novém
+            # žadatelem se re-dotažení dle IČO omezí na jeho pobočky stejně jako v novém
             # formuláři.
             cti_form = _render_form_pole(
                 formular, _fdata, editable=lze_upravit, auto_editovatelne=lze_upravit,
                 pobocka_filtr=(None if not lze_upravit or _je_office(prava, formular)
-                               else _pobocka_uzivatele(user_id)))
+                               else _pobocky_uzivatele(user_id)))
 
         # Průběh („očičko")
         with ui.expansion("Průběh případu", icon="history").classes("w-full"):

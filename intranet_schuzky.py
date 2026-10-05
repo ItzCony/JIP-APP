@@ -161,7 +161,13 @@ def _mozne_delky(start_min: int, blokovane: set) -> list:
 # =========================================================
 # INICIALIZACE DATABÁZE
 # =========================================================
+_SCHUZKY_DB_INIT_HOTOVO = False  # schéma + seed jen jednou za běh procesu
+
+
 def inicializace_schuzky_db():
+    global _SCHUZKY_DB_INIT_HOTOVO
+    if _SCHUZKY_DB_INIT_HOTOVO:
+        return
     conn = intranet_data.get_db_connection()
     if not conn:
         return
@@ -222,6 +228,7 @@ def inicializace_schuzky_db():
             cur.execute("INSERT IGNORE INTO schuzky_terminy (datum, vytvoril) VALUES (%s, %s)",
                         (d, 'systém'))
         conn.commit()
+        _SCHUZKY_DB_INIT_HOTOVO = True
     except Exception as e:
         print(f'[schuzky] inicializace_schuzky_db: {e}')
     finally:

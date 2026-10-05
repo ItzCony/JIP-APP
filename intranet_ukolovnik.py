@@ -65,7 +65,15 @@ KAL_BARVY_OSOB = ['#2563eb', '#0ea5e9', '#a855f7', '#059669',
 # =========================================================
 # INICIALIZACE DB
 # =========================================================
+# Schéma + migrace jen jednou za běh procesu (dřív ~27 dotazů vč. SHOW COLUMNS
+# při každém otevření Úkolovníku).
+_UKOLOVNIK_DB_INIT_HOTOVO = False
+
+
 def inicializace_ukolovnik_db():
+    global _UKOLOVNIK_DB_INIT_HOTOVO
+    if _UKOLOVNIK_DB_INIT_HOTOVO:
+        return
     conn = intranet_data.get_db_connection()
     if not conn:
         return
@@ -288,6 +296,7 @@ def inicializace_ukolovnik_db():
 
         conn.commit()
         cur.close()
+        _UKOLOVNIK_DB_INIT_HOTOVO = True
     except Exception as e:
         print(f"Chyba při inicializaci DB Úkolovníku: {e}")
     finally:

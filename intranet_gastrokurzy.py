@@ -64,7 +64,13 @@ FIRMY_STYL = {
     'NESTLE':   ('#B45309', '#FBBF24'),
 }
 _FIRMA_DEFAULT = ('#334155', '#94A3B8')
-_JIP_STYL = ('#F43F5E', '#E11D48')      # kurz JIP – růžová jako datumový sloupec
+# Kurz JIP – barva podle místa konání (Praha růžová jako v Excelu, Ostrava zelená);
+# druhý odstín = barva místa v kalendáři a popiscích.
+_JIP_STYL = {'Praha': ('#F43F5E', '#E11D48'), 'Ostrava': ('#059669', '#047857')}
+
+
+def _styl_mista(misto):
+    return _JIP_STYL.get(misto, _JIP_STYL['Praha'])
 
 _MESICE = ['', 'leden', 'únor', 'březen', 'duben', 'květen', 'červen',
            'červenec', 'srpen', 'září', 'říjen', 'listopad', 'prosinec']
@@ -187,6 +193,9 @@ def inicializace_db():
             "updated_at = updated_at WHERE zdroj IS NULL",
             "UPDATE gastrokurzy_termin SET souhrn_verze = verze, souhrn_odeslan = NOW(), "
             "updated_at = updated_at WHERE souhrn_verze IS NULL",
+            # Rezervace = místo zapsané bez jména zákazníka; upravovat ho smí jen
+            # ten, kdo ho zapsal (`zapsal`), i po doplnění jména.
+            "ALTER TABLE gastrokurzy_prihlaska ADD COLUMN rezervace TINYINT NOT NULL DEFAULT 0 AFTER podpis",
         ):
             try:
                 cur.execute(prikaz)
@@ -560,12 +569,22 @@ def _smaz_termin(termin_id):
         conn.close()
 
 
-def _uloz_prihlasku(data, prihlaska_id):
+def _cizi_rezervace(cur, prihlaska_id, user_name):
+    """True = zápis je rezervace jiného uživatele (nebo neexistuje) – měnit ho nelze."""
+    cur.execute("SELECT rezervace, zapsal FROM gastrokurzy_prihlaska WHERE id=%s",
+                (prihlaska_id,))
+    r = cur.fetchone()
+    return r is None or (bool(r[0]) and r[1] != user_name)
+
+
+def _uloz_prihlasku(data, prihlaska_id, user_name):
     conn = intranet_data.get_db_connection()
     if not conn:
         return False
     cur = conn.cursor()
     try:
+        if _cizi_rezervace(cur, prihlaska_id, user_name):
+            return False
         cur.execute("""UPDATE gastrokurzy_prihlaska
               SET pobocka_klic=%s, oz=%s, ico=%s, provozovna=%s, zakaznik=%s,
                   funkce=%s, telefon=%s, podpis=%s
@@ -593,11 +612,12 @@ def _zapis_prihlasky(zaznamy):
     try:
         cur.executemany("""INSERT INTO gastrokurzy_prihlaska
               (termin_id, pobocka_klic, oz, ico, provozovna, zakaznik,
-               funkce, telefon, podpis, zapsal)
-              VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+               funkce, telefon, podpis, rezervace, zapsal)
+              VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                         [(d['termin_id'], d['pobocka_klic'], d['oz'], d['ico'],
                           d['provozovna'], d['zakaznik'], d['funkce'],
-                          d['telefon'], int(d['podpis']), d['zapsal']) for d in zaznamy])
+                          d['telefon'], int(d['podpis']), int(not d['zakaznik']),
+                          d['zapsal']) for d in zaznamy])
         conn.commit()
         return True
     except Exception as e:
@@ -609,13 +629,16 @@ def _zapis_prihlasky(zaznamy):
         conn.close()
 
 
-def _zmen_stav_prihlasky(prihlaska_id, stav, user_name):
-    """Zrušení zápisu (stav 'zruseno') nebo jeho obnovení ('aktivni')."""
+def _zmen_stav_prihlasky(prihlaska_id, stav, user_name, spravce=False):
+    """Zrušení zápisu (stav 'zruseno') nebo jeho obnovení ('aktivni').
+    Cizí rezervaci smí správce zrušit (ne obnovit ani upravit)."""
     conn = intranet_data.get_db_connection()
     if not conn:
         return False
     cur = conn.cursor()
     try:
+        if not (spravce and stav == 'zruseno') and _cizi_rezervace(cur, prihlaska_id, user_name):
+            return False
         if stav == 'zruseno':
             cur.execute("""UPDATE gastrokurzy_prihlaska
                   SET stav='zruseno', zrusil=%s, zruseno_kdy=NOW() WHERE id=%s""",
@@ -634,12 +657,14 @@ def _zmen_stav_prihlasky(prihlaska_id, stav, user_name):
         conn.close()
 
 
-def _prepni_podpis(prihlaska_id, hodnota):
+def _prepni_podpis(prihlaska_id, hodnota, user_name):
     conn = intranet_data.get_db_connection()
     if not conn:
         return False
     cur = conn.cursor()
     try:
+        if _cizi_rezervace(cur, prihlaska_id, user_name):
+            return False
         cur.execute("UPDATE gastrokurzy_prihlaska SET podpis=%s WHERE id=%s",
                     (int(hodnota), prihlaska_id))
         conn.commit()
@@ -851,6 +876,7 @@ def vykresli(user_id, user_name, vsechna_prava):
              'typ': 'vse', 'od': '', 'do': ''}
     kal = {'rok': dnes_.year, 'mesic': dnes_.month}
     posledni_pobocka_key = f'gastrokurzy_pob_{user_id}'
+    skryt_zrusene_key = f'gastrokurzy_skryt_zrusene_{user_id}'
 
     # =================================================================
     # DIALOG: PREZENČNÍ LISTINA
@@ -867,8 +893,11 @@ def vykresli(user_id, user_name, vsechna_prava):
                 'min-width: 1100px; max-width: 1400px; max-height: 90vh; overflow-y: auto'):
 
             # --- hlavička: údaje se doplňují automaticky z termínu ---
-            barva = 'from-rose-500 to-pink-600' if t['typ'] == 'standard' else 'from-violet-600 to-fuchsia-600'
-            with ui.column().classes(f'w-full p-6 gap-1 bg-gradient-to-r {barva} text-white'):
+            # stejná barva jako dlaždice: TOP = barva firmy, JIP = barva místa konání
+            od, do = (FIRMY_STYL.get((t.get('firma') or '').upper(), _FIRMA_DEFAULT)
+                      if t['typ'] == 'top' else _styl_mista(t['misto']))
+            with ui.column().classes('w-full p-6 gap-1 text-white').style(
+                    f'background: linear-gradient(135deg, {od} 0%, {do} 100%)'):
                 with ui.row().classes('w-full items-center gap-3'):
                     ui.icon('assignment_ind', size='2rem')
                     ui.label('Prezenční listina').classes('text-2xl font-extrabold')
@@ -897,7 +926,17 @@ def vykresli(user_id, user_name, vsechna_prava):
                     # každý řádek = jeden zápis; „+1“ přidá kopii posledního řádku
                     # (jméno a podpis zůstanou prázdné – jde o jinou osobu)
                     radky = []
+                    odebrat_radek = {}  # id(r) -> funkce, která řádek odebere
+                    tlacitko_pocet = []  # tlačítko „+N“ (vzniká až pod řádky)
+                    # rezervace navíc přidané Shift + kolečkem – bez vlastního řádku,
+                    # vzniknou až při Zapsat jako kopie posledního řádku bez jména
+                    navic = [0]
                     radky_box = ui.column().classes('w-full gap-2')
+
+                    def _obnov_pocet():
+                        # číslo v tlačítku = počet zapisovaných osob (řádky + rezervace navíc)
+                        if tlacitko_pocet:
+                            tlacitko_pocet[0].text = f'+{len(radky) + navic[0]}'
 
                     def _novy_radek(vzor=None):
                         v = vzor or {}
@@ -913,7 +952,7 @@ def vykresli(user_id, user_name, vsechna_prava):
                                     'outlined dense').classes('w-32'),
                                 'provozovna': ui.input('Provozovna', value=v.get('provozovna', '')).props(
                                     'outlined dense').classes('flex-1 min-w-40'),
-                                'zakaznik': ui.input('Jméno zákazníka *').props(
+                                'zakaznik': ui.input('Jméno zákazníka').props(
                                     'outlined dense' + (' autofocus' if vzor else '')).classes('flex-1 min-w-48'),
                                 'funkce': ui.input('Funkce *', value=v.get('funkce', '')).props(
                                     'outlined dense').classes('w-40'),
@@ -925,7 +964,11 @@ def vykresli(user_id, user_name, vsechna_prava):
 
                             def _odeber():
                                 radky.remove(r)
+                                odebrat_radek.pop(id(r), None)
                                 radek.delete()
+                                _obnov_pocet()
+                            odebrat_radek[id(r)] = _odeber
+                            _obnov_pocet()
                             # první řádek nejde odebrat; neviditelné tlačítko drží zarovnání sloupců
                             ui.button(icon='close', on_click=_odeber).props(
                                 'flat round dense size=sm color=grey').tooltip('Odebrat řádek').classes(
@@ -934,11 +977,15 @@ def vykresli(user_id, user_name, vsechna_prava):
                     _novy_radek()
 
                     async def _pridej():
+                        # se jménem = plný zápis; bez jména = rezervace místa (stačí pobočka,
+                        # zbytek si autor doplní později – nikdo jiný ji upravit nemůže)
                         povinne = (('Pobočka', 'pobocka_klic'), ('OZ', 'oz'), ('IČO', 'ico'),
-                                   ('Jméno', 'zakaznik'), ('Funkce', 'funkce'))
+                                   ('Funkce', 'funkce'))
                         chybi = []
                         for i, r in enumerate(radky, 1):
-                            pole = [lbl for lbl, k in povinne if not str(r[k].value or '').strip()]
+                            jen_rezervace = not str(r['zakaznik'].value or '').strip()
+                            pole = [lbl for lbl, k in (povinne[:1] if jen_rezervace else povinne)
+                                    if not str(r[k].value or '').strip()]
                             if pole:
                                 chybi.append((f'řádek {i} – ' if len(radky) > 1 else '') + ', '.join(pole))
                         if chybi:
@@ -949,6 +996,9 @@ def vykresli(user_id, user_name, vsechna_prava):
                                     **{k: str(r[k].value or '').strip() for k in
                                        ('oz', 'ico', 'provozovna', 'zakaznik', 'funkce', 'telefon')}}
                                    for r in radky]
+                        # rezervace navíc = kopie posledního řádku bez jména a podpisu
+                        zaznamy += [{**zaznamy[-1], 'zakaznik': '', 'podpis': False}
+                                    for _ in range(navic[0])]
                         volno = _volna_mista(t, ref['data'])
                         if volno is not None and volno < len(zaznamy):
                             ui.notify('Kurz je plně obsazen.' if volno <= 0 else
@@ -960,19 +1010,51 @@ def vykresli(user_id, user_name, vsechna_prava):
                         app.storage.user[posledni_pobocka_key] = zaznamy[0]['pobocka_klic']
                         pobocky = dict.fromkeys(POBOCKY_NAZVY.get(z['pobocka_klic'], z['pobocka_klic'])
                                                 for z in zaznamy)
+                        jmena = [z['zakaznik'] for z in zaznamy if z['zakaznik']]
+                        rezervaci = len(zaznamy) - len(jmena)
+                        popis = ', '.join(jmena + ([f'rezervace {rezervaci} míst'] if rezervaci else []))
                         intranet_logger.log_activity(
                             user_name, LOG_KATEGORIE,
                             f"Zápis na kurz {t['nazev']} ({t['misto']} {_fmt_datum(t['datum'])}): "
-                            f"{', '.join(z['zakaznik'] for z in zaznamy)} – {', '.join(pobocky)}")
+                            f"{popis} – {', '.join(pobocky)}")
+                        if rezervaci:
+                            ui.notify(f'Rezervováno míst: {rezervaci}. Jména a údaje doplníte přes '
+                                      f'tlačítko Upravit – nikdo jiný je měnit nemůže.', type='positive')
                         radky.clear()
+                        odebrat_radek.clear()
                         radky_box.clear()
+                        navic[0] = 0
                         _novy_radek()
                         await _obnov()
 
-                    with ui.row().classes('w-full justify-end gap-2'):
-                        ui.button('+1', on_click=lambda: _novy_radek({k: el.value for k, el in radky[-1].items()})
-                                  ).props('outline color=primary').classes('font-bold').tooltip(
-                            'Další osoba – zkopíruje poslední řádek, stačí doplnit jméno')
+                    def _kopie_radku():
+                        _novy_radek({k: el.value for k, el in radky[-1].items()})
+
+                    def _kolecko(e):
+                        # Shift + kolečko nahoru/dolů = přidat/ubrat rezervaci navíc – řádky
+                        # nepřibývají, místa se zapíšou až po kliknutí na Zapsat
+                        if e.args > 0:
+                            navic[0] += 1
+                        elif navic[0] > 0:
+                            navic[0] -= 1
+                        _obnov_pocet()
+
+                    with ui.row().classes('w-full items-center justify-end gap-2'):
+                        ui.label('Bez jména zákazníka se místo jen zarezervuje – údaje doplníte později '
+                                 'a upravovat je smíte jen vy.').classes('text-xs text-gray-400 mr-auto')
+                        tlacitko_pocet.append(ui.button(
+                            f'+{len(radky)}', on_click=_kopie_radku).props('outline color=primary').classes(
+                            'font-bold').tooltip(
+                            'Počet zapisovaných osob. Klik = další osoba (zkopíruje poslední řádek, '
+                            'stačí doplnit jméno). Shift + kolečko myši nahoru/dolů přidává/ubírá '
+                            'rezervace bez jména – zapíšou se až po kliknutí na Zapsat.'
+                        ).on('wheel', _kolecko, js_handler='''(e) => {
+                            if (!e.shiftKey) return;
+                            e.preventDefault();
+                            // se Shiftem prohlížeč často posílá vodorovný posun (deltaX místo deltaY)
+                            const d = e.deltaY || e.deltaX;
+                            if (d) emit(d < 0 ? 1 : -1);
+                        }'''))
                         ui.button('Zapsat', icon='person_add', on_click=_pridej).props(
                             'unelevated color=primary').classes('font-bold')
 
@@ -990,11 +1072,28 @@ def vykresli(user_id, user_name, vsechna_prava):
                         ui.label(f'Volná místa: {volno}').classes(
                             f'text-sm font-black px-3 py-1 rounded-full {cls}')
                     zrusenych = len(data) - len(aktivni)
+                    skryt = bool(app.storage.user.get(skryt_zrusene_key, False))
                     if zrusenych:
                         ui.label(f'Zrušeno: {zrusenych}').classes(
                             'text-sm font-bold text-gray-400 bg-gray-50 px-3 py-1 rounded-full')
 
+                        def _prepni_zrusene():
+                            app.storage.user[skryt_zrusene_key] = not skryt
+                            _seznam.refresh()
+                        ui.button('Zobrazit zrušené' if skryt else 'Skrýt zrušené',
+                                  icon='visibility' if skryt else 'visibility_off',
+                                  on_click=_prepni_zrusene).props(
+                            'flat dense no-caps color=grey-7').classes('ml-auto')
+
+                if skryt:
+                    data = aktivni
+
                 if not data:
+                    if zrusenych:
+                        with ui.column().classes('w-full items-center py-12 gap-2'):
+                            ui.icon('visibility_off', size='3rem', color='grey-4')
+                            ui.label('Všechny zápisy jsou zrušené a skryté.').classes('text-gray-400')
+                        return
                     with ui.column().classes('w-full items-center py-12 gap-2'):
                         ui.icon('groups', size='3rem', color='grey-4')
                         ui.label('Zatím se nikdo nezapsal.').classes('text-gray-400')
@@ -1016,6 +1115,10 @@ def vykresli(user_id, user_name, vsechna_prava):
                 zruseno = p['stav'] == 'zruseno'
                 zaklad = 'text-sm text-gray-400 line-through' if zruseno else 'text-sm text-gray-700'
                 anonym = not (p['zakaznik'] or '').strip()
+                rezervace = bool(p.get('rezervace'))
+                # cizí rezervaci smí měnit jen ten, kdo ji zapsal (i když už má jméno)
+                cizi = rezervace and p['zapsal'] != user_name
+                muze = editovat and not cizi
                 with ui.row().classes(
                         'w-full items-center gap-2 px-2 py-1.5 border-b border-gray-100 '
                         + ('bg-gray-50' if zruseno else 'hover:bg-blue-50')):
@@ -1025,7 +1128,9 @@ def vykresli(user_id, user_name, vsechna_prava):
                     ui.label(p['ico'] or '—').classes(f'w-28 {zaklad} font-mono')
                     ui.label(p['provozovna'] or '—').classes(f'w-52 {zaklad} truncate').tooltip(
                         p['provozovna'] or '')
-                    if anonym:
+                    if anonym and rezervace:
+                        ui.label('Rezervováno').classes('flex-1 min-w-48 text-sm italic text-indigo-500')
+                    elif anonym:
                         with ui.row().classes('flex-1 min-w-48 items-center gap-1'):
                             ui.label('K doplnění').classes('text-sm italic text-amber-600')
                             ui.icon('info', size='0.9rem', color='amber').tooltip(
@@ -1036,7 +1141,7 @@ def vykresli(user_id, user_name, vsechna_prava):
                     ui.label(p['telefon'] or '—').classes(f'w-32 {zaklad}')
 
                     async def _podpis(e, pid=p['id']):
-                        if not await asyncio.to_thread(_prepni_podpis, pid, e.value):
+                        if not await asyncio.to_thread(_prepni_podpis, pid, e.value, user_name):
                             ui.notify('Podpis se nepodařilo uložit.', type='negative')
 
                     with ui.element('div').classes('w-20'):
@@ -1044,7 +1149,7 @@ def vykresli(user_id, user_name, vsechna_prava):
                             ui.icon('block', color='grey-5')
                         else:
                             ui.checkbox(value=bool(p['podpis']), on_change=_podpis).props(
-                                f'dense {"" if editovat else "disable"}').tooltip(
+                                f'dense {"" if muze else "disable"}').tooltip(
                                 'Prezence – lze zaškrtnout i v den kurzu nebo později.')
 
                     with ui.row().classes('w-24 items-center gap-1 justify-end'):
@@ -1052,17 +1157,25 @@ def vykresli(user_id, user_name, vsechna_prava):
                             kdy = p['zruseno_kdy'].strftime('%d.%m.%Y') if p['zruseno_kdy'] else ''
                             ui.icon('history', size='1rem', color='grey-5').tooltip(
                                 f"Zrušil: {p['zrusil'] or '?'} {kdy}")
-                            if editovat:
+                            if muze:
                                 ui.button(icon='undo', on_click=lambda _, pid=p['id']: _zmen(pid, 'aktivni')
                                           ).props('flat dense round size=sm color=grey').tooltip('Obnovit zápis')
-                        elif editovat:
+                        elif muze:
                             ui.button(icon='edit', on_click=lambda _, pp=p: _otevri_editaci(pp)
-                                      ).props('flat dense round size=sm color=grey').tooltip('Upravit')
+                                      ).props('flat dense round size=sm color=grey').tooltip(
+                                'Doplnit údaje' if anonym and rezervace else 'Upravit')
                             ui.button(icon='cancel', on_click=lambda _, pid=p['id']: _zmen(pid, 'zruseno')
                                       ).props('flat dense round size=sm color=red').tooltip('Zrušit zápis')
+                        elif editovat:  # cizí rezervace
+                            ui.icon('lock', size='1rem', color='grey-5').tooltip(
+                                f"Rezervace – upravovat smí jen {p['zapsal']}.")
+                            if je_spravce:
+                                ui.button(icon='cancel', on_click=lambda _, pid=p['id']: _zmen(pid, 'zruseno')
+                                          ).props('flat dense round size=sm color=red').tooltip(
+                                    f"Zrušit rezervaci ({p['zapsal']}) – jako správce")
 
             async def _zmen(pid, stav):
-                if not await asyncio.to_thread(_zmen_stav_prihlasky, pid, stav, user_name):
+                if not await asyncio.to_thread(_zmen_stav_prihlasky, pid, stav, user_name, je_spravce):
                     ui.notify('Změnu se nepodařilo uložit.', type='negative')
                     return
                 intranet_logger.log_activity(
@@ -1091,7 +1204,7 @@ def vykresli(user_id, user_name, vsechna_prava):
                             'ico': str(e_ico.value).strip(), 'provozovna': str(e_prov.value).strip(),
                             'zakaznik': str(e_jm.value).strip(),
                             'funkce': str(e_fce.value).strip(), 'telefon': str(e_tel.value).strip(),
-                            'podpis': e_pod.value}, p['id'])
+                            'podpis': e_pod.value}, p['id'], user_name)
                         if not ok:
                             ui.notify('Uložení se nepodařilo.', type='negative')
                             return
@@ -1253,7 +1366,7 @@ def vykresli(user_id, user_name, vsechna_prava):
         zruseno = t['stav'] == 'zruseno'
         je_top = t['typ'] == 'top'
         od, do = (FIRMY_STYL.get((t['firma'] or '').upper(), _FIRMA_DEFAULT)
-                  if je_top else _JIP_STYL)
+                  if je_top else _styl_mista(t['misto']))
         volno = _volna_mista(t, None)
         obsazeno_pct = min(100, round(t['pocet'] / t['kapacita'] * 100)) if t['kapacita'] else 0
         dnu = (t['datum'] - datetime.date.today()).days
@@ -1279,8 +1392,9 @@ def vykresli(user_id, user_name, vsechna_prava):
                     with ui.row().classes('items-center gap-1'):
                         ui.icon('event', size='0.9rem').classes('opacity-80')
                         ui.label(_fmt_datum(t['datum'])).classes('text-xs font-bold')
-                    with ui.row().classes('items-center gap-1'):
-                        ui.icon('place', size='0.9rem').classes('opacity-80')
+                    with ui.row().classes('items-center gap-1 bg-white rounded-full px-2 py-0.5').style(
+                            f"color: {_styl_mista(t['misto'])[1]}"):
+                        ui.icon('place', size='0.9rem')
                         ui.label(t['misto']).classes('text-xs font-bold')
                     if t['lektor']:
                         with ui.row().classes('items-center gap-1'):
@@ -1324,12 +1438,13 @@ def vykresli(user_id, user_name, vsechna_prava):
             + ('opacity-60 ' if zruseno else 'hover:shadow-lg '))
         with karta:
             with ui.row().classes('w-full items-stretch gap-0 no-wrap'):
-                # datum – růžový sloupec jako v Excelu, kurz dodavatele si drží barvu firmy
+                # datum – barva místa konání, kurz dodavatele si drží barvu firmy
                 sloupec = ui.column().classes(
-                    'items-center justify-center px-4 py-3 gap-0 min-w-28 '
-                    + ('bg-gray-300' if zruseno else 'bg-rose-500'))
-                if je_top and not zruseno:
-                    od, do = FIRMY_STYL.get((t['firma'] or '').upper(), _FIRMA_DEFAULT)
+                    'items-center justify-center px-4 py-3 gap-0 min-w-28'
+                    + (' bg-gray-300' if zruseno else ''))
+                if not zruseno:
+                    od, do = (FIRMY_STYL.get((t['firma'] or '').upper(), _FIRMA_DEFAULT)
+                              if je_top else _styl_mista(t['misto']))
                     sloupec.style(f'background: linear-gradient(135deg, {od} 0%, {do} 100%)')
                 with sloupec:
                     if t['datum']:
@@ -1355,8 +1470,9 @@ def vykresli(user_id, user_name, vsechna_prava):
                                 'text-[10px] font-black text-red-600 bg-red-100 px-2 py-0.5 rounded-full')
                     with ui.row().classes('items-center gap-2 flex-wrap'):
                         with ui.row().classes('items-center gap-1'):
-                            ui.icon('place', size='0.9rem', color='grey-6')
-                            ui.label(t['misto']).classes('text-xs font-bold text-gray-500')
+                            barva_mista = _styl_mista(t['misto'])[1]
+                            ui.icon('place', size='0.9rem').style(f'color: {barva_mista}')
+                            ui.label(t['misto']).classes('text-xs font-bold').style(f'color: {barva_mista}')
                         if t['lektor']:
                             with ui.row().classes('items-center gap-1'):
                                 ui.icon('person', size='0.9rem', color='grey-6')
@@ -1406,7 +1522,7 @@ def vykresli(user_id, user_name, vsechna_prava):
             """Barva podle místa konání; TOP kurz má vlastní fialovou."""
             if t['typ'] == 'top':
                 return '#7C3AED'
-            return '#E11D48' if t['misto'] == 'Praha' else '#0E7490'
+            return _styl_mista(t['misto'])[1]
 
         def _bunka_dne(datum, terminy_dne, aktualni_mesic):
             dnes = datetime.date.today()
@@ -1497,7 +1613,8 @@ def vykresli(user_id, user_name, vsechna_prava):
                 ui.element('div').classes('flex-1')
                 ui.label(f'{len(v_mesici)} termínů · {sum(t["pocet"] for t in v_mesici)} přihlášených'
                          ).classes('text-xs font-bold text-gray-400')
-                for popis, barva in (('Praha', '#E11D48'), ('Ostrava', '#0E7490'), ('TOP kurz', '#7C3AED')):
+                for popis, barva in (('Praha', _styl_mista('Praha')[1]), ('Ostrava', _styl_mista('Ostrava')[1]),
+                                     ('TOP kurz', '#7C3AED')):
                     with ui.row().classes('items-center gap-1'):
                         ui.element('div').classes('w-3 h-3 rounded').style(f'background:{barva}')
                         ui.label(popis).classes('text-[11px] font-bold text-gray-500')
