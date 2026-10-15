@@ -27,6 +27,7 @@ import asyncio
 import collections
 import glob
 import json
+import time
 import uuid
 
 from nicegui import app
@@ -217,3 +218,34 @@ def odhlas_rucne(email: str, token: str) -> None:
         t = PENDING_LOGOUTS.pop(token, None)
         if t:
             t.cancel()
+
+
+# ========================================================
+# Druhá brána (step-up ověření) pro citlivé moduly
+# ========================================================
+# Odemčení je vázané na `login_token` aktuálního přihlášení (odhlášení / nové
+# přihlášení ho zruší) a po BRANA_PLATNOST_S vyprší. Ověřit se jde kódem 2FA,
+# nebo znovu přes Entra ID (/auth/login?brana=<nazev>).
+BRANY = {'podklady_vr': '/asm'}      # název brány → kam se vrátit po ověření přes M365
+BRANA_PLATNOST_S = 30 * 60
+
+
+def brana_odemcena(nazev: str) -> bool:
+    """Fail closed: chyba úložiště / jiné přihlášení / vypršení = zamčeno."""
+    try:
+        b = app.storage.user.get(f'brana_{nazev}') or {}
+        token = app.storage.user.get('login_token')
+        return bool(token) and b.get('token') == token and float(b.get('do') or 0) > time.time()
+    except Exception:
+        return False
+
+
+def odemkni_branu(nazev: str) -> None:
+    app.storage.user[f'brana_{nazev}'] = {
+        'token': app.storage.user.get('login_token'),
+        'do': time.time() + BRANA_PLATNOST_S,
+    }
+
+
+def zamkni_branu(nazev: str) -> None:
+    app.storage.user.pop(f'brana_{nazev}', None)

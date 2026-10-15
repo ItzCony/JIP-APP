@@ -36,22 +36,28 @@ def je_prihlasen() -> bool:
         return False
 
 
-def ma_pravo(pravo: str) -> bool:
-    """True, pokud přihlášený a aktivní uživatel requestu má `pravo`.
+def ma_pravo(pravo: str | tuple[str, ...]) -> bool:
+    """True, pokud přihlášený a aktivní uživatel requestu má `pravo`
+    (u n-tice aspoň jedno z nich).
 
     Čte práva z DB při každém requestu, takže odebrání práva platí hned.
     Chyba nebo výpadek DB (= prázdná práva) → False. Fail closed.
     """
+    hledana = {pravo} if isinstance(pravo, str) else set(pravo)
     try:
         prava, aktivni = intranet_data.ziskej_prava_a_aktivitu(app.storage.user.get('user_id'))
-        return aktivni and pravo in (p.lower() for p in prava)
+        return aktivni and any(p.lower() in hledana for p in prava)
     except Exception:
         return False
 
 
-def chranene_soubory(url_prefix: str, adresar: str, pravo: str | None = None) -> None:
+def chranene_soubory(url_prefix: str, adresar: str,
+                     pravo: str | tuple[str, ...] | None = None,
+                     kontrola=None) -> None:
     """Servíruje obsah `adresar` na `url_prefix` pouze přihlášeným uživatelům
-    (se zadaným `pravo` jen těm, kdo ho mají)."""
+    (se zadaným `pravo` jen těm, kdo ho mají; n-tice = stačí kterékoli).
+    `kontrola` = volitelná funkce bez argumentů, další podmínka (např. odemčená
+    druhá brána); výjimka = zamítnuto."""
     url_prefix = '/' + url_prefix.strip('/')
     if url_prefix in _ZAREGISTROVANE:
         return
@@ -68,6 +74,13 @@ def chranene_soubory(url_prefix: str, adresar: str, pravo: str | None = None) ->
         # jestli soubor existuje.
         if not je_prihlasen() or (pravo and not ma_pravo(pravo)):
             return PlainTextResponse('Nenalezeno', status_code=404)
+        if kontrola:
+            try:
+                povoleno = bool(kontrola())
+            except Exception:
+                povoleno = False
+            if not povoleno:
+                return PlainTextResponse('Nenalezeno', status_code=404)
         soubor = os.path.realpath(os.path.join(koren, cesta))
         if soubor != koren and not soubor.startswith(koren + os.sep):
             return PlainTextResponse('Nenalezeno', status_code=404)  # ../ traversal

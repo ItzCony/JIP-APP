@@ -162,7 +162,7 @@ def _prehled() -> list:
                     f'FROM {T_SOUBOR} ORDER BY obdobi DESC')
         soubory = cur.fetchall()
         cur.execute(f"SELECT soubor_id, list_klic, nakupci, COUNT(*) AS n, "
-                    f"SUM(TRIM(zapis) NOT IN ('', 'není', 'neni')) AS vypl "
+                    f"SUM(TRIM(zapis) <> '') AS vypl "
                     f"FROM {T_RADEK} GROUP BY soubor_id, list_klic, nakupci")
         pocty = {}
         for r in cur.fetchall():

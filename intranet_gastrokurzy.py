@@ -37,6 +37,8 @@ import gastrokurzy_seed_prezence
 import asyncio
 import calendar
 import datetime
+import json
+import re
 import unicodedata
 
 # ==========================================
@@ -76,7 +78,6 @@ _MESICE = ['', 'leden', 'únor', 'březen', 'duben', 'květen', 'červen',
            'červenec', 'srpen', 'září', 'říjen', 'listopad', 'prosinec']
 
 _db_init = False
-_POSLEDNI_SOUHRN_DATUM = None   # datum posledního odeslaného denního souhrnu
 
 
 # ==========================================
@@ -169,15 +170,17 @@ def inicializace_db():
             FOREIGN KEY (termin_id) REFERENCES gastrokurzy_termin (id) ON DELETE CASCADE
         ) ENGINE=InnoDB CHARACTER SET utf8mb4""")
         conn.commit()
-        # Stopa o denním souhrnu — v DB, ne v RAM, aby restart serveru nezpůsobil
+        # Stopa o e-mailu o změnách — v DB, ne v RAM, aby restart serveru nezpůsobil
         # druhé odeslání téhož termínu. Verze se počítá, nesrovnává s časem:
         # `updated_at` má granularitu 1 s, takže úprava ve stejné sekundě jako
         # rozesílka by se ztratila. Termíny existující v okamžiku migrace se
-        # označí za ohlášené (žádný mail zpětně za historii).
+        # označí za ohlášené (žádný mail zpětně za historii). `souhrn_data` =
+        # JSON ohlášeného stavu, z něj e-mail vypisuje „původně → nyní".
         for prikaz in (
             "ALTER TABLE gastrokurzy_termin ADD COLUMN verze INT NOT NULL DEFAULT 1",
             "ALTER TABLE gastrokurzy_termin ADD COLUMN souhrn_verze INT NULL",
             "ALTER TABLE gastrokurzy_termin ADD COLUMN souhrn_odeslan DATETIME NULL",
+            "ALTER TABLE gastrokurzy_termin ADD COLUMN souhrn_data TEXT NULL",
             "ALTER TABLE gastrokurzy_prihlaska ADD COLUMN provozovna VARCHAR(255) NULL AFTER ico",
             # IČO z prezenční listiny bývá i s názvem firmy („27553205 - JET Chlumec s.r.o.").
             "ALTER TABLE gastrokurzy_prihlaska MODIFY COLUMN ico VARCHAR(50) NULL",
@@ -331,6 +334,158 @@ def _txt(v):
     return str(v).strip() or None
 
 
+def _import_navrh(raw, zapsat=True):
+    """Import listu „Návrh kurzů" (KURZY_<rok>_termíny_a_přehled_kurzů….xlsx).
+
+    Sloupec A = místo, B = datum (lektor v komentáři „Lektor: …"), řádek 1 = název
+    kurzu, pod ním dvojice sloupců Pobočka + poč. Každé místo se zapíše jako řádek
+    „K doplnění" (bez jména, rezervace=0 – doplnit ho smí kdokoli s právem zápisu).
+    Termín se páruje podle místa a data; prázdný název a lektor se doplní,
+    vyplněné hodnoty se nepřepisují. Import jen dorovnává aktivní zápisy pobočky
+    na počet z Excelu a nic nemaže, takže jde spustit opakovaně.
+    zapsat=False → jen náhled, do DB se nic nezapíše.
+    """
+    import io
+    import re
+    import openpyxl
+    try:
+        # read_only by neumožnil číst sloučené buňky ani komentáře
+        ws = openpyxl.load_workbook(io.BytesIO(raw), data_only=True).worksheets[0]
+    except Exception as e:
+        return {'chyba': f'Soubor nejde přečíst: {e}'}
+
+    sloucene = {}
+    for m in ws.merged_cells.ranges:
+        for r in range(m.min_row, m.max_row + 1):
+            for c in range(m.min_col, m.max_col + 1):
+                sloucene[(r, c)] = (m.min_row, m.min_col)
+
+    def bunka(r, c):
+        return ws.cell(*sloucene.get((r, c), (r, c)))
+
+    kurzy = {c: _txt(bunka(1, c).value) for c in range(3, ws.max_column + 1)
+             if _bez_diakritiky(bunka(2, c).value).startswith('pobocka')
+             and _txt(bunka(1, c).value)}
+    if not kurzy:
+        return {'chyba': 'Tohle není Návrh kurzů – v 2. řádku chybí sloupce Pobočka / poč.'}
+    rok = re.search(r'(20\d\d)', str(ws['A1'].value or ''))
+    rok = int(rok[1]) if rok else datetime.date.today().year
+
+    bloky = {}          # (místo, datum, název) → {'lektor': …, 'pobocky': {klíč: počet}}
+    poznamky, nahlaseno = [], set()
+    for r in range(3, ws.max_row + 1):
+        misto = next((m for m in MISTA if _bez_diakritiky(m) == _bez_diakritiky(bunka(r, 1).value)),
+                     None)
+        bd = bunka(r, 2)
+        if not misto or bd.value is None:
+            continue
+        if isinstance(bd.value, datetime.datetime):
+            d = bd.value.date()
+        else:
+            mm = re.match(r'\s*(\d{1,2})\.\s*(\d{1,2})\.?\s*$', str(bd.value))
+            try:
+                d = datetime.date(rok, int(mm[2]), int(mm[1])) if mm else None
+            except ValueError:
+                d = None
+        if not d:
+            if bd.coordinate not in nahlaseno:
+                nahlaseno.add(bd.coordinate)
+                poznamky.append(f'{bd.coordinate}: datum „{bd.value}" – přeskočeno')
+            continue
+        lektor = re.search(r'Lektor\s*:\s*([^\n]+)', bd.comment.text) if bd.comment else None
+        lektor = lektor[1].strip() if lektor else None
+        for c, nazev in kurzy.items():
+            p = _txt(ws.cell(r, c).value)
+            if not p:
+                continue
+            n = _txt(ws.cell(r, c + 1).value)
+            mm = re.match(r'^(.*?)\s+(\d+)$', p)
+            if n is None and mm:            # „Praha 2" bez vyplněného počtu
+                p, n = mm[1], mm[2]
+            klic = _klic_pobocky(p)
+            if not klic or not str(n or '').isdigit():
+                poznamky.append(f'{ws.cell(r, c).coordinate}: „{p}" / {n} – nerozpoznáno')
+                continue
+            b = bloky.setdefault((misto, d, nazev), {'lektor': lektor, 'pobocky': {}})
+            b['pobocky'][klic] = b['pobocky'].get(klic, 0) + int(n)
+    if not bloky:
+        return {'chyba': 'V souboru nejsou žádné kurzy s pobočkami.'}
+
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return {'chyba': 'Databáze není dostupná.'}
+    cur = conn.cursor()
+    vysl = {'nove': 0, 'doplnene': 0, 'mist': 0, 'terminu': 0, 'radky': [], 'poznamky': poznamky}
+    try:
+        for (misto, d, nazev), b in sorted(bloky.items(), key=lambda x: (x[0][1], x[0][0])):
+            popis = f'{_fmt_datum(d)} {misto} – {nazev}'
+            cur.execute("""SELECT id, nazev, lektor FROM gastrokurzy_termin
+                  WHERE typ='standard' AND misto=%s AND datum=%s ORDER BY id""", (misto, d))
+            kandidati = cur.fetchall()
+            # při zdvojeném termínu vyhrává starší (nižší id)
+            shoda = (next((k for k in kandidati if _bez_diakritiky(k[1]) == _bez_diakritiky(nazev)), None)
+                     or next((k for k in kandidati if not (k[1] or '').strip()), None))
+            if kandidati and not shoda:
+                poznamky.append(f'{popis}: v intranetu je ten den „{kandidati[0][1]}" – přeskočeno')
+                continue
+            vysl['terminu'] += 1
+            tid, stav_db, akce = None, {}, ''
+            if shoda:
+                tid = shoda[0]
+                dopln = [k for k, je in (('název', not (shoda[1] or '').strip()),
+                                         ('lektor', b['lektor'] and not (shoda[2] or '').strip())) if je]
+                if dopln:
+                    vysl['doplnene'] += 1
+                    akce = 'doplněn ' + ' + '.join(dopln)
+                    if zapsat:
+                        cur.execute("""UPDATE gastrokurzy_termin
+                              SET nazev = COALESCE(NULLIF(TRIM(nazev), ''), %s),
+                                  lektor = COALESCE(NULLIF(TRIM(lektor), ''), %s)
+                              WHERE id=%s""", (nazev, b['lektor'], tid))
+                cur.execute("""SELECT pobocka_klic, COUNT(*) FROM gastrokurzy_prihlaska
+                      WHERE termin_id=%s AND stav='aktivni' GROUP BY pobocka_klic""", (tid,))
+                stav_db = {k: int(n) for k, n in cur.fetchall()}
+            else:
+                vysl['nove'] += 1
+                akce = 'nový termín'
+                if zapsat:
+                    # souhrn_odeslan = NOW(): import se do denního souhrnu nehlásí
+                    cur.execute("""INSERT INTO gastrokurzy_termin
+                          (typ, misto, datum, nazev, lektor, stav, zdroj, souhrn_verze, souhrn_odeslan)
+                          VALUES ('standard', %s, %s, %s, %s, 'aktivni', 'import-navrh', 1, NOW())""",
+                                (misto, d, nazev, b['lektor']))
+                    tid = cur.lastrowid
+            pridat, vic = [], []
+            for klic, pocet in b['pobocky'].items():
+                chybi = pocet - stav_db.get(klic, 0)
+                nazev_p = POBOCKY_NAZVY.get(klic, klic)
+                if chybi > 0:
+                    pridat.append(f'{nazev_p} +{chybi}')
+                    vysl['mist'] += chybi
+                    if zapsat:
+                        cur.executemany("""INSERT INTO gastrokurzy_prihlaska
+                              (termin_id, pobocka_klic, rezervace, zapsal)
+                              VALUES (%s, %s, 0, 'import-navrh')""", [(tid, klic)] * chybi)
+                elif chybi < 0:
+                    vic.append(f'{nazev_p}: v intranetu {stav_db[klic]}, v Excelu {pocet}')
+            if pridat or akce:
+                vysl['radky'].append(f"{popis}: {', '.join(([akce] if akce else []) + pridat)}")
+            if vic:
+                poznamky.append(f"{popis} – víc zápisů než v Excelu (nic se nemaže): {'; '.join(vic)}")
+        if zapsat:
+            conn.commit()
+        else:
+            conn.rollback()
+        return vysl
+    except Exception as e:
+        conn.rollback()
+        print(f"[gastrokurzy] Import Návrhu kurzů: {e}")
+        return {'chyba': f'Import selhal: {e}'}
+    finally:
+        cur.close()
+        conn.close()
+
+
 def _import_excel(raw):
     """Import kurzů i účastníků z Excelu (jeden řádek = jeden účastník).
 
@@ -437,6 +592,228 @@ def _import_excel(raw):
 
 
 # ==========================================
+# EXPORT DO EXCELU (blokující – volat přes asyncio.to_thread)
+# ==========================================
+XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+
+
+def _nazev_souboru(*casti, pripona='xlsx'):
+    """('prezencka', date, 'Praha') → 'prezencka_2026-09-09_praha.xlsx' (jen ASCII)."""
+    return '_'.join(re.sub(r'[^a-z0-9]+', '-', _bez_diakritiky(c)).strip('-')
+                    for c in casti if c) + '.' + pripona
+
+
+def _export_xlsx(terminy, prihlasky, titulek, podtitulek):
+    """Formátovaný .xlsx (bytes) s účastníky zadaných termínů.
+
+    Jeden termín → list „Prezenční listina" (údaje kurzu v podtitulku).
+    Víc termínů → list „Kurzy" (přehled s počty) + list „Účastníci" se sloupci kurzu.
+    prihlasky = zápisy (dicty s termin_id); zápisy jiných termínů se ignorují,
+    zrušené jsou na konci kurzu šedé a přeškrtnuté.
+    """
+    import io
+    import openpyxl
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+
+    tenka = Side(style='thin', color='D1D5DB')
+    ramecek = Border(left=tenka, right=tenka, top=tenka, bottom=tenka)
+    zebra = PatternFill('solid', fgColor='FFF1F2')
+    H = 4                                   # řádek hlavičky tabulky
+
+    def _list(ws, sloupce, radky, zrusene, souhrn=None):
+        ws['A1'] = titulek
+        ws['A1'].font = Font(bold=True, size=14, color='E11D48')
+        ws['A2'] = podtitulek
+        ws['A2'].font = Font(italic=True, color='6B7280')
+        for c, (nadpis, sirka) in enumerate(sloupce, 1):
+            b = ws.cell(row=H, column=c, value=nadpis)
+            b.font = Font(bold=True, color='FFFFFF')
+            b.fill = PatternFill('solid', fgColor='E11D48')
+            b.border = ramecek
+            b.alignment = Alignment(vertical='center', wrap_text=True)
+            ws.column_dimensions[get_column_letter(c)].width = sirka
+        for i, hodnoty in enumerate(radky):
+            for c, v in enumerate(hodnoty, 1):
+                b = ws.cell(row=H + 1 + i, column=c, value=v)
+                b.border = ramecek
+                b.alignment = Alignment(vertical='top', wrap_text=True)
+                if isinstance(v, datetime.date):
+                    b.number_format = 'DD.MM.YYYY'
+                if i in zrusene:
+                    b.font = Font(color='9CA3AF', strike=True)
+                elif i % 2:
+                    b.fill = zebra
+        for c, v in (souhrn or {}).items():
+            ws.cell(row=H + 1 + len(radky), column=c, value=v).font = Font(bold=True)
+        ws.freeze_panes = ws.cell(row=H + 1, column=1)
+        ws.auto_filter.ref = f'A{H}:{get_column_letter(len(sloupce))}{H + max(len(radky), 1)}'
+        ws.print_title_rows = f'{H}:{H}'
+        ws.page_setup.orientation = 'landscape'
+        ws.page_setup.fitToWidth, ws.page_setup.fitToHeight = 1, 0
+        ws.sheet_properties.pageSetUpPr.fitToPage = True
+
+    podle_terminu = {}
+    for p in prihlasky:
+        podle_terminu.setdefault(p['termin_id'], []).append(p)
+    vice = len(terminy) > 1
+    wb = openpyxl.Workbook()
+    ws = wb.active
+
+    if vice:
+        ws.title = 'Kurzy'
+        radky, zrusene = [], set()
+        for t in terminy:
+            pp = podle_terminu.get(t['id'], [])
+            if t['stav'] == 'zruseno':
+                zrusene.add(len(radky))
+            radky.append([
+                t['datum'], t['nazev'] or '',
+                t.get('firma') or ('dodavatel' if t['typ'] == 'top' else 'JIP'),
+                t['misto'] or '', t['lektor'] or '', t.get('kapacita') or None,
+                sum(p['stav'] == 'aktivni' for p in pp), _volna_mista(t, pp),
+                sum(p['stav'] == 'zruseno' for p in pp),
+                ', '.join(f'{POBOCKY_NAZVY.get(k, k)} {n}' for k, n in t.get('pobocky', [])),
+                'Zrušen' if t['stav'] == 'zruseno' else 'Aktivní'])
+        _list(ws, [('Datum', 12), ('Kurz', 34), ('Pořadatel', 13), ('Místo', 11), ('Lektor', 22),
+                   ('Kapacita', 10), ('Přihlášeno', 11), ('Volná místa', 11),
+                   ('Zrušené zápisy', 11), ('Pobočky', 40), ('Stav termínu', 12)],
+              radky, zrusene, souhrn={1: 'Celkem', 7: sum(r[6] for r in radky)})
+        ws = wb.create_sheet('Účastníci')
+    else:
+        ws.title = 'Prezenční listina'
+
+    radky, zrusene = [], set()
+    for t in terminy:
+        kurz = [t['datum'], t['nazev'] or '', t['misto'] or ''] if vice else []
+        for p in sorted(podle_terminu.get(t['id'], []), key=lambda p: p['stav'] == 'zruseno'):
+            if p['stav'] == 'zruseno':
+                zrusene.add(len(radky))
+            radky.append([len(radky) + 1] + kurz + [
+                POBOCKY_NAZVY.get(p['pobocka_klic'], p['pobocka_klic'] or ''),
+                p['oz'] or '', p['ico'] or '', p['provozovna'] or '',
+                p['zakaznik'] or ('(rezervace)' if p.get('rezervace') else ''),
+                p['funkce'] or '', p['telefon'] or '', '✓' if p['podpis'] else '',
+                'Zrušeno' if p['stav'] == 'zruseno' else 'Aktivní', p['zapsal'] or ''])
+    _list(ws, [('Č.', 5)] + ([('Datum', 12), ('Kurz', 30), ('Místo', 11)] if vice else []) + [
+              ('Pobočka', 16), ('OZ', 12), ('IČO', 12), ('Provozovna', 28),
+              ('Jméno zákazníka', 26), ('Funkce', 18), ('Telefon', 15), ('Podpis', 14),
+              ('Stav', 10), ('Zapsal', 20)],
+          radky, zrusene)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+# ==========================================
+# EXPORT DO PDF – jen tabulka zapsaných z prezenčky (Playwright/Chromium)
+# ==========================================
+PDF_MIME = 'application/pdf'
+_PDF_ZAMEK = None
+_SVG_FAJFKA = ('<svg viewBox="0 0 12 12"><polyline points="2.5,6.2 5,8.7 9.5,3.5" fill="none" '
+               'stroke="#fff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>')
+
+
+def _pdf_zamek():
+    """V jeden okamžik běží jen jedno Chromium (paměť serveru)."""
+    global _PDF_ZAMEK
+    if _PDF_ZAMEK is None:
+        _PDF_ZAMEK = asyncio.Semaphore(1)
+    return _PDF_ZAMEK
+
+
+def _prezencka_html(prihlasky, titulek):
+    """HTML jen s tabulkou zapsaných – stejné sloupce a vzhled jako prezenčka v aplikaci."""
+    from html import escape as e
+    radky = []
+    for p in prihlasky:
+        jmeno = (p['zakaznik'] or '').strip()
+        if jmeno:
+            jmeno_td = f'<td class="jm">{e(jmeno)}</td>'
+        elif p.get('rezervace'):
+            jmeno_td = '<td class="rez">Rezervováno</td>'
+        else:
+            jmeno_td = '<td class="dopl">K doplnění</td>'
+        radky.append(
+            '<tr>'
+            f'<td class="pob">{e(POBOCKY_NAZVY.get(p["pobocka_klic"], p["pobocka_klic"] or ""))}</td>'
+            f'<td>{e(p["oz"] or "—")}</td>'
+            f'<td class="ico">{e(p["ico"] or "—")}</td>'
+            f'<td>{e(p["provozovna"] or "—")}</td>'
+            f'{jmeno_td}'
+            f'<td>{e(p["funkce"] or "—")}</td>'
+            f'<td>{e(p["telefon"] or "—")}</td>'
+            f'<td class="pod"><span class="box{" ok" if p["podpis"] else ""}">'
+            f'{_SVG_FAJFKA if p["podpis"] else ""}</span></td>'
+            '</tr>')
+    if not radky:
+        radky.append('<tr><td colspan="8" class="prazdne">Zatím se nikdo nezapsal.</td></tr>')
+    return (
+        '<!DOCTYPE html><html lang="cs"><head><meta charset="utf-8">'
+        f'<title>{e(titulek)}</title><style>'
+        '*{box-sizing:border-box}'
+        'body{margin:0;font-family:Roboto,"Segoe UI",Arial,sans-serif;font-size:9pt;color:#374151}'
+        'table{width:100%;border-collapse:collapse}'
+        'thead{display:table-header-group}'
+        'tr{page-break-inside:avoid}'
+        'th{background:#f3f4f6;color:#6b7280;font-size:7pt;font-weight:900;text-transform:uppercase;'
+        'letter-spacing:.04em;text-align:left;padding:7px 6px}'
+        'th:first-child{border-top-left-radius:4px}th:last-child{border-top-right-radius:4px}'
+        'td{padding:6px;border-bottom:1px solid #f3f4f6;vertical-align:middle}'
+        '.pob{font-weight:700;color:#1f2937}'
+        '.ico{font-family:"Roboto Mono",Consolas,"DejaVu Sans Mono",monospace;font-size:8.5pt}'
+        '.jm{font-weight:600;color:#1f2937}'
+        '.rez{font-style:italic;color:#6366f1}.dopl{font-style:italic;color:#d97706}'
+        '.pod{text-align:center}'
+        '.box{display:inline-block;width:13px;height:13px;border:1.5px solid #6b7280;'
+        'border-radius:2px;vertical-align:middle}'
+        '.box.ok{background:#1976d2;border-color:#1976d2}.box svg{display:block;width:100%;height:100%}'
+        '.prazdne{text-align:center;color:#9ca3af;padding:24px}'
+        '</style></head><body><table><colgroup>'
+        '<col style="width:13%"><col style="width:9%"><col style="width:9%"><col style="width:17%">'
+        '<col style="width:19%"><col style="width:14%"><col style="width:11%"><col style="width:8%">'
+        '</colgroup><thead><tr>'
+        + ''.join(f'<th>{h}</th>' for h in ('Pobočka', 'OZ', 'IČO', 'Provozovna',
+                                             'Jméno zákazníka', 'Funkce', 'Telefon'))
+        + '<th class="pod">Podpis</th>'
+        + '</tr></thead><tbody>' + ''.join(radky) + '</tbody></table></body></html>')
+
+
+async def _render_pdf(html_, zapati):
+    """HTML → PDF (A4 na šířku) přes Playwright/Chromium; zapati = text vlevo v patičce."""
+    from html import escape
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError as e:
+        raise RuntimeError('Na serveru chybí Playwright (pip install playwright; '
+                           f'playwright install chromium). Detail: {e}')
+    async with _pdf_zamek():
+        async with async_playwright() as pw:
+            try:
+                browser = await pw.chromium.launch()
+            except Exception as e:
+                raise RuntimeError(f'Nepodařilo se spustit Chromium ({e}). '
+                                   'Spusťte na serveru: playwright install chromium')
+            try:
+                page = await browser.new_page()
+                await page.set_content(html_, wait_until='load')
+                return await page.pdf(
+                    format='A4', landscape=True, print_background=True,
+                    margin={'top': '10mm', 'right': '10mm', 'bottom': '13mm', 'left': '10mm'},
+                    display_header_footer=True, header_template='<div></div>',
+                    footer_template=(
+                        '<div style="width:100%;font-size:7pt;color:#9ca3af;'
+                        'font-family:Arial,sans-serif;padding:0 10mm;'
+                        'display:flex;justify-content:space-between;">'
+                        f'<span>{escape(zapati)}</span>'
+                        '<span>Strana <span class="pageNumber"></span> / '
+                        '<span class="totalPages"></span></span></div>'))
+            finally:
+                await browser.close()
+
+
+# ==========================================
 # DB VRSTVA (blokující – volat přes asyncio.to_thread)
 # ==========================================
 def _nacti_terminy(typ):
@@ -504,8 +881,8 @@ def _nacti_vsechny_prihlasky():
         return []
     cur = conn.cursor(dictionary=True)
     try:
-        cur.execute("""SELECT p.id, p.pobocka_klic, p.oz, p.ico, p.provozovna, p.zakaznik,
-                      p.funkce, p.telefon, p.podpis, p.stav, p.zapsal,
+        cur.execute("""SELECT p.id, p.termin_id, p.pobocka_klic, p.oz, p.ico, p.provozovna,
+                      p.zakaznik, p.funkce, p.telefon, p.podpis, p.rezervace, p.stav, p.zapsal,
                       t.datum, t.misto, t.nazev, t.firma, t.lektor, t.typ
                   FROM gastrokurzy_prihlaska p
                   JOIN gastrokurzy_termin t ON t.id = p.termin_id
@@ -527,6 +904,7 @@ def _uloz_termin(data, termin_id=None):
     cur = conn.cursor()
     try:
         if termin_id:
+            _zachyt_ohlaseny_stav(cur, termin_id)
             cur.execute("""UPDATE gastrokurzy_termin
                   SET typ=%s, misto=%s, datum=%s, nazev=%s, firma=%s, lektor=%s,
                       kapacita=%s, stav=%s, poznamka=%s, verze = verze + 1
@@ -695,90 +1073,154 @@ def _nazvy_kurzu():
 
 
 # ==========================================
-# E-MAILY – denní souhrn nových a upravených termínů
+# E-MAILY – ruční rozeslání nových a upravených termínů
 # ==========================================
-def _nacti_neohlasene_terminy():
-    """Termíny, které ještě nebyly v souhrnu, nebo se od něj změnily.
+# Údaje, které příjemce v e-mailu vidí; jejich ohlášený stav drží `souhrn_data`.
+_POLE_OHLASENI = ('typ', 'misto', 'datum', 'nazev', 'firma', 'lektor', 'kapacita', 'stav', 'poznamka')
 
-    Kritérium je v datech (sloupec `souhrn_odeslan`), ne v časovém okně — restart
-    serveru ani zmeškaná minuta časovače tedy nic neduplikuje ani neztratí.
-    """
+
+def _snimek_terminu(t):
+    """Porovnatelný stav termínu (JSON-serializovatelný, prázdný text = None)."""
+    s = {}
+    for k in _POLE_OHLASENI:
+        v = t.get(k)
+        if isinstance(v, (datetime.date, datetime.datetime)):
+            v = v.isoformat()[:10]
+        elif isinstance(v, str):
+            v = v.strip() or None
+        elif k == 'kapacita' and v is not None:
+            v = int(v)
+        s[k] = v
+    return s
+
+
+def _zachyt_ohlaseny_stav(cur, termin_id):
+    """Před úpravou uloží snímek termínu, je-li jeho současný stav ohlášený a snímek
+    chybí (termíny z importu a z doby před zavedením `souhrn_data`) — jinak by
+    e-mail neměl s čím porovnat."""
+    cur.execute(f"""SELECT {', '.join(_POLE_OHLASENI)} FROM gastrokurzy_termin
+          WHERE id=%s AND souhrn_data IS NULL AND souhrn_verze = verze""", (termin_id,))
+    row = cur.fetchone()
+    if row:
+        t = row if isinstance(row, dict) else dict(zip(_POLE_OHLASENI, row))
+        cur.execute("UPDATE gastrokurzy_termin SET souhrn_data=%s, updated_at=updated_at WHERE id=%s",
+                    (json.dumps(_snimek_terminu(t), ensure_ascii=False), termin_id))
+
+
+def _nacti_neohlasene_terminy():
+    """Termíny, které ještě nebyly rozeslány, nebo se od rozeslání změnily.
+    None = chyba DB. `puvodne` = ohlášený snímek (None u nového / neznámého)."""
     conn = intranet_data.get_db_connection()
     if not conn:
-        return []
+        return None
     cur = conn.cursor(dictionary=True)
     try:
-        cur.execute("""SELECT t.*,
-                  SUM(p.stav = 'aktivni') AS pocet,
-                  (t.souhrn_verze IS NULL) AS je_novy
-              FROM gastrokurzy_termin t
-              LEFT JOIN gastrokurzy_prihlaska p ON p.termin_id = t.id
-              WHERE t.souhrn_verze IS NULL OR t.souhrn_verze < t.verze
-              GROUP BY t.id
-              ORDER BY je_novy DESC, t.datum IS NULL, t.datum, t.misto, t.nazev""")
+        cur.execute("""SELECT t.*, SUM(p.stav = 'aktivni') AS pocet,
+                              (t.souhrn_verze IS NULL) AS je_novy
+                         FROM gastrokurzy_termin t
+                         LEFT JOIN gastrokurzy_prihlaska p ON p.termin_id = t.id
+                        WHERE t.souhrn_verze IS NULL OR t.souhrn_verze < t.verze
+                        GROUP BY t.id
+                        ORDER BY je_novy DESC, t.datum IS NULL, t.datum, t.misto, t.nazev""")
         terminy = cur.fetchall()
         for t in terminy:
             t['pocet'] = int(t['pocet'] or 0)
             t['je_novy'] = bool(t['je_novy'])
             t['volno'] = max(0, int(t['kapacita']) - t['pocet']) if t['kapacita'] else None
+            try:
+                t['puvodne'] = json.loads(t['souhrn_data']) if t.get('souhrn_data') else None
+            except ValueError:
+                t['puvodne'] = None
         return terminy
     except Exception as e:
-        print(f"[gastrokurzy] Načtení nenahlášených termínů: {e}")
-        return []
+        print(f"[gastrokurzy] Načtení neohlášených termínů: {e}")
+        return None
     finally:
         cur.close()
         conn.close()
 
 
 def _oznac_jako_ohlasene(terminy):
-    """Uloží, KTERÁ verze termínu byla ohlášena (`souhrn_odeslan` = jeho `updated_at`
-    z okamžiku sestavení mailu), ne kdy se mail poslal.
-
-    Díky tomu se úprava provedená ve stejné sekundě jako rozesílka neztratí a
-    naopak se nic neohlásí dvakrát. `updated_at = updated_at` potlačí
-    ON UPDATE NOW(), jinak by se termín tímto zápisem sám označil za změněný.
-    """
+    """Uloží ohlášenou verzi a její snímek. Verze je ta načtená před odesláním —
+    úprava provedená mezitím zůstane neohlášená a nabídne se příště."""
     if not terminy:
-        return
+        return True
     conn = intranet_data.get_db_connection()
     if not conn:
-        return
+        return False
     cur = conn.cursor()
     try:
         cur.executemany("""UPDATE gastrokurzy_termin
-              SET souhrn_verze = %s, souhrn_odeslan = NOW(), updated_at = updated_at
+              SET souhrn_verze = %s, souhrn_odeslan = NOW(), souhrn_data = %s,
+                  updated_at = updated_at
               WHERE id = %s""",
-                        [(t['verze'], t['id']) for t in terminy])
+                        [(t['verze'], json.dumps(_snimek_terminu(t), ensure_ascii=False), t['id'])
+                         for t in terminy])
         conn.commit()
+        return True
     except Exception as e:
-        print(f"[gastrokurzy] Označení odeslaného souhrnu: {e}")
+        print(f"[gastrokurzy] Označení ohlášených termínů: {e}")
+        return False
     finally:
         cur.close()
         conn.close()
 
 
+def _hodnota_pole(klic, v):
+    """Hodnota údaje pro e-mail."""
+    if klic == 'datum':
+        return _fmt_datum(datetime.date.fromisoformat(v) if isinstance(v, str) else v)
+    if klic == 'stav':
+        return 'TERMÍN ZRUŠEN' if v == 'zruseno' else 'aktivní'
+    if klic == 'typ':
+        return 'TOP' if v == 'top' else 'běžný'
+    if klic == 'kapacita':
+        return 'neomezeno' if v is None else str(v)
+    if klic == 'nazev' and v is None:
+        return '(bez názvu)'
+    return '—' if v is None else str(v)
+
+
+def _zmenena_pole(t):
+    """Klíče údajů změněných od ohlášení (prázdné, když snímek chybí)."""
+    p = t.get('puvodne')
+    if not p:
+        return []
+    s = _snimek_terminu(t)
+    return [k for k in _POLE_OHLASENI if p.get(k) != s[k]]
+
+
 def _blok_terminu(t):
-    """Odstavec jednoho termínu v e-mailu."""
-    radky = [f"Kurz:          {t['nazev'] or '(bez názvu)'}"]
-    if t['typ'] == 'top' and t.get('firma'):
-        radky.append(f"Firma:         {t['firma']}")
-    radky.append(f"Místo konání:  {t['misto']}")
-    radky.append(f"Datum:         {_fmt_datum(t['datum'])}")
-    if t.get('lektor'):
-        radky.append(f"Lektor:        {t['lektor']}")
-    if t['volno'] is None:
-        radky.append("Volná místa:   neomezeno")
-    else:
-        radky.append(f"Volná místa:   {t['volno']} z {t['kapacita']}")
-    if t['stav'] == 'zruseno':
-        radky.append("Stav:          TERMÍN ZRUŠEN")
-    if t.get('poznamka'):
-        radky.append(f"Poznámka:      {t['poznamka']}")
+    """Odstavec jednoho termínu v e-mailu; změněné údaje jako „► původně → nyní"."""
+    s = _snimek_terminu(t)
+    p = t.get('puvodne') or {}
+    zmeny = set(_zmenena_pole(t))
+    radky = []
+    odsaz = '  ' if zmeny else ''      # ať nezměněné řádky lícují s „► …“
+
+    def radek(popis, klic, vzdy=True):
+        if klic in zmeny:
+            radky.append(f"► {popis + ':':<15}{_hodnota_pole(klic, p.get(klic))} → "
+                         f"{_hodnota_pole(klic, s[klic])}")
+        elif vzdy:
+            radky.append(f"{odsaz}{popis + ':':<15}{_hodnota_pole(klic, s[klic])}")
+
+    radek('Kurz', 'nazev')
+    radek('Typ', 'typ', vzdy=False)
+    radek('Firma', 'firma', vzdy=s['typ'] == 'top' and bool(s['firma']))
+    radek('Místo konání', 'misto')
+    radek('Datum', 'datum')
+    radek('Lektor', 'lektor', vzdy=bool(s['lektor']))
+    radek('Kapacita', 'kapacita', vzdy=False)
+    radky.append(f"{odsaz}{'Volná místa:':<15}"
+                 + ('neomezeno' if t['volno'] is None else f"{t['volno']} z {t['kapacita']}"))
+    radek('Stav', 'stav', vzdy=s['stav'] == 'zruseno')
+    radek('Poznámka', 'poznamka', vzdy=bool(s['poznamka']))
     return '\n'.join(radky)
 
 
 def _text_souhrnu(terminy):
-    """Tělo souhrnného e-mailu; None = není co poslat."""
+    """Tělo e-mailu o změnách; None = není co poslat."""
     nove = [t for t in terminy if t['je_novy']]
     zmenene = [t for t in terminy if not t['je_novy']]
     if not nove and not zmenene:
@@ -789,7 +1231,8 @@ def _text_souhrnu(terminy):
         casti.append(f"v Gastrokurzech přibyly nové termíny ({len(nove)}):\n")
         casti.append('\n\n'.join(_blok_terminu(t) for t in nove))
     if zmenene:
-        casti.append(f"\nUpravené termíny ({len(zmenene)}):\n")
+        casti.append(f"{chr(10) + 'Upravené' if nove else 'v Gastrokurzech byly upraveny'} termíny "
+                     f"({len(zmenene)}) — změny jsou označené ►, ve tvaru původně → nyní:\n")
         casti.append('\n\n'.join(_blok_terminu(t) for t in zmenene))
     casti.append("\nPřihlášky na kurzy zapisujte v modulu Gastrokurzy.")
     if intranet_data.APP_URL:
@@ -797,23 +1240,27 @@ def _text_souhrnu(terminy):
     return '\n'.join(casti)
 
 
-def _odesli_souhrn():
-    """Sestaví a rozešle denní souhrn zapisovatelům. Blokující.
+def _predmet_souhrnu(terminy):
+    nove = sum(1 for t in terminy if t['je_novy'])
+    upravene = len(terminy) - nove
+    casti = ([f"nové termíny ({nove})"] if nove else []) \
+        + ([f"upravené termíny ({upravene})"] if upravene else [])
+    return "Gastrokurzy – " + ", ".join(casti)
 
-    Termín se označí za nahlášený jen při skutečném odeslání — když e-maily
-    selžou, zůstane ve frontě na další den, místo aby tiše zmizel.
-    """
-    terminy = _nacti_neohlasene_terminy()
+
+def _odesli_souhrn(terminy, user_name):
+    """Rozešle e-mail o změnách zapisovatelům (spouští správce tlačítkem). Blokující.
+    `terminy` = přesně ty, které správce viděl v náhledu.
+
+    Termíny se označí za ohlášené jen při skutečném odeslání — když e-maily
+    selžou, zůstanou v nabídce k dalšímu odeslání. Vrací (odeslano, pocet_prijemcu)."""
     text = _text_souhrnu(terminy)
     if not text:
-        return
+        return 0, 0
     prijemci = intranet_data.ziskej_emaily_s_pravem('gastrokurzy_zapisovatel')
     if not prijemci:
-        print("[gastrokurzy] Souhrn: žádný příjemce s právem gastrokurzy_zapisovatel")
-        return
-    pocet_novych = sum(1 for t in terminy if t['je_novy'])
-    predmet = (f"Gastrokurzy – {pocet_novych} nových termínů" if pocet_novych
-               else "Gastrokurzy – upravené termíny")
+        return 0, 0
+    predmet = _predmet_souhrnu(terminy)
     odeslano = 0
     for p in prijemci:
         try:
@@ -824,33 +1271,9 @@ def _odesli_souhrn():
     if odeslano:
         _oznac_jako_ohlasene(terminy)
     intranet_logger.log_activity(
-        "Systém Gastrokurzy", LOG_KATEGORIE,
-        f"Denní souhrn: {odeslano}/{len(prijemci)} příjemců, {len(terminy)} termínů")
-
-
-async def bg_gastrokurzy_souhrn():
-    """Jednou denně (výchozí 12:00) rozešle souhrn nových a upravených termínů.
-
-    Hlídá „dnes už proběhlo" jen v RAM kvůli zbytečným dotazům; proti duplicitě
-    po restartu chrání `souhrn_odeslan` v DB. Podmínka je `>= čas`, ne rovnost na
-    minutu — restart přes poledne tedy souhrn dožene, místo aby ho přeskočil.
-    """
-    global _POSLEDNI_SOUHRN_DATUM
-    await asyncio.sleep(120)
-    while True:
-        try:
-            nastaveni = intranet_data.nacti_nastaveni_intranetu()
-            if (nastaveni.get('gastrokurzy_zapnuty', True)
-                    and nastaveni.get('gastrokurzy_email_zapnuty', True)):
-                cas = str(nastaveni.get('gastrokurzy_email_cas', '12:00')).strip()
-                nyni = datetime.datetime.now()
-                if (nyni.strftime('%H:%M') >= cas
-                        and _POSLEDNI_SOUHRN_DATUM != nyni.date()):
-                    _POSLEDNI_SOUHRN_DATUM = nyni.date()
-                    await asyncio.to_thread(_odesli_souhrn)
-        except Exception as e:
-            print(f"[bg_gastrokurzy_souhrn] Chyba: {e}")
-        await asyncio.sleep(60)
+        user_name, LOG_KATEGORIE,
+        f"E-mail o změnách: {odeslano}/{len(prijemci)} příjemců, {len(terminy)} termínů")
+    return odeslano, len(prijemci)
 
 
 # ==========================================
@@ -887,6 +1310,44 @@ def vykresli(user_id, user_name, vsechna_prava):
         zruseny_termin = t['stav'] == 'zruseno'
         editovat = muze_zapisovat and not zruseny_termin
 
+        async def _export_prezencky():
+            # exportuje to, co je vidět – respektuje „Skrýt zrušené"
+            skryt = bool(app.storage.user.get(skryt_zrusene_key, False))
+            data = [p for p in ref['data'] if not skryt or p['stav'] == 'aktivni']
+            info = [t['misto'], _fmt_datum(t['datum']),
+                    f"lektor {t['lektor']}" if t['lektor'] else 'lektor neurčen']
+            if t.get('firma'):
+                info.append(f"firemní kurz {t['firma']}, kapacita {t.get('kapacita') or '—'} míst")
+            if zruseny_termin:
+                info.append('TERMÍN ZRUŠEN')
+            obsah = await asyncio.to_thread(
+                _export_xlsx, [t], data, f"Prezenční listina – {t['nazev'] or 'kurz'}",
+                ' · '.join(info))
+            ui.download.content(obsah, _nazev_souboru('prezencka', t['datum'], t['misto'],
+                                                      t['nazev']), XLSX_MIME)
+            intranet_logger.log_activity(
+                user_name, LOG_KATEGORIE,
+                f"Export účastníků kurzu {t['nazev']} ({t['misto']} {_fmt_datum(t['datum'])})")
+
+        async def _export_pdf():
+            # v PDF je vždy jen tabulka zapsaných (aktivní zápisy) – k tisku a podpisům
+            data = [p for p in ref['data'] if p['stav'] == 'aktivni']
+            popis = f"{t['nazev'] or 'Kurz'} – {t['misto']} {_fmt_datum(t['datum'])}"
+            notif = ui.notification('Připravuji PDF…', type='ongoing', spinner=True, timeout=None)
+            try:
+                obsah = await _render_pdf(_prezencka_html(data, f'Prezenční listina – {popis}'),
+                                          f'Prezenční listina – {popis}')
+            except Exception as e:
+                notif.dismiss()
+                ui.notify(f'Nepodařilo se vytvořit PDF: {e}', type='negative', multi_line=True)
+                return
+            notif.dismiss()
+            ui.download.content(obsah, _nazev_souboru('prezencka', t['datum'], t['misto'],
+                                                      t['nazev'], pripona='pdf'), PDF_MIME)
+            intranet_logger.log_activity(
+                user_name, LOG_KATEGORIE,
+                f"Export účastníků kurzu do PDF {t['nazev']} ({t['misto']} {_fmt_datum(t['datum'])})")
+
         # Dialog visí mimo _panel — _obnov() volá _panel.refresh(), který by ho
         # jinak smazal i s otevřenou prezenčkou (zrušení/zápis ji zavíral).
         with ui.context.client.layout, ui.dialog() as dlg, ui.card().classes('p-0 gap-0').style(
@@ -902,6 +1363,10 @@ def vykresli(user_id, user_name, vsechna_prava):
                     ui.icon('assignment_ind', size='2rem')
                     ui.label('Prezenční listina').classes('text-2xl font-extrabold')
                     ui.element('div').classes('flex-1')
+                    ui.button('Export do Excelu', icon='download', on_click=_export_prezencky).props(
+                        'flat no-caps color=white').classes('font-bold')
+                    ui.button('Export do PDF', icon='picture_as_pdf', on_click=_export_pdf).props(
+                        'flat no-caps color=white').classes('font-bold')
                     ui.button(icon='close', on_click=dlg.close).props('flat round color=white')
                 with ui.row().classes('items-center gap-6 mt-1'):
                     for ikona, text in (('place', t['misto']),
@@ -1231,6 +1696,63 @@ def vykresli(user_id, user_name, vsechna_prava):
     # =================================================================
     # DIALOG: TERMÍN KURZU (jen správce)
     # =================================================================
+    async def _otevri_email_dialog():
+        """Náhled e-mailu o nových/upravených termínech a jeho ruční rozeslání."""
+        terminy = await asyncio.to_thread(_nacti_neohlasene_terminy)
+        if terminy is None:
+            ui.notify('Termíny se nepodařilo načíst.', type='negative')
+            return
+        if not terminy:
+            ui.notify('Žádné nové ani upravené termíny k odeslání.')
+            _panel.refresh()
+            return
+        prijemci = await asyncio.to_thread(intranet_data.ziskej_emaily_s_pravem,
+                                           'gastrokurzy_zapisovatel') or []
+        with ui.dialog() as dlg, ui.card().classes('p-6 gap-3').style('min-width: 640px; max-width: 900px'):
+            ui.label('Odeslat změny e-mailem').classes('text-lg font-extrabold text-gray-800')
+            ui.label(f'Příjemci: {len(prijemci)} (všichni s právem zapisovat do Gastrokurzů)'
+                     if prijemci else 'Nikdo nemá právo zapisovat do Gastrokurzů – není komu poslat.'
+                     ).classes('text-xs ' + ('text-gray-500' if prijemci else 'text-red-600 font-bold'))
+            ui.label(f'Předmět: {_predmet_souhrnu(terminy)}').classes('text-sm font-bold text-gray-700')
+            ui.label(_text_souhrnu(terminy)) \
+                .classes('text-xs font-mono whitespace-pre-wrap bg-gray-50 border rounded p-3 w-full') \
+                .style('max-height: 55vh; overflow-y: auto')
+
+            async def _odeslat():
+                tl_odeslat.disable()
+                odeslano, celkem = await asyncio.to_thread(_odesli_souhrn, terminy, user_name)
+                if odeslano:
+                    ui.notify(f'E-mail odeslán {odeslano} z {celkem} příjemců.', type='positive')
+                    dlg.close()
+                    _panel.refresh()
+                else:
+                    ui.notify('E-mail se nepodařilo odeslat (SMTP?) – změny zůstávají k odeslání.',
+                              type='negative')
+                    tl_odeslat.enable()
+
+            async def _jen_oznacit():
+                if await asyncio.to_thread(_oznac_jako_ohlasene, terminy):
+                    intranet_logger.log_activity(
+                        user_name, LOG_KATEGORIE,
+                        f"Změny označeny jako ohlášené bez e-mailu: {len(terminy)} termínů")
+                    ui.notify('Označeno – tyto změny se už nebudou nabízet k odeslání.')
+                    dlg.close()
+                    _panel.refresh()
+                else:
+                    ui.notify('Označení se nezdařilo.', type='negative')
+
+            with ui.row().classes('w-full items-center gap-2 pt-2'):
+                ui.button('Neposílat, jen označit', on_click=_jen_oznacit) \
+                    .props('flat no-caps color=grey-7') \
+                    .tooltip('Např. po opravě překlepu – změny se už nebudou nabízet k odeslání')
+                ui.element('div').classes('flex-1')
+                ui.button('Zavřít', on_click=dlg.close).props('flat')
+                tl_odeslat = ui.button('Odeslat', icon='send', on_click=_odeslat) \
+                    .props('no-caps color=primary').classes('font-bold')
+                if not prijemci:
+                    tl_odeslat.disable()
+        dlg.open()
+
     def _otevri_import_dialog():
         """Nalití kurzů i účastníků z Excelu (prezenční listina v řádcích)."""
         with ui.dialog() as dlg, ui.card().classes('p-6 gap-3').style('min-width: 560px'):
@@ -1261,6 +1783,66 @@ def vykresli(user_id, user_name, vsechna_prava):
             ui.upload(label='Vybrat soubor (.xlsx)', on_upload=_nahraj, auto_upload=True,
                       max_file_size=20_000_000).props('accept=".xlsx" flat dense') \
                 .classes('w-full')
+
+            # --- Návrh kurzů: náhled → potvrzení ---
+            ui.separator().classes('my-2')
+            ui.label('Import Návrhu kurzů').classes('text-base font-extrabold text-gray-800')
+            ui.label('Soubor KURZY_…_termíny_a_přehled_kurzů: datum ve sloupci, název kurzu '
+                     'v 1. řádku, pod ním Pobočka + poč. Každé místo se zapíše jako „K doplnění" '
+                     '(jméno pak doplní OZ). Import jen dorovná počty podle Excelu, nic nemaže – '
+                     'jde ho pustit znovu po každé úpravě tabulky.').classes('text-xs text-gray-500')
+            navrh = {'raw': None}
+
+            @ui.refreshable
+            def _nahled(vysl=None, hotovo=False):
+                if not vysl:
+                    return
+                if vysl.get('chyba'):
+                    ui.label(vysl['chyba']).classes('text-sm font-bold text-red-600')
+                    return
+                ui.label(('Zapsáno' if hotovo else 'Náhled') +
+                         f" – termínů: {vysl['terminu']}, nových: {vysl['nove']}, "
+                         f"doplněných: {vysl['doplnene']}, míst k doplnění: +{vysl['mist']}"
+                         ).classes('text-sm font-bold ' + ('text-green-700' if hotovo else 'text-gray-700'))
+                with ui.scroll_area().classes('w-full h-56 border rounded'):
+                    for r in vysl['radky']:
+                        ui.label(r).classes('text-xs text-gray-700')
+                    for r in vysl['poznamky']:
+                        ui.label(f'⚠ {r}').classes('text-xs text-amber-700')
+                    if not vysl['radky'] and not vysl['poznamky']:
+                        ui.label('Intranet už odpovídá Excelu – není co doplnit.') \
+                            .classes('text-xs text-gray-500')
+                if not hotovo and (vysl['radky'] or vysl['nove']):
+                    ui.button('Zapsat do intranetu', icon='save', on_click=_zapis_navrh) \
+                        .props('unelevated color=primary')
+
+            async def _nahraj_navrh(e):
+                navrh['raw'] = await e.file.read()
+                _nahled.refresh(await asyncio.to_thread(_import_navrh, navrh['raw'], False))
+
+            async def _zapis_navrh():
+                if navrh.get('bezi'):       # dvojklik → dva souběžné zápisy = zdvojená místa
+                    return
+                navrh['bezi'] = True
+                try:
+                    vysl = await asyncio.to_thread(_import_navrh, navrh['raw'], True)
+                finally:
+                    navrh['bezi'] = False
+                _nahled.refresh(vysl, not vysl.get('chyba'))
+                if vysl.get('chyba'):
+                    ui.notify(vysl['chyba'], type='negative')
+                    return
+                intranet_logger.log_activity(
+                    user_name, LOG_KATEGORIE,
+                    f"Import Návrhu kurzů – nové termíny: {vysl['nove']}, doplněné: "
+                    f"{vysl['doplnene']}, míst k doplnění: {vysl['mist']}")
+                ui.notify('Návrh kurzů naimportován.', type='positive')
+                _panel.refresh()
+
+            ui.upload(label='Import Návrhu kurzů (.xlsx)', on_upload=_nahraj_navrh,
+                      auto_upload=True, max_file_size=20_000_000) \
+                .props('accept=".xlsx" flat dense').classes('w-full')
+            _nahled()
             with ui.row().classes('w-full justify-end pt-2'):
                 ui.button('Zavřít', on_click=dlg.close).props('flat')
         dlg.open()
@@ -1714,7 +2296,21 @@ def vykresli(user_id, user_name, vsechna_prava):
 
             with ui.row().classes('w-full items-center gap-2 mb-3'):
                 ui.element('div').classes('flex-1')
+                ui.button('Export do Excelu', icon='download',
+                          on_click=lambda: _export_obdobi(std)
+                          ).props('outline dense no-caps color=green-8').classes('font-bold') \
+                    .tooltip('Kurzy podle filtru (místo, typ, období) i s účastníky')
                 if je_spravce:
+                    cekajici = sum(1 for t in (ref['std'] or []) + (ref['top'] or [])
+                                   if t['souhrn_verze'] is None or t['souhrn_verze'] < t['verze'])
+                    with ui.button('Odeslat změny', icon='forward_to_inbox',
+                                   on_click=_otevri_email_dialog
+                                   ).props('outline dense no-caps color=orange-9'
+                                           if cekajici else 'outline dense no-caps color=grey-6'
+                                           ).classes('font-bold') \
+                            .tooltip('Rozeslat zapisovatelům e-mail o nových a upravených termínech'):
+                        if cekajici:
+                            ui.badge(str(cekajici), color='orange-9').props('floating')
                     ui.button('Import z Excelu', icon='upload_file',
                               on_click=_otevri_import_dialog
                               ).props('outline dense no-caps color=grey-8').classes('font-bold')
@@ -1763,6 +2359,33 @@ def vykresli(user_id, user_name, vsechna_prava):
                     continue
                 out.append(t)
             return out
+
+        async def _export_obdobi(terminy):
+            """Kurzy právě zobrazené v seznamu (období + filtry) i s účastníky do Excelu."""
+            if not terminy:
+                ui.notify('Filtru neodpovídá žádný kurz.', type='warning')
+                return
+            od, do = _parse_datum(filtr['od']), _parse_datum(filtr['do'])
+            if od or do:
+                popis = [f"Období {_fmt_datum(od) if od else '…'} – {_fmt_datum(do) if do else '…'}"]
+            else:
+                popis = ['Nadcházející kurzy' if filtr['skryt_stare'] else 'Všechny kurzy']
+            if filtr['misto'] != 'vse':
+                popis.append(filtr['misto'])
+            if filtr['typ'] != 'vse':
+                popis.append('kurzy JIP' if filtr['typ'] == 'standard' else 'kurzy dodavatel')
+            if filtr['hledej'].strip():
+                popis.append(f"hledáno „{filtr['hledej'].strip()}“")
+            popis.append(f'{len(terminy)} kurzů · export {_fmt_datum(datetime.date.today())}')
+            prihlasky = await asyncio.to_thread(_nacti_vsechny_prihlasky)
+            obsah = await asyncio.to_thread(_export_xlsx, terminy, prihlasky,
+                                            'Gastrokurzy – přehled kurzů a účastníků',
+                                            ' · '.join(popis))
+            nazev = (_nazev_souboru('gastrokurzy', od or 'zacatek', do or 'konec') if od or do
+                     else _nazev_souboru('gastrokurzy', datetime.date.today()))
+            ui.download.content(obsah, nazev, XLSX_MIME)
+            intranet_logger.log_activity(user_name, LOG_KATEGORIE,
+                                         f"Export kurzů do Excelu ({' · '.join(popis)})")
 
         # --- hlavička modulu ---
         with ui.row().classes('w-full items-center gap-3 mb-1'):

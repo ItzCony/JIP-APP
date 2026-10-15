@@ -13,6 +13,7 @@ import sys
 import traceback
 from contextlib import closing
 import intranet_data
+import intranet_halloween
 from intranet_ui_utils import refreshable_na_klienta
 from nicegui.element import Element
 
@@ -43,6 +44,9 @@ PRIKAZY = {
     '/dark-mode on': 'Zapne tmavý režim (testovací fáze) pro tvůj účet',
     '/dark-mode off': 'Vypne tmavý režim pro tvůj účet',
     '/modul': 'Otevře přepínač modulů portálu (zapnutí / vypnutí)',
+    '/halloween on': 'Zapne halloweenský vzhled přihlašovací stránky (i mimo říjen)',
+    '/halloween off': 'Vypne halloweenský vzhled přihlašovací stránky (i v říjnu)',
+    '/halloween auto': 'Halloweenský vzhled zase řídí datum — zapnutý celý říjen',
 }
 
 _EMAIL_RE = re.compile(r'[\w.+-]+@[\w.-]+\.\w+')
@@ -715,7 +719,7 @@ def _severity(uroven: str, zprava: str):
     t = (uroven + ' ' + zprava).lower()
     if any(k in t for k in ('chyb', 'error', 'exception', 'kritick', 'pád')):
         return 'chyba'
-    if any(k in t for k in ('varován', 'warning')):
+    if any(k in t for k in ('varován', 'warning', 'odepřen')):
         return 'warning'
     if 'zamítn' in t or 'zamitnut' in t:
         return 'zamitnut'
@@ -1110,6 +1114,20 @@ def vykresli_logy(user_name, vsechna_prava):
                   type='info', position='top', timeout=2000)
         ui.navigate.reload()  # přímo, bez ui.timer — konzole si přestavuje slot (padal parent slot)
 
+    def _nastav_halloween(volba):
+        # Globální vzhled přihlašovací stránky pro všechny — uloží se do nastavení
+        # portálu (přežije restart) a projeví se při dalším načtení přihlašovací stránky.
+        intranet_halloween.nastav_rezim({'on': True, 'off': False, 'auto': None}[volba])
+        if volba == 'auto':
+            stav = ('řízen datem (zapnutý celý říjen) — teď '
+                    + ('zapnutý' if intranet_halloween.je_halloween() else 'vypnutý'))
+        else:
+            stav = 'zapnut' if volba == 'on' else 'vypnut'
+        log_activity(user_name, 'Halloween',
+                     f'Příkaz /halloween {volba} — halloweenský vzhled přihlašovací stránky {stav}')
+        ui.notify(f'Halloweenský vzhled přihlašovací stránky {stav}.',
+                  type='info', position='top')
+
     def _muze_menit_moduly():
         # Konzoli vidí i právo admin_logy, ale moduly patří pod „Nastavení portálu"
         # (právo mysql). Bez téhle kontroly by konzole obešla oprávnění z UI.
@@ -1165,11 +1183,14 @@ def vykresli_logy(user_name, vsechna_prava):
             ui.button('Zavřít', on_click=dlg.close).props('flat no-caps color=grey-8').classes('self-end mt-3')
         dlg.open()
 
-    def _zpracuj_prikaz():
-        prikaz = (hledat_input.value or '').strip()
+    def _zpracuj_prikaz(e):
+        # Text přichází s Enterem přímo z pole (js_handler níž) — hodnota na serveru
+        # kvůli debounce=200 po rychlém Enteru ještě nese předchozí stav pole.
+        prikaz = (e.args if isinstance(e.args, str) else (hledat_input.value or '')).strip()
         if not prikaz.startswith('/'):
             return
         hledat_input.value = ''
+        prikaz = re.sub(r'^/haloween\b', '/halloween', prikaz)  # i s jedním „l"
         if prikaz == '/reboot':
             _potvrd_reboot()
         elif prikaz == '/dark-mode on':
@@ -1178,9 +1199,19 @@ def vykresli_logy(user_name, vsechna_prava):
             _nastav_dark(False)
         elif prikaz in ('/modul', '/moduly'):
             _dialog_moduly()
+        elif prikaz in ('/halloween on', '/halloween off', '/halloween auto'):
+            _nastav_halloween(prikaz.split()[1])
         else:
             ui.notify(f'Neznámý příkaz: {prikaz}', type='negative')
-    hledat_input.on('keydown.enter', _zpracuj_prikaz)
+    # Příkaz smaže z pole rovnou prohlížeč: „input" s prázdnou hodnotou zruší i čekající
+    # debounce, který by jinak starý text do pole vrátil (smazání ze serveru nestačí).
+    hledat_input.on('keydown.enter', _zpracuj_prikaz, js_handler='''(e) => {
+        emit(e.target.value);
+        if (e.target.value.trim().startsWith('/')) {
+            e.target.value = '';
+            e.target.dispatchEvent(new Event('input'));
+        }
+    }''')
 
 
     with koren:

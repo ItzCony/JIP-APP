@@ -142,13 +142,13 @@ if __name__ == "__main__":
     app.on_startup(intranet_spolvecer.inicializace_db)
     # Gastrokurzy — tabulky + jednorázový import termínů z Excelu (jen když je prázdno).
     app.on_startup(intranet_gastrokurzy.inicializace_db)
-    # Gastrokurzy — denní souhrn nových/upravených termínů (výchozí 12:00).
-    app.on_startup(lambda: asyncio.create_task(intranet_gastrokurzy.bg_gastrokurzy_souhrn()))
-
     app.on_startup(lambda: asyncio.create_task(intranet_narozeniny.bg_narozeniny_emaily()))
     # Evidence OZ — ranní přepočet „Aktivní OZ" + kontrola proti kartám.
     import intranet_asm
     app.on_startup(lambda: asyncio.create_task(intranet_asm.bg_oz_denni()))
+    # Podklady VŘ — e-mail vybraným lidem X dní před koncem platnosti.
+    import intranet_podklady_vr
+    app.on_startup(lambda: asyncio.create_task(intranet_podklady_vr.bg_upozorneni()))
     # Nahrané soubory jen pro přihlášené (viz intranet_static)
     intranet_static.chranene_soubory('/znacky_foto', 'znacky_foto')
     intranet_static.chranene_soubory(znacky_provoz.foto_route, znacky_provoz.foto_dir)
