@@ -22,7 +22,8 @@ Role (intranet_prava.py):
   • sankce_ctenar   – obě sestavy jen pro čtení (filtry/řazení/export + diskuze).
   • sankce_tiket_XX – nákupčí s kódem XX: řeší tikety svých dodavatelů a píše
     vyjádření k Nedodávkám u řádků se svým kódem NAK.
-  • sankce_tiket_provoz   – tikety předané na provoz.
+  • sankce_tiket_vsichni_nakupci – zástup v tiketech: jako by měl všechna sankce_tiket_XX kromě VN (Nedodávky ne).
+  • sankce_tiket_provoz  – tikety předané na provoz.
   • sankce_tiket_kontrola – druhotná kontrola: schvaluje storno i abnormalitu.
   • sankce_tiket_tvrde_storno – storno bez kontroly a bez mailu (rovnou Nevyfakturovat).
   • sankce_tiket_unibrands – POUZE dlaždice „Nedodávky dod. k vyjádření" a zápis
@@ -164,6 +165,7 @@ _MAPA_NEDODAVKY = {
     'nazevzbozi':           'nazev_zbozi',
     'kod2':                 'kod2',
     'cisloobj.':            'cislo_obj',
+    'c.obj.unibrands':      'cislo_obj_ub',
     'pobocka':              'pobocka',
     'pozadovano':           'pozadovano',
     'dat.zalozenizdokladu': 'datum_zalozeni',
@@ -190,7 +192,7 @@ _MAPA_NEDOD_KT = {
 _CISLA_NEDOD_KT = _CISLA_NEDODAVKY | {'objednano_mj', 'dodano_mj'}
 
 # Sloupce, které v importovaném souboru chybět SMĚJÍ (import je nepovažuje za chybu).
-_VOLITELNE = {'nakupci_pob'}
+_VOLITELNE = {'nakupci_pob', 'cislo_obj_ub'}
 
 # Sloupce do připnutého součtového řádku „Celkem" — vše číselné KROMĚ obj_cena.
 # (Obj.-cena je cena za 1 MJ; její sečtení napříč řádky nic nevypovídá.)
@@ -219,7 +221,8 @@ _SESTAVA_IMPORT = {
         'nazev': 'Nedodávky dod. k vyjádření',
         'hash': ('ico', 'kod_zbozi', 'cislo_obj', 'pobocka', 'pozadovano',
                  'rozdil_dodano_kc'),
-        'rucni': ('vyjadreni', 'vyjadreni_by', 'vyjadreni_at'),
+        'rucni': ('vyjadreni', 'vyjadreni_by', 'vyjadreni_at',
+                  'vyjadreni_ub', 'vyjadreni_ub_by', 'vyjadreni_ub_at'),
         'datumy': _DATUMY_NEDODAVKY,
         'filtr': {'dcera': 'ne', 'status': 'nedodano', 'stavprijemky': 'prijemka'},
         'kt': _NEDOD_KT_TABULKA,    # + celý list do kontingenční tabulky
@@ -806,6 +809,7 @@ _EXP_NEDODAVKY = [
     ('Název zboží',       'nazev_zbozi',      'text',  40),
     ('KOD 2',             'kod2',             'text',  12),
     ('Č.obj.',            'cislo_obj',        'text',  14),
+    ('Č. obj. Unibrands', 'cislo_obj_ub',     'text',  16),
     ('Pobočka',           'pobocka',          'text',  12),
     ('Požadováno',        'pozadovano',       'date',  13),
     ('Dat. založení',     'datum_zalozeni',   'date',  13),
@@ -835,6 +839,7 @@ _EXP_NEDOD_KT = [
     ('Název zboží',             'nazev_zbozi',      'text',  40),
     ('KOD 2',                   'kod2',             'text',   9),
     ('Číslo obj.',              'cislo_obj',        'text',  12),
+    ('Č. obj. Unibrands',       'cislo_obj_ub',     'text',  16),
     ('Pobočka',                 'pobocka',          'text',  18),
     ('Požadováno',              'pozadovano',       'date',  12),
     ('Dat. Založení z dokladu', 'datum_zalozeni',   'date',  13),
@@ -1061,6 +1066,130 @@ def _grid_bez_prestavby(g):
     se mu posílají přes `_nastav_grid`."""
     g._update_method = None
     return g
+
+
+# Schránka v gridech (AG Grid Community clipboard nemá): buňky jde označit myší
+# (enableCellTextSelection), Ctrl+C na zaměřené buňce zkopíruje její hodnotu a
+# Ctrl+V vloží text do zaměřené buňky — nebo do všech označených řádků.
+_GRID_KOPIE_OPTS = {'enableCellTextSelection': True, 'ensureDomOrder': True}
+_GRID_KOPIE_CLASS = 'sankce-kopie'
+
+
+def _kopirovani_bunek_skript() -> None:
+    """Delegované posluchače na stránku pro gridy s třídou `sankce-kopie`.
+
+    Ctrl+C: zkopíruje hodnotu zaměřené buňky (označený text má přednost, editor
+    se neruší). Zápis přes textarea+execCommand — navigator.clipboard na http
+    (intranet bez TLS) nefunguje (viz Lupa).
+
+    Ctrl+V (event `paste`, ten schránku přečte i na http): na zaměřené buňce
+    upravitelného sloupce. Jeden text → zaměřený řádek, nebo všechny označené
+    řádky, je-li zaměřený mezi nimi (Shift/Ctrl+klik). Výřez z Excelu (HTML
+    tabulka) → hodnoty po sobě jdoucím řádkům od zaměřeného dolů. Grid pak
+    dostane event 'vlozeni' {pole, polozky: [{id, text, kontrola}], mimo};
+    zápis i kontrolu práv dělá server. `kontrola` = klíčová pole řádku, aby
+    server poznal, že se tabulka mezitím nepřenačetla."""
+    ui.run_javascript(r'''
+    (function () {
+      if (window.__sankceSchranka) return;
+      window.__sankceSchranka = true;
+      const KLICE = __KLICE__;
+      const hlaska = (zprava) => {
+        const d = document.createElement('div');
+        d.textContent = zprava;
+        d.style.cssText = 'position:fixed;left:50%;bottom:32px;transform:translateX(-50%);'
+          + 'background:#1e293b;color:#fff;padding:6px 14px;border-radius:6px;'
+          + 'font-size:13px;z-index:9999;pointer-events:none;';
+        document.body.appendChild(d);
+        setTimeout(() => d.remove(), 2000);
+      };
+      const zkrat = (t) => (t.length > 60 ? t.slice(0, 60) + '…' : t);
+      // Zaměřený prvek, pokud to není pole/editor (tam funguje nativní schránka).
+      const mimoEditor = () => {
+        const a = document.activeElement;
+        if (!a || !a.closest || a.matches('input, textarea, [contenteditable="true"]')) return null;
+        return a;
+      };
+      document.addEventListener('keydown', (ev) => {
+        if (!(ev.ctrlKey || ev.metaKey) || ev.altKey || ev.shiftKey) return;
+        if (ev.code !== 'KeyC' && (ev.key || '').toLowerCase() !== 'c') return;
+        const sel = window.getSelection && window.getSelection();
+        if (sel && !sel.isCollapsed && String(sel).trim()) return;
+        const a = mimoEditor();
+        const bunka = a && a.closest('.sankce-kopie .ag-cell');
+        if (!bunka) return;
+        const txt = (bunka.innerText || '').trim();
+        if (!txt) return;
+        ev.preventDefault();
+        let ok = false;
+        const onCopy = (e) => {
+          e.clipboardData.setData('text/plain', txt);
+          e.preventDefault(); ok = true;
+        };
+        try {
+          const ta = document.createElement('textarea');
+          ta.value = txt;
+          ta.style.position = 'fixed'; ta.style.top = '0'; ta.style.opacity = '0';
+          document.body.appendChild(ta); ta.focus(); ta.select();
+          document.addEventListener('copy', onCopy, true);
+          document.execCommand('copy');
+          document.removeEventListener('copy', onCopy, true);
+          ta.remove();
+        } catch (_) {
+          document.removeEventListener('copy', onCopy, true);
+        }
+        if (!ok && navigator.clipboard) {
+          try { navigator.clipboard.writeText(txt); ok = true; } catch (e) {}
+        }
+        bunka.focus({preventScroll: true});   // šipky dál chodí po gridu
+        hlaska(ok ? 'Zkopírováno: ' + zkrat(txt) : 'Kopie selhala — označte text myší a Ctrl+C');
+      }, true);
+      document.addEventListener('paste', (ev) => {
+        const a = mimoEditor();
+        const koren = a && a.closest('.sankce-kopie');
+        if (!koren || !a.closest('.ag-cell')) return;
+        const komp = getElement(koren);
+        const api = komp && komp.api;
+        if (!api || api.getEditingCells().length) return;
+        const fc = api.getFocusedCell();
+        const uzel = (fc && !fc.rowPinned) ? api.getDisplayedRowAtIndex(fc.rowIndex) : null;
+        if (!uzel) return;
+        ev.preventDefault();
+        const sl = fc.column;
+        if (!sl.isCellEditable(uzel)) {
+          hlaska('Vkládat jde jen do sloupce Vyjádření u řádků, do kterých smíte psát.');
+          return;
+        }
+        const cd = ev.clipboardData;
+        const txt = (cd && cd.getData('text/plain')) || '';
+        const zExcelu = /<table/i.test((cd && cd.getData('text/html')) || '');
+        const radky = zExcelu
+          ? txt.replace(/\r/g, '').replace(/\n+$/, '').split('\n').map((r) => r.split('\t')[0].trim())
+          : [txt.trim()];
+        if (radky.length === 1 && !radky[0]) { hlaska('Schránka je prázdná.'); return; }
+        const polozky = [];
+        let mimo = 0;
+        const pridej = (n, t) => {
+          if (n && !n.rowPinned && n.data && sl.isCellEditable(n)) {
+            const k = {};
+            KLICE.forEach((p) => { if (p in n.data) k[p] = n.data[p]; });
+            polozky.push({id: n.data.id, text: t, kontrola: k});
+          } else {
+            mimo++;
+          }
+        };
+        if (radky.length > 1) {
+          radky.forEach((t, i) => pridej(api.getDisplayedRowAtIndex(fc.rowIndex + i), t));
+        } else {
+          const oz = api.getSelectedNodes().filter((n) => n.rowIndex != null && !n.rowPinned);
+          const cile = (oz.length > 1 && oz.includes(uzel)) ? oz : [uzel];
+          cile.sort((x, y) => x.rowIndex - y.rowIndex).forEach((n) => pridej(n, radky[0]));
+        }
+        if (!polozky.length) { hlaska('Do těchto řádků nemůžete psát.'); return; }
+        komp.$emit('vlozeni', {pole: sl.getColId(), polozky: polozky, mimo: mimo});
+      }, true);
+    })();
+    '''.replace('__KLICE__', json.dumps(list(_KT_RADKY))))
 
 
 def _nastav_grid(g, **volby) -> None:
@@ -1305,6 +1434,7 @@ def inicializace_sankce_db():
                 nazev_zbozi VARCHAR(255),
                 kod2 VARCHAR(40),
                 cislo_obj VARCHAR(40),
+                cislo_obj_ub VARCHAR(40),
                 pobocka VARCHAR(60),
                 pozadovano DATE,
                 datum_zalozeni DATE,
@@ -1314,6 +1444,9 @@ def inicializace_sankce_db():
                 vyjadreni TEXT,
                 vyjadreni_by VARCHAR(255),
                 vyjadreni_at DATETIME DEFAULT NULL,
+                vyjadreni_ub TEXT,
+                vyjadreni_ub_by VARCHAR(255),
+                vyjadreni_ub_at DATETIME DEFAULT NULL,
                 import_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 imported_by VARCHAR(255),
                 INDEX idx_obdobi (obdobi), INDEX idx_hash (row_hash),
@@ -1333,6 +1466,7 @@ def inicializace_sankce_db():
                 nazev_zbozi VARCHAR(255),
                 kod2 VARCHAR(40),
                 cislo_obj VARCHAR(40),
+                cislo_obj_ub VARCHAR(40),
                 pobocka VARCHAR(60),
                 pozadovano DATE,
                 datum_zalozeni DATE,
@@ -1442,6 +1576,22 @@ def inicializace_sankce_db():
                         "AND COLUMN_NAME=%s", (_sl,))
             if cur.fetchone()[0] == 0:
                 cur.execute(f'ALTER TABLE sankce_chat ADD COLUMN {_sl} {_def}')
+        # Migrace: vyjádření Unibrands — vlastní sloupec vedle vyjádření nákupčího.
+        for _sl, _def in (('vyjadreni_ub', 'TEXT AFTER vyjadreni_at'),
+                          ('vyjadreni_ub_by', 'VARCHAR(255) AFTER vyjadreni_ub'),
+                          ('vyjadreni_ub_at', 'DATETIME DEFAULT NULL AFTER vyjadreni_ub_by')):
+            cur.execute("SELECT COUNT(*) FROM information_schema.COLUMNS "
+                        "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='sankce_nedodavky' "
+                        "AND COLUMN_NAME=%s", (_sl,))
+            if cur.fetchone()[0] == 0:
+                cur.execute(f'ALTER TABLE sankce_nedodavky ADD COLUMN {_sl} {_def}')
+        # Migrace: „Č. obj. Unibrands" přibyl do sešitu Nedodávek (sestava i KT).
+        for _t in ('sankce_nedodavky', _NEDOD_KT_TABULKA):
+            cur.execute("SELECT COUNT(*) FROM information_schema.COLUMNS "
+                        "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s "
+                        "AND COLUMN_NAME='cislo_obj_ub'", (_t,))
+            if cur.fetchone()[0] == 0:
+                cur.execute(f'ALTER TABLE {_t} ADD COLUMN cislo_obj_ub VARCHAR(40) AFTER cislo_obj')
         # Migrace: zálohy byly původně jen pro „Sankce k vystavení" — starým
         # snímkům dopiš, ke které sestavě patří.
         cur.execute("SELECT COUNT(*) FROM information_schema.COLUMNS "
@@ -2553,7 +2703,8 @@ def _smaz_radky(tabulka: str, radek_ids: list) -> tuple:
 # =========================================================
 _POLE_LABEL = {'stav': 'Stav', 'stav2': 'Aktivita 2', 'sleva': 'Sleva na sankci',
                'poznamka': 'Poznámka', 'tiket': 'Tiket', 'rozhodnuti': 'Rozhodnutí',
-               'tiket_stav': 'Stav tiketu'}
+               'tiket_stav': 'Stav tiketu', 'vyjadreni': 'Vyjádření nákupčího',
+               'vyjadreni_ub': 'Vyjádření Unibrands'}
 
 
 def _zobraz_historii(tabulka: str, row_hash: str, popis: str):
@@ -5034,6 +5185,18 @@ KOD_PRAVO = {k: 'sankce_tiket_' + k.lower() for k in KODY_NAKUPCI}
 PRAVO_UNIBRANDS = 'sankce_tiket_unibrands'
 # VN nefiguruje v datech jako kód NAK — vedoucí nákupu píše vyjádření všude.
 PRAVO_VEDOUCI_NAKUPU = KOD_PRAVO['VN']
+# Zástup za všechny nákupčí (jen tikety): rozvine se na všechna KOD_PRAVO kromě VN (viz vykresli_sankce).
+PRAVO_VSICHNI_NAKUPCI = 'sankce_tiket_vsichni_nakupci'
+
+
+def _rozvin_prava(vsechna_prava) -> list:
+    """Právo „všichni nákupčí" = jako by uživatel měl každý kód nákupčího.
+    Platí JEN pro tikety (seznam + detail) — Nedodávky dostávají nerozvinutá práva.
+    VN záměrně ne — vedoucí nákupu je samostatná role."""
+    prava = list(vsechna_prava or [])
+    if PRAVO_VSICHNI_NAKUPCI in prava:
+        prava += [p for k, p in KOD_PRAVO.items() if k != 'VN' and p not in prava]
+    return prava
 
 _SANKCE_URL = 'https://analytikasys.jip-napoje.cz/sankce'
 
@@ -5257,7 +5420,10 @@ def _nacti_tikety() -> list:
                                      AND p.radek_id=r.radek_id)) AS zbyva_radku,
               (SELECT COALESCE(SUM(v.hodn_sankce*(1-COALESCE(v.sleva,0))),0)
                  FROM sankce_tiket_radky r JOIN sankce_vystaveni v ON v.id=r.radek_id
-                WHERE r.tiket_id=t.id) AS castka
+                WHERE r.tiket_id=t.id) AS castka,
+              (SELECT GROUP_CONCAT(DISTINCT v.obdobi SEPARATOR '|')
+                 FROM sankce_tiket_radky r JOIN sankce_vystaveni v ON v.id=r.radek_id
+                WHERE r.tiket_id=t.id) AS obdobi_radku
             FROM sankce_tikety t
             WHERE t.stav NOT IN (""" + ','.join(['%s'] * len(TIKET_STAV_ARCHIV)) + """)
             ORDER BY t.id DESC
@@ -5268,6 +5434,8 @@ def _nacti_tikety() -> list:
             t['stav_label'] = TIKET_STAV_LABEL.get(t.get('stav'), t.get('stav') or '')
             t['typ_label'] = TIKET_TYP_LABEL.get(t.get('typ'), t.get('typ') or '')
             t['castka'] = float(t.get('castka') or 0)
+            # Všechna období řádků tiketu — sloupec `obdobi` má u víc období jen „N období".
+            t['obdobi_radku'] = [o for o in (t.get('obdobi_radku') or '').split('|') if o]
             for k in ('predano_at', 'zmeneno'):
                 d = t.pop(k, None)
                 t[k + '_txt'] = d.strftime('%d.%m.%Y %H:%M') if hasattr(d, 'strftime') else ''
@@ -6004,7 +6172,12 @@ async def _vykresli_tikety(user_id, user_name, vsechna_prava):
         t['_chat_pocet'] = st['pocet'] if st else 0
         t['_chat_unread'] = st['unread'] if st else False
 
-    filtr = {'jen_otevrene': True, 'moje': False}
+    filtr = {'jen_otevrene': True, 'moje': False, 'obdobi': None}
+    VSE_OBD = '(všechna období)'
+    # Pořadí od nejnovějšího jako v „Sankce k vystavení", jen období, která tikety mají.
+    pritomna = {o for t in vsechny for o in t['obdobi_radku']}
+    obdobi_list = [o for o in await asyncio.to_thread(_seznam_obdobi, 'sankce_vystaveni')
+                   if o in pritomna]
 
     # „Moje fronta" jen pro ty, kdo vidí všechno a zároveň něco řeší — ostatní
     # už v seznamu mají jen svoje tikety. Admin ('vse') se počítá jen s explicitními
@@ -6016,12 +6189,18 @@ async def _vykresli_tikety(user_id, user_name, vsechna_prava):
 
     def _zobrazene():
         if filtr['moje']:
-            return list(moje_fronta)
-        if filtr['jen_otevrene']:
-            return [t for t in vsechny if t.get('stav') in TIKET_STAV_OTEVRENE]
-        return list(vsechny)
+            data = moje_fronta
+        elif filtr['jen_otevrene']:
+            data = [t for t in vsechny if t.get('stav') in TIKET_STAV_OTEVRENE]
+        else:
+            data = vsechny
+        if filtr['obdobi']:
+            data = [t for t in data if filtr['obdobi'] in t['obdobi_radku']]
+        return list(data)
 
     with ui.row().classes('w-full items-center gap-3 mb-2 flex-wrap'):
+        sel_obd = ui.select([VSE_OBD] + obdobi_list, value=VSE_OBD, label='Období') \
+            .props('outlined dense options-dense').classes('w-60')
         sw = ui.switch('Jen otevřené', value=True) \
             .tooltip('Skryje uzavřené a vyřešené tikety (stornováno / k fakturaci / uzavřeno). '
                      'Předané tikety jsou v archivu — v seznamu nejsou vůbec.')
@@ -6055,6 +6234,8 @@ async def _vykresli_tikety(user_id, user_name, vsechna_prava):
         grid.run_grid_method('setGridOption', 'rowData', data)
         info.set_text(_info(data))
     sw.on_value_change(lambda e: (filtr.__setitem__('jen_otevrene', bool(e.value)), _aplikuj()))
+    sel_obd.on_value_change(lambda e: (filtr.__setitem__(
+        'obdobi', None if e.value == VSE_OBD else e.value), _aplikuj()))
     if sw_moje is not None:
         def _on_moje(e):
             filtr['moje'] = bool(e.value)
@@ -6114,33 +6295,77 @@ def _nedod_edit_js(moje_kody, vse_kody: bool) -> str:
             % json.dumps(sorted(moje_kody)))
 
 
-# Detail nedodávek: sloupce ukotvené vlevo si volí každý uživatel sám (tlačítko
-# „Ukotvit sloupce"). Výchozí = nic ukotveného. 👁 a Poř. č. jsou ukotvené vždy.
-_NEDOD_KOTVA_VYCHOZI = ()
-_NEDOD_KOTVA_KLIC = 'sankce_nedod_kotva'   # app.storage.user → seznam polí
-_NEDOD_KOTVA_PEVNE = ('_eye', '_poradi')
+# Ukotvení sloupců vlevo si v každém pohledu Nedodávek (detail, souhrn, kontingenční
+# tabulka) volí uživatel sám — tlačítko „Ukotvit sloupce", volba se pamatuje zvlášť
+# pro každý pohled. Výchozí (dokud si uživatel nic nezvolí) viz _NEDOD_KOTVA_VYCHOZI.
+# Sloupce připnuté už v definici (👁, Poř. č.) jsou ukotvené vždy a v nabídce nejsou.
+_NEDOD_KOTVA_KLIC = {'radky': 'sankce_nedod_kotva', 'souhrn': 'sankce_nedod_kotva_souhrn',
+                     'kt': 'sankce_nedod_kotva_kt'}   # app.storage.user → [colId]
+_NEDOD_KOTVA_VYCHOZI = {'radky': (), 'souhrn': ('ico',), 'kt': ('ico',)}
 
 
-def _nedod_kotvitelne() -> list:
-    """[(pole, název)] sloupců detailu, které jde ukotvit — v pořadí sloupců."""
-    return [(c['field'], c['headerName']) for c in _col_defs_nedodavky('false')
-            if c.get('colId', c['field']) not in _NEDOD_KOTVA_PEVNE]
+def _col_id(c: dict) -> str:
+    return c.get('colId') or c['field']
 
 
-def _col_defs_nedodavky(edit_js: str, kotva=_NEDOD_KOTVA_VYCHOZI) -> list:
-    defs = _col_defs_nedodavky_zaklad(edit_js)
+def _s_kotvou(defs: list, kotva) -> list:
+    """Ukotví vlevo zvolené sloupce (colId); pevně připnuté nechá být."""
     kotva = set(kotva)
-    for c in defs:
-        if c.get('colId', c['field']) in _NEDOD_KOTVA_PEVNE:
-            continue
-        if c['field'] in kotva:
-            c['pinned'] = 'left'
-        else:
-            c.pop('pinned', None)
-    return defs
+    return [{**c, 'pinned': 'left'} if not c.get('pinned') and _col_id(c) in kotva else c
+            for c in defs]
 
 
-def _col_defs_nedodavky_zaklad(edit_js: str) -> list:
+def _kotva_tlacitko(klic: str, defs_fn, grid_fn, vychozi=()):
+    """Tlačítko „Ukotvit sloupce" s nabídkou zaškrtávátek pro jeden grid.
+    `defs_fn(kotva)` vrátí columnDefs s ukotvením, `grid_fn()` grid (ten může
+    vzniknout až po tlačítku). Volba se uživateli uloží; běžící grid se
+    nepřestavuje — filtry, řazení i posun zůstanou.
+    Vrací (tlačítko, počáteční seznam ukotvených colId)."""
+    volitelne = [(_col_id(c), c.get('headerName') or _col_id(c))
+                 for c in defs_fn(()) if not c.get('pinned')]
+    ulozena = app.storage.user.get(klic)
+    ulozena = set(ulozena if isinstance(ulozena, list) else vychozi)   # nic uloženo → výchozí
+    stav = {'v': [k for k, _ in volitelne if k in ulozena], 'ticho': False}
+
+    def _nastav(nove):
+        stav['v'] = [k for k, _ in volitelne if k in set(nove)]   # pořadí sloupců
+        app.storage.user[klic] = stav['v']
+        g = grid_fn()
+        # Server drží aktuální columnDefs; do běžícího gridu jde jen stav sloupců.
+        with g._props.suspend_updates():
+            g.options['columnDefs'] = defs_fn(stav['v'])
+        g.run_grid_method('applyColumnState', {'state': [
+            {'colId': k, 'pinned': 'left' if k in stav['v'] else None}
+            for k, _ in volitelne]})
+
+    def _chk(k, zapnuto):
+        if not stav['ticho']:
+            _nastav([x for x in stav['v'] if x != k] + ([k] if zapnuto else []))
+
+    def _zrus():
+        stav['ticho'] = True
+        try:
+            for ch in chk.values():
+                ch.set_value(False)
+        finally:
+            stav['ticho'] = False
+        _nastav(())
+
+    with ui.button(icon='push_pin', text='Ukotvit sloupce') \
+            .props('flat dense no-caps color=grey-8') as btn:
+        btn.tooltip('Zvolte sloupce, které zůstanou vlevo vidět při posunu doprava')
+        with ui.menu():
+            ui.label('Ukotvené sloupce (vlevo)').classes('text-xs text-gray-500 px-3 pt-2')
+            chk = {k: ui.checkbox(nazev, value=k in stav['v'],
+                                  on_change=lambda e, k=k: _chk(k, e.value))
+                   .props('dense').classes('px-3')
+                   for k, nazev in volitelne}
+            ui.separator()
+            ui.menu_item('↺ Zrušit ukotvení', on_click=_zrus, auto_close=False)
+    return btn, stav['v']
+
+
+def _col_defs_nedodavky(edit_js: str) -> list:
     return [
         {'headerName': '', 'field': '_eye', 'width': 46, 'minWidth': 46, 'maxWidth': 46,
          'pinned': 'left', 'sortable': False, 'editable': False, 'resizable': False,
@@ -6154,7 +6379,7 @@ def _col_defs_nedodavky_zaklad(edit_js: str) -> list:
         {'headerName': 'IČO', 'field': 'ico', 'width': 95, 'sortable': True,
          'cellStyle': {'fontFamily': 'monospace', 'fontSize': '12px'}},
         {'headerName': 'Dodavatel', 'field': 'jmeno_dodavatele', 'width': 200, 'sortable': True},
-        # Ukotvení řeší _col_defs_nedodavky (volba uživatele, viz _NEDOD_KOTVA_VYCHOZI).
+        # Ukotvení si volí uživatel (viz _kotva_tlacitko).
         {'headerName': 'Dodavatel-popis', 'field': 'dodavatel_popis', 'width': 180,
          'maxWidth': 220},
         {'headerName': 'Kód zboží', 'field': 'kod_zbozi', 'width': 100, 'maxWidth': 130,
@@ -6163,6 +6388,7 @@ def _col_defs_nedodavky_zaklad(edit_js: str) -> list:
          'sortable': True},
         {'headerName': 'KOD 2', 'field': 'kod2', 'width': 90},
         {'headerName': 'Č.obj.', 'field': 'cislo_obj', 'width': 110},
+        {'headerName': 'Č. obj. Unibrands', 'field': 'cislo_obj_ub', 'width': 140},
         {'headerName': 'Pobočka', 'field': 'pobocka', 'width': 100, 'sortable': True},
         {'headerName': 'Požadováno', 'field': 'pozadovano', 'width': 110},
         {'headerName': 'Dat. založení', 'field': 'datum_zalozeni', 'width': 115},
@@ -6186,7 +6412,7 @@ def _col_defs_nedodavky_zaklad(edit_js: str) -> list:
 def _col_defs_nedod_souhrn(edit_js: str) -> list:
     return [
         {'headerName': 'IČO', 'field': 'ico', 'width': 100, 'sortable': True,
-         'pinned': 'left', 'checkboxSelection': True, 'headerCheckboxSelection': True,
+         'checkboxSelection': True, 'headerCheckboxSelection': True,
          'headerCheckboxSelectionFilteredOnly': True,
          'cellStyle': {'fontFamily': 'monospace', 'fontSize': '12px'}},
         {'headerName': 'Dodavatel', 'field': 'jmeno_dodavatele', 'width': 260, 'sortable': True,
@@ -6216,7 +6442,7 @@ _KT_FILTRY = (('stav_prijemky', 'Stav příjemky'), ('odmitnuto', 'Odmítnuto'),
               ('dcera', 'DCERA'), ('status', 'STATUS'), ('nak', 'NAK'))
 # Řádková pole kontingenční tabulky; mezisoučet se dělá za první z nich (IČO).
 _KT_RADKY = ('ico', 'jmeno_dodavatele', 'dodavatel_popis', 'kod_zbozi', 'nazev_zbozi',
-             'kod2', 'cislo_obj', 'pobocka', 'pozadovano', 'datum_zalozeni')
+             'kod2', 'cislo_obj', 'cislo_obj_ub', 'pobocka', 'pozadovano', 'datum_zalozeni')
 _KT_HODNOTY = ('objednano_mj', 'dodano_mj', 'rozdil_dodano_mj', 'rozdil_dodano_kc',
                'odmitnuto_mj')
 _KT_SUMY = ('SUM(objednano_mj) objednano_mj, SUM(dodano_mj) dodano_mj, '
@@ -6263,6 +6489,47 @@ def _klic_jako_excel(r: dict) -> tuple:
                  if p not in ('pozadovano', 'datum_zalozeni'))
 
 
+# Vyjádření Unibrands — vlastní sloupec hned za „Vyjádření nákupčího". Vidí ho
+# všichni v sestavě, píše do něj jen role Unibrands (PRAVO_UNIBRANDS) a jen
+# u dodavatele UNIBRANDS (kontrola se opakuje i na serveru, JS jen zamkne buňku).
+_VYJ_UB = 'vyjadreni_ub'
+_VYJ_UB_NAZEV = 'Vyjádření Unibrands'
+_VYJ_UB_SMI_JS = ("var d=p.data||{};return !(p.node&&p.node.rowPinned)&&"
+                  "String(d.jmeno_dodavatele||'').toUpperCase().indexOf('UNIBRANDS')>=0;")
+
+
+def _s_vyj_ub(defs: list, kt: bool = False, psat: bool = False) -> list:
+    """Vloží za sloupec „Vyjádření nákupčího" sloupec „Vyjádření Unibrands".
+    `psat` = uživatel má roli Unibrands; ostatní ho mají jen pro čtení.
+    V kontingenční tabulce rozhoduje o zápisu `_smi_ub` (doplní server)."""
+    i = next(i for i, c in enumerate(defs) if c.get('field') == 'vyjadreni')
+    ub = {k: v for k, v in defs[i].items()
+          if k not in ('pinned', 'cellStyle', ':cellStyle', ':editable', 'headerTooltip')}
+    smi = 'p.data&&p.data._smi_ub' if kt else None
+    ub.update({
+        'headerName': _VYJ_UB_NAZEV, 'field': _VYJ_UB,
+        'headerTooltip': 'Vyjádření Unibrands k nedodávce — píše role Unibrands '
+                         'u dodavatele UNIBRANDS',
+    })
+    if not psat:
+        ub['editable'] = False
+        return defs[:i + 1] + [ub] + defs[i + 1:]
+    ub.update({
+        ':editable': (f'function(p){{return !!({smi});}}' if kt
+                      else f'function(p){{{_VYJ_UB_SMI_JS}}}'),
+        ':cellStyle': (f'function(p){{return ({smi})?{{backgroundColor:"#fffbeb"}}:null;}}' if kt
+                       else f'function(p){{return (function(){{{_VYJ_UB_SMI_JS}}})()'
+                            '?{backgroundColor:"#fffbeb"}:null;}'),
+    })
+    return defs[:i + 1] + [ub] + defs[i + 1:]
+
+
+def _exp_s_vyj_ub(sloupce: list) -> list:
+    """Export: za „Vyjádření nákupčího" přidá sloupec „Vyjádření Unibrands"."""
+    i = next(i for i, s in enumerate(sloupce) if s[1] == 'vyjadreni')
+    return sloupce[:i + 1] + [(_VYJ_UB_NAZEV, _VYJ_UB) + tuple(sloupce[i][2:])] + sloupce[i + 1:]
+
+
 # Vyjádření v kontingenční tabulce: jen na řádcích, které jsou v sestavě Nedodávek
 # a uživatel do nich smí psát (`_smi` doplní server).
 _KT_VYJ_COL = {
@@ -6280,7 +6547,6 @@ def _col_defs_nedod_kt() -> list:
              **({'type': 'numericColumn',
                  ':valueFormatter': _MONEY_FMT if typ == 'money' else _NUM_FMT}
                 if typ in ('num', 'money') else {}),
-             **({'pinned': 'left'} if field == 'ico' else {}),
              **(_KT_VYJ_COL if field == 'vyjadreni' else {})}
             for nadpis, field, typ, _w in _EXP_NEDOD_KT]
 
@@ -6373,12 +6639,13 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
     je_analytik = ma_vse or 'sankce_analytik' in vsechna_prava
     # Nákupčí vidí a edituje jen řádky se svým kódem NAK; ostatní role čtou vše.
     moje_kody = {k for k, p in KOD_PRAVO.items() if p in vsechna_prava}
-    # Unibrands píše do všech řádků, ale jinak v modulu nic nemá.
+    # Unibrands má vlastní sloupec „Vyjádření Unibrands" (píše do něj u dodavatele
+    # UNIBRANDS, ostatní ho jen čtou); do „Vyjádření nákupčího" nepíše.
+    ma_ub = PRAVO_UNIBRANDS in vsechna_prava
     # VN = vedoucí nákupu: nemá vlastní kód NAK v datech, píše za všechny nákupčí.
-    psat_vse = (je_analytik or PRAVO_UNIBRANDS in vsechna_prava
-                or PRAVO_VEDOUCI_NAKUPU in vsechna_prava)
-    vidi_vse = psat_vse or bool({'sankce_ucetni', 'sankce_ctenar', 'sankce_nakup'}
-                                & set(vsechna_prava))
+    psat_vse = je_analytik or PRAVO_VEDOUCI_NAKUPU in vsechna_prava
+    vidi_vse = psat_vse or ma_ub or bool({'sankce_ucetni', 'sankce_ctenar', 'sankce_nakup'}
+                                         & set(vsechna_prava))
 
     # Unibrands vidí jen řádky dodavatele UNIBRANDS.
     jen_unibrands = not je_analytik and PRAVO_UNIBRANDS in vsechna_prava
@@ -6389,6 +6656,7 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
                    if 'UNIBRANDS' in (r.get('jmeno_dodavatele') or '').upper()]
     elif not vidi_vse:
         vsechny = [r for r in vsechny if (r.get('nak') or '') in moje_kody]
+
     # Pořadí 1:1 s kontingenční tabulkou v Excelu; období zůstávají seskupená
     # (nejnovější nahoře), uvnitř období řadí _klic_jako_excel.
     _por_obd = {}
@@ -6431,9 +6699,20 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
     edit_js = _nedod_edit_js(moje_kody, psat_vse)
 
     def _smi_psat(r) -> bool:
-        if jen_unibrands:
-            return 'UNIBRANDS' in (r.get('jmeno_dodavatele') or '').upper()
         return psat_vse or (r.get('nak') or '') in moje_kody
+
+    def _smi_ub(r) -> bool:
+        return ma_ub and 'UNIBRANDS' in (r.get('jmeno_dodavatele') or '').upper()
+
+    # Zapisovatelná vyjádření → kdo smí psát. Vyjádření Unibrands jen pro jeho roli
+    # (server odmítne i podvržený zápis z klienta).
+    _SMI = {'vyjadreni': _smi_psat, **({_VYJ_UB: _smi_ub} if ma_ub else {})}
+    _NAZEV_VYJ = {'vyjadreni': 'Vyjádření', _VYJ_UB: _VYJ_UB_NAZEV}
+    # Sloupec, který uživatel sám vyplňuje („Jen bez vyjádření", počet bez vyjádření).
+    vlastni_vyj = _VYJ_UB if jen_unibrands else 'vyjadreni'
+
+    def _ub(defs: list, kt: bool = False) -> list:
+        return _s_vyj_ub(defs, kt, psat=ma_ub)
 
     def _zobrazene():
         data = vsechny
@@ -6442,7 +6721,7 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
         if stav['nak']:
             data = [r for r in data if (r.get('nak') or '').strip() == stav['nak']]
         if stav['jen_bez']:
-            data = [r for r in data if not (r.get('vyjadreni') or '').strip()]
+            data = [r for r in data if not (r.get(vlastni_vyj) or '').strip()]
         if stav['ico']:
             data = [r for r in data if str(r.get('ico') or '') == stav['ico']]
         return data
@@ -6466,18 +6745,21 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
                                'jmeno_dodavatele': (r.get('jmeno_dodavatele') or '').strip(),
                                'dodavatel_popis': (r.get('dodavatel_popis') or '').strip(),
                                'pocet': 0, 'odmitnuto_mj': 0.0, 'rozdil_dodano_kc': 0.0,
-                               '_nak': set(), '_vyj': set()}
+                               '_nak': set(), '_vyj': set(), '_vyj_ub': set()}
             g['pocet'] += 1
             g['odmitnuto_mj'] += _f(r.get('odmitnuto_mj')) or 0.0
             g['rozdil_dodano_kc'] += _f(r.get('rozdil_dodano_kc')) or 0.0
             if r.get('nak'):
                 g['_nak'].add(r['nak'])
             g['_vyj'].add((r.get('vyjadreni') or '').strip())
+            g['_vyj_ub'].add((r.get(_VYJ_UB) or '').strip())
         out = []
         for g in skup.values():
             g['nak'] = ', '.join(sorted(g.pop('_nak')))
             vyj = g.pop('_vyj')
             g['vyjadreni'] = next(iter(vyj)) if len(vyj) == 1 else _MIX_LABEL
+            vyj = g.pop('_vyj_ub')
+            g[_VYJ_UB] = next(iter(vyj)) if len(vyj) == 1 else _MIX_LABEL
             out.append(g)
         # Podle IČO jako text — 1:1 s Excelem (řazení podle Rozdílu Kč jde hlavičkou).
         out.sort(key=lambda x: str(x['ico']).casefold())
@@ -6492,7 +6774,7 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
 
     def _info_text(data=None):
         data = _zobrazene() if data is None else data
-        bez = sum(1 for r in data if not (r.get('vyjadreni') or '').strip())
+        bez = sum(1 for r in data if not (r.get(vlastni_vyj) or '').strip())
         return (f'Zobrazeno řádků: {len(data)} • dodavatelů: '
                 f'{len({r.get("ico") for r in data})} • bez vyjádření: {bez}')
 
@@ -6516,7 +6798,7 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
                 ui.notify('Aktuální filtr nevrací žádné řádky — není co exportovat.',
                           type='warning', position='top', timeout=6000)
                 return
-            await _export_xlsx(_EXP_NEDOD_KT, radky, celkem,
+            await _export_xlsx(_exp_s_vyj_ub(_EXP_NEDOD_KT), radky, celkem,
                                'nedodavky_kontingencni', 'Souhrn')
             return
         je_souhrn = pohled['v'] == 'souhrn'
@@ -6532,10 +6814,10 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
                       type='warning', position='top', timeout=6000)
             return
         if je_souhrn:
-            await _export_xlsx(_EXP_NEDODAVKY_SOUHRN, data, _souhrn_celkem(data),
+            await _export_xlsx(_exp_s_vyj_ub(_EXP_NEDODAVKY_SOUHRN), data, _souhrn_celkem(data),
                                'nedodavky_dodavatele', 'Dodavatelé')
         else:
-            await _export_xlsx(_EXP_NEDODAVKY, data, _celkem_row(data),
+            await _export_xlsx(_exp_s_vyj_ub(_EXP_NEDODAVKY), data, _celkem_row(data),
                                'nedodavky', 'Nedodávky')
 
     # Data jen přes _nastav_grid (setGridOption) — filtry v hlavičkách, řazení
@@ -6583,7 +6865,8 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
             sel_nak.on_value_change(_on_nak)
 
         sw_bez = ui.switch('Jen bez vyjádření', value=False) \
-            .tooltip('Zobrazí pouze řádky, ke kterým nákupčí zatím nic nenapsal')
+            .tooltip(f'Zobrazí pouze řádky bez „{_VYJ_UB_NAZEV}"' if jen_unibrands
+                     else 'Zobrazí pouze řádky, ke kterým nákupčí zatím nic nenapsal')
 
         def _on_bez(e):
             stav['jen_bez'] = bool(e.value)
@@ -6595,56 +6878,29 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
             .props('flat round dense color=grey-7').tooltip('Zrušit filtr na dodavatele')
         btn_zrus_dod.set_visibility(False)
 
-        # ── Ukotvení sloupců detailu (volba se uživateli pamatuje) ──
-        kotvitelne = _nedod_kotvitelne()
-        _ulozena = app.storage.user.get(_NEDOD_KOTVA_KLIC)
-        kotva = {'v': [f for f, _ in kotvitelne
-                       if f in set(_ulozena if isinstance(_ulozena, list)
-                                   else _NEDOD_KOTVA_VYCHOZI)],
-                 'ticho': False}
-
-        def _kotva_nastav(nove):
-            kotva['v'] = [f for f, _ in kotvitelne if f in set(nove)]   # pořadí sloupců
-            app.storage.user[_NEDOD_KOTVA_KLIC] = kotva['v']
-            # Server drží aktuální columnDefs; do běžícího gridu jen stav sloupců
-            # (bez přestavby — filtry, řazení i posun zůstanou).
-            with grid._props.suspend_updates():
-                grid.options['columnDefs'] = _col_defs_nedodavky(edit_js, kotva['v'])
-            grid.run_grid_method('applyColumnState', {'state': [
-                {'colId': f, 'pinned': 'left' if f in kotva['v'] else None}
-                for f, _ in kotvitelne]})
-
-        def _kotva_chk(pole, zapnuto):
-            if kotva['ticho']:
-                return
-            _kotva_nastav([f for f in kotva['v'] if f != pole] + ([pole] if zapnuto else []))
-
-        def _kotva_vychozi():
-            kotva['ticho'] = True
-            try:
-                for f, ch in kotva_chk.items():
-                    ch.set_value(f in _NEDOD_KOTVA_VYCHOZI)
-            finally:
-                kotva['ticho'] = False
-            _kotva_nastav(_NEDOD_KOTVA_VYCHOZI)
-
-        with ui.button(icon='push_pin', text='Ukotvit sloupce') \
-                .props('flat dense no-caps color=grey-8') as btn_kotva:
-            btn_kotva.tooltip('Zvolte sloupce, které zůstanou vlevo vidět při posunu doprava')
-            with ui.menu():
-                ui.label('Ukotvené sloupce (vlevo)').classes('text-xs text-gray-500 px-3 pt-2')
-                kotva_chk = {}
-                for f, nazev in kotvitelne:
-                    kotva_chk[f] = ui.checkbox(
-                        nazev, value=f in kotva['v'],
-                        on_change=lambda e, f=f: _kotva_chk(f, e.value)) \
-                        .props('dense').classes('px-3')
-                ui.separator()
-                ui.menu_item('↺ Zrušit ukotvení', on_click=_kotva_vychozi, auto_close=False)
-        btn_kotva.set_visibility(False)   # jen v pohledu Řádky (viz _prepni)
+        # ── Ukotvení sloupců — vlastní volba pro každý pohled (viz _kotva_tlacitko);
+        # vidět je vždy jen tlačítko aktuálního pohledu (_prepni). ──
+        kotva_defs = {
+            'radky': lambda k: _s_kotvou(_ub(_col_defs_nedodavky(edit_js)), k),
+            'souhrn': lambda k: _s_kotvou(_ub(_col_defs_nedod_souhrn(edit_js)), k),
+            'kt': lambda k: _s_kotvou(_ub(_col_defs_nedod_kt(), kt=True), k),
+        }
+        kotva_grid = {'radky': lambda: grid, 'souhrn': lambda: souhrn, 'kt': lambda: kt_grid}
+        kotva_btn, kotva = {}, {}
+        for _p in kotva_defs:
+            kotva_btn[_p], kotva[_p] = _kotva_tlacitko(
+                _NEDOD_KOTVA_KLIC[_p], kotva_defs[_p], kotva_grid[_p], _NEDOD_KOTVA_VYCHOZI[_p])
+            kotva_btn[_p].set_visibility(False)
 
         ui.space()
         info = ui.label('').classes('text-sm text-gray-500')
+        # Druhé okno pod stejným přihlášením (sdílí cookie → žádné „vykopnutí"
+        # single-session) — např. dvě období vedle sebe. Otevírá se přímo v JS,
+        # ať ho prohlížeč nebere jako vyskakovací okno.
+        ui.button(icon='open_in_new').props('flat dense round color=grey-8') \
+            .on('click', lambda: None, js_handler="() => window.open('/sankce', '_blank')") \
+            .tooltip('Otevřít Nedodávky v novém okně — např. dvě období vedle sebe '
+                     '(stejné přihlášení, nic se neodhlásí)')
         # Filtry sestavy — v kontingenční tabulce se schovají (ta má vlastní lištu).
         jen_sestava = [sel_obd, sw_bez, lbl_dod, info] + ([sel_nak] if len(nak_list) > 1 else [])
         ui.button(icon='download', text='Export', on_click=_export) \
@@ -6660,21 +6916,33 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
             _smazat_button(_NEDOD_TABULKA, _NEDOD_NAZEV,
                            user_name, _vykresli_nedodavky.refresh)
 
-    if not psat_vse and moje_kody:
+    if jen_unibrands and not moje_kody:
+        ui.label(f'✍ Vyplňujete sloupec „{_VYJ_UB_NAZEV}" u dodavatele UNIBRANDS; '
+                 '„Vyjádření nákupčího" vidíte jen pro čtení. V souhrnu se zápis propíše '
+                 'do všech zobrazených řádků dodavatele.') \
+            .classes('text-xs text-gray-500 mb-1')
+    elif not psat_vse and moje_kody:
         ui.label(f'✍ Vidíte a vyplňujete nedodávky svého nákupu ({", ".join(sorted(moje_kody))}). '
                  'V souhrnu se zápis propíše do všech zobrazených řádků dodavatele.') \
             .classes('text-xs text-gray-500 mb-1')
     elif not psat_vse:
         ui.label('👁 Sestavu vidíte jen pro čtení — filtrovat, řadit a exportovat můžete, '
                  'vyjádření píší nákupčí podle kódu NAK.').classes('text-xs text-gray-500 mb-1')
+    if psat_vse or moje_kody or ma_ub:
+        ui.label('⌨ Vyjádření jako v Excelu: psát začnete dvojklikem nebo rovnou psaním. '
+                 'Ctrl+C zkopíruje buňku, Ctrl+V ji vloží — do všech označených řádků '
+                 '(Shift+klik = rozsah, Ctrl+klik = přidat řádek). Vložit jde i sloupec '
+                 'zkopírovaný z Excelu.').classes('text-xs text-gray-500 mb-1')
 
     _opts = {
-        'columnDefs': _col_defs_nedodavky(edit_js, kotva['v']),
+        'columnDefs': kotva_defs['radky'](kotva['radky']),
         'rowData': _zobrazene(),
         'pinnedBottomRowData': [_celkem_row(_zobrazene())],
         'defaultColDef': {'resizable': True, 'sortable': False, 'filter': True},
         'rowHeight': 32,
-        'singleClickEdit': True,
+        # Jako Excel: klik buňku vybere (Ctrl+C / Ctrl+V, Shift/Ctrl+klik = víc
+        # řádků), psát se začne dvojklikem, Enterem, F2 nebo rovnou psaním.
+        'rowSelection': 'multiple',
         'stopEditingWhenCellsLoseFocus': True,
         'suppressMovableColumns': True,
         ':getRowStyle': _PINNED_TOTAL_STYLE,
@@ -6682,19 +6950,20 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
         ':onGridSizeChanged': _AUTOSIZE_FIT,
         ':onFilterChanged': _FILTER_RECALC_NEDODAVKY,
         ':getRowId': _GET_ROW_ID,
+        **_GRID_KOPIE_OPTS,
     }
     if je_analytik:
         _opts.update(_grid_mazani_js(_NEDOD_TABULKA))
-    grid = _grid_bez_prestavby(ui.aggrid(_opts).classes('w-full').style(_GRID_STYLE))
+    grid = _grid_bez_prestavby(ui.aggrid(_opts).classes(f'w-full {_GRID_KOPIE_CLASS}').style(_GRID_STYLE))
+    _kopirovani_bunek_skript()
 
     _s0 = _souhrn_data()
     souhrn = ui.aggrid({
-        'columnDefs': _col_defs_nedod_souhrn(edit_js),
+        'columnDefs': kotva_defs['souhrn'](kotva['souhrn']),
         'rowData': _s0,
         'pinnedBottomRowData': [_souhrn_celkem(_s0)],
         'defaultColDef': {'resizable': True, 'sortable': False, 'filter': True},
         'rowHeight': 32,
-        'singleClickEdit': True,
         'stopEditingWhenCellsLoseFocus': True,
         'suppressMovableColumns': True,
         'rowSelection': 'multiple',
@@ -6704,7 +6973,8 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
         ':onGridSizeChanged': _AUTOSIZE_FIT,
         ':onFilterChanged': _FILTER_RECALC_NEDOD_SOUHRN,
         ':getRowId': _GET_ROW_ID,
-    }).classes('w-full').style(_GRID_STYLE)
+        **_GRID_KOPIE_OPTS,
+    }).classes(f'w-full {_GRID_KOPIE_CLASS}').style(_GRID_STYLE)
     _grid_bez_prestavby(souhrn)
 
     # ── Kontingenční tabulka: list „Souhrn" nad celým nahraným listem „data" ──
@@ -6729,7 +6999,7 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
             ui.space()
             kt_info = ui.label('').classes('text-sm text-gray-500')
         kt_grid = ui.aggrid({
-            'columnDefs': _col_defs_nedod_kt(),
+            'columnDefs': kotva_defs['kt'](kotva['kt']),
             'rowData': [],
             # Filtry v hlavičkách jako v ostatních sestavách (řazení ne — pořadí
             # drží strukturu Excelu: detail dodavatele, pod ním jeho „Celkem").
@@ -6738,13 +7008,14 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
             'suppressMovableColumns': True,
             ':getRowStyle': _KT_ROW_STYLE,
             ':getRowId': 'function(p){return String(p.data.id);}',
-            'singleClickEdit': True,
+            'rowSelection': 'multiple',
             'stopEditingWhenCellsLoseFocus': True,
             ':onFirstDataRendered': _AUTOSIZE_FIT,
             ':onGridSizeChanged': _AUTOSIZE_FIT,
             ':onFilterChanged': _FILTER_RECALC_KT,
             **_KT_EXT_FILTR,
-        }).classes('w-full').style(_GRID_STYLE)
+            **_GRID_KOPIE_OPTS,
+        }).classes(f'w-full {_GRID_KOPIE_CLASS}').style(_GRID_STYLE)
         _grid_bez_prestavby(kt_grid)
 
     def _kt_zdroj(rid) -> list:
@@ -6760,9 +7031,11 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
             podle_hash.setdefault(s.get('row_hash'), []).append(s)
         for r in (kt['data'] or {}).get('radky', []):
             zdroj = [s for h in kt['hashe'].get(r['id'], ()) for s in podle_hash.get(h, ())]
-            vyj = {(s.get('vyjadreni') or '').strip() for s in zdroj}
-            r['vyjadreni'] = (next(iter(vyj)) if len(vyj) == 1 else _MIX_LABEL) if vyj else ''
+            for pole in ('vyjadreni', _VYJ_UB):
+                vyj = {(s.get(pole) or '').strip() for s in zdroj}
+                r[pole] = (next(iter(vyj)) if len(vyj) == 1 else _MIX_LABEL) if vyj else ''
             r['_smi'] = any(_smi_psat(s) for s in zdroj)
+            r['_smi_ub'] = any(_smi_ub(s) for s in zdroj)
 
     async def _kt_obnov(moznosti: bool = False):
         """Načte kontingenční tabulku podle filtrů (moznosti=True: i nabídky filtrů)."""
@@ -6861,7 +7134,8 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
         for w in jen_sestava:
             w.set_visibility(not je_kt)
         btn_zrus_dod.set_visibility(not je_kt and bool(stav['ico']))
-        btn_kotva.set_visibility(v == 'radky')
+        for _p, _b in kotva_btn.items():
+            _b.set_visibility(_p == v)
         if je_kt:
             if not kt['nacteno']:
                 await _kt_obnov(moznosti=True)
@@ -6915,10 +7189,22 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
     info.set_text(_info_text())
 
     # ── Zápis vyjádření ──
-    def _uloz_vyjadreni(radky: list, text: str) -> int:
+    def _uloz_vyjadreni(radky: list, text: str, pole: str = 'vyjadreni') -> int:
         """Zapíše vyjádření do daných řádků (DB + audit + paměť). Vrací počet."""
-        cile = [r for r in radky if _smi_psat(r)
-                and (r.get('vyjadreni') or '') != (text or '')]
+        return _uloz_vyjadreni_dvojice([(r, text) for r in radky], pole)
+
+    def _uloz_vyjadreni_dvojice(dvojice: list, pole: str = 'vyjadreni') -> int:
+        """Zapíše [(řádek, text)] do sloupce `pole` (klíč _SMI) jedním spojením
+        a commitem. Řádky bez práva a beze změny přeskočí; je-li řádek víckrát,
+        platí poslední text."""
+        smi = _SMI.get(pole)
+        if smi is None:
+            return 0
+        cile = {}
+        for r, text in dvojice:
+            cile[id(r)] = (r, text or '')
+        cile = [(r, t) for r, t in cile.values()
+                if smi(r) and (r.get(pole) or '') != t]
         if not cile:
             return 0
         kdy = datetime.datetime.now().strftime('%d.%m.%Y %H:%M')
@@ -6928,24 +7214,68 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
             return 0
         try:
             cur = conn.cursor()
+            # `pole` je jen klíč z _SMI (whitelist) — do SQL nejde nic od klienta.
             cur.executemany(
-                f'UPDATE {_NEDOD_TABULKA} SET vyjadreni=%s, vyjadreni_by=%s, '
-                f'vyjadreni_at=NOW() WHERE id=%s',
-                [(text, user_name, r.get('id')) for r in cile])
+                f'UPDATE {_NEDOD_TABULKA} SET {pole}=%s, {pole}_by=%s, '
+                f'{pole}_at=NOW() WHERE id=%s',
+                [(t, user_name, r.get('id')) for r, t in cile])
             conn.commit(); cur.close()
         finally:
             conn.close()
-        for r in cile:
-            zapis_audit(_NEDOD_TABULKA, r.get('row_hash'), r.get('id'),
-                        'vyjadreni', r.get('vyjadreni'), text, user_id, user_name)
-            r['vyjadreni'] = text
-            r['vyjadreni_by'] = user_name
-            r['vyjadreni_at'] = kdy
+        zapis_audit_hromadne(
+            _NEDOD_TABULKA,
+            [(r.get('row_hash'), r.get('id'), pole, r.get(pole), t)
+             for r, t in cile],
+            user_id, user_name)
+        for r, t in cile:
+            r[pole] = t
+            r[f'{pole}_by'] = user_name
+            r[f'{pole}_at'] = kdy
         return len(cile)
+
+    def _polozky_vlozeni(e) -> tuple:
+        """Ctrl+V z gridu (event 'vlozeni', viz _kopirovani_bunek_skript) →
+        ([(id, text, kontrola)], počet cílových řádků, kam psát nejde, pole)."""
+        a = e.args
+        if isinstance(a, (list, tuple)):
+            a = a[0] if a else None
+        if not isinstance(a, dict) or a.get('pole') not in _SMI:
+            return [], 0, None
+        polozky = []
+        for p in a.get('polozky') or []:
+            if not isinstance(p, dict) or p.get('id') is None:
+                continue
+            text = str(p.get('text') or '')
+            if text == _MIX_LABEL:   # zkopírovaný štítek „různé" není vyjádření
+                continue
+            kontrola = p.get('kontrola')
+            polozky.append((p['id'], text, kontrola if isinstance(kontrola, dict) else {}))
+        try:
+            mimo = int(a.get('mimo') or 0)
+        except (TypeError, ValueError):
+            mimo = 0
+        return polozky, mimo, a['pole']
+
+    def _hlas_vlozeni(pocet: int, cilu: int, mimo: int) -> None:
+        if pocet:
+            zprava = f'Vyjádření vloženo do {pocet} řádků.'
+            if cilu - pocet:
+                zprava += f' Beze změny {cilu - pocet} (už tam bylo).'
+            if mimo:
+                zprava += f' Přeskočeno {mimo} (bez práva psát).'
+            ui.notify(zprava, type='positive', position='top', timeout=4000)
+        else:
+            ui.notify('Nic se nezměnilo — text už tam je, nebo k těmto řádkům '
+                      'nemáte právo psát.', type='warning', position='top', timeout=5000)
+
+    def _hlaska_bez_prava(pole: str) -> str:
+        return (f'„{_VYJ_UB_NAZEV}" jde psát jen u dodavatele UNIBRANDS.' if pole == _VYJ_UB
+                else 'Vyjádření smí psát jen nákupčí s odpovídajícím kódem NAK.')
 
     def _on_change(e):
         a = e.args or {}
-        if a.get('colId') != 'vyjadreni':
+        pole = a.get('colId')
+        if pole not in _SMI:
             return
         d = a.get('data') or {}
         rid = d.get('id')
@@ -6953,23 +7283,48 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
         radek = next((r for r in vsechny if r.get('id') == rid), None)
         if radek is None:
             return
-        if not _smi_psat(radek):
-            ui.notify('Vyjádření smí psát jen nákupčí s odpovídajícím kódem NAK.',
-                      type='warning')
+        if not _SMI[pole](radek):
+            ui.notify(_hlaska_bez_prava(pole), type='warning')
             _aplikuj()
             return
-        if _uloz_vyjadreni([radek], nova or ''):
+        if _uloz_vyjadreni([radek], nova or '', pole):
             intranet_logger.log_activity(user_name, 'Sankce',
-                                         f'Vyjádření (Nedodávky) #{rid}')
+                                         f'{_NAZEV_VYJ[pole]} (Nedodávky) #{rid}')
             grid.run_grid_method('applyTransaction', {'update': [radek]})
             _aplikuj_souhrn()
             info.set_text(_info_text())
     grid.on('cellValueChanged', _on_change)
 
+    def _vloz_dvojice(dvojice: list, mimo: int, popis: str, pole: str) -> int:
+        """Společný konec Ctrl+V: zápis, hlášení, log. Vrací počet změněných."""
+        prava = [(r, t) for r, t in dvojice if _SMI[pole](r)]
+        mimo += len({id(r) for r, _t in dvojice} - {id(r) for r, _t in prava})
+        pocet = _uloz_vyjadreni_dvojice(prava, pole)
+        _hlas_vlozeni(pocet, len({id(r) for r, _t in prava}), mimo)
+        if pocet:
+            intranet_logger.log_activity(
+                user_name, 'Sankce',
+                f'{_NAZEV_VYJ[pole]} vloženo (Nedodávky, {popis}): {pocet} řádků')
+        return pocet
+
+    def _on_vlozeni(e):
+        """Ctrl+V v detailu: text do zaměřeného / označených řádků (nebo výřez z Excelu)."""
+        polozky, mimo, pole = _polozky_vlozeni(e)
+        if not polozky:
+            return
+        podle_id = {r.get('id'): r for r in vsechny}
+        dvojice = [(podle_id[rid], text) for rid, text, _k in polozky if rid in podle_id]
+        if _vloz_dvojice(dvojice, mimo, 'detail', pole):
+            grid.run_grid_method('applyTransaction', {'update': [r for r, _t in dvojice]})
+            _aplikuj_souhrn()
+            info.set_text(_info_text())
+    grid.on('vlozeni', _on_vlozeni)
+
     def _on_change_kt(e):
         """Zápis v kontingenční tabulce → do řádků sestavy, ze kterých řádek vznikl."""
         a = e.args or {}
-        if a.get('colId') != 'vyjadreni':
+        pole = a.get('colId')
+        if pole not in _SMI:
             return
         d = a.get('data') or {}
         rid = d.get('id')
@@ -6984,24 +7339,57 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
         zdroj = _kt_zdroj(rid)
         chyba = ('Řádek není v sestavě Nedodávek (jiný Stav příjemky / DCERA / STATUS) '
                  '— vyjádření k němu nejde zapsat.' if not zdroj else
-                 'Vyjádření smí psát jen nákupčí s odpovídajícím kódem NAK.'
-                 if not any(_smi_psat(s) for s in zdroj) else None)
-        pocet = 0 if chyba or nova == _MIX_LABEL else _uloz_vyjadreni(zdroj, nova or '')
+                 _hlaska_bez_prava(pole)
+                 if not any(_SMI[pole](s) for s in zdroj) else None)
+        pocet = 0 if chyba or nova == _MIX_LABEL else _uloz_vyjadreni(zdroj, nova or '', pole)
         if chyba:
             ui.notify(chyba, type='warning')
         _kt_vyjadreni()   # vrátí / potvrdí hodnotu v buňce
         kt_grid.run_grid_method('applyTransaction', {'update': [radek]})
         if pocet:
             intranet_logger.log_activity(
-                user_name, 'Sankce', f'Vyjádření (Nedodávky, kontingenční) {pocet} řádků')
+                user_name, 'Sankce',
+                f'{_NAZEV_VYJ[pole]} (Nedodávky, kontingenční) {pocet} řádků')
             _aplikuj()
     kt_grid.on('cellValueChanged', _on_change_kt)
+
+    def _on_vlozeni_kt(e):
+        """Ctrl+V v kontingenční tabulce → do řádků sestavy, ze kterých řádky vznikly."""
+        polozky, mimo, pole = _polozky_vlozeni(e)
+        if not polozky:
+            return
+        radky_kt = (kt['data'] or {}).get('radky', [])
+        podle_id = {r.get('id'): r for r in radky_kt}
+        # Pojistka jako u ruční editace: tabulka se mohla mezitím přenačíst.
+        if any(rid not in podle_id
+               or any(k.get(p) != podle_id[rid].get(p) for p in _KT_RADKY)
+               for rid, _t, k in polozky):
+            ui.notify('Tabulka se mezitím změnila — nic se nevložilo, zkuste znovu.',
+                      type='warning')
+            return
+        dvojice = []
+        for rid, text, _k in polozky:
+            zdroj = _kt_zdroj(rid)
+            if zdroj:
+                dvojice += [(s, text) for s in zdroj]
+            else:
+                mimo += 1   # řádek mimo sestavu Nedodávek — není kam psát
+        if not _vloz_dvojice(dvojice, mimo, 'kontingenční', pole):
+            return
+        pred = {r.get('id'): r.get(pole) for r in radky_kt}
+        _kt_vyjadreni()
+        zmenene = [r for r in radky_kt if r.get(pole) != pred.get(r.get('id'))]
+        if zmenene:
+            kt_grid.run_grid_method('applyTransaction', {'update': zmenene})
+        _aplikuj()
+    kt_grid.on('vlozeni', _on_vlozeni_kt)
 
     async def _on_change_souhrn(e):
         """Zápis v souhrnu = vyjádření na VŠECH zobrazených řádcích dodavatele
         (a všech označených dodavatelů, je-li jich zaškrtnuto víc)."""
         a = e.args or {}
-        if a.get('colId') != 'vyjadreni':
+        pole = a.get('colId')
+        if pole not in _SMI:
             return
         gid = (a.get('data') or {}).get('id')
         nova = a.get('newValue')
@@ -7022,7 +7410,7 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
 
         data = _zobrazene()
         radky = [r for r in data if str(r.get('ico') or '') in cile]
-        pocet = _uloz_vyjadreni(radky, nova or '')
+        pocet = _uloz_vyjadreni(radky, nova or '', pole)
         if not pocet:
             ui.notify('Nic se nezměnilo — buď je text stejný, nebo k těmto řádkům '
                       'nemáte právo psát.', type='warning', position='top', timeout=5000)
@@ -7030,14 +7418,33 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
             return
         intranet_logger.log_activity(
             user_name, 'Sankce',
-            f'Vyjádření (Nedodávky) hromadně: {len(cile)} dod. / {pocet} řádků')
-        ui.notify(f'Vyjádření zapsáno u {pocet} řádků ({len(cile)} dodavatel(ů)).',
+            f'{_NAZEV_VYJ[pole]} (Nedodávky) hromadně: {len(cile)} dod. / {pocet} řádků')
+        ui.notify(f'{_NAZEV_VYJ[pole]} zapsáno u {pocet} řádků ({len(cile)} dodavatel(ů)).',
                   type='positive', position='top', timeout=4000)
         grid.run_grid_method('applyTransaction', {'update': radky})
         grid.run_grid_method('onFilterChanged')
         _aplikuj_souhrn(data)
         info.set_text(_info_text(data))
     souhrn.on('cellValueChanged', _on_change_souhrn)
+
+    def _on_vlozeni_souhrn(e):
+        """Ctrl+V v souhrnu = vyjádření na všech zobrazených řádcích dodavatele
+        (zaměřeného, nebo všech zaškrtnutých)."""
+        polozky, mimo, pole = _polozky_vlozeni(e)
+        if not polozky:
+            return
+        data = _zobrazene()
+        podle_ico = {}
+        for r in data:
+            podle_ico.setdefault(str(r.get('ico') or ''), []).append(r)
+        dvojice = [(r, text) for gid, text, _k in polozky
+                   for r in podle_ico.get(str(gid), ())]
+        if _vloz_dvojice(dvojice, mimo, f'dodavatelé {len(polozky)}', pole):
+            grid.run_grid_method('applyTransaction', {'update': [r for r, _t in dvojice]})
+            grid.run_grid_method('onFilterChanged')
+            info.set_text(_info_text(data))
+        _aplikuj_souhrn(data)
+    souhrn.on('vlozeni', _on_vlozeni_souhrn)
 
     # ── Kliknutí: očičko (historie) v detailu, jméno dodavatele v souhrnu ──
     def _on_click(e):
@@ -7085,6 +7492,8 @@ def _dlazdice(emoji, nadpis, barva_border, barva_btn, on_click):
 
 @refreshable_na_klienta
 async def vykresli_sankce(user_id, user_name, vsechna_prava):
+    # „Všichni nákupčí" se rozvine jen pro tikety; Nedodávky ho neznají.
+    prava_tikety = _rozvin_prava(vsechna_prava)
     # DB dotazy běží ve vlákně — nedrží event loop celého serveru
     await asyncio.to_thread(inicializace_sankce_db)
     # Pozn.: globální handler 'sankce_radek_del' se registruje JIŽ při stavbě
@@ -7097,7 +7506,7 @@ async def vykresli_sankce(user_id, user_name, vsechna_prava):
     vidi_vystaveni = ma_vse or je_ctenar or 'sankce_ucetni' in vsechna_prava or 'sankce_analytik' in vsechna_prava
     vidi_zamitnute = ma_vse or je_ctenar or 'sankce_nakup' in vsechna_prava or 'sankce_analytik' in vsechna_prava
     vidi_tikety = vidi_vystaveni or bool(
-        {'sankce_tiket_provoz', 'sankce_tiket_kontrola', *KOD_PRAVO.values()} & set(vsechna_prava))
+        {'sankce_tiket_provoz', 'sankce_tiket_kontrola', *KOD_PRAVO.values()} & set(prava_tikety))
     # Nedodávky: čtou všechny role modulu, píší do nich nákupčí podle kódu NAK.
     vidi_nedodavky = vidi_zamitnute or vidi_vystaveni or bool(
         {PRAVO_UNIBRANDS, *KOD_PRAVO.values()} & set(vsechna_prava))
@@ -7143,7 +7552,7 @@ async def vykresli_sankce(user_id, user_name, vsechna_prava):
         await _vykresli_vystaveni(user_id, user_name, vsechna_prava)
         return
     if pohled == 'tikety':
-        await _vykresli_tikety(user_id, user_name, vsechna_prava)
+        await _vykresli_tikety(user_id, user_name, prava_tikety)
         return
     if pohled == 'nedodavky':
         await _vykresli_nedodavky(user_id, user_name, vsechna_prava)

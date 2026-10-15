@@ -33,6 +33,7 @@ import intranet_gastrokurzy
 import intranet_monitory
 import intranet_zalistovaci
 import intranet_manualy
+import intranet_halloween
 
 import time
 import asyncio
@@ -80,7 +81,7 @@ def cil_po_prihlaseni(client, aktivni_tab='prehled'):
 import os as _os
 from intranet_ui_utils import prepni_tab, zaregistruj_prepinac_tabu
 _STATIC_WHITELIST = [
-    'auto.svg', 'auto.png',
+    'auto.svg', 'auto.png', 'auto_halloween.svg',
     'prizemi.svg', 'druhe_patro.svg', 'suteren.svg',
     'prizemi_podklad.png',
     'pozadi.jpg',
@@ -593,12 +594,15 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
         </script>
         ''')
 
+    # Jednou za načtení — CSS v hlavičce a dekorace přihlašovací stránky se musí shodnout,
+    # i když mezitím někdo přepne /halloween v audit konzoli.
+    halloween_vzhled = intranet_halloween.je_halloween()
     ui.add_head_html('''
         <style>
             /* Okamžité nastavení pozadí přes CSS ještě před spuštěním JS – eliminuje bílý záblesk */
             html, body { background-color: #f3f4f6; }
 
-''' + _POZADI_CSS + _LOGIN_CSS + '''
+''' + _POZADI_CSS + _LOGIN_CSS + (intranet_halloween.CSS if halloween_vzhled else '') + '''
             body.intranet-pozadi {
                 margin: 0 !important;
                 padding: 0 !important;
@@ -634,7 +638,7 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
             }
             .car-driving {
                 display: block !important;
-                animation: driveRight 1.5s ease-in-out forwards;
+                animation: driveRight 2s ease-in-out forwards;
             }
         </style>
     ''')
@@ -965,7 +969,7 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
         any(p in vsechna_prava for p in (
             'asm_zadatel', 'asm_office', 'asm_spravce',
             'asm_spravce_bez_emailu', 'asm_vkladatel',
-            'asm_navyseni_office'))
+            'asm_navyseni_office', 'podklady_vr_ctenar', 'podklady_vr_spravce'))
     )
     # Schůzky s vedoucími jsou dlaždice uvnitř Formulářů ASM — kdo má právo jen
     # na ně, musí záložku vidět taky (uvnitř pak uvidí jen tu jednu dlaždici).
@@ -1004,6 +1008,8 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
         except Exception:
             pass
         ui.query('body').classes(add='prihlaseni-pozadi', remove='intranet-pozadi')
+        if halloween_vzhled:
+            intranet_halloween.vykresli_dekorace()
         with ui.column().classes('w-full h-screen items-center justify-center m-0 py-8 px-4 overflow-y-auto'):
             try:
                 if app.storage.user.get('vykopnut_duplicita'):
@@ -1026,7 +1032,8 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
             except AssertionError:
                 pass
 
-            car_img = ui.image('/static/auto.svg').classes('car-container w-64')
+            car_img = ui.image('/static/auto_halloween.svg' if halloween_vzhled else '/static/auto.svg') \
+                .classes('car-container w-64')
 
             # Předvyplnění e-mailu z „Zapamatovat si mě" (ukládá se JEN e-mail, nikdy heslo)
             try:
@@ -1093,7 +1100,8 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
                         None, intranet_data.overit_prihlaseni, email, heslo)
 
                     async def dokonci_prihlaseni():
-                        if app.storage.user.get('auto_zapnuto', True):
+                        auto_jede = app.storage.user.get('auto_zapnuto', True)
+                        if auto_jede:
                             car_img.classes(add='car-driving')
 
                         # „Zapamatovat si mě" — ukládáme POUZE e-mail do relace uživatele
@@ -1116,7 +1124,8 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
                         loading_dlg.open()
 
                         _cil = cil_po_prihlaseni(client, aktivni_tab)
-                        ui.timer(0.8, lambda: ui.navigate.to(_cil), once=True)
+                        # S autem čekáme déle, aby stihlo stejný kus jízdy (poměr 0.8 s : 1.5 s jízdy, viz .car-driving)
+                        ui.timer(1.07 if auto_jede else 0.8, lambda: ui.navigate.to(_cil), once=True)
 
                         # Logování až PO zobrazení dialogu a naplánování navigace —
                         # JS detekce Brave (timeout až 2 s) nesmí zdržet přihlášení.

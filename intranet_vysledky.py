@@ -6027,11 +6027,15 @@ _OZ_FMT_NUM0 = (
     "return new Intl.NumberFormat('cs-CZ',{maximumFractionDigits:0}).format(n);"
     "}"
 )
+# `_mimo` = měsíc mimo zvolené období → šedý řádek (viz `_oz_rows2`).
+_OZ_MIMO_STYL = "{color:'#b0b0b0',backgroundColor:'#f3f3f3'}"
 _OZ_CELKEM_CS = (
-    "function(p){return (p.data&&p.data._celkem)?{fontWeight:'bold'}:null;}"
+    "function(p){if(p.data&&p.data._mimo)return" + _OZ_MIMO_STYL + ";"
+    "return (p.data&&p.data._celkem)?{fontWeight:'bold'}:null;}"
 )
 _OZ_POROVNANI_CS = (
-    "function(p){if(p.data&&p.data._celkem)"
+    "function(p){if(p.data&&p.data._mimo)return" + _OZ_MIMO_STYL + ";"
+    "if(p.data&&p.data._celkem)"
     "return{backgroundColor:'#404040',color:'#fff',fontWeight:'bold'};"
     "return{backgroundColor:'#EBF1DE'};}"
 )
@@ -6522,7 +6526,9 @@ def _oz_zjisti_roky(*datasets) -> tuple[int, int]:
 
 def _oz_cols2(rok_old: int, rok_new: int, editable: bool, je_marze: bool) -> list[dict]:
     fmt = _SOUHRN_FMT_PCT if je_marze else _OZ_FMT_NUM0
-    edit_js = "function(p){return %s;}" % ('true' if (editable and not je_marze) else 'false')
+    # `_vypocet` = Celkem dopočtený ze zvoleného období → needitovatelný.
+    edit_js = ("function(p){return !(p.data&&p.data._vypocet);}" if (editable and not je_marze)
+               else "function(p){return false;}")
     cols = [
         {'headerName': 'Měsíc', 'field': 'mesic', 'width': 90, 'minWidth': 84, 'maxWidth': 110,
          'cellDataType': 'text', ':cellStyle': _OZ_CELKEM_CS},
@@ -6545,16 +6551,39 @@ def _oz_cols2(rok_old: int, rok_new: int, editable: bool, je_marze: bool) -> lis
     return cols
 
 
-def _oz_rows2(vals_old: dict, vals_new: dict) -> list[dict]:
+def _oz_rows2(vals_old: dict, vals_new: dict, obdobi: dict | None = None,
+              celkem=None) -> list[dict]:
+    """Řádky karty. `obdobi` = {'od': m, 'do': m}; měsíce mimo něj jsou `_mimo`
+    (šedé) a Celkem se sečte jen za zvolené měsíce. Celé období (1–12) =
+    Celkem z uložené hodnoty (měsíc 0), jako dosud. `celkem(od, do)` → (old, new)
+    nahradí prostý součet (Marže v % = zisk ÷ obrat za období, ne součet procent)."""
+    m_od, m_do = (obdobi['od'], obdobi['do']) if obdobi else (1, 12)
     rows = []
     for m in range(1, 13):
-        rows.append({'mesic': str(m), 'y_old': vals_old.get(m), 'y_new': vals_new.get(m), '_celkem': False})
-    rows.append({'mesic': 'Celkem', 'y_old': vals_old.get(0), 'y_new': vals_new.get(0), '_celkem': True})
+        rows.append({'mesic': str(m), 'y_old': vals_old.get(m), 'y_new': vals_new.get(m),
+                     '_celkem': False, '_mimo': not (m_od <= m <= m_do)})
+    if (m_od, m_do) == (1, 12):
+        rows.append({'mesic': 'Celkem', 'y_old': vals_old.get(0),
+                     'y_new': vals_new.get(0), '_celkem': True})
+    else:
+        if celkem:
+            c_old, c_new = celkem(m_od, m_do)
+        else:
+            def _soucet(vals):
+                hodnoty = [vals.get(m) for m in range(m_od, m_do + 1) if vals.get(m) is not None]
+                return sum(hodnoty) if hodnoty else None
+            c_old, c_new = _soucet(vals_old), _soucet(vals_new)
+        rows.append({'mesic': f'Celkem {m_od}–{m_do}', 'y_old': c_old,
+                     'y_new': c_new, '_celkem': True, '_vypocet': True})
     return rows
 
 
 def _oz_karta(pobocka, list_klic, skup, sekce_key, rok_old, rok_new,
-              vals_old, vals_new, titul, popis, editable, je_marze, popis_h=96):
+              vals_old, vals_new, titul, popis, editable, je_marze, popis_h=96,
+              obdobi: dict | None = None, prepocty: list | None = None, celkem=None):
+    """`obdobi` + `prepocty`: karta si do `prepocty` zaregistruje funkci, která
+    po změně období (nebo editaci měsíce) přepočítá řádky bez překreslení.
+    `celkem` – viz `_oz_rows2` (vlastní výpočet Celkem za období)."""
     with ui.column().classes('gap-1 w-full'):
         # Popisový blok na pevné výšce → tabulky ve 3 sloupcích se zarovnají.
         with ui.column().classes('gap-0 w-full').style(f'height: {popis_h}px; overflow: hidden'):
@@ -6563,7 +6592,7 @@ def _oz_karta(pobocka, list_klic, skup, sekce_key, rok_old, rok_new,
                 ui.label(line).classes('text-xs text-gray-500 leading-tight')
         grid = ui.aggrid({
             'columnDefs': _oz_cols2(rok_old, rok_new, editable, je_marze),
-            'rowData': _oz_rows2(vals_old, vals_new),
+            'rowData': _oz_rows2(vals_old, vals_new, obdobi, celkem),
             'defaultColDef': {'resizable': True, 'sortable': False, 'wrapHeaderText': True, 'autoHeaderHeight': True},
             'rowHeight': 30, 'suppressMovableColumns': True,
             'stopEditingWhenCellsLoseFocus': True,
@@ -6572,15 +6601,22 @@ def _oz_karta(pobocka, list_klic, skup, sekce_key, rok_old, rok_new,
             ':onGridSizeChanged': _AUTOSIZE_FIT,
         }).classes('w-full oz-grid')
 
+        def _prepocti():
+            grid.run_grid_method('setGridOption', 'rowData', _oz_rows2(vals_old, vals_new, obdobi, celkem))
+        if prepocty is not None:
+            prepocty.append(_prepocti)
+
         if editable and not je_marze:
             def _on_change(e):
                 a = e.args or {}
                 col = a.get('colId')
                 if col not in ('y_old', 'y_new'):
                     return
+                row = a.get('data') or {}
+                if row.get('_vypocet'):
+                    return
                 rok = rok_old if col == 'y_old' else rok_new
-                ml = (a.get('data') or {}).get('mesic')
-                mesic = 0 if ml == 'Celkem' else int(ml)
+                mesic = 0 if row.get('_celkem') else int(row.get('mesic'))
                 nv = a.get('newValue')
                 try:
                     val = (float(str(nv).replace('\xa0', '').replace(' ', '').replace(',', '.'))
@@ -6588,6 +6624,10 @@ def _oz_karta(pobocka, list_klic, skup, sekce_key, rok_old, rok_new,
                 except (TypeError, ValueError):
                     val = 0.0
                 uloz_oz_hodnota(pobocka, list_klic, skup, sekce_key, rok, mesic, val)
+                # Lokální kopie hodnot pro přepočet „Celkem" za zvolené období
+                (vals_old if col == 'y_old' else vals_new)[mesic] = val
+                if obdobi and (obdobi['od'], obdobi['do']) != (1, 12):
+                    _prepocti()
             grid.on('cellValueChanged', _on_change)
 
 
@@ -6601,9 +6641,49 @@ def _oz_render_novy(pobocka: str, je_ao: bool, user_name: str, list_klic: str):
     ui.label(f'{txt["titulek"]} {pobocka} – {rok_new} × {rok_old}') \
         .classes('text-lg font-bold text-gray-800 mb-1 oz-titul-banner') \
         .style('background-color:#FFFFCC;padding:4px 10px;border-radius:4px')
-    if je_ao:
-        ui.label('Editovatelné jsou hodnoty 2025/2026 i Celkový součet; „Porovnání" a „Marže v %" se počítají.') \
-            .classes('text-xs text-gray-400 italic mb-3')
+
+    # ── Období měsíců (Obraty i Zisk) – měsíce mimo období zešednou a „Celkem"
+    #    se přepočítá jen za zvolené měsíce. Volba se pamatuje uživateli,
+    #    pro každou záložku zvlášť. ─────────────────────────────────────────────
+    obdobi = prepocty = None
+    if list_klic in ('obraty', 'zisk'):
+        k_od, k_do = (('vysledky_oz_mesic_od', 'vysledky_oz_mesic_do') if list_klic == 'obraty'
+                      else ('vysledky_oz_zisk_mesic_od', 'vysledky_oz_zisk_mesic_do'))
+        m_od = app.storage.user.get(k_od)
+        m_do = app.storage.user.get(k_do)
+        if m_od not in range(1, 13):
+            m_od = 1
+        if m_do not in range(1, 13):
+            m_do = 12
+        obdobi = {'od': min(m_od, m_do), 'do': max(m_od, m_do)}
+        prepocty = []
+        mesice_options = {i: f'{i} – {MESICE_NAZVY[i - 1]}' for i in range(1, 13)}
+
+        with ui.row().classes('items-center gap-3 mb-2 flex-wrap'):
+            ui.label('Období:').classes('text-sm font-medium text-gray-600')
+            sel_od = ui.select(mesice_options, value=obdobi['od'], label='Od měsíce') \
+                .props('dense outlined options-dense').style('min-width: 150px')
+            sel_do = ui.select(mesice_options, value=obdobi['do'], label='Do měsíce') \
+                .props('dense outlined options-dense').style('min-width: 150px')
+            btn_cele = ui.button('Celý rok', icon='restart_alt') \
+                .props('flat dense color=grey-7').classes('text-xs')
+
+        def _nastav_obdobi(od: int, do: int):
+            od, do = min(od, do), max(od, do)
+            if (od, do) == (obdobi['od'], obdobi['do']):
+                return
+            obdobi['od'], obdobi['do'] = od, do
+            app.storage.user[k_od], app.storage.user[k_do] = od, do
+            sel_od.set_value(od)
+            sel_do.set_value(do)
+            btn_cele.set_visibility((od, do) != (1, 12))
+            for f in prepocty:
+                f()
+
+        sel_od.on_value_change(lambda e: e.value and _nastav_obdobi(e.value, obdobi['do']))
+        sel_do.on_value_change(lambda e: e.value and _nastav_obdobi(obdobi['od'], e.value))
+        btn_cele.on_click(lambda: _nastav_obdobi(1, 12))
+        btn_cele.set_visibility((obdobi['od'], obdobi['do']) != (1, 12))
 
     # ── Editovatelné sekce (Obraty: Kč+Kg; Zisk: Kč) ──────────────────────────
     for sekce_key, sekce_nazev in txt['sekce']:
@@ -6614,7 +6694,8 @@ def _oz_render_novy(pobocka: str, je_ao: bool, user_name: str, list_klic: str):
                 sek = data.get(skup, {}).get(sekce_key, {})
                 _oz_karta(pobocka, list_klic, skup, sekce_key, rok_old, rok_new,
                           sek.get(rok_old, {}), sek.get(rok_new, {}),
-                          titul, popis, je_ao, je_marze=False)
+                          titul, popis, je_ao, je_marze=False,
+                          obdobi=obdobi, prepocty=prepocty)
 
     # ── Staropramen + Operace (import „Tabulka nákladů_DATA.xlsx") ────────────
     if list_klic == 'obraty':
@@ -6627,7 +6708,8 @@ def _oz_render_novy(pobocka: str, je_ao: bool, user_name: str, list_klic: str):
                     _oz_karta(pobocka, list_klic, skup, sekce_key, rok_old, rok_new,
                               sek.get(rok_old, {}), sek.get(rok_new, {}),
                               titul, popis, je_ao, je_marze=False,
-                              popis_h=96 if popis else 28)
+                              popis_h=96 if popis else 28,
+                              obdobi=obdobi, prepocty=prepocty)
 
         _ozn_grid([k for k in _OZN_KARTY if k[1] != 'ops'])
         ui.label('Operace').classes('text-base font-bold text-gray-700 mt-4 mb-1')
@@ -6647,27 +6729,45 @@ def _oz_render_novy(pobocka: str, je_ao: bool, user_name: str, list_klic: str):
                           sek.get(rok_old, {}), sek.get(rok_new, {}),
                           f'Záložní sklad – {sekce_nazev}',
                           ['Prodeje na záložní sklad (dceřiná společnost)'],
-                          je_ao, je_marze=False, popis_h=48)
+                          je_ao, je_marze=False, popis_h=48,
+                          obdobi=obdobi, prepocty=prepocty)
 
     # ── Marže v % (jen Zisk) – dopočítané ze Zisk ÷ Obraty ────────────────────
     if list_klic == 'zisk':
         marze_nazev, marze_pod = txt['marze']
         ui.label(marze_nazev).classes('text-base font-bold text-gray-700 mt-4 mb-1')
 
+        def _zk_ob(skup, rok):
+            # Kopie – marže se počítá ze stavu při vykreslení (jako dosud).
+            return (dict(data.get(skup, {}).get('kc', {}).get(rok, {})),
+                    dict(obraty.get(skup, {}).get('kc', {}).get(rok, {})))
+
         def _marze_vals(skup, rok):
-            zk = data.get(skup, {}).get('kc', {}).get(rok, {})
-            ob = obraty.get(skup, {}).get('kc', {}).get(rok, {})
+            zk, ob = _zk_ob(skup, rok)
             out = {}
             for m in list(range(1, 13)) + [0]:
                 o = ob.get(m)
                 out[m] = (zk.get(m) / o) if (o and zk.get(m) is not None) else None
             return out
 
+        def _marze_celkem(skup):
+            # Marže za období = Σ zisku ÷ Σ obratu (jen měsíce, kde je obojí) –
+            # ne součet měsíčních procent.
+            zo = {r: _zk_ob(skup, r) for r in (rok_old, rok_new)}
+
+            def _za_rok(rok, od, do):
+                zk, ob = zo[rok]
+                ms = [m for m in range(od, do + 1) if ob.get(m) and zk.get(m) is not None]
+                s_ob = sum(ob[m] for m in ms)
+                return (sum(zk[m] for m in ms) / s_ob) if s_ob else None
+            return lambda od, do: (_za_rok(rok_old, od, do), _za_rok(rok_new, od, do))
+
         with ui.grid(columns=3).classes('w-full gap-4'):
             for skup in _OZ_SKUP_PORADI:
                 _oz_karta(pobocka, list_klic, skup, 'marze', rok_old, rok_new,
                           _marze_vals(skup, rok_old), _marze_vals(skup, rok_new),
-                          f'Marže v % – {marze_pod[skup]}', [], False, je_marze=True, popis_h=28)
+                          f'Marže v % – {marze_pod[skup]}', [], False, je_marze=True, popis_h=28,
+                          obdobi=obdobi, prepocty=prepocty, celkem=_marze_celkem(skup))
 
 
 @refreshable_na_klienta

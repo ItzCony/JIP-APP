@@ -117,7 +117,7 @@ ZAKLADNI_PRAVA = {
     'sankce_tiket_provoz':    {'kategorie': 'Modul Sankce', 'podskupina': 'Tikety', 'nazev': 'Tiket: Provoz', 'popis': 'Dostává tikety předané na provoz a rozhoduje u nich Fakturovat / Stornovat.', 'ikona': 'engineering'},
     'sankce_tiket_kontrola':  {'kategorie': 'Modul Sankce', 'podskupina': 'Tikety', 'nazev': 'Tiket: Druhotná kontrola storna', 'popis': 'Schvaluje (palec nahoru) nebo vrací (palec dolů) požadavky na STORNOVÁNÍ sankce. Bez tohoto schválení se řádky nestornují.', 'ikona': 'thumbs_up_down'},
     'sankce_tiket_tvrde_storno': {'kategorie': 'Modul Sankce', 'podskupina': 'Tikety', 'nazev': 'Tiket: Tvrdé storno', 'popis': 'Storno bez druhotné kontroly: řádky přejdou rovnou na „Nevyfakturovat" a nikomu se neposílá e-mail.', 'ikona': 'gavel'},
-    'sankce_tiket_unibrands': {'kategorie': 'Modul Sankce', 'podskupina': 'Nákupčí (tikety)', 'nazev': 'Tikety – Unibrands', 'popis': 'Vidí pouze dlaždici „Nedodávky dod. k vyjádření" a smí tam zapisovat do sloupce „Vyjádření nákupčího" u dodavatele UNIBRANDS. Žádné jiné sestavy ani tikety.', 'ikona': 'edit_note'},
+    'sankce_tiket_unibrands': {'kategorie': 'Modul Sankce', 'podskupina': 'Nákupčí (tikety)', 'nazev': 'Tikety – Unibrands', 'popis': 'Vidí pouze dlaždici „Nedodávky dod. k vyjádření" a smí tam zapisovat do sloupce „Vyjádření Unibrands" u dodavatele UNIBRANDS („Vyjádření nákupčího" jen čte). Žádné jiné sestavy ani tikety.', 'ikona': 'edit_note'},
     'sankce_tiket_dr': {'kategorie': 'Modul Sankce', 'podskupina': 'Nákupčí (tikety)', 'nazev': 'Tiket: nákupčí DR', 'popis': 'Vidí a řeší tikety sankcí s kódem nákupčího DR.', 'ikona': 'assignment_ind'},
     'sankce_tiket_sk': {'kategorie': 'Modul Sankce', 'podskupina': 'Nákupčí (tikety)', 'nazev': 'Tiket: nákupčí SK', 'popis': 'Vidí a řeší tikety sankcí s kódem nákupčího SK.', 'ikona': 'assignment_ind'},
     'sankce_tiket_ck': {'kategorie': 'Modul Sankce', 'podskupina': 'Nákupčí (tikety)', 'nazev': 'Tiket: nákupčí CK', 'popis': 'Vidí a řeší tikety sankcí s kódem nákupčího CK.', 'ikona': 'assignment_ind'},
@@ -132,6 +132,7 @@ ZAKLADNI_PRAVA = {
     'sankce_tiket_mr': {'kategorie': 'Modul Sankce', 'podskupina': 'Nákupčí (tikety)', 'nazev': 'Tiket: nákupčí MR', 'popis': 'Vidí a řeší tikety sankcí s kódem nákupčího MR.', 'ikona': 'assignment_ind'},
     'sankce_tiket_oz': {'kategorie': 'Modul Sankce', 'podskupina': 'Nákupčí (tikety)', 'nazev': 'Tiket: nákupčí OZ', 'popis': 'Vidí a řeší tikety sankcí s kódem nákupčího OZ.', 'ikona': 'assignment_ind'},
     'sankce_tiket_vn': {'kategorie': 'Modul Sankce', 'podskupina': 'Nákupčí (tikety)', 'nazev': 'Tiket: nákupčí VN (vedoucí nákupu)', 'popis': 'Vidí a řeší tikety sankcí s kódem nákupčího VN.', 'ikona': 'assignment_ind'},
+    'sankce_tiket_vsichni_nakupci': {'kategorie': 'Modul Sankce', 'podskupina': 'Nákupčí (tikety)', 'nazev': 'Tiket: všichni nákupčí', 'popis': 'Vidí a řeší tikety sankcí všech nákupčích (DR … OZ) — jako by měl všechny kódy kromě VN. Týká se jen tiketů (Nedodávky ne). Upozornění na nové tikety nedostává.', 'ikona': 'groups'},
 
     # -- Modul Monitor - každý monitor je samostatná podsekce (viz MONITORY v intranet_monitory.py) --
     'monitor_kupi_ctenar':   {'kategorie': 'Modul Monitor', 'podskupina': 'KUPI', 'nazev': 'Čtenář - KUPI', 'popis': 'Vidí sestavu monitoru KUPI, může filtrovat, řadit a exportovat. NEsmí psát vyjádření ani nahrávat data.', 'ikona': 'visibility'},
@@ -215,6 +216,8 @@ ZAKLADNI_PRAVA = {
     'asm_oz_prijemce':        {'kategorie': 'Modul Formuláře ASM', 'nazev': 'Nový OZ - Příjemce',  'popis': 'Chodí mu e-mail o novém formuláři OZ. Vidí celý přehled včetně příloh a exportu, needituje.', 'ikona': 'mark_email_read'},
     'asm_oz_analytik':        {'kategorie': 'Modul Formuláře ASM', 'nazev': 'Nový OZ - Analytik',  'popis': 'Import XLSX, kontrola proti kartám (Dealer), editace všech záznamů a doplňování údajů.', 'ikona': 'analytics'},
     'asm_navyseni_office':    {'kategorie': 'Modul Formuláře ASM', 'nazev': 'Navýšení položek - Office obchod', 'popis': 'Vidí celou frontu formuláře „Navýšení položek v cenotvorbě“, případy zpracovává, vrací k opravě nebo postupuje správci, uzavírá. Chodí mu e-mail o novém případu. Žádosti zakládá běžný Žadatel, schvaluje je Správce obchod — právo Office obchod na tuto frontu NEVIDÍ.', 'ikona': 'task_alt'},
+    'podklady_vr_ctenar':     {'kategorie': 'Modul Formuláře ASM', 'nazev': 'Podklady VŘ - Čtenář', 'popis': 'Vidí dlaždici „Podklady VŘ“: platné i archivní PDF podklady, jejich náhled, tisk a stažení. Nemůže nahrávat, upravovat, archivovat ani mazat; šablony nevidí.', 'ikona': 'visibility'},
+    'podklady_vr_spravce':    {'kategorie': 'Modul Formuláře ASM', 'nazev': 'Podklady VŘ - Správce', 'popis': 'Veškerá práva k dlaždici „Podklady VŘ“: nahrává PDF s platností od–do, upravuje, archivuje a maže podklady, spravuje šablony opakovaně podepisovaných dokumentů a vytváří z nich PDF k tisku.', 'ikona': 'manage_accounts'},
 
     # Lupou na obchod — přístup ASM a vedoucích se NEUDĚLUJE právem. Odvozuje se:
     # ASM se páruje s uživatelem podle příjmení, vedoucí vidí ASM svého oddělení

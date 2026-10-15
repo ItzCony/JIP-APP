@@ -1117,6 +1117,13 @@ mark.m-nalez.m-aktivni{background:#fb923c;color:#fff}
 #u-zvyr button{width:20px;height:20px;padding:0;border-radius:50%;cursor:pointer;
  border:1px solid rgba(0,0,0,.25);font-size:12px;line-height:1;background:#fff}
 #u-zvyr button:hover{outline:2px solid #065f46;outline-offset:1px}
+/* Nulový okraj stránky = prohlížeč netiskne záhlaví/zápatí (datum, titulek, URL);
+   okraj místo něj dělá padding těla, clone ho opakuje na každé stránce. */
+@page{margin:0}
+@media print{body{padding:12mm 15mm;-webkit-box-decoration-break:clone;box-decoration-break:clone}
+ #u-zvyr{display:none !important}
+ .m-tbl-obal{overflow:visible}
+ *{-webkit-print-color-adjust:exact;print-color-adjust:exact}}
 '''
 
 # Word si veze vlastní písmo a řádkování; čitelnost je přednější — přepíšeme je
@@ -1351,6 +1358,11 @@ def vykresli_manualy(user_id, user_name, vsechna_prava):
                     .props('flat dense round color=white').tooltip('Další kapitola')
                 # Celá obrazovka čistě v prohlížeči — requestFullscreen() chce
                 # čerstvý klik, cesta přes server by ho mohla promeškat.
+                # Tiskne se jen dokument v rámu (text kapitoly), ne celé UI.
+                ui.button(icon='print').props('flat dense round color=white') \
+                    .tooltip('Tisk kapitoly') \
+                    .on('click', js_handler=f'() => getHtmlElement({ramec.id})'
+                                            '.querySelector("iframe").contentWindow.print()')
                 ui.button(icon='fullscreen').props('flat dense round color=white') \
                     .classes('fs-zap').tooltip('Celá obrazovka') \
                     .on('click', js_handler=f'() => getHtmlElement({ramec.id}).requestFullscreen()')

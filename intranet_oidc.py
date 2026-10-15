@@ -165,9 +165,15 @@ def _zpet_s_chybou(zprava: str) -> RedirectResponse:
 # Routy
 # --------------------------------------------------------------------------
 @app.get('/auth/login')
-async def oidc_login():
+async def oidc_login(request: Request):
     if not je_zapnuto():
         return RedirectResponse('/')
+
+    # ?brana=<nazev> = druhé ověření přihlášeného uživatele pro citlivý modul
+    # (viz intranet_session.BRANY). Neznámá brána / nepřihlášený = běžné přihlášení.
+    brana = request.query_params.get('brana', '')
+    if brana not in intranet_session.BRANY or not app.storage.user.get('user_id'):
+        brana = ''
 
     verifier, challenge = vytvor_pkce()
     state = secrets.token_urlsafe(32)
@@ -176,12 +182,16 @@ async def oidc_login():
         'oidc_state': state,
         'oidc_verifier': verifier,
         'oidc_nonce': nonce,
+        'oidc_brana': brana,
     })
 
     try:
         disc = await asyncio.to_thread(_discovery)
     except Exception as e:
         intranet_logger.log_activity('Systém', 'OIDC', f'Discovery selhalo: {e}')
+        if brana:
+            app.storage.user['brana_chyba'] = 'Ověření přes firemní účet je dočasně nedostupné.'
+            return RedirectResponse(intranet_session.BRANY[brana])
         return _zpet_s_chybou('Přihlášení přes firemní účet je dočasně nedostupné.')
 
     parametry = {
@@ -202,10 +212,15 @@ async def oidc_login():
     try:
         hint = str(app.storage.user.get('oidc_hint')
                    or app.storage.user.get('login_email') or '').strip()
+        if brana:
+            hint = str(app.storage.user.get('user_email') or '').strip()
         if '@' in hint:
             parametry['login_hint'] = hint
     except Exception:
         pass
+    if brana:
+        # Brána musí ověřit člověka u počítače, ne jen platnou SSO cookie u Microsoftu.
+        parametry['prompt'] = 'login'
 
     dotaz = urllib.parse.urlencode(parametry)
     return RedirectResponse(disc['authorization_endpoint'] + '?' + dotaz)
@@ -219,34 +234,58 @@ async def oidc_callback(request: Request):
     ceka_state = app.storage.user.pop('oidc_state', '')
     verifier = app.storage.user.pop('oidc_verifier', '')
     nonce = app.storage.user.pop('oidc_nonce', '')
+    brana = app.storage.user.pop('oidc_brana', '')
+    if brana not in intranet_session.BRANY:
+        brana = ''
+
+    def _chyba(zprava: str) -> RedirectResponse:
+        if not brana:
+            return _zpet_s_chybou(zprava)
+        try:
+            app.storage.user['brana_chyba'] = zprava
+        except Exception:
+            pass
+        return RedirectResponse(intranet_session.BRANY[brana])
 
     chyba = request.query_params.get('error_description') or request.query_params.get('error')
     if chyba:
         intranet_logger.log_activity('Systém', 'OIDC', f'IdP vrátil chybu: {chyba}')
-        return _zpet_s_chybou('Přihlášení přes firemní účet se nezdařilo.')
+        return _chyba('Ověření přes firemní účet se nezdařilo.')
 
     code = request.query_params.get('code', '')
     prisel_state = request.query_params.get('state', '')
     # CSRF: state musí sedět na to, co jsme vydali do TÉTO relace
     if not code or not ceka_state or not secrets.compare_digest(prisel_state, ceka_state):
         intranet_logger.log_activity('Systém', 'OIDC', 'Callback odmítnut — neplatný state')
-        return _zpet_s_chybou('Přihlášení vypršelo, zkuste to prosím znovu.')
+        return _chyba('Přihlášení vypršelo, zkuste to prosím znovu.')
 
     try:
         odpoved = await asyncio.to_thread(_vymen_kod, code, verifier)
         claims = rozbal_id_token(odpoved['id_token'])
     except Exception as e:
         intranet_logger.log_activity('Systém', 'OIDC', f'Výměna kódu selhala: {e}')
-        return _zpet_s_chybou('Přihlášení přes firemní účet se nezdařilo.')
+        return _chyba('Přihlášení přes firemní účet se nezdařilo.')
 
     duvod = overit_claims(claims, nonce)
     if duvod:
         intranet_logger.log_activity('Systém', 'OIDC', f'ID token odmítnut ({duvod})')
-        return _zpet_s_chybou('Přihlášení přes firemní účet se nezdařilo.')
+        return _chyba('Přihlášení přes firemní účet se nezdařilo.')
 
     email = email_z_claims(claims)
     if not email:
-        return _zpet_s_chybou('Firemní účet nemá e-mail, přihlaste se heslem.')
+        return _chyba('Firemní účet nemá e-mail, přihlaste se heslem.')
+
+    if brana:
+        # Druhé ověření: firemní účet musí patřit TOMU, kdo je přihlášený.
+        prihlaseny = str(app.storage.user.get('user_email') or '').strip().lower()
+        jmeno = str(app.storage.user.get('user_name') or prihlaseny)
+        if not prihlaseny or email.strip().lower() != prihlaseny:
+            intranet_logger.log_activity(jmeno, 'Druhé ověření',
+                                         f'Odmítnuto ({brana}): firemní účet {email} nepatří přihlášenému')
+            return _chyba('Firemní účet nepatří přihlášenému uživateli.')
+        intranet_session.odemkni_branu(brana)
+        intranet_logger.log_activity(jmeno, 'Druhé ověření', f'Odemčeno přes M365 ({brana})')
+        return RedirectResponse(intranet_session.BRANY[brana])
 
     id_u, jmeno, potiz = await asyncio.to_thread(intranet_data.najdi_uzivatele_dle_emailu, email)
     if not id_u:
