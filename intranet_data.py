@@ -515,7 +515,6 @@ def vycistit_stare_cache_prava(max_vek_sekund=7200):
 # Jediný zdroj pravdy pro příkaz /modul v audit konzoli (v UI se moduly
 # nepřepínají). Alias pro konzoli = klíč bez sufixu „_zapnuty".
 MODULY = {
-    'finance_zapnuty':       ('Modul Aprovia (Finance)',        'Aprovia'),
     'kviz_zapnuty':          ('Modul Zkouškový Kvíz',           'Kvíz'),
     'veletrh_zapnuty':       ('Modul Veletrh',                  'Veletrh'),
     'znacky_zapnuty':        ('Modul Značky JIP',               'Značky JIP'),
@@ -1185,7 +1184,7 @@ def inicializace_db():
 
         cursor.execute("SELECT COUNT(*) FROM user")
         if cursor.fetchone()[0] == 0:
-            for p in ['vse', 'kviz', 'dochazka_zadosti', 'dochazka_admin', 'dochazka_schvalovat_sebe', 'dochazka_mazani', 'dochazka_export', 'dochazka_email', 'vystup_osobni', 'vystup_vse', 'uzivatele', 'mysql', 'dlazdice', 'slozky_vse', 'kalendar_vse', 'dlazdice_dochazka_zaklad', 'tisk_vse', 'tisk_odd_vse', 'veletrh_admin', 'veletrh_uzivatel', 'veletrh_pristup', 'nakup_uzivatel', 'nakup_schvalit', 'faktury_seznam_schvalit', 'admin_logy', 'admin_server']:
+            for p in ['vse', 'kviz', 'dochazka_zadosti', 'dochazka_admin', 'dochazka_schvalovat_sebe', 'dochazka_mazani', 'dochazka_export', 'dochazka_email', 'vystup_osobni', 'vystup_vse', 'uzivatele', 'mysql', 'dlazdice', 'slozky_vse', 'kalendar_vse', 'dlazdice_dochazka_zaklad', 'tisk_vse', 'tisk_odd_vse', 'veletrh_admin', 'veletrh_uzivatel', 'veletrh_pristup', 'admin_logy', 'admin_server']:
                 cursor.execute("INSERT IGNORE INTO privileges (name) VALUES (%s)", (p,))
 
             cursor.execute("INSERT IGNORE INTO jobPosition (name) VALUES ('Administrátor')")
@@ -2837,155 +2836,6 @@ def smaz_smlouvu_veletrh(smlouva_id):
         return True
     except Exception as e:
         print(f"Chyba při mazání smlouvy: {e}")
-        return False
-    finally:
-        if cursor: cursor.close()
-        if conn: conn.close()
-
-_FAKTURY_DB_INIT_HOTOVO = False  # schéma + migrace jen jednou za běh procesu
-
-
-def inicializace_faktur_db():
-    global _FAKTURY_DB_INIT_HOTOVO
-    if _FAKTURY_DB_INIT_HOTOVO: return
-    conn = get_db_connection()
-    if not conn: return
-    cursor = None
-    try:
-        cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS faktury (
-                id VARCHAR(50) PRIMARY KEY,
-                zadavatel VARCHAR(100),
-                dodavatel VARCHAR(255),
-                ico VARCHAR(50),
-                variabilni_symbol VARCHAR(100),
-                cislo_faktury VARCHAR(100),
-                duzp VARCHAR(20),
-                splatnost VARCHAR(20),
-                castka DECIMAL(12,2),
-                castka_21 DECIMAL(12,2) DEFAULT 0.00,
-                castka_12 DECIMAL(12,2) DEFAULT 0.00,
-                castka_0 DECIMAL(12,2) DEFAULT 0.00,
-                popis TEXT,
-                schvalovatel VARCHAR(100),
-                soubor_original VARCHAR(500),
-                soubor_schvaleny VARCHAR(500),
-                stav VARCHAR(50),
-                datum_zadani DATETIME,
-                datum_schvaleni DATETIME NULL
-            ) ENGINE=InnoDB CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
-        """)
-
-        for col, col_def in [("ico", "VARCHAR(50) DEFAULT ''"), ("variabilni_symbol", "VARCHAR(100) DEFAULT ''"), ("castka_21", "DECIMAL(12,2) DEFAULT 0.00"), ("castka_12", "DECIMAL(12,2) DEFAULT 0.00"), ("castka_0", "DECIMAL(12,2) DEFAULT 0.00")]:
-            try:
-                cursor.execute(f"ALTER TABLE faktury ADD COLUMN {col} {col_def}")
-                conn.commit()
-            except Exception: pass
-
-        for p in ['nakup_uzivatel', 'nakup_schvalit', 'faktury_seznam_schvalit']:
-            cursor.execute("INSERT IGNORE INTO privileges (name) VALUES (%s)", (p,))
-
-        # ── Migrace Aprovia práv na 3 role dle dokumentu ──────────────────
-        # ADITIVNÍ a idempotentní: uživatelům se zrušenými/sloučenými právy se
-        # pouze PŘIDÁ ekvivalentní nové právo (nic se nemaže), aby nikdo neztratil
-        # přístup. Zrušené názvy práv zůstanou v DB neškodně (kód je už nečte).
-        # Granty existují ve 3 vazebních tabulkách → projdeme všechny.
-        try:
-            _vazby = [
-                ("user_To_privileges", "user_iduser"),
-                ("jobPosition_To_privileges", "jobPosition_idjobPosition"),
-                ("department_To_privileges", "department_iddepartment"),
-            ]
-            # (zdrojové právo → cílové právo, které má držitel získat)
-            _mapovani = [
-                ('faktury_admin', 'faktury_seznam_schvalit'),
-                ('faktury_uzivatel', 'nakup_uzivatel'),
-                ('nakup_admin', 'nakup_schvalit'),
-                ('nakup_admin', 'nakup_uzivatel'),
-            ]
-            for tab, sloupec in _vazby:
-                for stare, nove in _mapovani:
-                    cursor.execute(
-                        f"INSERT IGNORE INTO {tab} ({sloupec}, privileges_idprivileges) "
-                        f"SELECT t.{sloupec}, pn.idprivileges FROM {tab} t "
-                        f"JOIN privileges ps ON ps.idprivileges = t.privileges_idprivileges AND ps.name=%s "
-                        f"JOIN privileges pn ON pn.name=%s",
-                        (stare, nove))
-            conn.commit()
-        except Exception:
-            pass
-
-        # Naplnit dodavatel_firma z existujících faktur (3NF: ico → dodavatel)
-        try: cursor.execute("INSERT IGNORE INTO dodavatel_firma (ico, nazev) SELECT DISTINCT ico, dodavatel FROM faktury WHERE ico IS NOT NULL AND ico != '' AND dodavatel IS NOT NULL AND dodavatel != ''")
-        except Exception: pass
-
-        conn.commit()
-        _FAKTURY_DB_INIT_HOTOVO = True
-    except Exception as e:
-        print(f"Chyba při inicializaci DB faktur: {e}")
-    finally:
-        if cursor: cursor.close()
-        if conn: conn.close()
-
-def uloz_fakturu(data):
-    inicializace_faktur_db()
-    conn = get_db_connection()
-    if not conn: return False
-    cursor = None
-    try:
-        cursor = conn.cursor()
-        cursor.execute("""
-            INSERT INTO faktury (id, zadavatel, dodavatel, ico, variabilni_symbol, cislo_faktury, duzp, splatnost, castka, popis, schvalovatel, soubor_original, stav, datum_zadani)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """, (data['id'], data['zadavatel'], data['dodavatel'], data.get('ico', ''), data.get('variabilni_symbol', ''), data['cislo_faktury'], data['duzp'], data['splatnost'], data['castka'], data['popis'], data['schvalovatel'], data['soubor_original'], data['stav'], data['datum_zadani']))
-        conn.commit()
-        return True
-    except Exception as e:
-        print(f"Chyba uložení faktury: {e}")
-        return False
-    finally:
-        if cursor: cursor.close()
-        if conn: conn.close()
-
-def ziskej_vsechny_faktury():
-    inicializace_faktur_db()
-    conn = get_db_connection()
-    if not conn: return []
-    cursor = None
-    try:
-        cursor = conn.cursor(dictionary=True)
-        cursor.execute("SELECT * FROM faktury ORDER BY datum_zadani DESC")
-        res = cursor.fetchall()
-
-        for row in res:
-            if row['datum_zadani']: row['datum_zadani'] = row['datum_zadani'].strftime('%Y-%m-%d %H:%M')
-            if row['datum_schvaleni']: row['datum_schvaleni'] = row['datum_schvaleni'].strftime('%Y-%m-%d %H:%M')
-            row['castka'] = float(row['castka'])
-
-        return res
-    except Exception as e:
-        print(f"Chyba načtení faktur: {e}")
-        return []
-    finally:
-        if cursor: cursor.close()
-        if conn: conn.close()
-
-def aktualizuj_stav_faktury(f_id, stav, soubor_schvaleny, datum_schvaleni):
-    conn = get_db_connection()
-    if not conn: return False
-    cursor = None
-    try:
-        cursor = conn.cursor()
-        cursor.execute("""
-            UPDATE faktury 
-            SET stav = %s, soubor_schvaleny = %s, datum_schvaleni = %s 
-            WHERE id = %s
-        """, (stav, soubor_schvaleny, datum_schvaleni, f_id))
-        conn.commit()
-        return True
-    except Exception as e:
-        print(f"Chyba aktualizace faktury: {e}")
         return False
     finally:
         if cursor: cursor.close()

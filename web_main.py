@@ -2,6 +2,7 @@ import sys
 sys.setrecursionlimit(3000)   # NiceGUI/inspect potřebuje více prostoru pro komplexní render stromy
 
 import asyncio
+import logging
 import os
 from nicegui import ui, app
 from starlette.middleware.gzip import GZipMiddleware
@@ -16,7 +17,6 @@ import intranet_data
 import intranet_static
 import intranet_logger
 import intranet_obsah
-import intranet_finance
 import intranet_kviz
 import odstavka
 import intranet
@@ -41,8 +41,7 @@ if os.environ.get('JIP_ICON_AUDIT') == '1':
 # U nich nutíme nebezpečné (inline-spustitelné) typy ke stažení, aby přes přímou
 # URL nešlo spustit uložené XSS. Obrázky a PDF zůstávají inline (např. náhledy).
 _UPLOAD_PREFIXY = (
-    '/prilohy_predpoptavky', '/tisk_nakup', '/prilohy_nakup', '/faktury_soubory',
-    '/faktury_exporty_soubory', '/znacky_foto', '/znacky_provoz_foto',
+    '/znacky_foto', '/znacky_provoz_foto',
     '/kom_prilohy', '/spolvecer_prilohy', '/planogram_fotos', '/ukol_prilohy',
     '/projekt_prilohy', '/narozeniny_podpisy_static', '/sankce_prilohy',
     '/asm_oz_prilohy',
@@ -88,6 +87,28 @@ async def _nastav_exception_handler():
         loop.default_exception_handler(context)
 
     loop.set_exception_handler(_handler)
+
+
+class _TichyKonecFiltr(logging.Filter):
+    """
+    Ztlumí šum uvicornu při vypínání (Ctrl+C / SIGTERM). Requesty zrušené po
+    vypršení timeout_graceful_shutdown nebo při 2× Ctrl+C (vynucený konec)
+    končí CancelledError a Starlette/uvicorn je hlásí jako ERROR s tracebackem —
+    nejde o chybu aplikace. CancelledError se do logu uvicornu dostane jen při
+    vypínání (odpojení klienta request neruší), filtr tedy nic jiného neskryje.
+    """
+
+    def filter(self, record):
+        exc = record.exc_info[1] if record.exc_info else None
+        if isinstance(exc, asyncio.CancelledError):
+            return False
+        msg = record.getMessage()
+        # Starlette posílá traceback zrušené lifespan úlohy jako prostý text.
+        if 'in lifespan' in msg and msg.rstrip().endswith('CancelledError'):
+            return False
+        if 'timeout graceful shutdown exceeded' in msg:
+            record.levelno, record.levelname = logging.INFO, 'INFO'
+        return True
 
 
 async def bg_periodicky_cleanup():
@@ -143,6 +164,8 @@ if __name__ == "__main__":
     # Gastrokurzy — tabulky + jednorázový import termínů z Excelu (jen když je prázdno).
     app.on_startup(intranet_gastrokurzy.inicializace_db)
     app.on_startup(lambda: asyncio.create_task(intranet_narozeniny.bg_narozeniny_emaily()))
+    # IKOS — každé pondělí v 1:00 CSV schválených absencí za předchozí týden do ikos_export/.
+    app.on_startup(lambda: asyncio.create_task(intranet_exporty.bg_ikos_tydenni_export()))
     # Evidence OZ — ranní přepočet „Aktivní OZ" + kontrola proti kartám.
     import intranet_asm
     app.on_startup(lambda: asyncio.create_task(intranet_asm.bg_oz_denni()))
@@ -167,6 +190,8 @@ if __name__ == "__main__":
         _reconnect_s = 15.0
     _reconnect_s = min(max(_reconnect_s, 3.0), 30.0)
 
+    logging.getLogger('uvicorn.error').addFilter(_TichyKonecFiltr())
+
     try:
         ui.run(
             title="Moje JIPka",
@@ -176,6 +201,11 @@ if __name__ == "__main__":
             storage_secret=_STORAGE_SECRET,
             reload=False,
             reconnect_timeout=_reconnect_s,  # viz komentář nad try
+            # Ctrl+C / SIGTERM čeká na rozpracované requesty max. 10 s, pak je zruší
+            # a proběhnou on_shutdown hooky. Bez limitu uvicorn čekal donekonečna,
+            # 2. Ctrl+C pak vynutil konec BEZ hooků (traceback CancelledError).
+            # Pod systemd je to hluboko pod TimeoutStopSec (90 s → SIGKILL).
+            timeout_graceful_shutdown=10,
             # JIP_DEV_VUE=1 => nemíněný (dev) Vue/Quasar: chyby v konzoli hlásí jméno
             # komponenty a vadný prop místo minifikovaného `u.match is not a function`.
             # Jen pro ladění na testu — dev build je větší a pomalejší.

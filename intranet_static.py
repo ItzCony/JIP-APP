@@ -2,8 +2,7 @@
 
 `app.add_static_files()` pošle soubor komukoli, kdo zná URL — bez ohledu na
 přihlášení. Jména nahraných souborů jsou přitom často odvoditelná
-(např. /faktury_exporty_soubory/Export_Schvalenych_Faktur_2026-04-30.zip nebo
-/tisk_nakup/Tisk_OBJ_<cislo_akce>.html), takže veřejný mount = stažení
+(např. podle ID záznamu nebo data exportu), takže veřejný mount = stažení
 firemních dokumentů bez přihlášení.
 
 Všechny adresáře s uploady proto jdou přes `chranene_soubory()`, která před

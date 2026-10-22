@@ -121,7 +121,6 @@ _KAT_IKONY = (
     ('kvíz',         'school'),
     ('účetní',       'account_balance'),
     ('veletrh',      'storefront'),
-    ('aprovia',      'shopping_cart'),
     ('značky',       'how_to_vote'),
     ('prodejní',     'point_of_sale'),
     ('mzdy',         'payments'),
@@ -617,7 +616,6 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
         }
     ) and nastaveni.get('prod_akt_zapnuty', True)
 
-    ma_pristup_finance = ("vse" in vsechna_prava or any(p in vsechna_prava for p in ['nakup_uzivatel', 'nakup_schvalit', 'faktury_seznam_schvalit'])) and nastaveni.get('finance_zapnuty', True)
     ma_pristup_narozeniny = (
         "vse" in vsechna_prava or
         "narozeniny_sprava" in vsechna_prava
@@ -658,6 +656,7 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
         'sankce_ucetni' in vsechna_prava or
         'sankce_nakup' in vsechna_prava or
         'sankce_ctenar' in vsechna_prava or
+        'sankce_vedouci_pobocky' in vsechna_prava or
         any(p.startswith('sankce_tiket_') for p in vsechna_prava)
     ) and nastaveni.get('sankce_zapnuty', True)
     ma_pristup_monitor = (
@@ -723,7 +722,6 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
     nazev_kviz       = "Zkouškový Kvíz"
     nazev_dochazka   = "Docházka a Volno"
     nazev_veletrh    = "Plán Veletrh 2027"
-    nazev_finance    = "Aprovia"
     nazev_narozeniny = "Narozeniny"
     nazev_komunikace = "Komunikační portál"
 
@@ -814,7 +812,6 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
         _d('dochazka', ma_pristup_dochazka_zaklad_dlazdice, '📅', nazev_dochazka, '#f97316',
            _akce('dochazka', 'aktivni_slozka_dochazka')),
         _d('veletrh', ma_pristup_veletrh, '🎪', nazev_veletrh, '#a855f7', _akce('veletrh')),
-        _d('finance', ma_pristup_finance, '💼', nazev_finance, '#3b82f6', _akce('finance')),
         _d('znacky', ma_pristup_znacky, '🏷️', 'Privátní značky JIP', '#f59e0b', _akce('znacky')),
         _d('znacky_provoz', ma_pristup_znacky_provoz, '🏭', 'Hlas Provozu', '#14b8a6', _akce('znacky_provoz')),
         _d('prod_akt', ma_pristup_prod_akt, '📈', 'Prodejní aktivity', '#10b981', _akce('prod_akt')),
@@ -1700,6 +1697,15 @@ def vykresli_dochazku(user_id, user_name, vsechna_prava):
         jsem_vedouci_oddeleni = jsem_majitel or ma_pristup_vsechny_kalendare or any(p.startswith('hlavni_vedouci_') for p in vsechna_prava)
         # Řadový člen vidí u kolegů jen veřejné typy; ostatní se maskují jako "Absence".
         VEREJNE_TYPY = {'dovolená', 'homeoffice'}
+        # Členové oddělení si absence navzájem nevidí – cizí absence ve vlastním
+        # oddělení vidí jen jeho vedoucí. Nečlen s právem kalendar_{odd} (např. HR) vidí dál.
+        moje_oddeleni = {o.strip() for o in (muj_ucet.get('oddeleni') or '').split(',') if o.strip()}
+        def vidim_absence(uid, odd):
+            if uid in moji_sledovani or ma_pristup_vsechny_kalendare:
+                return True
+            if f"kalendar_{odd.lower()}" not in vsechna_prava:
+                return False
+            return uid == user_id or odd not in moje_oddeleni or f"hlavni_vedouci_{odd.lower()}" in vsechna_prava
         @ui.refreshable
         def vykresli_mesic():
             try:
@@ -1815,8 +1821,7 @@ def vykresli_dochazku(user_id, user_name, vsechna_prava):
                     elif vybrany_filter != 'Všechna' and odd_nazev != vybrany_filter:
                         continue
 
-                    if not (v.get('user_iduser') in moji_sledovani or ma_pristup_vsechny_kalendare
-                            or f"kalendar_{odd_nazev.lower()}" in vsechna_prava):
+                    if not vidim_absence(v.get('user_iduser'), odd_nazev):
                         continue
 
                     typ_zobrazeny = v['typ']

@@ -332,6 +332,19 @@ def _ziskej_uzivatele_options():
     return dict(sorted(opts.items(), key=lambda x: x[1]))
 
 
+def _ziskej_uzivatele_s_oddelenim() -> list:
+    """Aktivní uživatelé [{'id', 'jmeno', 'odd': set názvů oddělení}] seřazení podle jména."""
+    vysl = []
+    for u in intranet_data.ziskej_vsechny_uzivatele().values():
+        if u.get('aktivni', True):
+            vysl.append({
+                'id': u['id'],
+                'jmeno': f"{u.get('jmeno', '')} {u.get('prijmeni', '')}".strip(),
+                'odd': {o.strip() for o in (u.get('oddeleni') or '').split(',') if o.strip()},
+            })
+    return sorted(vysl, key=lambda x: x['jmeno'])
+
+
 def _ziskej_viditelne_uzivatele(user_id: int, vsechna_prava) -> dict:
     """
     Vrátí {id: jmeno} uživatelů viditelných pro daného uživatele.
@@ -3153,8 +3166,9 @@ async def _vykresli_ukoly(user_id, user_name, vsechna_prava, dialog_anchor=None,
     # Podřízení pro filtr osob — vedoucí vidí lidi svého oddělení (bez sebe)
     podrizeni_uk = [u for u in uzivatele_oddeleni if u['id'] != user_id] if je_vedouci_uk else []
     if is_admin and not podrizeni_uk:
-        uziv_all = await asyncio.to_thread(_ziskej_uzivatele_options)
-        podrizeni_uk = [{'id': uid, 'jmeno': jm} for uid, jm in uziv_all.items() if uid != user_id]
+        # i s odděleními → filtr „Osoba" se zúží podle zvoleného oddělení
+        uziv_all = await asyncio.to_thread(_ziskej_uzivatele_s_oddelenim)
+        podrizeni_uk = [u for u in uziv_all if u['id'] != user_id]
 
     # Oddělení pro filtr správce — načíst PŘED stavbou UI (atomická přestavba)
     odd_opts_admin = (await asyncio.to_thread(_ziskej_oddeleni_options)) if is_admin else {}
@@ -3188,8 +3202,21 @@ async def _vykresli_ukoly(user_id, user_name, vsechna_prava, dialog_anchor=None,
     # Bez toho by je změna stavu úkolu (→ _safe_refresh → přestavba sekce) shodila
     # zpět na výchozí, včetně termínu zpět na „Dnes".
     _filtry = ukoly_stav.setdefault('filtry', {
-        'stav': '', 'typ': '', 'termin': 'dnes', 'zdroj': '',
-        'moje': '', 'osoba': '', 'odd': ''})
+        'stav': '', 'typ': '', 'termin': 'dnes',
+        'moje': '', 'osoba': [], 'odd': '', 'od': '', 'do': ''})
+    _TERMIN_OPTS = {'': 'Termín: Vše', 'po': 'Po termínu', 'dnes': 'Dnes',
+                    'tyden': 'Tento týden', 'budouci': 'Budoucí'}
+
+    def _termin_opts():
+        # Období z kalendáře je v nabídce jen když je zvolené — popisek ukazuje rozsah.
+        od, do = _filtry.get('od'), _filtry.get('do')
+        if _filtry['termin'] != 'obdobi' or not od:
+            return _TERMIN_OPTS
+        od_d, do_d = datetime.date.fromisoformat(od), datetime.date.fromisoformat(do)
+        fmt = '%d.%m.' if od_d.year == do_d.year == dnes.year else '%d.%m.%Y'
+        txt = od_d.strftime(fmt) if od == do else f'{od_d.strftime(fmt)} – {do_d.strftime(fmt)}'
+        return {**_TERMIN_OPTS, 'obdobi': f'📅 {txt}'}
+
     with ui.row().classes('w-full gap-2 mb-1 flex-wrap items-center'):
         filtr_stav = ui.select(
             {'': 'Stav: Vše', 'Zadáno': 'Zadáno', 'Rozpracováno': 'Rozpracováno',
@@ -3200,14 +3227,20 @@ async def _vykresli_ukoly(user_id, user_name, vsechna_prava, dialog_anchor=None,
             {'': 'Typ: Vše', 'Pravidelný': '🔄 Pravidelný', 'Mimořádný': '⚡ Mimořádný'},
             value=_filtry['typ'], label=''
         ).classes('w-40').props('dense outlined')
-        filtr_termin = ui.select(
-            {'': 'Termín: Vše', 'po': '🔴 Po termínu', 'dnes': '🟡 Dnes', 'tyden': '🟠 Tento týden', 'budouci': '🟢 Budoucí'},
-            value=_filtry['termin'], label=''
-        ).classes('w-44').props('dense outlined')
-        filtr_zdroj = ui.select(
-            {'': 'Zdroj: Vše', 'porada': 'Z porady', 'samostatne': 'Samostatné'},
-            value=_filtry['zdroj'], label=''
-        ).classes('w-40').props('dense outlined')
+        with ui.row().classes('items-center gap-0 no-wrap'):
+            _t_opts = _termin_opts()
+            filtr_termin = ui.select(
+                _t_opts, value=_filtry['termin'] if _filtry['termin'] in _t_opts else '', label=''
+            ).classes('w-48').props('dense outlined')
+            with ui.button(icon='event').props('flat round dense color=grey-7') as _kal_btn:
+                _kal_btn.tooltip('Vybrat období termínů v kalendáři')
+                with ui.menu() as termin_kal_menu:
+                    _od, _do = _filtry.get('od'), _filtry.get('do')
+                    termin_kal = ui.date(
+                        value=(_od if _od == _do else {'from': _od, 'to': _do}) if _od else None
+                    ).props('range first-day-of-week=1 today-btn')
+                    with ui.row().classes('w-full justify-end px-2 pb-2'):
+                        ui.button('Vymazat', on_click=lambda: termin_kal.set_value(None)).props('flat dense no-caps')
 
     with ui.row().classes('w-full gap-2 mb-3 flex-wrap items-center'):
         filtr_moje = ui.select(
@@ -3215,14 +3248,33 @@ async def _vykresli_ukoly(user_id, user_name, vsechna_prava, dialog_anchor=None,
             value=_filtry['moje'], label=''
         ).classes('w-44').props('dense outlined')
         # Filtr osoby — jen pro vedoucí
-        if je_vedouci_uk:
-            osoba_opts_uk = {'': 'Osoba: Vše'}
+        def _osoba_opts(odd: str = '') -> dict:
+            # zvolené oddělení → jen jeho členové (záznamy bez 'odd' = vedoucí, nefiltruje se)
+            opts = {}
             for p in podrizeni_uk:
-                osoba_opts_uk[str(p['id'])] = p['jmeno']
-            # uložená osoba už nemusí být v podřízených (změna struktury) → fallback Vše
-            filtr_osoba = ui.select(osoba_opts_uk,
-                                    value=_filtry['osoba'] if _filtry['osoba'] in osoba_opts_uk else '',
-                                    label='').classes('w-44').props('dense outlined')
+                if not odd or 'odd' not in p or odd in p['odd']:
+                    opts[str(p['id'])] = p['jmeno']
+            return opts
+
+        def _osoba_popisek():
+            # kompaktní text v poli místo řady jmen (prázdný výběr = Vše)
+            vals = filtr_osoba.value or []
+            txt = ('Osoba: Vše' if not vals else
+                   filtr_osoba.options.get(vals[0], 'Osoba') if len(vals) == 1 else
+                   f'Osoby: {len(vals)}')
+            filtr_osoba._props['display-value'] = txt
+            filtr_osoba.update()
+
+        if je_vedouci_uk:
+            osoba_opts_uk = _osoba_opts(_filtry['odd'] if _filtry['odd'] in odd_opts_admin else '')
+            # starší stav držel jednu osobu jako řetězec
+            _uloz = _filtry['osoba']
+            _uloz = [_uloz] if isinstance(_uloz, str) and _uloz else (_uloz or [])
+            # uložené osoby už nemusí být v podřízených (změna struktury) → vynechat
+            filtr_osoba = ui.select(osoba_opts_uk, multiple=True,
+                                    value=[v for v in _uloz if v in osoba_opts_uk],
+                                    label='').classes('w-44').props('dense outlined clearable options-dense')
+            _osoba_popisek()
         else:
             filtr_osoba = None
         # Filtr oddělení — pouze pro správce (načteno v datové fázi)
@@ -3286,6 +3338,9 @@ async def _vykresli_ukoly(user_id, user_name, vsechna_prava, dialog_anchor=None,
             return t and 0 <= (t - dnes).days <= 7
         if ft == 'budouci':
             return t and (t - dnes).days > 7
+        if ft == 'obdobi':
+            od, do = _filtry.get('od'), _filtry.get('do')
+            return not od or (t and od <= t.isoformat() <= do)
         return True
 
     STRANKA_VEL = 30
@@ -3564,10 +3619,9 @@ async def _vykresli_ukoly(user_id, user_name, vsechna_prava, dialog_anchor=None,
         _karty_reg.clear()
         fs  = filtr_stav.value
         ft  = filtr_termin.value
-        fz  = filtr_zdroj.value
         fm  = filtr_moje.value
         fty = filtr_typ.value
-        fo  = filtr_osoba.value if filtr_osoba else ''
+        fo  = set(filtr_osoba.value or []) if filtr_osoba else set()
         fodd = filtr_odd.value if filtr_odd else ''
 
         # Režim sloupce „Přiděleno":
@@ -3601,9 +3655,8 @@ async def _vykresli_ukoly(user_id, user_name, vsechna_prava, dialog_anchor=None,
             ((u['stav'] in ('Hotovo', 'Zrušen')) if _pohled['hotove'] else (u['stav'] not in ('Hotovo', 'Zrušen'))) and
             (not fs  or u['stav'] == fs) and
             (not fty or u.get('typ_ukolu', 'Pravidelný') == fty) and
-            (not fz  or (fz == 'porada' and u.get('porada_id')) or (fz == 'samostatne' and not u.get('porada_id'))) and
             (not fm  or (fm == 'prirazen' and u.get('prirazen_id') == user_id) or (fm == 'zadal' and u.get('zadal_id') == user_id)) and
-            (not fo  or str(u.get('prirazen_id','')) == fo or str(u.get('zadal_id','')) == fo) and
+            (not fo  or str(u.get('prirazen_id','')) in fo or str(u.get('zadal_id','')) in fo) and
             (not fodd or fodd in (u.get('oddeleni') or '')) and
             _filtruj_termin(u, ft)
         ]
@@ -3818,15 +3871,45 @@ async def _vykresli_ukoly(user_id, user_name, vsechna_prava, dialog_anchor=None,
     prekresli()
 
     def _filtr_zmena():
+        if filtr_odd and filtr_osoba and filtr_odd.value != _filtry['odd']:
+            # změna oddělení → nabídka osob jen z něj; osoba mimo oddělení se ruší
+            _opts = _osoba_opts(filtr_odd.value or '')
+            filtr_osoba.set_options(_opts, value=[v for v in (filtr_osoba.value or []) if v in _opts])
+        if filtr_osoba:
+            _osoba_popisek()
         # zapiš do rodičovského stavu, ať přestavba sekce (změna stavu úkolu) filtry nesmaže
         _filtry.update(stav=filtr_stav.value, typ=filtr_typ.value,
-                       termin=filtr_termin.value, zdroj=filtr_zdroj.value,
+                       termin=filtr_termin.value,
                        moje=filtr_moje.value,
-                       osoba=filtr_osoba.value if filtr_osoba else '',
+                       osoba=list(filtr_osoba.value or []) if filtr_osoba else [],
                        odd=filtr_odd.value if filtr_odd else '')
+        if filtr_termin.value != 'obdobi' and _filtry.get('od'):
+            # jiná volba termínu ruší období z kalendáře
+            _filtry.update(od='', do='')
+            termin_kal.set_value(None)
+            filtr_termin.set_options(_termin_opts())
         _stranka['p'] = 1
         prekresli()
-    for _f in [filtr_stav, filtr_typ, filtr_termin, filtr_zdroj, filtr_moje]:
+
+    def _termin_kal_zmena(e):
+        v = e.value
+        if isinstance(v, dict):
+            od, do = v.get('from'), v.get('to')
+        else:
+            od = do = v or ''   # v režimu range vrací jeden den jako řetězec
+        if od:
+            _filtry.update(termin='obdobi', od=od, do=do)
+            termin_kal_menu.close()
+        elif _filtry['termin'] == 'obdobi':
+            _filtry.update(termin='', od='', do='')   # „Vymazat" → Termín: Vše
+        else:
+            return   # vymazání vyvolané změnou selectu, _filtr_zmena už překreslil
+        filtr_termin.set_options(_termin_opts(), value=_filtry['termin'])
+        _stranka['p'] = 1
+        prekresli()
+    termin_kal.on_value_change(_termin_kal_zmena)
+
+    for _f in [filtr_stav, filtr_typ, filtr_termin, filtr_moje]:
         _f.on('update:model-value', lambda: _filtr_zmena())
     if filtr_osoba:
         filtr_osoba.on('update:model-value', lambda: _filtr_zmena())

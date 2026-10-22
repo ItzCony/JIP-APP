@@ -15,7 +15,8 @@ Práva (intranet_prava.ZALISTOVACI_ROLE):
   Komise – OffObchod … vidí a zapisuje listy Změna K2 a Delist
   Komise – Správce   … vše (vč. importu a mazání období)
   Komise – Čtenář    … vidí vše, filtruje, exportuje; na Sumarizaci jen řádky
-                       svých zkratek nákupčího (sloupec A, „Rozdělení nákupčích")
+                       svých zkratek nákupčího (sloupec A, „Rozdělení nákupčích");
+                       s právem Vedoucí nákupu vidí všechny zkratky
   Komise – Import    … nevidí nic, jen nahrává soubor
 
 Staré tabulky (zalistovaci_komise, zalistovaci_komise_meta) se nepoužívají a
@@ -86,9 +87,10 @@ def prava(vsechna_prava) -> dict:
     pise = {'sumarizace': admin or nakup,
             'zmena_k2': admin or obchod,
             'delist': admin or obchod}
-    # Celou Sumarizaci vidí Správce a OffNákup; samotný Čtenář jen řádky svých zkratek.
+    # Celou Sumarizaci vidí Správce, OffNákup a Vedoucí nákupu; samotný Čtenář jen řádky svých zkratek.
     prefix = intranet_prava.ZALISTOVACI_KOD_PREFIX
-    kody = None if (admin or nakup) else {
+    vedouci = intranet_prava.ZALISTOVACI_VEDOUCI_NAKUPU in p
+    kody = None if (admin or nakup or vedouci) else {
         k for k in intranet_prava.ZALISTOVACI_KODY if f'{prefix}{k.lower()}' in p}
     return {'vidi': vidi, 'pise': pise, 'kody': kody, 'admin': admin,
             'importuje': admin or 'zalistovaci_vkladatel' in p}

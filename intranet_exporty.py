@@ -1489,132 +1489,138 @@ def vykresli_exportni_tlacitka(user_name, vsechna_prava, vsichni_uzivatele_kompl
         for _r in sorted(aktualni_oddeleni_dict.keys()):
             ikos_vsechna_odd[_r] = _r
 
-        with ui.dialog().props('maximized transition-show="slide-up" transition-hide="slide-down"') as ikos_dlg:
-            with ui.card().classes('w-full h-full p-4 bg-gray-100 text-black overflow-y-auto'):
-                _ui_hlavicka_dialogu(ikos_dlg, 'output', 'IKOS Export volna',
-                                     'CSV export schválených voln pro mzdový systém IKOS',
-                                     'bg-teal-100 text-teal-700')
+        with ui.dialog() as ikos_dlg, ui.card().classes('w-[520px] max-w-full p-6 rounded-2xl gap-4'):
+            with ui.row().classes('w-full items-center justify-between no-wrap'):
+                with ui.row().classes('items-center gap-3 no-wrap'):
+                    with ui.element('div').classes('w-10 h-10 rounded-xl bg-teal-100 text-teal-700 flex items-center justify-center'):
+                        ui.icon('output', size='sm')
+                    ui.label('IKOS Export').classes('text-xl font-bold text-gray-800 leading-tight')
+                ui.button(icon='close', on_click=ikos_dlg.close).props('flat round dense').classes('text-gray-400')
 
-                with ui.row().classes('w-full gap-3 mb-6 items-end bg-white p-4 rounded-2xl border border-gray-200 shadow-sm flex-wrap'):
-                    with ui.input('Od data').classes('w-32 bg-white').props('outlined dense') as ikos_od:
-                        with ikos_od.add_slot('append'):
-                            ui.icon('edit_calendar').on('click', lambda: ikos_menu_od.open()).classes('cursor-pointer text-gray-500 hover:text-blue-500')
-                        with ui.menu() as ikos_menu_od:
-                            ui.date().bind_value(ikos_od)
+            def _ikos_rozsah(klic):
+                d = datetime.date.today()
+                if klic == 'vcera':
+                    od = do = d - datetime.timedelta(days=1)
+                elif klic == '3dny':
+                    od, do = d - datetime.timedelta(days=3), d - datetime.timedelta(days=1)
+                elif klic == 'tyden':
+                    od = d - datetime.timedelta(days=d.weekday() + 7)
+                    do = od + datetime.timedelta(days=6)
+                else:  # mesic
+                    do = d.replace(day=1) - datetime.timedelta(days=1)
+                    od = do.replace(day=1)
+                return od.isoformat(), do.isoformat()
 
-                    with ui.input('Do data').classes('w-32 bg-white').props('outlined dense') as ikos_do:
-                        with ikos_do.add_slot('append'):
-                            ui.icon('edit_calendar').on('click', lambda: ikos_menu_do.open()).classes('cursor-pointer text-gray-500 hover:text-blue-500')
-                        with ui.menu() as ikos_menu_do:
-                            ui.date().bind_value(ikos_do)
+            def _ikos_obdobi_zmena(e):
+                if e.value:
+                    ikos_od.value, ikos_do.value = _ikos_rozsah(e.value)
 
-                    _dnes_i = datetime.date.today()
-                    ikos_od.value = f"{_dnes_i.year}-{_dnes_i.month:02d}-01"
-                    ikos_do.value = f"{_dnes_i.year}-{_dnes_i.month:02d}-{calendar.monthrange(_dnes_i.year, _dnes_i.month)[1]:02d}"
+            # Období: rychlá volba, pod ní dvě data (ruční úprava volbu zruší)
+            ikos_obdobi = ui.toggle(
+                {'vcera': 'Včera', '3dny': 'Poslední 3 dny', 'tyden': 'Minulý týden', 'mesic': 'Minulý měsíc'},
+                value='tyden', on_change=_ikos_obdobi_zmena,
+            ).props('spread no-caps unelevated toggle-color=teal text-color=grey-8').classes('w-full border border-gray-200 rounded-lg')
 
-                    def nastav_minuly_mesic_ikos():
-                        d = datetime.date.today()
-                        y, m = (d.year - 1, 12) if d.month == 1 else (d.year, d.month - 1)
-                        ikos_od.value = f"{y}-{m:02d}-01"
-                        ikos_do.value = f"{y}-{m:02d}-{calendar.monthrange(y, m)[1]:02d}"
+            _od0, _do0 = _ikos_rozsah('tyden')
+            with ui.row().classes('w-full gap-3 no-wrap'):
+                ikos_od = ui.input('Od', value=_od0).props('outlined dense type=date').classes('flex-1')
+                ikos_do = ui.input('Do', value=_do0).props('outlined dense type=date').classes('flex-1')
 
-                    ui.button('Předchozí měsíc', icon='history', on_click=nastav_minuly_mesic_ikos).classes('bg-gray-100 hover:bg-gray-200 text-gray-600 h-10 px-3 text-sm rounded-lg border border-gray-200').props('flat')
+            def _ikos_rucni(i):
+                def h(e):
+                    if ikos_obdobi.value and e.value != _ikos_rozsah(ikos_obdobi.value)[i]:
+                        ikos_obdobi.value = None
+                return h
+            ikos_od.on_value_change(_ikos_rucni(0))
+            ikos_do.on_value_change(_ikos_rucni(1))
 
-                    ikos_role_sel = ui.select(ikos_vsechna_odd, value=list(ikos_vsechna_odd.keys())[0] if ikos_vsechna_odd else None, label='Oddělení').classes('w-48 bg-white').props('outlined dense')
-                    ikos_jmeno_sel = ui.select({'vse': 'Všichni zaměstnanci'}, value='vse', label='Zaměstnanec', with_input=True).classes('w-48 bg-white').props('outlined dense')
+            with ui.row().classes('w-full gap-3 no-wrap'):
+                ikos_role_sel = ui.select(ikos_vsechna_odd, value=list(ikos_vsechna_odd.keys())[0] if ikos_vsechna_odd else None, label='Oddělení').classes('flex-1').props('outlined dense')
+                ikos_role_sel.set_visibility(len(ikos_vsechna_odd) > 1)  # jediné oddělení -> není co vybírat
+                ikos_jmeno_sel = ui.select({'vse': 'Všichni zaměstnanci'}, value='vse', label='Zaměstnanec', with_input=True).classes('flex-1').props('outlined dense')
 
-                    ikos_sloucit_cb = ui.checkbox(
-                        'Sloučit příznak s os. číslem',
-                        value=intranet_data.nacti_nastaveni_intranetu().get('ikos_sloucit_priznak', False),
-                    ).classes('font-bold text-teal-700')
+            ikos_sloucit_cb = ui.checkbox('Sloučit příznak s os. číslem', value=True).classes('text-sm text-gray-700 -mt-2')
 
-                    def update_ikos_jmena(e=None):
-                        vybr = ikos_role_sel.value
-                        opts = {'vse': 'Všichni zaměstnanci'}
-                        for _ud in vsichni_uzivatele_komplet.values():
-                            _odd_l = [o.strip() for o in (_ud.get('oddeleni') or 'Bez oddělení').split(',')]
-                            if vybr == 'vse' or vybr in _odd_l:
-                                opts[_ud['jmeno_cele']] = _ud['jmeno_cele']
-                        ikos_jmeno_sel.options = dict(sorted(opts.items(), key=lambda x: (x[0] != 'vse', x[0])))
-                        if ikos_jmeno_sel.value not in ikos_jmeno_sel.options:
-                            ikos_jmeno_sel.value = 'vse'
-                        ikos_jmeno_sel.update()
+            def update_ikos_jmena(e=None):
+                vybr = ikos_role_sel.value
+                opts = {'vse': 'Všichni zaměstnanci'}
+                for _ud in vsichni_uzivatele_komplet.values():
+                    _odd_l = [o.strip() for o in (_ud.get('oddeleni') or 'Bez oddělení').split(',')]
+                    if vybr == 'vse' or vybr in _odd_l:
+                        opts[_ud['jmeno_cele']] = _ud['jmeno_cele']
+                ikos_jmeno_sel.options = dict(sorted(opts.items(), key=lambda x: (x[0] != 'vse', x[0])))
+                if ikos_jmeno_sel.value not in ikos_jmeno_sel.options:
+                    ikos_jmeno_sel.value = 'vse'
+                ikos_jmeno_sel.update()
 
-                    ikos_role_sel.on_value_change(lambda e: update_ikos_jmena(e))
-                    update_ikos_jmena()
+            ikos_role_sel.on_value_change(lambda e: update_ikos_jmena(e))
+            update_ikos_jmena()
 
-                    _btn_ikos_ref = {}
-                    with ui.element('div').classes('flex items-center gap-2 px-3 py-2 bg-teal-50 border border-teal-200 rounded-lg').style('display:none') as _prog_ikos:
-                        ui.icon('download').classes('text-teal-500 text-lg animate-pulse flex-shrink-0')
-                        with ui.column().classes('gap-1'):
-                            with ui.element('div').classes('w-40 h-2 bg-teal-200 rounded-full overflow-hidden'):
-                                _bar_ikos = ui.element('div').classes('h-full bg-teal-500 rounded-full').style('width:0%;transition:width 0.1s')
-                            _pct_ikos = ui.label('0 %').classes('text-xs font-bold text-teal-600 text-center')
+            _btn_ikos_ref = {}
 
-                    async def proved_ikos_export():
-                        btn = _btn_ikos_ref.get('btn')
-                        if btn: btn.disable()
-                        _bar_ikos.style('width:0%;transition:width 0.1s')
-                        _pct_ikos.set_text('0 %')
-                        _prog_ikos.style('display:flex')
+            async def proved_ikos_export():
+                btn = _btn_ikos_ref.get('btn')
+                if btn: btn.disable()
+                _bar_ikos.style('width:0%;transition:width 0.1s')
+                _pct_ikos.set_text('0 %')
+                _prog_ikos.style('display:flex')
 
-                        val_od = ikos_od.value
-                        val_do = ikos_do.value
-                        val_role = ikos_role_sel.value
-                        val_jmeno = ikos_jmeno_sel.value
-                        val_sloucit = ikos_sloucit_cb.value
+                val_od = ikos_od.value
+                val_do = ikos_do.value
+                val_role = ikos_role_sel.value
+                val_jmeno = ikos_jmeno_sel.value
+                val_sloucit = ikos_sloucit_cb.value
 
-                        async def _sim_ikos():
-                            v = 0.0
-                            while v < 0.90:
-                                await asyncio.sleep(0.12)
-                                v = min(v + random.uniform(0.04, 0.10), 0.90)
-                                _bar_ikos.style(f'width:{int(v*100)}%;transition:width 0.1s')
-                                _pct_ikos.set_text(f'{int(v*100)} %')
+                async def _sim_ikos():
+                    v = 0.0
+                    while v < 0.90:
+                        await asyncio.sleep(0.12)
+                        v = min(v + random.uniform(0.04, 0.10), 0.90)
+                        _bar_ikos.style(f'width:{int(v*100)}%;transition:width 0.1s')
+                        _pct_ikos.set_text(f'{int(v*100)} %')
 
-                        sim = asyncio.create_task(_sim_ikos())
+                sim = asyncio.create_task(_sim_ikos())
 
-                        def _zpracuj_ikos():
-                            # gather: jen DB čtení (běží ve vláknu)
-                            nast_i = intranet_data.nacti_nastaveni_intranetu()
-                            oddelovac = nast_i.get('ikos_oddelovac', ';')
-                            slozka = nast_i.get('ikos_slozka', 'Exporty_Dochazka')
-                            vsechna_volna = intranet_data.ziskej_vsechna_volna_kalendar(jen_budouci=False)
-                            return vsechna_volna, oddelovac, slozka
+                def _zpracuj_ikos():
+                    # gather: jen DB čtení (běží ve vláknu)
+                    nast_i = intranet_data.nacti_nastaveni_intranetu()
+                    oddelovac = nast_i.get('ikos_oddelovac', ';')
+                    slozka = nast_i.get('ikos_slozka', 'Exporty_Dochazka')
+                    vsechna_volna = intranet_data.ziskej_vsechna_volna_kalendar(jen_budouci=False)
+                    return vsechna_volna, oddelovac, slozka
 
-                        try:
-                            # 1) gather (DB) ve VLÁKNĚ; 2) filtr + zápis CSV v PROCESU
-                            vsechna_volna, oddelovac, slozka = await intranet_jobs.io(_zpracuj_ikos)
-                            cesta = await intranet_jobs.cpu(
-                                build_ikos_csv, vsechna_volna, vsichni_uzivatele_komplet,
-                                val_role, val_jmeno, val_od, val_do, val_sloucit, oddelovac, slozka,
-                            )
-                            sim.cancel()
-                            _bar_ikos.style('width:100%;transition:width 0.2s')
-                            _pct_ikos.set_text('100 %')
-                            await asyncio.sleep(0.6)
-                            ui.download(cesta)
-                            intranet_logger.log_activity(user_name, "IKOS Export", "Stažen IKOS export docházky")
-                            ui.notify('IKOS Export úspěšně stažen.', type='positive', position='top')
-                        except ValueError as ve:
-                            sim.cancel()
-                            ui.notify(str(ve), type='warning', position='top')
-                        except Exception as e:
-                            sim.cancel()
-                            ui.notify(f'Chyba IKOS exportu: {e}', type='negative', position='top')
-                        finally:
-                            _prog_ikos.style('display:none')
-                            btn = _btn_ikos_ref.get('btn')
-                            if btn: btn.enable()
+                try:
+                    # 1) gather (DB) ve VLÁKNĚ; 2) filtr + zápis CSV v PROCESU
+                    vsechna_volna, oddelovac, slozka = await intranet_jobs.io(_zpracuj_ikos)
+                    cesta = await intranet_jobs.cpu(
+                        build_ikos_csv, vsechna_volna, vsichni_uzivatele_komplet,
+                        val_role, val_jmeno, val_od, val_do, val_sloucit, oddelovac, slozka,
+                    )
+                    sim.cancel()
+                    _bar_ikos.style('width:100%;transition:width 0.2s')
+                    _pct_ikos.set_text('100 %')
+                    await asyncio.sleep(0.6)
+                    ui.download(cesta)
+                    intranet_logger.log_activity(user_name, "IKOS Export", "Stažen IKOS export docházky")
+                    ui.notify('IKOS Export úspěšně stažen.', type='positive', position='top')
+                except ValueError as ve:
+                    sim.cancel()
+                    ui.notify(str(ve), type='warning', position='top')
+                except Exception as e:
+                    sim.cancel()
+                    ui.notify(f'Chyba IKOS exportu: {e}', type='negative', position='top')
+                finally:
+                    _prog_ikos.style('display:none')
+                    btn = _btn_ikos_ref.get('btn')
+                    if btn: btn.enable()
 
-                    _btn_ikos_ref['btn'] = ui.button('Exportovat IKOS CSV', icon='download', on_click=proved_ikos_export).props('unelevated').classes('bg-teal-600 hover:bg-teal-700 text-white font-bold h-10 px-5 rounded-lg text-sm')
+            _btn_ikos_ref['btn'] = ui.button('Exportovat CSV', icon='download', on_click=proved_ikos_export).props('unelevated').classes('w-full bg-teal-600 hover:bg-teal-700 text-white font-bold h-11 rounded-lg')
 
-                with ui.card().classes('p-4 bg-white border border-gray-200 rounded-2xl mt-4 shadow-sm'):
-                    with ui.row().classes('items-center gap-2 mb-1'):
-                        ui.icon('info', size='xs').classes('text-teal-600')
-                        ui.label('Formát souboru').classes('text-sm font-bold text-teal-800')
-                    ui.label('Os. číslo  ·  Datum od  ·  Datum do  ·  Čas od  ·  Čas do  ·  Druh volna').classes('text-sm text-teal-700 font-mono bg-teal-50 px-3 py-1.5 rounded-lg')
-                    ui.label('Export zahrnuje pouze schválená volna všech typů. Oddělovač a cílová složka jsou v Nastavení portálu → Exporty → IKOS Export.').classes('text-xs text-gray-500 mt-2 italic')
+            with ui.row().classes('w-full items-center gap-3 no-wrap px-3 py-2 bg-teal-50 border border-teal-200 rounded-lg').style('display:none') as _prog_ikos:
+                ui.icon('download').classes('text-teal-500 text-lg animate-pulse')
+                with ui.element('div').classes('flex-1 h-2 bg-teal-200 rounded-full overflow-hidden'):
+                    _bar_ikos = ui.element('div').classes('h-full bg-teal-500 rounded-full').style('width:0%;transition:width 0.1s')
+                _pct_ikos = ui.label('0 %').classes('text-xs font-bold text-teal-600')
 
     # =====================================================================
     # IMPORT REÁLNÝCH ZŮSTATKŮ DOVOLENÉ
@@ -1786,22 +1792,61 @@ def vykresli_exportni_tlacitka(user_name, vsechna_prava, vsichni_uzivatele_kompl
         ui.button('IKOS Export', icon='output', on_click=ikos_dlg.open).props('unelevated').classes('bg-teal-50 hover:bg-teal-100 text-teal-700 border border-teal-200 rounded-lg px-4 h-10 font-bold shadow-sm')
 
 
+# Týdenní automatický IKOS export → <složka aplikace>/ikos_export/
+IKOS_AUTO_SLOZKA = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ikos_export')
+# Značka posledního exportovaného týdne (ISO datum pondělí). Hlídá, aby restart
+# služby nevyrobil export znovu a aby smazání/přesun CSV nespustil nový běh.
+_IKOS_ZNACKA = os.path.join(IKOS_AUTO_SLOZKA, '.posledni_tyden')
+
+
+def _ikos_predchozi_tyden(dnes: datetime.date):
+    pondeli_tohoto = dnes - datetime.timedelta(days=dnes.weekday())
+    return pondeli_tohoto - datetime.timedelta(days=7), pondeli_tohoto - datetime.timedelta(days=1)
+
+
+def _ikos_posledni_tyden() -> str:
+    try:
+        with open(_IKOS_ZNACKA, encoding='utf-8') as f:
+            return f.read().strip()
+    except OSError:
+        return ''
+
+
+async def bg_ikos_tydenni_export():
+    """Každé pondělí v 1:00 uloží CSV schválených absencí za předchozí týden
+    (po–ne) do ikos_export/. Když server v pondělí v 1:00 neběžel, export
+    dožene po startu kdykoli během týdne."""
+    await asyncio.sleep(150)
+    while True:
+        pauza = 60
+        try:
+            nyni = datetime.datetime.now()
+            if not (nyni.weekday() == 0 and nyni.hour < 1):
+                d_od, _ = _ikos_predchozi_tyden(nyni.date())
+                if _ikos_posledni_tyden() != d_od.isoformat():
+                    ok, info = await asyncio.to_thread(proved_automaticky_export_ikos)
+                    print(f'[bg_ikos_tydenni_export] {"OK" if ok else "Chyba"}: {info}')
+                    if not ok:
+                        pauza = 600   # DB nedostupná apod. — zkusit znovu za 10 min
+        except Exception as e:
+            print(f'[bg_ikos_tydenni_export] Chyba: {e}')
+            pauza = 600
+        await asyncio.sleep(pauza)
+
+
 def proved_automaticky_export_ikos():
-    """Automatický IKOS export – voláno z background tasku v web_main.py."""
+    """Týdenní IKOS export – volá bg_ikos_tydenni_export (spouštěno z web_main.py)."""
     try:
         nast = intranet_data.nacti_nastaveni_intranetu()
         oddelovac = nast.get('ikos_oddelovac', ';')
-        slozka = nast.get('ikos_slozka', 'Exporty_Dochazka')
-        prijemci = nast.get('ikos_prijemci', [])
-        sloucit_priznak = nast.get('ikos_sloucit_priznak', False)
+        slozka = IKOS_AUTO_SLOZKA
 
         vsichni = intranet_data.ziskej_vsechny_uzivatele()
         vsechna_volna = intranet_data.ziskej_vsechna_volna_kalendar(jen_budouci=False)
+        if vsechna_volna is None:
+            return False, 'Nepodařilo se načíst absence z DB.'
 
-        dnes = datetime.date.today()
-        pondeli_tohoto = dnes - datetime.timedelta(days=dnes.weekday())
-        d_od = pondeli_tohoto - datetime.timedelta(days=7)   # pondělí předchozího týdne
-        d_do = pondeli_tohoto - datetime.timedelta(days=1)   # neděle předchozího týdne
+        d_od, d_do = _ikos_predchozi_tyden(datetime.date.today())
 
         radky = []
         for v in vsechna_volna:
@@ -1809,39 +1854,23 @@ def proved_automaticky_export_ikos():
             if not (v['to'] >= d_od and v['from'] <= d_do): continue
             cele_jmeno = f"{v['u_jmeno']} {v['u_prijmeni']}"
             udata = next((u for u in vsichni.values() if u['jmeno_cele'] == cele_jmeno), {})
-            os_cislo = str(udata.get('id', '')).zfill(6)
-            if sloucit_priznak:
-                priznak = udata.get('priznak_nazev', '') or ''
-                if priznak:
-                    os_cislo = f'{priznak}{os_cislo}'
+            # automatický export příznak s os. číslem slučuje vždy
+            os_cislo = f"{udata.get('priznak_nazev', '') or ''}{str(udata.get('id', '')).zfill(6)}"
             datum_od_s = v['from'].strftime('%d.%m.%Y') if hasattr(v['from'], 'strftime') else str(v['from'])
             datum_do_s = v['to'].strftime('%d.%m.%Y') if hasattr(v['to'], 'strftime') else str(v['to'])
             cas_od_s = _ikos_fmt_cas(v.get('cas_od'))
             cas_do_s = _ikos_fmt_cas(v.get('cas_do'))
             radky.append([os_cislo, datum_od_s, datum_do_s, cas_od_s, cas_do_s, v['typ']])
 
-        if not radky:
-            return False, 'Žádná schválená volna pro předchozí týden.'
-
+        # CSV vzniká každý týden — i bez absencí (jen hlavička), ať je řada souborů úplná.
         os.makedirs(slozka, exist_ok=True)
-        cesta = os.path.join(slozka, f"IKOS_Export_{time.strftime('%Y%m%d_%H%M%S')}.csv")
+        cesta = os.path.join(slozka, f"IKOS_Export_{d_od.strftime('%Y%m%d')}-{d_do.strftime('%Y%m%d')}.csv")
         with open(cesta, 'w', newline='', encoding='utf-8-sig') as f:
             w = _csv_mod.writer(f, delimiter=oddelovac)
             w.writerow(['Os. číslo', 'Datum od', 'Datum do', 'Čas od', 'Čas do', 'Druh volna'])
             w.writerows(radky)
-
-        # Rozeslat e-mailem příjemcům
-        if prijemci:
-            import intranet_emaily as _em
-            obdobi_str = f"{d_od.strftime('%d.%m.%Y')} – {d_do.strftime('%d.%m.%Y')}"
-            predmet = f"IKOS Export volna – {obdobi_str}"
-            text = (f"Dobrý den,\n\nv příloze zasíláme automatický IKOS export volna za období {obdobi_str} "
-                    f"({len(radky)} záznamů).\n\nS pozdravem,\nMoje JIPka")
-            for prijemce in prijemci:
-                try:
-                    _em.odesli_email_s_prilohou(prijemce, predmet, text, cesta)
-                except Exception as e_mail:
-                    print(f'[ikos_exporty] Chyba e-mailu ({prijemce}): {e_mail}')
+        with open(_IKOS_ZNACKA, 'w', encoding='utf-8') as f:
+            f.write(d_od.isoformat())
 
         return True, cesta
     except Exception as e:
