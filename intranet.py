@@ -10,7 +10,6 @@ import intranet_monitor
 import intranet_helpdesk
 import intranet_kviz
 import intranet_nastaveni
-import intranet_finance
 import znackyjip
 import znacky_provoz
 import prodejni_aktivity
@@ -97,9 +96,6 @@ for _sf in _STATIC_WHITELIST:
 for _dir in ('planogram_fotos', 'ochutnavky_prilohy', 'ukol_prilohy',
              'projekt_prilohy', 'spolvecer_prilohy', 'asm_prirucka'):
     intranet_static.chranene_soubory(f'/{_dir}', _dir)
-# Instalátor desktopové aplikace (sestavuje desktop/build.cmd) – jen hlavnímu administrátorovi (právo 'vse').
-_INSTALATOR_APLIKACE = _os.path.join('desktop', 'dist', 'JIPka-setup.exe')
-intranet_static.chranene_soubory('/aplikace', _os.path.dirname(_INSTALATOR_APLIKACE), pravo='vse')
 
 # Evidence aktivních relací + „chytré" automatické odhlašování je v intranet_session
 # (GLOBAL_ACTIVE_SESSIONS, počítání živých připojení, odložené odhlášení po zavření
@@ -324,37 +320,6 @@ def _obrazovka_vynucene_zmeny_hesla(user_id, user_email, user_name):
                     ui.navigate.to('/')
                 ui.button('Odhlásit', on_click=odhlasit).props('flat no-caps unelevated').classes('flex-1 gate-btn-secondary font-bold h-12 rounded-xl')
                 ui.button('Uložit heslo', on_click=ulozit).props('no-caps unelevated').classes('flex-1 login-btn')
-
-
-def _nabidka_desktop_aplikace(client: Client, je_hlavni_admin: bool) -> None:
-    """Tlačítko „Aplikace pro Windows“ v hlavičce: stažení instalátoru desktopové aplikace.
-
-    Jen pro hlavního administrátora (právo 'vse'; stejně hlídá i cesta /aplikace/),
-    pokud je instalátor na serveru sestavený, uživatel je na Windows a nejde
-    o aplikaci samotnou (ta posílá v User-Agentu „JIPkaDesktop“, viz desktop/Program.cs).
-    """
-    if not je_hlavni_admin:
-        return
-    try:
-        ua = client.request.headers.get('user-agent', '')
-    except RuntimeError:  # klient bez HTTP requestu
-        return
-    if 'Windows' not in ua or 'JIPkaDesktop' in ua or not _os.path.isfile(_INSTALATOR_APLIKACE):
-        return
-    with ui.dialog() as dialog, ui.card().classes('max-w-md'):
-        ui.label('Moje JIPka pro Windows').classes('text-lg font-bold')
-        ui.label('Portál ve vlastním okně se zástupcem na ploše a ve Startu. '
-                 'Instalace nepotřebuje práva správce.')
-        ui.label('Instalátor není digitálně podepsaný. Pokud prohlížeč upozorní, že se soubor '
-                 'běžně nestahuje, potvrďte, že ho chcete ponechat. Pokud Windows zobrazí '
-                 '„Systém Windows ochránil váš počítač“, klikněte na Další informace → Přesto spustit.') \
-            .classes('text-sm text-gray-600')
-        with ui.row().classes('w-full justify-end'):
-            ui.button('Zavřít', on_click=dialog.close).props('flat')
-            ui.button('Stáhnout', icon='download', on_click=lambda: (
-                ui.download.from_url('/aplikace/JIPka-setup.exe'), dialog.close()))
-    ui.button(icon='desktop_windows', on_click=dialog.open) \
-        .props('flat round color=white dense').tooltip('Aplikace pro Windows')
 
 
 async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
@@ -728,7 +693,6 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
 
     # Mapování tab klíče → klíč nastavení modulu
     _TAB_MODUL_KLIC = {
-        'finance':       'finance_zapnuty',
         'kviz':          'kviz_zapnuty',
         'veletrh':       'veletrh_zapnuty',
         'znacky':        'znacky_zapnuty',
@@ -825,12 +789,6 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
         # klient zbytečně zatěžovala event loop při desítkách připojených uživatelů.
         ui.timer(5.0, kontrola_zmen)
 
-    ma_prava_finance = ma_vse or any(p in vsechna_prava for p in ['nakup_uzivatel', 'nakup_schvalit', 'faktury_seznam_schvalit'])
-    has_finance = ma_prava_finance and nastaveni.get('finance_zapnuty', True)
-
-    if has_finance:
-        dostupne_taby.append('finance')
-
     if (ma_vse or "znacky_uzivatel" in vsechna_prava or "znacky_spravce" in vsechna_prava) and nastaveni.get('znacky_zapnuty', True):
         dostupne_taby.append('znacky')
     if (ma_vse or "znacky_provoz_uzivatel" in vsechna_prava or "znacky_provoz_spravce" in vsechna_prava) and nastaveni.get('znacky_provoz_zapnuty', True):
@@ -909,6 +867,7 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
         'sankce_ucetni' in vsechna_prava or
         'sankce_nakup' in vsechna_prava or
         'sankce_ctenar' in vsechna_prava or
+        'sankce_vedouci_pobocky' in vsechna_prava or
         # řešitelé tiketů (nákupčí dle kódu, provoz, druhotná kontrola)
         any(p.startswith('sankce_tiket_') for p in vsechna_prava)
     )
@@ -1410,7 +1369,10 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
                 async def _notif_badge():
                     # DB dotaz ve vlákně — běží při každém načtení stránky a pak
                     # à 30 s per klient, nesmí blokovat event loop.
+                    kontejner = ui.context.slot.parent
                     pocet = await asyncio.to_thread(intranet_notifikace.pocet_neprectenych, user_id)
+                    if kontejner.is_deleted:  # klient mezitím odešel (zavřel tab)
+                        return
                     if pocet > 0:
                         ui.badge(str(pocet), color='red').props('floating')
 
@@ -1431,6 +1393,8 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
                             with ui.row().classes('w-full justify-center py-6') as _nacitani:
                                 ui.spinner('dots', size='2rem', color='primary')
                             notifs       = await asyncio.to_thread(intranet_notifikace.ziskej, user_id, 25)
+                            if _nacitani.is_deleted:  # klient mezitím odešel
+                                return
                             _nacitani.delete()
                             neprectenych = sum(1 for n in notifs if not n['precteno'])
 
@@ -1560,7 +1524,6 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
                 ui.timer(30, _notif_badge.refresh)
                 # ─────────────────────────────────────────────────────────
 
-                _nabidka_desktop_aplikace(client, ma_vse)
                 ui.button(icon='settings', on_click=lambda: prepni_tab('nastaveni')) \
                     .props('flat round color=white dense') \
                     .tooltip('Osobní nastavení')
@@ -1582,22 +1545,11 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
                     ui.tab('prehled', label='📊  Přehled').classes('justify-start text-lg text-gray-800')
                     ui.tab('helpdesk', label='🎧  Helpdesk').classes('hidden')
 
-                    tab_dochazka = tab_vystup = tab_uzivatele = tab_mysql = tab_veletrh = tab_logy = tab_server = tab_finance = tab_znacky = tab_znacky_provoz = tab_narozeniny = tab_smeny = tab_komunikace = tab_planogram = tab_ochutnavky = tab_prod_akt = tab_ukolovnik = tab_vysledky = tab_sankce = tab_spolvecer = tab_vizitky = None
+                    tab_dochazka = tab_vystup = tab_uzivatele = tab_mysql = tab_veletrh = tab_logy = tab_server = tab_znacky = tab_znacky_provoz = tab_narozeniny = tab_smeny = tab_komunikace = tab_planogram = tab_ochutnavky = tab_prod_akt = tab_ukolovnik = tab_vysledky = tab_sankce = tab_spolvecer = tab_vizitky = None
 
                     if ma_vse or "dochazka_admin" in vsechna_prava or "dochazka_export" in vsechna_prava or "dochazka_zadosti" in vsechna_prava or any(p.startswith('schvalovat_') for p in vsechna_prava) or any(p.startswith('hlavni_vedouci_') for p in vsechna_prava) or any(p.startswith('slozka_') for p in vsechna_prava):
                         tab_dochazka = ui.tab('dochazka', label='📅  Evidence absencí').classes('justify-start text-lg text-gray-800')
 
-                    if has_finance:
-                        tab_finance = ui.tab('finance', label='💼  Aprovia').classes('justify-start text-lg text-gray-800')
-
-                        async def _nacti_finance_badge(tab=tab_finance):
-                            pocet = await asyncio.get_running_loop().run_in_executor(
-                                None, intranet_finance.ziskej_badge_pocet_rychle, user_id, user_name, vsechna_prava
-                            )
-                            if client.has_socket_connection and pocet > 0:
-                                tab.props(f'label="💼  Aprovia ({pocet})"')
-
-                        ui.timer(0.1, _nacti_finance_badge, once=True)
 
                     if ma_vse or "vystup_vse" in vsechna_prava or "vystup_osobni" in vsechna_prava:
                         tab_vystup = ui.tab('vystup', label='📈  Výstup Kvíz').classes('justify-start text-lg text-gray-800')
@@ -1693,7 +1645,6 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
                     'helpdesk':     lambda: intranet_helpdesk.vykresli_helpdesk(user_id, user_name, vsechna_prava),
                 }
                 if tab_dochazka:    _RENDER_FNS['dochazka']     = lambda: intranet_obsah.vykresli_dochazku(user_id, user_name, vsechna_prava)
-                if tab_finance:     _RENDER_FNS['finance']       = lambda: intranet_finance.vykresli_finance(user_id, user_name, vsechna_prava)
                 if tab_vystup:      _RENDER_FNS['vystup']        = lambda: intranet_kviz.vykresli_vystup_kviz(user_name, vsechna_prava)
                 if tab_uzivatele:   _RENDER_FNS['uzivatele']     = lambda: intranet_obsah.vykresli_spravu_uzivatelu(user_email, user_name, vsechna_prava)
                 if tab_mysql:       _RENDER_FNS['mysql']         = lambda: intranet_nastaveni.vykresli_nastaveni_portalu(user_name)
@@ -1817,10 +1768,6 @@ async def route_prehled(client: Client):
 @ui.page('/veletrh')
 async def route_veletrh(client: Client):
     await vykresli_kompletni_intranet(client, 'veletrh')
-
-@ui.page('/finance')
-async def route_finance(client: Client):
-    await vykresli_kompletni_intranet(client, 'finance')
 
 @ui.page('/dochazka')
 async def route_dochazka(client: Client):

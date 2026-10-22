@@ -479,17 +479,36 @@ class _Prevodnik:
                     mapa[(nid, ilvl)] = fmt
         return mapa
 
+    def _numpr_stylu(self, kod: str):
+        """numPr zděděné po řetězu basedOn stylu odstavce."""
+        chod, pojistka = kod, 0
+        while chod and chod in self.stylopis._xml and pojistka < 20:
+            ppr = self.stylopis._xml[chod].find(_wq('pPr'))
+            numpr = ppr.find(_wq('numPr')) if ppr is not None else None
+            if numpr is not None and numpr.find(_wq('numId')) is not None:
+                return numpr
+            chod, pojistka = self.stylopis._rodic.get(chod), pojistka + 1
+        return None
+
     def _seznam_info(self, p: Paragraph):
         """Vrátí (úroveň, je_odrážkový) nebo None, když odstavec není v seznamu."""
         numpr = p._p.find(qn('w:pPr'))
         numpr = numpr.find(qn('w:numPr')) if numpr is not None else None
-        if numpr is None:
-            return None
-        nid_el = numpr.find(qn('w:numId'))
-        ilvl_el = numpr.find(qn('w:ilvl'))
+        nid_el = numpr.find(qn('w:numId')) if numpr is not None else None
+        ilvl_el = numpr.find(qn('w:ilvl')) if numpr is not None else None
         if nid_el is None:
-            return None
+            # Styl „Seznam s odrážkami“ apod. nese číslování ve stylu, ne v odstavci.
+            numpr_stylu = self._numpr_stylu(self._kod_stylu(p))
+            if numpr_stylu is None:
+                return None
+            nid_el = numpr_stylu.find(qn('w:numId'))
+            if ilvl_el is None:
+                ilvl_el = numpr_stylu.find(qn('w:ilvl'))
+            if nid_el is None:
+                return None
         nid = nid_el.get(qn('w:val'))
+        if nid in (None, '0'):     # numId 0 = číslování ve stylu vypnuté
+            return None
         ilvl = ilvl_el.get(qn('w:val')) if ilvl_el is not None else '0'
         fmt = self.cislovani.get((nid, ilvl), 'bullet')
         try:
@@ -657,8 +676,9 @@ def _bloky(doc: Document):
             yield Table(ch, doc)
 
 
-def preved_docx(data: bytes, jmeno_souboru: str) -> dict:
-    """DOCX → struktura kapitol. Obrázky vysype do OBRAZKY_DIR."""
+def preved_docx(data: bytes, jmeno_souboru: str, vychozi_nadpis: str = 'Úvod') -> dict:
+    """DOCX → struktura kapitol. Obrázky vysype do OBRAZKY_DIR.
+    `vychozi_nadpis` dostane text před prvním nadpisem (a dokument bez nadpisů)."""
     doc = Document(io.BytesIO(data))
     with zipfile.ZipFile(io.BytesIO(data)) as balik:
         stylopis = _Stylopis(balik)
@@ -683,7 +703,7 @@ def preved_docx(data: bytes, jmeno_souboru: str) -> dict:
     for blok in _bloky(doc):
         if isinstance(blok, Table):
             if aktualni is None:
-                aktualni = nova_kapitola('Úvod', 1)
+                aktualni = nova_kapitola(vychozi_nadpis, 1)
                 kapitoly.append(aktualni)
             zavri_seznamy()
             html_tab = prevodnik._tabulka_html(blok)
@@ -732,7 +752,7 @@ def preved_docx(data: bytes, jmeno_souboru: str) -> dict:
             continue
 
         if aktualni is None:
-            aktualni = nova_kapitola('Úvod', 1)
+            aktualni = nova_kapitola(vychozi_nadpis, 1)
             kapitoly.append(aktualni)
 
         seznam = prevodnik._seznam_info(p)
@@ -951,6 +971,87 @@ def vytvor_kapitolu(manual: dict, po_indexu: int, nadpis: str,
     intranet_logger.log_activity(user_name, 'Manuály',
                                  f'Vytvořena kapitola „{nadpis}“')
     return index
+
+
+def _sluc_styly(manual: dict, styly_nove: dict) -> dict:
+    """Přidá třídy importovaného dokumentu do stylopisu manuálu. Stejně
+    pojmenovaná třída s jiným vzhledem (jiná šablona Wordu) dostane nové
+    jméno, ať nepřepíše vzhled stávajících kapitol. Vrací mapu přejmenování."""
+    styly = manual.setdefault('styly', {})
+    prejmenovani = {}
+    for jmeno, deklarace in (styly_nove or {}).items():
+        if styly.get(jmeno, deklarace) == deklarace:
+            styly[jmeno] = deklarace
+            continue
+        # `--` z _Stylopis.trida nevznikne (slučuje pomlčky), kolize nehrozí.
+        poradi = 2
+        while styly.get(f'{jmeno}--{poradi}', deklarace) != deklarace:
+            poradi += 1
+        nove = f'{jmeno}--{poradi}'
+        styly[nove] = deklarace
+        prejmenovani[jmeno] = nove
+    return prejmenovani
+
+
+def _prejmenuj_tridy(html_text: str, mapa: dict) -> str:
+    if not mapa:
+        return html_text
+    return re.sub(r'class="([^"]*)"',
+                  lambda m: 'class="' + ' '.join(mapa.get(t, t) for t in m.group(1).split()) + '"',
+                  html_text)
+
+
+def preved_import(data: bytes, jmeno_souboru: str) -> dict:
+    """Převod DOCX pro import kapitol (těžká část — volá se mimo event loop)."""
+    nazev = os.path.splitext(os.path.basename(jmeno_souboru or ''))[0].strip() or 'Importovaná kapitola'
+    prevod = preved_docx(data, jmeno_souboru, vychozi_nadpis=nazev)
+    if not prevod['kapitoly']:
+        raise ValueError('Dokument neobsahuje žádný text.')
+    return prevod
+
+
+def vloz_import(manual: dict, po_indexu: int, prevod: dict, cast: str,
+                user_name: str) -> tuple[int, int]:
+    """Vloží kapitoly z převedeného DOCX za danou pozici.
+    Vrací (index první vložené, počet vložených)."""
+    kapitoly = manual['kapitoly']
+    zaloz_verzi(f"import kapitol ze souboru {prevod.get('soubor') or ''}")
+    mapa = _sluc_styly(manual, prevod.get('styly') or {})
+    cast = (cast or '').strip()
+    prvni = min(max(po_indexu + 1, 0), len(kapitoly))
+    for poradi, k in enumerate(prevod['kapitoly']):
+        kapitoly.insert(prvni + poradi, {
+            **k,
+            'id': _volne_id(kapitoly, k['nadpis']),
+            # Předěl uvnitř importu má přednost, jinak část zvolená v dialogu.
+            'cast': k.get('cast') or cast,
+            'trida': mapa.get(k.get('trida', ''), k.get('trida', '')),
+            'html': _prejmenuj_tridy(k.get('html', ''), mapa),
+        })
+    pocet = len(prevod['kapitoly'])
+    manual['upraveno'] = datetime.datetime.now().strftime('%d.%m.%Y %H:%M')
+    manual['upravil'] = user_name
+    _zapis_json(manual)
+    intranet_logger.log_activity(
+        user_name, 'Manuály',
+        f"Import z {prevod.get('soubor') or 'DOCX'}: {pocet} kapitol "
+        f"(„{prevod['kapitoly'][0]['nadpis']}“…)")
+    return prvni, pocet
+
+
+def smaz_kapitolu(manual: dict, index: int, user_name: str) -> None:
+    """Odebere kapitolu. Předchozí podoba manuálu zůstane v historii verzí."""
+    kapitoly = manual['kapitoly']
+    if len(kapitoly) < 2:
+        raise ValueError('Poslední kapitolu smazat nejde — manuál by zůstal prázdný.')
+    nadpis = kapitoly[index].get('nadpis') or ''
+    zaloz_verzi(f'smazání kapitoly „{nadpis}“')
+    del kapitoly[index]
+    manual['upraveno'] = datetime.datetime.now().strftime('%d.%m.%Y %H:%M')
+    manual['upravil'] = user_name
+    _zapis_json(manual)
+    intranet_logger.log_activity(user_name, 'Manuály',
+                                 f'Smazána kapitola „{nadpis}“')
 
 
 # ============================================================
@@ -1228,9 +1329,54 @@ if(!window.__manualSipky){window.__manualSipky=true;
 }
 '''
 
+# Word kopíruje odrážky jako odstavce se stylem mso-list a znakem odrážky
+# v <span style="mso-list:Ignore">. Prohlížeč mso-* styly při vložení zahodí,
+# zbyde jen „·“ v písmu Symbol (po přebití na Arial skoro neviditelná tečka).
+# Při vložení do editoru manuálu proto takové odstavce převedeme na <ul>/<ol>.
+_SKRIPT_WORD = '''
+if(!window.__manualWord){window.__manualWord=true;
+ const uroven=p=>{const m=(p.getAttribute('style')||'').match(/mso-list:[^;]*level(\\d+)/i);return m?+m[1]:0;};
+ const cislovany=z=>/^(\\d+|[a-z]{1,4})[.)]$/i.test(z);
+ document.addEventListener('paste',e=>{
+  const cil=e.target.nodeType===1?e.target:e.target.parentElement;
+  const html=e.clipboardData&&e.clipboardData.getData('text/html');
+  if(!cil||!cil.closest('.manual-editor .q-editor__content')||!html||!/mso-list/i.test(html))return;
+  const doc=new DOMParser().parseFromString(html,'text/html');
+  const polozky=[...doc.body.querySelectorAll('p')].filter(uroven);
+  if(!polozky.length)return;
+  const navazuje=polozky.map(p=>polozky.includes(p.previousElementSibling));
+  let zasobnik=[];
+  polozky.forEach((p,i)=>{
+   const u=uroven(p);
+   let znak='';
+   const s=[...p.querySelectorAll('span')].find(s=>/mso-list:\\s*ignore/i.test(s.getAttribute('style')||''));
+   if(s){
+    znak=s.textContent.replace(/\\s/g,'');
+    let rodic=s.parentElement;s.remove();
+    while(rodic!==p&&!rodic.textContent.trim()&&!rodic.querySelector('img')){const r=rodic.parentElement;rodic.remove();rodic=r;}
+   }
+   if(!navazuje[i])zasobnik=[];
+   while(zasobnik.length&&zasobnik.at(-1).u>u)zasobnik.pop();
+   let vrch=zasobnik.at(-1);
+   if(!vrch||vrch.u<u){
+    const sez=doc.createElement(cislovany(znak)?'ol':'ul');
+    if(vrch)vrch.sez.lastElementChild.appendChild(sez);else p.before(sez);
+    zasobnik.push(vrch={u,sez});
+   }
+   const li=doc.createElement('li');li.append(...p.childNodes);vrch.sez.appendChild(li);p.remove();
+  });
+  e.preventDefault();
+  document.execCommand('insertHTML',false,doc.body.innerHTML);
+ },true);
+}
+'''
+
 _CSS = '''
 .manual-editor { display: flex; flex-direction: column; min-height: 0; }
 .manual-editor .q-editor__content { flex: 1; overflow-y: auto; }
+/* Tailwind preflight bere seznamům odrážky i odsazení — v editoru je vrátíme jako ve čtečce. */
+.manual-editor .q-editor__content ul { list-style: disc; padding-left: 2rem; }
+.manual-editor .q-editor__content ol { list-style: decimal; padding-left: 2rem; }
 .manual-ramec:fullscreen { background: #fff; padding: 8px; }
 /* rám má výšku v inline stylu → bez !important nepřebijeme */
 .manual-ramec:fullscreen iframe { height: calc(100vh - 64px) !important; }
@@ -1378,6 +1524,11 @@ def vykresli_manualy(user_id, user_name, vsechna_prava):
                             .props('flat dense round color=white').tooltip('Upravit kapitolu')
                         ui.button(icon='playlist_add', on_click=lambda: _dialog_nova_kapitola()) \
                             .props('flat dense round color=white').tooltip('Nová kapitola')
+                        ui.button(icon='post_add', on_click=lambda: _dialog_import()) \
+                            .props('flat dense round color=white') \
+                            .tooltip('Importovat kapitolu z Wordu')
+                        ui.button(icon='delete', on_click=lambda: _dialog_smazani(stav['index'])) \
+                            .props('flat dense round color=white').tooltip('Smazat kapitolu')
                         ui.button(icon='history', on_click=lambda: _dialog_verze(user_name)) \
                             .props('flat dense round color=white').tooltip('Historie verzí')
                         ui.button(icon='upload_file', on_click=lambda: _dialog_nahrani(user_name)) \
@@ -1547,6 +1698,79 @@ def vykresli_manualy(user_id, user_name, vsechna_prava):
         ui.notify('Kapitola vytvořena — teď ji můžete naplnit.', type='positive')
         _dialog_editace(index)
 
+    def _dialog_import():
+        po_indexu = stav['index']
+        soused = kapitoly[po_indexu]
+        with kotva_dialogu, ui.dialog() as dlg, \
+                ui.card().classes('w-[560px] max-w-[95vw] p-5 gap-3'):
+            with ui.row().classes('w-full items-center gap-2'):
+                ui.icon('post_add', size='1.6rem').classes('text-emerald-600')
+                ui.label('Import kapitoly z Wordu').classes('text-lg font-bold')
+                ui.space()
+                ui.button(icon='close', on_click=dlg.close).props('flat dense round')
+            ui.label('Soubor .docx. Každý nadpis 1. a 2. úrovně bude samostatná kapitola; '
+                     'dokument bez nadpisů se vloží jako jedna kapitola pojmenovaná '
+                     'podle souboru. Zbytek manuálu zůstane beze změny.') \
+                .classes('text-sm text-gray-600')
+            cast_i = ui.input('Část manuálu', value=soused.get('cast') or '') \
+                .props('outlined dense').classes('w-full')
+            ui.label(f"Vloží se hned za „{soused.get('nadpis') or ''}“.") \
+                .classes('text-xs text-gray-400')
+            prubeh = ui.column().classes('w-full gap-1')
+
+            async def _nahrano(e):
+                nahravani.set_visibility(False)
+                prubeh.clear()
+                with prubeh:
+                    ui.spinner('dots', size='1.6rem').classes('text-emerald-600')
+                    ui.label('Převádím dokument…').classes('text-sm text-gray-600')
+                data = await e.file.read()
+                try:
+                    prevod = await asyncio.get_running_loop().run_in_executor(
+                        None, preved_import, data, e.file.name)
+                    prvni, pocet = vloz_import(manual, po_indexu, prevod,
+                                               cast_i.value, user_name)
+                except Exception as chyba:
+                    prubeh.clear()
+                    with prubeh:
+                        ui.label(f'Import selhal: {chyba}').classes('text-sm text-red-600')
+                    nahravani.set_visibility(True)
+                    nahravani.reset()
+                    return
+                dlg.close()
+                stav['otisk'] += 1
+                _otevri(prvni)
+                ui.notify(f'Importováno kapitol: {pocet}.', type='positive')
+
+            nahravani = ui.upload(on_upload=_nahrano, max_files=1, auto_upload=True) \
+                .props('accept=".docx" flat bordered').classes('w-full')
+        dlg.open()
+
+    def _dialog_smazani(index: int):
+        nadpis = kapitoly[index].get('nadpis') or ''
+        with kotva_dialogu, ui.dialog() as dlg, \
+                ui.card().classes('w-[520px] max-w-[95vw] p-5 gap-3'):
+            ui.label('Smazat kapitolu?').classes('text-base font-bold')
+            ui.label(f'Kapitola „{nadpis}“ zmizí z manuálu. '
+                     'Vrátit ji jde přes Historii verzí.').classes('text-sm text-gray-600')
+            with ui.row().classes('w-full justify-end gap-2'):
+                ui.button('Zrušit', on_click=dlg.close).props('flat no-caps')
+                ui.button('Smazat', icon='delete',
+                          on_click=lambda: _smaz(index, dlg)) \
+                    .props('unelevated no-caps color=negative')
+        dlg.open()
+
+    def _smaz(index: int, dlg):
+        try:
+            smaz_kapitolu(manual, index, user_name)
+        except Exception as chyba:
+            ui.notify(str(chyba), type='negative')
+            return
+        dlg.close()
+        stav['otisk'] += 1
+        _otevri(index)  # _otevri ořízne index, po smazání poslední skočí na novou poslední
+        ui.notify('Kapitola smazána.', type='positive')
+
     def _dialog_verze(_user_name: str):
         verze = seznam_verzi()
         with kotva_dialogu, ui.dialog() as dlg, \
@@ -1585,7 +1809,7 @@ def vykresli_manualy(user_id, user_name, vsechna_prava):
             _otevri(novy)
 
     koren.on('sipka', _sipka, ['detail'])
-    ui.run_javascript(_SKRIPT_SIPKY)
+    ui.run_javascript(_SKRIPT_SIPKY + (_SKRIPT_WORD if je_admin else ''))
 
     _vykresli_telo()
     _vykresli_panel()

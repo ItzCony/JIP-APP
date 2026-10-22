@@ -37,10 +37,6 @@ ZAKLADNI_PRAVA = {
     'veletrh_uzivatel':   {'kategorie': 'Modul Veletrh', 'nazev': 'Rezervace stánků',          'popis': 'Může vyplňovat údaje stánků, měnit velikost a připojení.',                       'ikona': 'edit_note'},
     'veletrh_admin':      {'kategorie': 'Modul Veletrh', 'nazev': 'Plná správa Veletrhu',      'popis': 'Může mazat cizí stánky, podepisovat smlouvy a stahovat Wordy.',                  'ikona': 'gavel'},
 
-    # ── Modul Aprovia — 3 role dle dokumentu ──────────────────────────────
-    'nakup_uzivatel':  {'kategorie': 'Modul Aprovia', 'nazev': 'Uživatel', 'popis': 'Může vytvářet objednávky, vidět své koncepty a objednávky a nahrávat fakturu ke svému případu.', 'ikona': 'shopping_cart'},
-    'nakup_schvalit':  {'kategorie': 'Modul Aprovia', 'nazev': 'Schvalovatel objednávek', 'popis': 'Zobrazí se mu fronta ke schválení a může schvalovat/zamítat přiřazené objednávky.', 'ikona': 'fact_check'},
-    'faktury_seznam_schvalit': {'kategorie': 'Modul Aprovia', 'nazev': 'Schvalovatel faktur', 'popis': 'Schvaluje objednávky s přiloženou fakturou a zadává schválené faktury do účetnictví.', 'ikona': 'receipt_long'},
     'ucetni_pristup': {'kategorie': 'Účetní pohledy', 'nazev': 'Exporty (Účtárna)', 'popis': 'Speciální přístupy k detailním exportům pro mzdy.', 'ikona': 'account_balance'},
     'import_dovolene': {'kategorie': 'Účetní pohledy', 'nazev': 'Import dovolené', 'popis': 'Může nahrávat Excel s reálnými zůstatky dovolené, které se párují na osobní číslo zaměstnance.', 'ikona': 'upload_file'},
 
@@ -112,6 +108,7 @@ ZAKLADNI_PRAVA = {
     'sankce_ucetni':   {'kategorie': 'Modul Sankce', 'nazev': 'Účtárna (Sankce k vystavení)', 'popis': 'Vidí sestavu „Sankce k vystavení", mění stav řádků (nevyfakturováno / rozpracováno / vyfakturováno) a píše poznámky. Každá změna se zaznamenává (očičko).', 'ikona': 'receipt_long'},
     'sankce_nakup':    {'kategorie': 'Modul Sankce', 'nazev': 'Nákup (Zamítnuté dodávky)', 'popis': 'Vidí sestavu „Zamítnuté dodávky dodavatelem" a může u řádků psát poznámky. Každá změna se zaznamenává (očičko).', 'ikona': 'shopping_cart'},
     'sankce_ctenar':   {'kategorie': 'Modul Sankce', 'nazev': 'Čtenář (všechny sestavy)', 'popis': 'Vidí sestavy Zamítnuté dodávky, Sankce k vystavení i Nedodávky pouze pro čtení – může filtrovat, řadit, exportovat a psát do diskuze (bublina 💬). Nemůže editovat buňky, importovat ani mazat data.', 'ikona': 'visibility'},
+    'sankce_vedouci_pobocky': {'kategorie': 'Modul Sankce', 'nazev': 'Vedoucí pobočky (Nedodávky)', 'popis': 'Vidí pouze dlaždici „Nedodávky dod. k vyjádření" – všechny řádky, souhrn i kontingenční tabulku včetně vyjádření nákupčích a Unibrands, jen pro čtení. Může filtrovat, řadit a exportovat, nemůže nic zapisovat.', 'ikona': 'storefront'},
 
     # Tikety (workflow „předáno na nákup / provoz") — podskupiny, ať se seznam práv nezaplevelí.
     'sankce_tiket_provoz':    {'kategorie': 'Modul Sankce', 'podskupina': 'Tikety', 'nazev': 'Tiket: Provoz', 'popis': 'Dostává tikety předané na provoz a rozhoduje u nich Fakturovat / Stornovat.', 'ikona': 'engineering'},
@@ -167,7 +164,7 @@ ZAKLADNI_PRAVA = {
     'manualy_admin':  {'kategorie': 'Modul Manuály', 'nazev': 'Správce', 'popis': 'Vše co čtenář + edituje kapitoly přímo v aplikaci, vrací starší verze a nahrává nový DOCX. Každý zásah jde do logu.', 'ikona': 'upload_file'},
 
     'gastrokurzy_spravce':     {'kategorie': 'Modul Gastrokurzy', 'nazev': 'Správce kurzů', 'popis': 'Zakládá a edituje kurzy, jejich termíny a lektory, zapisuje prezenci a manipuluje s přihlášenými lidmi.', 'ikona': 'manage_accounts'},
-    'gastrokurzy_zapisovatel': {'kategorie': 'Modul Gastrokurzy', 'nazev': 'Zapisovatel (ASM / vedoucí pobočky)', 'popis': 'Zapisuje pozvané zákazníky na kurzy a ruší zápisy. Nemůže měnit termíny kurzů.', 'ikona': 'person_add'},
+    'gastrokurzy_zapisovatel': {'kategorie': 'Modul Gastrokurzy', 'nazev': 'Zapisovatel (ASM / vedoucí pobočky)', 'popis': 'Zapisuje pozvané zákazníky na kurzy. Upravovat a rušit smí jen zápisy, které sám zadal. Nemůže měnit termíny kurzů.', 'ikona': 'person_add'},
     'gastrokurzy_ctenar':      {'kategorie': 'Modul Gastrokurzy', 'nazev': 'Čtenář', 'popis': 'Vidí termíny kurzů i prezenční listiny pouze pro čtení. Nemůže zapisovat ani rušit zápisy.', 'ikona': 'visibility'},
 
     'spolvecer_schvalovatel': {'kategorie': 'Modul Společenský večer', 'nazev': 'Schvalovatel', 'popis': 'Vidí všechny pobočky, komunikuje v chatu a schvaluje náklady (mění stav na Schváleno).', 'ikona': 'verified'},
@@ -256,6 +253,11 @@ ZALISTOVACI_ROLE = ('zalistovaci_offnakup', 'zalistovaci_offobchod', 'zalistovac
                     'zalistovaci_vkladatel', 'zalistovaci_admin')
 ZALISTOVACI_KOD_PREFIX = 'zalistovaci_kod_'
 ZALISTOVACI_KODY = ('CK', 'DR', 'HV', 'KO', 'LT', 'ML', 'MR', 'NP', 'OZ', 'RD', 'SK', 'UP', 'VI')
+ZALISTOVACI_VEDOUCI_NAKUPU = 'zalistovaci_vedouci_nakupu'
+ZAKLADNI_PRAVA[ZALISTOVACI_VEDOUCI_NAKUPU] = {
+    'kategorie': 'Modul Zalistovací komise', 'podskupina': 'Rozdělení nákupčích', 'nazev': 'Vedoucí nákupu',
+    'popis': 'Čtenář uvidí na listu „Sumarizace“ řádky všech zkratek nákupčích. Samo o sobě přístup do modulu nedává.',
+    'ikona': 'supervisor_account'}
 for _k in ZALISTOVACI_KODY:
     ZAKLADNI_PRAVA[f'{ZALISTOVACI_KOD_PREFIX}{_k.lower()}'] = {
         'kategorie': 'Modul Zalistovací komise', 'podskupina': 'Rozdělení nákupčích', 'nazev': f'Nákupčí: {_k}',
@@ -287,7 +289,6 @@ ADMIN_ONLY_PRAVA = {k for k, v in ZAKLADNI_PRAVA.items()
 _MODUL_KATEGORIE = {
     'Modul Kvíz':                'kviz_zapnuty',
     'Modul Veletrh':             'veletrh_zapnuty',
-    'Modul Aprovia':             'finance_zapnuty',
     'Modul Prodejní aktivity':   'prod_akt_zapnuty',
     'Modul Narozeniny':          'narozeniny_zapnuty',
     'Modul Plánování směn':      'smeny_zapnuty',
@@ -380,10 +381,8 @@ PREFIXY_PRAV_ODDELENI = (
 )
 
 # Práva mimo katalog, která kód pořád čte — úklid je nesmí smazat.
-#   faktury_admin, nakup_admin — intranet_finance (výběr schvalovatelů faktur/nákupu)
-#   faktury_uzivatel           — zdroj migrace Aprovia (intranet_data.inicializace_faktur_db)
 #   dochazka_export            — brána záložky Docházka a exportu (intranet.py, intranet_obsah.py)
-PRAVA_MIMO_KATALOG = frozenset({'faktury_admin', 'faktury_uzivatel', 'nakup_admin', 'dochazka_export'})
+PRAVA_MIMO_KATALOG = frozenset({'dochazka_export'})
 
 # Prefixy mimo katalog, podle kterých kód pořád filtruje data — úklid je vynechá.
 #   tisk_typ_, ucetni_typ_ — typy absencí v exportu (intranet_exporty.py, f'…{t_nazev.lower()}')

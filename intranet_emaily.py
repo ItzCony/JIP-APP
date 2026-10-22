@@ -3,8 +3,6 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.image import MIMEImage
-from email.mime.base import MIMEBase
-from email import encoders
 from email.header import Header
 import imaplib
 import mimetypes
@@ -162,49 +160,6 @@ def odesli_upozorneni_email(prijemce, predmet, text):
     sys_log(f"=== KONEC ODESÍLÁNÍ PRO: {prijemce} ===")
     intranet_logger.log_activity("Systém E-mail", "Odeslání e-mailu", f"Příjemce: {prijemce} | Předmět: {predmet}")
     return True
-
-
-def odesli_email_s_prilohou(prijemce, predmet, text, cesta_souboru):
-    """Odešle e-mail s textovým tělem a přiloženým souborem."""
-    sys_log(f"=== IKOS EMAIL S PŘÍLOHOU PRO: {prijemce} ===")
-    try:
-        smtp = intranet_data.nacti_smtp()
-        if not smtp["enabled"]:
-            sys_log(f" -> INFO: Odesílání e-mailů je vypnuto ({_smtp_duvod(smtp)}).")
-            return False
-
-        smtp_user = smtp["smtp_user"]
-
-        msg = MIMEMultipart()
-        msg['From']    = smtp_user
-        msg['To']      = prijemce
-        msg['Subject'] = Header(predmet, 'utf-8')
-        msg.attach(MIMEText(text, 'plain', 'utf-8'))
-
-        # Příloha
-        nazev_souboru = os.path.basename(cesta_souboru)
-        mime_type, _ = mimetypes.guess_type(cesta_souboru)
-        if not mime_type:
-            mime_type = 'application/octet-stream'
-        main_type, sub_type = mime_type.split('/', 1)
-        with open(cesta_souboru, 'rb') as f:
-            part = MIMEBase(main_type, sub_type)
-            part.set_payload(f.read())
-        encoders.encode_base64(part)
-        part.add_header('Content-Disposition', 'attachment', filename=nazev_souboru)
-        msg.attach(part)
-
-        server = _spoj_smtp(smtp)
-        server.sendmail(smtp_user, prijemce, msg.as_string())
-        server.quit()
-
-        intranet_logger.log_activity("Systém E-mail", "Odeslání e-mailu", f"IKOS příloha | Příjemce: {prijemce} | Soubor: {nazev_souboru}")
-        sys_log(f" -> ÚSPĚCH: IKOS e-mail odeslán na {prijemce}.")
-        return True
-    except Exception as e:
-        sys_log(f" -> CHYBA: IKOS e-mail selhal ({prijemce}): {e}")
-        traceback.print_exc()
-        return False
 
 
 def odesli_html_email(prijemce, predmet, html_obsah, inline_soubory=None):

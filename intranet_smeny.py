@@ -25,10 +25,6 @@ _ABSENCE_STYL_MAP = {
     'ošetřování': ('#8b5cf6', '👶'),
 }
 
-# Typy absencí viditelné řadovým členům oddělení; ostatní typy cizích absencí
-# se řadovému členovi maskují jako obecná "Absence" (vedoucí vidí vše).
-VEREJNE_TYPY_ABSENCI = {'dovolená', 'homeoffice'}
-
 def _abs_styl(typ):
     t = (typ or '').lower()
     for klic, hodnota in _ABSENCE_STYL_MAP.items():
@@ -342,11 +338,8 @@ def _smeny_den_detail(skupina_id, datum_str):
         if cur: cur.close()
         if conn: conn.close()
 
-def _absence_rozsah(datum_od_str, datum_do_str, user_ids=None, maskovat_krome=None):
-    """Vrátí dict {datum_str: [{user_id, user_name, typ}, ...]} pro schválené absence v rozsahu.
-
-    maskovat_krome: user_id diváka-řadového člena — neveřejné typy cizích absencí
-    se nahradí obecným typem 'Absence'. None = bez maskování (vedoucí)."""
+def _absence_rozsah(datum_od_str, datum_do_str, user_ids=None):
+    """Vrátí dict {datum_str: [{user_id, user_name, typ}, ...]} pro schválené absence v rozsahu."""
     conn = intranet_data.get_db_connection()
     if not conn: return {}
     cur = None
@@ -371,9 +364,6 @@ def _absence_rozsah(datum_od_str, datum_do_str, user_ids=None, maskovat_krome=No
         d_od = datetime.date.fromisoformat(datum_od_str)
         d_do = datetime.date.fromisoformat(datum_do_str)
         for r in cur.fetchall():
-            if maskovat_krome is not None and r['user_iduser'] != maskovat_krome \
-                    and (r['typ'] or '').strip().lower() not in VEREJNE_TYPY_ABSENCI:
-                r['typ'] = 'Absence'
             a_od = r['od'] if isinstance(r['od'], datetime.date) else datetime.date.fromisoformat(str(r['od']))
             a_do = r['do_'] if isinstance(r['do_'], datetime.date) else datetime.date.fromisoformat(str(r['do_']))
             d = max(a_od, d_od)
@@ -953,7 +943,8 @@ def vykresli_smeny(user_id, user_name, vsechna_prava):
         oddeleni = skupina.get('oddeleni_nazev', '')
         je_ved = is_admin or _je_vedouci(vsechna_prava, oddeleni)
         lide   = _lide_skupiny(oddeleni) if je_ved else {}
-        filtr  = stav['filtr_uid'] if je_ved else user_id
+        # Směny (a v nich přiřazené kolegy) vidí celé oddělení; absence jen vedoucí.
+        filtr  = stav['filtr_uid'] if je_ved else None
         pohled = stav['pohled']
 
         # ESC zavře kalendář (návrat na dashboard). Když je otevřený dialog,
@@ -1011,16 +1002,14 @@ def vykresli_smeny(user_id, user_name, vsechna_prava):
         posledni_den_m = cal_lib.monthrange(prvni.year, prvni.month)[1]
         posledni_m = prvni.replace(day=posledni_den_m)
 
-        # Absence se zobrazují za celé oddělení – i řadovému zaměstnanci
-        absence_lide = lide if lide else _lide_skupiny(oddeleni)
-        lide_ids = list(absence_lide.keys()) if absence_lide else [user_id]
-        maska = None if je_ved else user_id
+        # Absence celého oddělení vidí jen vedoucí; řadový člen jen své vlastní.
+        lide_ids = list(lide.keys()) if lide else [user_id]
         if pohled == 'tyden':
             data = _smeny_rozsah(skupina['id'], str(pondeli), str(nedele), filtr)
-            absence_data = _absence_rozsah(str(pondeli), str(nedele), lide_ids, maskovat_krome=maska)
+            absence_data = _absence_rozsah(str(pondeli), str(nedele), lide_ids)
         else:
             data = _smeny_rozsah(skupina['id'], str(prvni), str(posledni_m), filtr)
-            absence_data = _absence_rozsah(str(prvni), str(posledni_m), lide_ids, maskovat_krome=maska)
+            absence_data = _absence_rozsah(str(prvni), str(posledni_m), lide_ids)
 
         # ── PDF / Tisk ────────────────────────────────────────────────────
         async def _nahled_pdf():

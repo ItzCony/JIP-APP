@@ -28,6 +28,8 @@ Role (intranet_prava.py):
   • sankce_tiket_tvrde_storno – storno bez kontroly a bez mailu (rovnou Nevyfakturovat).
   • sankce_tiket_unibrands – POUZE dlaždice „Nedodávky dod. k vyjádření" a zápis
     do sloupce „Vyjádření nákupčího" u dodavatele UNIBRANDS. Nic jiného v modulu.
+  • sankce_vedouci_pobocky – POUZE dlaždice „Nedodávky dod. k vyjádření", vše jen
+    pro čtení (všechny řádky i vyjádření nákupčích).
   • 'vse'           – vše.
 """
 
@@ -680,11 +682,18 @@ def _xlsx_bytes(cols: list, rows: list, total: dict = None, sheet: str = 'Data')
         ws.column_dimensions[get_column_letter(ci)].width = sirka
     ws.row_dimensions[1].height = 28
 
+    sub_font = Font(bold=True)
+    sub_fill = PatternFill('solid', fgColor='F5F7FF')  # jemnější než #eef2ff v gridu
     for ri, radek in enumerate(rows, start=2):
+        # Mezisoučtové řádky (`_sub`, např. „<IČO> Celkem" v KT) celé tučně
+        # a podbarvené.
+        sub = bool(radek.get('_sub'))
         for ci, (_nad, field, typ, _w) in enumerate(cols, start=1):
             hod = _xlsx_hodnota(radek.get(field), typ)
             c = ws.cell(row=ri, column=ci, value=hod)
             c.number_format = _xlsx_format(typ, hod)
+            if sub:
+                c.font, c.fill = sub_font, sub_fill
 
     posledni = 1 + len(rows)
     ws.freeze_panes = 'A2'
@@ -848,6 +857,7 @@ _EXP_NEDOD_KT = [
     ('Rozdíl dodáno MJ',        'rozdil_dodano_mj', 'num',   14),
     ('Rozdíl dodáno Kč',        'rozdil_dodano_kc', 'money', 16),
     ('Odmítnuto MJ',            'odmitnuto_mj',     'num',   13),
+    ('Nákupčí',                 'nak',              'text',  10),
     ('Vyjádření nákupčího',     'vyjadreni',        'text',  46),
 ]
 
@@ -5183,6 +5193,8 @@ KOD_PRAVO = {k: 'sankce_tiket_' + k.lower() for k in KODY_NAKUPCI}
 # Unibrands: jediné, co smí — vidět dlaždici Nedodávky a psát tam Vyjádření
 # nákupčího – jen řádky dodavatele UNIBRANDS. Žádné tikety.
 PRAVO_UNIBRANDS = 'sankce_tiket_unibrands'
+# Vedoucí pobočky: jen Nedodávky, vše jen pro čtení (včetně vyjádření nákupčích).
+PRAVO_VEDOUCI_POBOCKY = 'sankce_vedouci_pobocky'
 # VN nefiguruje v datech jako kód NAK — vedoucí nákupu píše vyjádření všude.
 PRAVO_VEDOUCI_NAKUPU = KOD_PRAVO['VN']
 # Zástup za všechny nákupčí (jen tikety): rozvine se na všechna KOD_PRAVO kromě VN (viz vykresli_sankce).
@@ -5472,6 +5484,13 @@ def _nacti_tiket_radky(tid) -> list:
 _HOTOVE_STAVY = ('vyfakturovano', 'nevyfakturovano')
 
 
+def _je_hlavni_admin(user_id) -> bool:
+    """Hlavní administrátor (uživatel id 1) — jediný smí přepsat rozhodnutí
+    v tiketu v jakémkoli stavu i u vyřízených a předaných řádků. Právo „vse"
+    na to nestačí."""
+    return str(user_id) == '1'
+
+
 def _otevrene_radky(tid, radky: list) -> list:
     """Řádky tiketu, které ještě čekají na vyřízení. Hotové (Fakturovat /
     Nevyfakturovat) ani už předané do navazujícího tiketu se do dalšího
@@ -5619,7 +5638,14 @@ def _odesli_rozhodnuti(tiket: dict, radky: list, user_id, user_name,
     Vrací (novy_stav_tiketu, hlaska)."""
     tid = tiket.get('id')
     zive = _otevrene_radky(tid, radky)  # už vyřízené řádky do rozhodování nevstupují
-    fakt = [r for r in zive if r.get('rozhodnuti') == 'vyfakturovat']
+    if _je_hlavni_admin(user_id):
+        # Hlavní admin: vyřízený/předaný řádek vstoupí znovu jen při ZMĚNĚ
+        # rozhodnutí — opakované odeslání by jinak zakládalo duplicitní tikety.
+        puvodni = {r.get('tr_id'): r.get('rozhodnuti') for r in _nacti_tiket_radky(tid)}
+        otevrene = {r.get('tr_id') for r in zive}
+        zive += [r for r in radky if r.get('tr_id') not in otevrene and r.get('rozhodnuti')
+                 and r.get('rozhodnuti') != puvodni.get(r.get('tr_id'))]
+    fakt =[r for r in zive if r.get('rozhodnuti') == 'vyfakturovat']
     prov = [r for r in zive if r.get('rozhodnuti') == 'provoz']
     stor = [r for r in zive if r.get('rozhodnuti') == 'storno']
     nak = [r for r in zive if r.get('rozhodnuti') == 'nakup']
@@ -5715,7 +5741,8 @@ def _palec_kontrola(tiket: dict, radky: list, schvaleno: bool, user_id, user_nam
     if schvaleno:
         _nastav_stav_radku([r.get('id') for r in stor], 'nevyfakturovano')
         # Zbyly nerozhodnuté řádky → tiket se vrací řešiteli, ne do „Storno".
-        zbyva = [r for r in radky if not r.get('rozhodnuti')]
+        # Vyřízené / předané řádky bez rozhodnutí tiket nedrží (jinak visí u řešitele).
+        zbyva = [r for r in _otevrene_radky(tid, radky) if not r.get('rozhodnuti')]
         novy = ('provoz' if _s(tiket.get('typ')) == 'provoz' else 'nakup') if zbyva \
             else 'storno'
         audit = [('sankce_vystaveni', r.get('row_hash'), r.get('id'), 'stav',
@@ -5911,9 +5938,15 @@ def _otevri_tiket(t: dict, user_id, user_name, vsechna_prava, refresh):
     muze_palec = ma_vse or 'sankce_tiket_kontrola' in vsechna_prava
     tvrde_storno = ma_vse or 'sankce_tiket_tvrde_storno' in vsechna_prava
     rozhoduje_se = stav in ('nakup', 'provoz', 'castecne')
-    editovatelne = muze_resit and rozhoduje_se
+    # Hlavní admin (id 1) mění rozhodnutí v kterémkoli stavu tiketu i u řádků,
+    # které ostatním zamyká _hotovo (vyřízené / předané).
+    hlavni_admin = _je_hlavni_admin(user_id)
+    editovatelne = hlavni_admin or (muze_resit and rozhoduje_se)
 
     radky = _nacti_tiket_radky(tid)
+    if hlavni_admin:
+        for r in radky:
+            r['_hotovo'] = False
     volby = ['', ROZ_LABEL['vyfakturovat'], ROZ_LABEL['storno']]
     volby.append(ROZ_LABEL['provoz'] if typ == 'nakup' else ROZ_LABEL['nakup'])
 
@@ -6448,6 +6481,9 @@ _KT_HODNOTY = ('objednano_mj', 'dodano_mj', 'rozdil_dodano_mj', 'rozdil_dodano_k
 _KT_SUMY = ('SUM(objednano_mj) objednano_mj, SUM(dodano_mj) dodano_mj, '
             'SUM(dodano_mj) - SUM(objednano_mj) rozdil_dodano_mj, '
             'SUM(rozdil_dodano_kc) rozdil_dodano_kc, SUM(odmitnuto_mj) odmitnuto_mj')
+# NAK není řádkové pole (v Excelu je to filtr stránky) — jen se ukáže u řádku,
+# aby nerozdělil seskupení; víc nákupčích v jednom řádku = výčet.
+_KT_NAK = "GROUP_CONCAT(DISTINCT nak ORDER BY nak SEPARATOR ', ') nak"
 # ponytail: nad limit (typicky filtr STATUS = Vše, ~60 tis. řádků) jen součty
 # dodavatelů — celé by to šlo přes WebSocket v desítkách MB.
 _KT_MAX_RADKU = 10000
@@ -6598,7 +6634,7 @@ def _kt_souhrn(obdobi: str, filtry: dict, sbalit: bool, jen_nak, jen_unibrands: 
         w, par = _kt_where(obdobi, filtry, jen_nak, jen_unibrands)
         cur = conn.cursor(dictionary=True)
         cur.execute(f"SELECT ico, MIN(jmeno_dodavatele) jmeno_dodavatele, COUNT(*) pocet, "
-                    f"{_KT_SUMY} FROM {_NEDOD_KT_TABULKA} WHERE {w} "
+                    f"{_KT_SUMY}, {_KT_NAK} FROM {_NEDOD_KT_TABULKA} WHERE {w} "
                     f"GROUP BY ico ORDER BY ico", par)
         dod = cur.fetchall()
         pocet = sum(d['pocet'] for d in dod)
@@ -6608,7 +6644,8 @@ def _kt_souhrn(obdobi: str, filtry: dict, sbalit: bool, jen_nak, jen_unibrands: 
             sl = ','.join(_KT_RADKY)
             # _hashe = otisky řádků sestavy, ze kterých řádek tabulky vznikl (vazba vyjádření)
             cur.execute('SET SESSION group_concat_max_len = 1000000')
-            cur.execute(f"SELECT {sl}, {_KT_SUMY}, GROUP_CONCAT(DISTINCT row_hash) hashe "
+            cur.execute(f"SELECT {sl}, {_KT_SUMY}, {_KT_NAK}, "
+                        f"GROUP_CONCAT(DISTINCT row_hash) hashe "
                         f"FROM {_NEDOD_KT_TABULKA} WHERE {w} "
                         f"GROUP BY {sl} ORDER BY {sl}", par)
             for r in cur.fetchall():
@@ -6623,7 +6660,7 @@ def _kt_souhrn(obdobi: str, filtry: dict, sbalit: bool, jen_nak, jen_unibrands: 
             det = detail.get(d['ico'], [])
             radky += det
             radky.append({'ico': f"{d['ico']} Celkem", 'jmeno_dodavatele': d['jmeno_dodavatele'],
-                          '_sub': True, '_det': bool(det),
+                          'nak': d['nak'], '_sub': True, '_det': bool(det),
                           **{p: d[p] for p in _KT_HODNOTY}})
         celkem = {'ico': 'Celkový součet',
                   **{p: sum(d[p] or 0 for d in dod) for p in _KT_HODNOTY}}
@@ -6644,7 +6681,8 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
     ma_ub = PRAVO_UNIBRANDS in vsechna_prava
     # VN = vedoucí nákupu: nemá vlastní kód NAK v datech, píše za všechny nákupčí.
     psat_vse = je_analytik or PRAVO_VEDOUCI_NAKUPU in vsechna_prava
-    vidi_vse = psat_vse or ma_ub or bool({'sankce_ucetni', 'sankce_ctenar', 'sankce_nakup'}
+    vidi_vse = psat_vse or ma_ub or bool({'sankce_ucetni', 'sankce_ctenar', 'sankce_nakup',
+                                          PRAVO_VEDOUCI_POBOCKY}
                                          & set(vsechna_prava))
 
     # Unibrands vidí jen řádky dodavatele UNIBRANDS.
@@ -7509,7 +7547,7 @@ async def vykresli_sankce(user_id, user_name, vsechna_prava):
         {'sankce_tiket_provoz', 'sankce_tiket_kontrola', *KOD_PRAVO.values()} & set(prava_tikety))
     # Nedodávky: čtou všechny role modulu, píší do nich nákupčí podle kódu NAK.
     vidi_nedodavky = vidi_zamitnute or vidi_vystaveni or bool(
-        {PRAVO_UNIBRANDS, *KOD_PRAVO.values()} & set(vsechna_prava))
+        {PRAVO_UNIBRANDS, PRAVO_VEDOUCI_POBOCKY, *KOD_PRAVO.values()} & set(vsechna_prava))
 
     pohled = app.storage.user.get('sankce_pohled')
     if pohled == 'vystaveni' and not vidi_vystaveni:
@@ -7543,6 +7581,17 @@ async def vykresli_sankce(user_id, user_name, vsechna_prava):
                       'nedodavky': _NEDOD_NAZEV}.get(pohled,
                       'Přehled sankcí vůči dodavatelům')
             ui.label(nadpis).classes('text-sm text-gray-500')
+        if pohled == 'nedodavky':
+            # Popis reportu — v hlavičce vedle nadpisu, pro všechny role.
+            ui.label('Report nedodávek VO dodavatelů. Vytváří ho analytické oddělení '
+                     'každou středu za předchozí týden (po – ne). Nákupní oddělení '
+                     'od středy vyplňuje informace o nedodávkách — termín je čtvrtek '
+                     'do 17:00 téhož týdne, kdy musí být stavy vyplněné. V nedodávkách '
+                     'se zohledňují částečně nedodané objednávky, nikoliv kompletně '
+                     'nedodané.') \
+                .classes('text-sm text-sky-900 px-4 py-2 ml-8 rounded-lg bg-sky-50 '
+                         'border border-sky-200') \
+                .style('max-width: 820px')
 
     # ── Obsah ──
     if pohled == 'zamitnute':

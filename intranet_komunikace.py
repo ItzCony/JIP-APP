@@ -478,14 +478,16 @@ def ziskej_skupiny(user_id, user_email):
     try:
         cur = conn.cursor(dictionary=True)
         # Schválené místnosti: veřejné NEBO jsem člen NEBO jsem tvůrce
+        # NEBO jsem hlavní administrátor (vidí všechny)
         cur.execute("""
             SELECT DISTINCT s.*
             FROM kom_skupiny s
             LEFT JOIN kom_clenove c ON c.skupina_id = s.id AND LOWER(c.email) = %s
             WHERE s.stav = 'schvaleno'
-              AND (s.je_verejna = 1 OR c.email IS NOT NULL OR s.vytvoril_id = %s)
+              AND (s.je_verejna = 1 OR c.email IS NOT NULL OR s.vytvoril_id = %s OR %s)
             ORDER BY s.nazev
-        """, (user_email.lower(), user_id))
+        """, (user_email.lower(), user_id,
+              int(user_id == intranet_data.SKRYTY_ADMIN_ID)))
         schvalene = cur.fetchall()
         # Moje vlastní čekající/vrácené/zamítnuté
         cur.execute("""
