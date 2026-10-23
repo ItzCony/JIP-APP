@@ -1146,7 +1146,7 @@ def _nacti_souhrny(asmy):
 
 
 async def _prepni_pohled(stav_klic, hodnota, refreshable, popis):
-    """Překryv s kolečkem po dobu, než se pohled vykreslí (stejné jako Bonusy AO).
+    """Překryv s kolečkem po dobu, než se pohled vykreslí.
     Sestavení detailu = desítky dotazů na volby filtrů, bez překryvu to vypadá
     jako zamrzlá dlaždice."""
     app.storage.user[stav_klic] = hodnota
