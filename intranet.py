@@ -926,7 +926,8 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
         any(p in vsechna_prava for p in (
             'asm_zadatel', 'asm_office', 'asm_spravce',
             'asm_spravce_bez_emailu', 'asm_vkladatel',
-            'asm_navyseni_office', 'podklady_vr_ctenar', 'podklady_vr_spravce'))
+            'asm_navyseni_office', 'podklady_vr_ctenar', 'podklady_vr_spravce',
+            'vstupenky_zadatel', 'vstupenky_kontrola'))
     )
     # Schůzky s vedoucími jsou dlaždice uvnitř Formulářů ASM — kdo má právo jen
     # na ně, musí záložku vidět taky (uvnitř pak uvidí jen tu jednu dlaždici).
@@ -1825,11 +1826,17 @@ async def route_lupa(client: Client):
     await vykresli_kompletni_intranet(client, 'lupa')
 
 @ui.page('/asm')
-async def route_asm(client: Client, pripad: str = ''):
+async def route_asm(client: Client, pripad: str = '', vstupenka: str = ''):
     # Deep-link z e-mailu (/asm?pripad=<id>) → po vykreslení se otevře rovnou detail případu.
     if pripad:
         try:
             app.storage.user['asm_deep_pripad'] = int(pripad)
+        except (TypeError, ValueError):
+            pass
+    # /asm?vstupenka=<id> → dlaždice Vstupenky Veletrh + detail žádosti.
+    if vstupenka:
+        try:
+            app.storage.user['asm_deep_vstupenka'] = int(vstupenka)
         except (TypeError, ValueError):
             pass
     await vykresli_kompletni_intranet(client, 'asm')

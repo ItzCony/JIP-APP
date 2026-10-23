@@ -264,6 +264,18 @@ for _k in ZALISTOVACI_KODY:
         'popis': f'Čtenář uvidí na listu „Sumarizace“ řádky se zkratkou {_k} ve sloupci A. Samo o sobě přístup do modulu nedává.',
         'ikona': 'assignment_ind'}
 
+# Vstupenky Veletrh — dlaždice ve Formulářích ASM, ve správě uživatelů vlastní podsekce.
+_VSTUPENKY_POD = 'Vstupenky Veletrh'
+ZAKLADNI_PRAVA.update({
+    'vstupenky_zadatel':  {'kategorie': 'Modul Formuláře ASM', 'podskupina': _VSTUPENKY_POD, 'nazev': 'Žadatel Vstupenek', 'popis': 'Může žádat o vstupenky na veletrh JIP pro zákazníky své pobočky (IČO mimo pobočku nelze zadat). Vidí jen své žádosti a jejich stav.', 'ikona': 'confirmation_number'},
+    'vstupenky_kontrola': {'kategorie': 'Modul Formuláře ASM', 'podskupina': _VSTUPENKY_POD, 'nazev': 'Kontrola Vstupenek', 'popis': 'Vidí sekci „Žádosti o vstupenky“ — všechny žádosti, schvaluje je nebo zamítá. Chodí mu e-mail o každé nové žádosti.', 'ikona': 'fact_check'},
+})
+# Přepínač podsekcí se ve správě uživatelů ukáže až od dvou podskupin a práva bez
+# podskupiny se zobrazují v každé — ostatní práva ASM proto patří do „Formuláře".
+for _v in ZAKLADNI_PRAVA.values():
+    if _v.get('kategorie') == 'Modul Formuláře ASM':
+        _v.setdefault('podskupina', 'Formuláře')
+
 
 def ma_pristup_zalistovaci(prava) -> bool:
     """Vstup do modulu dává jen role (ne samotná zkratka nákupčího)."""
