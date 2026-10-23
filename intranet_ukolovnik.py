@@ -1825,6 +1825,7 @@ def _dialog_detail_ukolu(ukol_id, user_id, user_name, vsechna_prava=None, on_ref
                             _notifikuj_ucastniky_ukolu(ukol_id, user_id, f"💬 {user_name} přidal/a poznámku k úkolu '{uk['nazev'][:40]}'.")
                             nova_poz.value = ''
                             nacti_poznamky()
+                            if on_refresh: on_refresh()   # poslední poznámka v seznamu úkolů
 
                         ui.button(icon='send', on_click=pridat_poznamku).classes('bg-blue-600 text-white h-12 w-12 rounded-xl')
 
@@ -2819,6 +2820,11 @@ def _uloz_poradi_dne(user_id, ordered_ids: list):
 # =========================================================
 # SEKCE: ÚKOLY — rozšířené řádky
 # =========================================================
+# Text poslední poznámky úkolu (zobrazí se pod názvem v režimu seznam)
+_SQL_POSL_POZNAMKA = ("(SELECT p.text FROM ukolovnik_ukol_poznamky p WHERE p.ukol_id=u.id "
+                      "ORDER BY p.id DESC LIMIT 1) AS posledni_poznamka")
+
+
 def _nacti_ukoly_seznam(user_id, is_admin, nacti_oddeleni, odd_user_ids) -> list:
     """Hlavní seznam úkolů dle viditelnosti uživatele — čistý DB loader pro vlákno."""
     conn = intranet_data.get_db_connection()
@@ -2827,15 +2833,15 @@ def _nacti_ukoly_seznam(user_id, is_admin, nacti_oddeleni, odd_user_ids) -> list
         try:
             cur = conn.cursor(dictionary=True)
             if is_admin:
-                cur.execute("""
-                    SELECT * FROM ukolovnik_ukoly
-                    ORDER BY vytvoreno DESC
+                cur.execute(f"""
+                    SELECT u.*, {_SQL_POSL_POZNAMKA} FROM ukolovnik_ukoly u
+                    ORDER BY u.vytvoreno DESC
                 """)
             elif nacti_oddeleni:
                 # Vidí úkoly celého oddělení + sledované
                 placeholders = ','.join(['%s'] * len(odd_user_ids))
                 cur.execute(f"""
-                    SELECT DISTINCT u.* FROM ukolovnik_ukoly u
+                    SELECT DISTINCT u.*, {_SQL_POSL_POZNAMKA} FROM ukolovnik_ukoly u
                     LEFT JOIN ukolovnik_sledovaci s ON s.typ='ukol' AND s.ref_id=u.id AND s.user_id=%s
                     WHERE (u.prirazen_id IN ({placeholders})
                        OR u.zadal_id IN ({placeholders})
@@ -2846,8 +2852,8 @@ def _nacti_ukoly_seznam(user_id, is_admin, nacti_oddeleni, odd_user_ids) -> list
                         u.termin ASC, u.vytvoreno DESC
                 """, [user_id] + odd_user_ids + odd_user_ids)
             else:
-                cur.execute("""
-                    SELECT DISTINCT u.* FROM ukolovnik_ukoly u
+                cur.execute(f"""
+                    SELECT DISTINCT u.*, {_SQL_POSL_POZNAMKA} FROM ukolovnik_ukoly u
                     LEFT JOIN ukolovnik_sledovaci s ON s.typ='ukol' AND s.ref_id=u.id AND s.user_id=%s
                     WHERE (u.prirazen_id=%s OR u.zadal_id=%s OR s.id IS NOT NULL)
                     ORDER BY
@@ -3456,6 +3462,8 @@ async def _vykresli_ukoly(user_id, user_name, vsechna_prava, dialog_anchor=None,
                         with ui.column().classes('flex-1 min-w-0 gap-0.5'):
                             nazev_cls = 'text-base font-bold text-gray-800' + (' line-through text-gray-400' if je_hotovo else '')
                             ui.label(uk['nazev']).classes(f'{nazev_cls} line-clamp-1')
+                            if uk.get('posledni_poznamka') and not _pohled['hotove']:
+                                ui.label(uk['posledni_poznamka']).classes('text-xs text-gray-400 line-clamp-1')
                             with ui.row().classes('gap-1 flex-wrap items-center'):
                                 if uk.get('porada_id'):
                                     pd = uk['porada_datum'].strftime('%d.%m.%Y') if uk.get('porada_datum') else ''
