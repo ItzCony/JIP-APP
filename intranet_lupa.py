@@ -801,15 +801,17 @@ def _smaz_asm_na_pozadi(asmy):
         threading.Thread(target=_smaz_asm, args=(nova,), daemon=True).start()
 
 
-def _smaz_asm(asmy):
-    """Úplné smazání ASM smazaného uživatele: dlaždice, obraty, poznámky, komentáře.
+def _smaz_asm(asmy, kdo='Systém', duvod='uživatel byl smazán'):
+    """Úplné smazání ASM: dlaždice, obraty, poznámky, komentáře. Vrací smazaná ASM.
 
+    Volá se při smazání spárovaného uživatele (_mapy) i ručně z dlaždice (admin).
     Zákazníci a dealeři nesou sloupec asm, ale sdílí je víc ASM — maže se jen to,
     na co už žádný obrat neukazuje. Produkty a karty zboží jsou společné, zůstávají."""
+    smazana = []
     conn = intranet_data.get_db_connection()
     try:
         if not conn:
-            return
+            return smazana
         cur = conn.cursor()
         for asm in asmy:
             try:
@@ -825,8 +827,9 @@ def _smaz_asm(asmy):
                     cur.execute('DELETE d FROM lupa_dealer d WHERE d.asm=%s AND NOT EXISTS '
                                 '(SELECT 1 FROM lupa_obrat o WHERE o.dealer = d.dealer)', (asm,))
                     conn.commit()
-                intranet_logger.log_activity('Systém', 'Lupou na obchod',
-                                             f'Smazáno ASM {asm} i s daty — uživatel byl smazán')
+                smazana.append(asm)
+                intranet_logger.log_activity(kdo, 'Lupou na obchod',
+                                             f'Smazáno ASM {asm} i s daty — {duvod}')
             except Exception as e:
                 conn.rollback()
                 print(f'[lupa] smazání ASM {asm}: {e}')
@@ -836,6 +839,7 @@ def _smaz_asm(asmy):
             conn.close()
         _MAZANI.difference_update(asmy)
         vymaz_cache()
+    return smazana
 
 
 def je_admin(prava):
@@ -1096,11 +1100,16 @@ def vykresli_lupa(user_id, user_name, vsechna_prava):
                 ui.label('Zatím vám není přiřazeno žádné ASM.').classes('text-gray-400')
             return
 
+        muze_mazat = je_admin(vsechna_prava)
         with ui.row().classes('gap-6 flex-wrap items-stretch'):
             for s in souhrny:
-                _dlazdice_asm(s, stav_klic, obsah)
+                karta = _dlazdice_asm(s, stav_klic, obsah)
+                if muze_mazat:
+                    _menu_smazat(karta, s['asm'], obsah, user_name)
             for s in sede:
-                _dlazdice_neaktivni(s)
+                karta = _dlazdice_neaktivni(s)
+                if muze_mazat:
+                    _menu_smazat(karta, s['asm'], obsah, user_name)
             if je_vkladatel(vsechna_prava):
                 _dlazdice_import(stav_klic, obsah)
 
@@ -1158,18 +1167,70 @@ def _dlazdice_asm(s, stav_klic, refreshable):
         await _prepni_pohled(stav_klic, s['asm'], refreshable,
                              f"Načítám ASM {s['asm'].capitalize()}…")
 
-    with ui.card().classes(_KARTA).on('click', otevri):
+    with ui.card().classes(_KARTA).on('click', otevri) as karta:
         ui.label('🔍').classes('text-5xl mb-2')
         ui.label(s['asm'].capitalize()) \
             .classes('text-xl font-bold text-gray-800 text-center w-full')
+    return karta
 
 
 def _dlazdice_neaktivni(s):
     """ASM deaktivovaného účtu — data drží pro případnou reaktivaci, otevřít nejde."""
-    with ui.card().classes(_KARTA_SEDA):
+    with ui.card().classes(_KARTA_SEDA) as karta:
         ui.label('🔍').classes('text-5xl mb-2 grayscale')
         ui.label(s['asm'].capitalize()) \
             .classes('text-xl font-bold text-gray-500 text-center w-full')
+    return karta
+
+
+def _menu_smazat(karta, asm, refreshable, user_name):
+    """Pravý klik na dlaždici → Smazat: ASM zmizí i se všemi svými daty (jen admin).
+
+    Dialogy visí na kartě, ne na menu — obsah zavřeného QMenu se nevykresluje."""
+    nazev = asm.capitalize()
+
+    async def smaz(dlg):
+        dlg.close()     # hide → dlg.delete; odtud dál jen v kontextu karty
+        with karta:
+            if asm in _MAZANI:
+                ui.notify(f'ASM {nazev} se už maže.', type='warning')
+                return
+            if _blokuje_import(asm):
+                return
+            prekryv, _kruh, _popisek = prekryv_kolecko(f'Mažu ASM {nazev}…', procenta=False)
+            prekryv.open()
+            try:
+                async with _zamek_asm(asm):     # import téhož ASM počká, až mazání doběhne
+                    _MAZANI.add(asm)            # _smaz_asm ho ve finally zase uvolní
+                    smazana = await asyncio.to_thread(
+                        _smaz_asm, [asm], user_name, 'smazáno ručně z dlaždice')
+            finally:
+                try:
+                    prekryv.close()
+                except RuntimeError:
+                    pass    # karta mezitím zmizela jiným refreshem
+            if smazana:
+                ui.notify(f'ASM {nazev} smazáno i s daty.', type='positive')
+            else:
+                ui.notify(f'ASM {nazev} se nepodařilo smazat.', type='negative')
+            refreshable.refresh()
+
+    def potvrd():
+        with karta, ui.dialog() as dlg, ui.card().classes('max-w-md'):
+            ui.label(f'Smazat ASM {nazev}?').classes('text-lg font-bold text-gray-800')
+            ui.label('Dlaždice zmizí i se všemi daty: obraty, poznámky, komentáře '
+                     'a zákazníci/dealeři, na které už nevede žádný jiný obrat. '
+                     'Akci nelze vrátit — data vrátí jen nový import.') \
+                .classes('text-sm text-gray-600')
+            with ui.row().classes('w-full justify-end gap-2 mt-2'):
+                ui.button('Zrušit', on_click=dlg.close).props('flat')
+                ui.button('Smazat', icon='delete', on_click=lambda: smaz(dlg)) \
+                    .props('color=negative')
+        dlg.on('hide', dlg.delete)      # ať se zrušené dialogy na kartě nehromadí
+        dlg.open()
+
+    with karta, ui.context_menu():
+        ui.menu_item('Smazat', potvrd).classes('text-red-600')
 
 
 def _dlazdice_import(stav_klic, refreshable):
