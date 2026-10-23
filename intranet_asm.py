@@ -37,6 +37,7 @@ import intranet_data
 import intranet_static
 import intranet_schuzky
 import intranet_podklady_vr
+import intranet_vstupenky
 import intranet_emaily
 import intranet_logger
 
@@ -3921,6 +3922,16 @@ async def _vykresli_asm(user_id, user_name, vsechna_prava):
         pohled = None
     if pohled == "podklady" and not intranet_podklady_vr.vidi(vsechna_prava):
         pohled = None
+    if pohled == "vstupenky" and not intranet_vstupenky.vidi(vsechna_prava):
+        pohled = None
+
+    # Deep-link z e-mailu (/asm?vstupenka=<id>): otevři dlaždici Vstupenky a detail.
+    deep_vst = app.storage.user.pop("asm_deep_vstupenka", None)
+    if deep_vst and intranet_vstupenky.vidi(vsechna_prava):
+        pohled = "vstupenky"
+        app.storage.user["asm_pohled"] = pohled
+    else:
+        deep_vst = None
 
     # Deep-link z e-mailu (/asm?pripad=<id>): přepni na správnou frontu a otevři detail,
     # aby se posuzovatel neproklikával. Zpracuje se jen jednou (pop).
@@ -3952,13 +3963,15 @@ async def _vykresli_asm(user_id, user_name, vsechna_prava):
                 podtitul = "Nový OZ — evidence obchodních zástupců"
             elif pohled == "podklady":
                 podtitul = "Podklady VŘ — dokumenty s platností, archiv a šablony"
+            elif pohled == "vstupenky":
+                podtitul = "Vstupenky Veletrh — žádosti o vstupenky pro zákazníky"
             elif pohled in _FORMULARE:
                 podtitul = _FORMULARE[pohled]["nazev"]
             ui.label(podtitul).classes("text-sm text-gray-500")
         ui.space()
         # Manuál popisuje formuláře ASM — v schůzkách, evidenci OZ ani v navýšení
         # položek (příručka ho nepokrývá) nedává smysl.
-        if pohled not in ("schuzky", "novy_oz", "navyseni", "podklady"):
+        if pohled not in ("schuzky", "novy_oz", "navyseni", "podklady", "vstupenky"):
             ui.button("Manuál", icon="menu_book", on_click=_dialog_manual) \
                 .props("outline no-caps") \
                 .classes("text-emerald-700 font-semibold rounded-lg") \
@@ -3972,6 +3985,10 @@ async def _vykresli_asm(user_id, user_name, vsechna_prava):
         return
     if pohled == "podklady":
         await intranet_podklady_vr.vykresli_podklady(user_id, user_name, vsechna_prava)
+        return
+    if pohled == "vstupenky":
+        await intranet_vstupenky.vykresli_vstupenky(user_id, user_name, vsechna_prava,
+                                                    deep_id=deep_vst)
         return
     if pohled == "data":
         _panel_data(user_name)
@@ -4021,9 +4038,13 @@ async def _vykresli_asm(user_id, user_name, vsechna_prava):
         if _podklady:
             _tile("📑", "Podklady VŘ", "PDF podklady + šablony k podpisu",
                   "border-rose-200", lambda: _nav("podklady"))
+        _vstupenky = intranet_vstupenky.vidi(vsechna_prava)
+        if _vstupenky:
+            _tile("🎟️", "Vstupenky Veletrh", "žádosti o vstupenky pro zákazníky",
+                  "border-pink-200", lambda: _nav("vstupenky"))
     if (not _je_zadatel(vsechna_prava) and not _vidi_import(vsechna_prava)
             and not _vidi_schuzky(vsechna_prava) and not _vidi_oz(vsechna_prava)
-            and not _navyseni and not _podklady):
+            and not _navyseni and not _podklady and not _vstupenky):
         with ui.column().classes("items-center py-20 gap-3 w-full"):
             ui.icon("lock", size="4rem", color="grey-4")
             ui.label("Nemáte přístup k žádné dlaždici modulu Formuláře ASM.") \

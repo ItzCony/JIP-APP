@@ -694,7 +694,8 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
          any(p in vsechna_prava for p in (
              'asm_zadatel', 'asm_office', 'asm_spravce',
              'asm_spravce_bez_emailu', 'asm_vkladatel',
-             'asm_navyseni_office', 'podklady_vr_ctenar', 'podklady_vr_spravce'))
+             'asm_navyseni_office', 'podklady_vr_ctenar', 'podklady_vr_spravce',
+             'vstupenky_zadatel', 'vstupenky_kontrola'))
          ) and nastaveni.get('asm_zapnuty', True)
     ) or (
         ('vse' in vsechna_prava or
