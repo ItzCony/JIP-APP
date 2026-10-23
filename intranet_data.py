@@ -528,7 +528,6 @@ MODULY = {
     'cenopripad_zapnuty':    ('🏷️ Modul Cenopřípad',             'Cenopřípad'),
     'asm_zapnuty':           ('📝 Modul Formuláře ASM',          'Formuláře ASM'),
     'lupa_zapnuty':          ('🔍 Modul Lupou na obchod',        'Lupou na obchod'),
-    'bonusy_ao_zapnuty':     ('💰 Modul Bonusy AO',              'Bonusy AO'),
     'schuzky_zapnuty':       ('🗓️ Modul Schůzky s vedoucími',    'Schůzky s vedoucími'),
     'gastrokurzy_zapnuty':   ('👨‍🍳 Modul Gastrokurzy',            'Gastrokurzy'),
     'monitor_zapnuty':       ('📈 Modul Monitor',                'Monitor'),

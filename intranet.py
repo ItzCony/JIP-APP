@@ -27,7 +27,6 @@ import intranet_asm
 import intranet_vizitky
 import intranet_spolvecer
 import intranet_lupa
-import intranet_bonusy_ao
 import intranet_gastrokurzy
 import intranet_monitory
 import intranet_zalistovaci
@@ -710,7 +709,6 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
         'cenopripad':    'cenopripad_zapnuty',
         'asm':           'asm_zapnuty',
         'lupa':          'lupa_zapnuty',
-        'bonusy_ao':     'bonusy_ao_zapnuty',
         'gastrokurzy':   'gastrokurzy_zapnuty',
         'monitor':       'monitor_zapnuty',
         'zalistovaci':   'zalistovaci_zapnuty',
@@ -945,10 +943,6 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
     # uživatele a vedení oddělení. Ptáme se modulu.
     if nastaveni.get('lupa_zapnuty', True) and intranet_lupa.ma_pristup(user_id, vsechna_prava):
         dostupne_taby.append('lupa')
-
-    # Bonusy AO: zatím jen superadmin (vlastní práva se doplní, až budou role jasné).
-    if ma_vse and nastaveni.get('bonusy_ao_zapnuty', True):
-        dostupne_taby.append('bonusy_ao')
 
     _ma_gastrokurzy = (
         ma_vse
@@ -1589,8 +1583,6 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
                         tab_cenopripad = ui.tab('cenopripad', label='🏷️  Cenopřípad').classes('justify-start text-lg text-gray-800')
                     if 'asm' in dostupne_taby:
                         tab_asm = ui.tab('asm', label='📝  Formuláře ASM').classes('justify-start text-lg text-gray-800')
-                    if 'bonusy_ao' in dostupne_taby:
-                        ui.tab('bonusy_ao', label='💰  Bonusy AO').classes('justify-start text-lg text-gray-800')
                     if 'gastrokurzy' in dostupne_taby:
                         ui.tab('gastrokurzy', label='👨‍🍳  Gastrokurzy').classes('justify-start text-lg text-gray-800')
                     if 'manualy' in dostupne_taby:
@@ -1675,7 +1667,6 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
                 if 'cenopripad' in dostupne_taby: _RENDER_FNS['cenopripad'] = lambda: intranet_cenopripad.vykresli_cenopripad(user_id, user_name, vsechna_prava)
                 if 'asm'        in dostupne_taby: _RENDER_FNS['asm']        = lambda: intranet_asm.vykresli_asm(user_id, user_name, vsechna_prava)
                 if 'lupa'       in dostupne_taby: _RENDER_FNS['lupa']       = lambda: intranet_lupa.vykresli_lupa(user_id, user_name, vsechna_prava)
-                if 'bonusy_ao'  in dostupne_taby: _RENDER_FNS['bonusy_ao']  = lambda: intranet_bonusy_ao.vykresli_bonusy_ao(user_id, user_name, vsechna_prava)
                 if 'gastrokurzy' in dostupne_taby: _RENDER_FNS['gastrokurzy'] = lambda: intranet_gastrokurzy.vykresli(user_id, user_name, vsechna_prava)
 
                 if tab_logy:        _RENDER_FNS['logy']          = lambda: intranet_logger.vykresli_logy(user_name, vsechna_prava)
