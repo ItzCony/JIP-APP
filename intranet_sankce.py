@@ -1617,6 +1617,9 @@ def inicializace_sankce_db():
         cur.close()
         for _t in ('sankce_zamitnute', 'sankce_vystaveni', 'sankce_nedodavky'):
             _backfill_cisla(_t)
+        # Pojistka: tikety, jejichž řádky se vyřídily mimo UI sestavy (stará data,
+        # obnova ze zálohy), synchronizuj se sestavou při startu.
+        _synchronizuj_tikety()
         _SANKCE_DB_INIT_HOTOVO = True
     except Exception as e:
         print(f'Chyba při inicializaci DB Sankcí: {e}')
@@ -2161,6 +2164,8 @@ def _obnov_zalohu(zaloha_id: int, vytvoril: str):
         cur.close()
         # Stará záloha nemusí mít nase_cislo → dočíslovat hned (init už běží jen jednou).
         _backfill_cisla(tabulka)
+        if tabulka == 'sankce_vystaveni':
+            _synchronizuj_tikety(user_name=vytvoril)
         return True, len(rows), None
     except Exception as e:
         try:
@@ -4861,6 +4866,17 @@ async def _vykresli_vystaveni(user_id, user_name, vsechna_prava):
             _aplikuj_souhrn(data)
             info.set_text(_info_text(data))
 
+            # vyřízení celého dodavatele v souhrnu → synchronizuj jeho tikety
+            if je_stav and kod_novy in _HOTOVE_STAVY:
+                zmeny = await asyncio.to_thread(
+                    _synchronizuj_tikety, [r.get('id') for r in cilove],
+                    user_id, user_name)
+                if zmeny:
+                    intranet_logger.log_activity(user_name, 'Sankce',
+                                                 _hlaska_synchronizace(zmeny))
+                    ui.notify(_hlaska_synchronizace(zmeny), type='info',
+                              position='top', timeout=6000, multi_line=True)
+
         souhrn.on('cellValueChanged', _on_change_souhrn)
 
     # diskuze (chat): překreslení indikátoru jednoho řádku v gridu
@@ -5006,6 +5022,18 @@ async def _vykresli_vystaveni(user_id, user_name, vsechna_prava):
                 # aktuálně viditelné řádky.
                 grid.run_grid_method('onFilterChanged')
                 _obnov_filtr()
+
+                # Vyřízením řádků v sestavě může tiketu zmizet poslední otevřený
+                # řádek — synchronizuj, ať nevisí řešiteli ve frontě.
+                if kod_novy in _HOTOVE_STAVY:
+                    zmeny = await asyncio.to_thread(
+                        _synchronizuj_tikety, [r.get('id') for r in cilove],
+                        user_id, user_name)
+                    if zmeny:
+                        intranet_logger.log_activity(user_name, 'Sankce',
+                                                     _hlaska_synchronizace(zmeny))
+                        ui.notify(_hlaska_synchronizace(zmeny), type='info',
+                                  position='top', timeout=6000, multi_line=True)
 
             elif field == 'stav2_label':
                 kod_novy = STAV2_LABEL_REV.get(nova)
@@ -5176,8 +5204,10 @@ TIKET_STAV_LABEL = {
     'uzavreno':      'Uzavřeno',
 }
 # „Otevřené" = někdo na nich ještě má něco udělat (výchozí filtr seznamu tiketů).
+# Schválená 'abnormalita' sem nepatří — je vyřízená jako storno / k fakturaci,
+# nákupčímu z fronty zmizí a účtárna ji jen uzavře.
 TIKET_STAV_OTEVRENE = ('nakup', 'provoz', 'castecne', 'storno_ceka',
-                       'abnormalita_ceka', 'abnormalita')
+                       'abnormalita_ceka')
 # Archiv: tiket předaný dál. Ze seznamu mizí úplně — práce pokračuje v novém
 # tiketu, sem se dostaneš odkazem „z tiketu …" v jeho poznámce nebo diskuzi.
 TIKET_STAV_ARCHIV = ('predano_provoz', 'predano_nakup')
@@ -5425,7 +5455,8 @@ def _nacti_tikety() -> list:
               (SELECT COUNT(*) FROM sankce_tiket_radky r
                  JOIN sankce_vystaveni v ON v.id=r.radek_id
                 WHERE r.tiket_id=t.id
-                  AND v.stav NOT IN ('vyfakturovano','nevyfakturovano')
+                  AND COALESCE(v.stav,'') NOT IN ('vyfakturovano','nevyfakturovano',
+                                                  'odevzdano_uctarne')
                   AND NOT EXISTS (SELECT 1 FROM sankce_tiket_radky p
                                     JOIN sankce_tikety c ON c.id=p.tiket_id
                                    WHERE c.zdroj_tiket=t.id
@@ -5481,7 +5512,10 @@ def _nacti_tiket_radky(tid) -> list:
         conn.close()
 
 
-_HOTOVE_STAVY = ('vyfakturovano', 'nevyfakturovano')
+# Vyřízené stavy řádku. „Odevzdáno účtárně" následuje až po „Fakturovat" — bez
+# něj by se řádek po odevzdání v tiketu znovu tvářil jako otevřený.
+_HOTOVE_STAVY = ('vyfakturovano', 'nevyfakturovano', 'odevzdano_uctarne')
+_FAKT_STAVY = ('vyfakturovano', 'odevzdano_uctarne')
 
 
 def _je_hlavni_admin(user_id) -> bool:
@@ -5564,6 +5598,81 @@ def _uprav_tiket(tid, stav=None, poznamka=None):
         conn.commit(); cur.close()
     finally:
         conn.close()
+
+
+# Stavy, ve kterých tiket čeká na řešitele — jen ty synchronizace se sestavou zavírá.
+# Tikety u druhotné kontroly vyřídí palec (ten vyřízené řádky sám přeskočí).
+_TIKET_STAV_SYNC = ('nakup', 'provoz', 'castecne')
+
+
+def _synchronizuj_tikety(radek_ids=None, user_id=None, user_name=None) -> list:
+    """Synchronizace tiketů se sestavou „Sankce k vystavení". Když účtárna vyřídí
+    řádky přímo v sestavě (Fakturovat / Nevyfakturovat / Odevzdáno účtárně), tiket
+    o tom neví a dál visí řešiteli ve frontě. Tiket, kterému nezbyl žádný otevřený
+    řádek, se uzavře stejně, jako kdyby rozhodl řešitel: aspoň jeden řádek
+    k fakturaci → „K fakturaci", jinak „Stornováno". Bez e-mailů — řádky vyřídila
+    účtárna sama. radek_ids omezí kontrolu na tikety s těmito řádky (None = všechny).
+    Vrací [(tiket_id, novy_stav)]."""
+    if radek_ids is not None:
+        radek_ids = [i for i in radek_ids if i]
+        if not radek_ids:
+            return []
+    hot = ','.join(['%s'] * len(_HOTOVE_STAVY))
+    fak = ','.join(['%s'] * len(_FAKT_STAVY))
+    syn = ','.join(['%s'] * len(_TIKET_STAV_SYNC))
+    params = list(_HOTOVE_STAVY) + list(_FAKT_STAVY) + list(_TIKET_STAV_SYNC)
+    filtr = ''
+    if radek_ids is not None:
+        filtr = ('AND t.id IN (SELECT tiket_id FROM sankce_tiket_radky WHERE radek_id IN ('
+                 + ','.join(['%s'] * len(radek_ids)) + '))')
+        params += list(radek_ids)
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return []
+    zmeny = []
+    try:
+        cur = conn.cursor(dictionary=True)
+        cur.execute(f"""
+            SELECT t.id, t.stav,
+              SUM(COALESCE(v.stav,'') NOT IN ({hot})
+                  AND NOT EXISTS (SELECT 1 FROM sankce_tiket_radky p
+                                    JOIN sankce_tikety c ON c.id=p.tiket_id
+                                   WHERE c.zdroj_tiket=t.id
+                                     AND p.radek_id=r.radek_id)) AS otevrene,
+              SUM(v.stav IN ({fak})) AS fakt,
+              SUM(v.stav = 'nevyfakturovano') AS stor
+            FROM sankce_tikety t
+            JOIN sankce_tiket_radky r ON r.tiket_id=t.id
+            JOIN sankce_vystaveni v ON v.id=r.radek_id
+            WHERE t.stav IN ({syn}) {filtr}
+            GROUP BY t.id, t.stav
+            HAVING otevrene=0 AND (fakt>0 OR stor>0)
+        """, tuple(params))
+        for t in cur.fetchall():
+            novy = 'vyfakturovano' if t['fakt'] else 'storno'
+            # Podmínka na starý stav: souběžně odeslané rozhodnutí řešitele vyhrává.
+            cur.execute('UPDATE sankce_tikety SET stav=%s WHERE id=%s AND stav=%s',
+                        (novy, t['id'], t['stav']))
+            if cur.rowcount:
+                zmeny.append((t['id'], t['stav'], novy))
+        conn.commit(); cur.close()
+    except Exception as e:
+        print(f'[sankce] _synchronizuj_tikety error: {e}')
+        return []
+    finally:
+        conn.close()
+    jmeno = f'{user_name or "Systém"} (řádky vyřízeny v sestavě)'
+    _zapis_audit_bulk([('sankce_tikety', _tiket_rh(tid), tid, 'tiket_stav',
+                        TIKET_STAV_LABEL.get(stary), TIKET_STAV_LABEL[novy],
+                        user_id, jmeno) for tid, stary, novy in zmeny])
+    return [(tid, novy) for tid, _, novy in zmeny]
+
+
+def _hlaska_synchronizace(zmeny: list) -> str:
+    """Text notifikace o tiketech uzavřených synchronizací se sestavou."""
+    cisla = ', '.join(f'{_tiket_cislo(tid)} → {TIKET_STAV_LABEL[novy]}'
+                      for tid, novy in zmeny)
+    return f'Tikety uzavřené podle sestavy (žádný řádek už nečeká na řešitele): {cisla}'
 
 
 def _smaz_tiket(tid, user_id, user_name) -> int:
@@ -6235,7 +6344,8 @@ async def _vykresli_tikety(user_id, user_name, vsechna_prava):
         sel_obd = ui.select([VSE_OBD] + obdobi_list, value=VSE_OBD, label='Období') \
             .props('outlined dense options-dense').classes('w-60')
         sw = ui.switch('Jen otevřené', value=True) \
-            .tooltip('Skryje uzavřené a vyřešené tikety (stornováno / k fakturaci / uzavřeno). '
+            .tooltip('Skryje uzavřené a vyřešené tikety (stornováno / k fakturaci / '
+                     'schválená abnormalita / uzavřeno). '
                      'Předané tikety jsou v archivu — v seznamu nejsou vůbec.')
         sw_moje = None
         if ukaz_frontu:
