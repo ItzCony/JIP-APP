@@ -31,6 +31,7 @@ import intranet_gastrokurzy
 import intranet_monitory
 import intranet_zalistovaci
 import intranet_manualy
+import intranet_datuloziste
 import intranet_halloween
 
 import time
@@ -710,6 +711,7 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
         'asm':           'asm_zapnuty',
         'lupa':          'lupa_zapnuty',
         'gastrokurzy':   'gastrokurzy_zapnuty',
+        'uloziste':      'datuloziste_zapnuty',
         'monitor':       'monitor_zapnuty',
         'zalistovaci':   'zalistovaci_zapnuty',
 
@@ -953,6 +955,11 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
     )
     if _ma_gastrokurzy and nastaveni.get('gastrokurzy_zapnuty', True):
         dostupne_taby.append('gastrokurzy')
+
+    # Datové úložiště: správce dat, nebo kdo má přidělenou aspoň jednu složku (DB).
+    if (nastaveni.get('datuloziste_zapnuty', True)
+            and intranet_datuloziste.ma_pristup_k_modulu(user_id, vsechna_prava)):
+        dostupne_taby.append('uloziste')
 
     if not user_id:
         # Deep-link z e-mailu musí přežít i přesměrování přes firemní účet (OIDC) —
@@ -1588,6 +1595,8 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
                         ui.tab('gastrokurzy', label='👨‍🍳  Gastrokurzy').classes('justify-start text-lg text-gray-800')
                     if 'manualy' in dostupne_taby:
                         ui.tab('manualy', label='📖  Manuály').classes('justify-start text-lg text-gray-800')
+                    if 'uloziste' in dostupne_taby:
+                        ui.tab('uloziste', label='🗄️  Datové úložiště').classes('justify-start text-lg text-gray-800')
                     if 'lupa' in dostupne_taby:
                         tab_lupa = ui.tab('lupa', label='🔍  Lupou na obchod').classes('justify-start text-lg text-gray-800')
 
@@ -1669,6 +1678,7 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
                 if 'asm'        in dostupne_taby: _RENDER_FNS['asm']        = lambda: intranet_asm.vykresli_asm(user_id, user_name, vsechna_prava)
                 if 'lupa'       in dostupne_taby: _RENDER_FNS['lupa']       = lambda: intranet_lupa.vykresli_lupa(user_id, user_name, vsechna_prava)
                 if 'gastrokurzy' in dostupne_taby: _RENDER_FNS['gastrokurzy'] = lambda: intranet_gastrokurzy.vykresli(user_id, user_name, vsechna_prava)
+                if 'uloziste'   in dostupne_taby: _RENDER_FNS['uloziste']   = lambda: intranet_datuloziste.vykresli(user_id, user_name, vsechna_prava)
 
                 if tab_logy:        _RENDER_FNS['logy']          = lambda: intranet_logger.vykresli_logy(user_name, vsechna_prava)
                 if tab_server:      _RENDER_FNS['server']        = lambda: intranet_monitor.vykresli_monitor(vsechna_prava)
@@ -1840,6 +1850,17 @@ async def route_asm(client: Client, pripad: str = '', vstupenka: str = ''):
         except (TypeError, ValueError):
             pass
     await vykresli_kompletni_intranet(client, 'asm')
+
+@ui.page('/uloziste')
+async def route_uloziste(client: Client, slozka: str = ''):
+    # Deep-link z e-mailu (/uloziste?slozka=<id>). Je to jen přání — přístup
+    # ke složce ověří modul z DB, podvržené ID skončí v kořeni s hláškou.
+    if slozka:
+        try:
+            app.storage.user['datuloziste_slozka'] = int(slozka)
+        except (TypeError, ValueError):
+            pass
+    await vykresli_kompletni_intranet(client, 'uloziste')
 
 @ui.page('/logout')
 def route_logout(client: Client):
