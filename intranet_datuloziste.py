@@ -3,15 +3,23 @@
 Vzhled po vzoru SharePointu: vlevo rozbalovací strom složek, vpravo drobečková
 navigace a seznam Název / Změněno / Změnil / Velikost.
 
-Kdo co vidí:
-  * Správce Dat (právo `datuloziste_spravce`, admin `vse`) vidí vše, pravým
-    tlačítkem myši (kdekoli v boční liště i v seznamu) zakládá sekce a složky
-    a řídí přístup ke složkám. Ctrl+klikem vybere víc složek / souborů a smaže
-    je naráz (Delete nebo pravé tlačítko). Složka se maže i s obsahem a přístupy
-    k ní zaniknou — nová složka stejného jména nic nezdědí.
-  * Ostatní vidí jen složky, do kterých dostali přístup, a vše pod nimi.
-    Cesta k nim se zviditelní sama a je jen průchozí: v nadřazené složce
-    vidí jen svou větev — ne sourozence (Novák nevidí Novotného) ani soubory.
+Kdo co smí (role se dědí do podsložek, platí ta vyšší):
+  * Administrátor (právo `datuloziste_spravce`, admin `vse`) vidí a spravuje vše:
+    zakládá sekce, přiděluje přístup ke složkám (role správce / čtenář, našeptávač
+    uživatelů), vidí historii změn a může odpojit uživatele od otevřeného souboru.
+  * Správce složky v ní a pod ní nahrává, upravuje v Office, maže, přesouvá
+    (i přetažením myší), zakládá podsložky, píše popis složky a zamyká soubory,
+    které sám nahrál. Přidělenou složku samotnou smaže / přesune jen administrátor.
+  * Čtenář složku prochází, stahuje a dokumenty Office otevírá jen pro čtení.
+  * Cesta k přiděleným složkám se zviditelní sama a je jen průchozí: v nadřazené
+    složce vidí každý jen svou větev — ne sourozence (Novák nevidí Novotného) ani soubory.
+
+Ctrl+klikem se vybere víc položek a přesunou / smažou se naráz (Delete, pravé tlačítko,
+lišta výběru). Složka se maže i s obsahem a přístupy k ní zaniknou — nová složka
+stejného jména nic nezdědí. Uzamčený soubor nikdo nezmění, nesmaže ani nepřesune
+(ani se složkou, ve které leží), dokud ho neodemkne ten, kdo ho zamkl, nebo
+administrátor. Soubor stejného jména (nahrání, přesun) se přepíše jen po potvrzení.
+Lupa hledá v názvech jen tam, kam uživatel vidí.
 
 Soubory se otevírají klikem jako v SharePointu: dokumenty Office v desktopovém
 Wordu / Excelu / PowerPointu přes WebDAV — uložení v aplikaci (Ctrl+S) zapíše novou
@@ -53,8 +61,11 @@ import intranet_data
 import intranet_emaily
 import intranet_logger
 
-PRAVO_SPRAVCE = 'datuloziste_spravce'
+PRAVO_SPRAVCE = 'datuloziste_spravce'    # administrátor úložiště
+ROLE_SPRAVCE, ROLE_CTENAR = 'spravce', 'ctenar'     # role přístupu ke složce
+_ROLE = {ROLE_SPRAVCE: 'Správce', ROLE_CTENAR: 'Čtenář'}
 MAX_VELIKOST = 50 * 1024 * 1024          # 50 MB na soubor
+MAX_POPIS = 2000                         # znaků popisu složky
 ADRESAR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Datove_Uloziste')
 _LOG = 'Datové úložiště'
 _SLOZKY = 'SELECT id, parent_id, nazev, vytvoril, vytvoreno FROM datuloziste_slozky'
@@ -81,9 +92,12 @@ def inicializace_db():
                 nazev VARCHAR(255) NOT NULL,
                 vytvoril VARCHAR(255),
                 vytvoreno DATETIME DEFAULT CURRENT_TIMESTAMP,
+                popis TEXT NULL,
                 INDEX idx_parent (parent_id)
             ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
         """)
+        # nahral / nahrano = poslední změna (i uložení z Office); vlozil_id = kdo soubor
+        # nahrál (jen ten ho smí zamknout); zamkl_id = zamčeno proti jakékoli změně.
         cur.execute("""
             CREATE TABLE IF NOT EXISTS datuloziste_soubory (
                 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -93,6 +107,10 @@ def inicializace_db():
                 velikost BIGINT NOT NULL DEFAULT 0,
                 nahral VARCHAR(255),
                 nahrano DATETIME DEFAULT CURRENT_TIMESTAMP,
+                vlozil_id INT NULL,
+                zamkl_id INT NULL,
+                zamkl VARCHAR(255) NULL,
+                zamceno DATETIME NULL,
                 INDEX idx_slozka (slozka_id)
             ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
         """)
@@ -100,12 +118,44 @@ def inicializace_db():
             CREATE TABLE IF NOT EXISTS datuloziste_pristupy (
                 slozka_id INT NOT NULL,
                 user_id INT NOT NULL,
+                role VARCHAR(16) NOT NULL DEFAULT 'spravce',
                 udelil VARCHAR(255),
                 udeleno DATETIME DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (slozka_id, user_id),
                 INDEX idx_user (user_id)
             ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
         """)
+        # Historie změn pro administrátora. Název a místo se ukládají textem — záznam
+        # zůstane čitelný i po smazání nebo přesunu položky.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS datuloziste_historie (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                kdy DATETIME DEFAULT CURRENT_TIMESTAMP,
+                user_id INT NULL,
+                kdo VARCHAR(255),
+                akce VARCHAR(32) NOT NULL,
+                nazev VARCHAR(255) NOT NULL DEFAULT '',
+                misto VARCHAR(1024) NOT NULL DEFAULT '',
+                detail VARCHAR(1024) NOT NULL DEFAULT '',
+                slozka_id INT NULL,
+                soubor_id INT NULL,
+                INDEX idx_slozka (slozka_id),
+                INDEX idx_soubor (soubor_id)
+            ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        """)
+        # Tabulky z předchozí verze modulu: chybějící sloupce doplnit. Dosavadní přístupy
+        # dostanou roli správce (DEFAULT) — nikdo nepřijde o to, co dosud uměl.
+        for tabulka, sloupec, definice in (
+                ('datuloziste_slozky', 'popis', 'TEXT NULL'),
+                ('datuloziste_soubory', 'vlozil_id', 'INT NULL'),
+                ('datuloziste_soubory', 'zamkl_id', 'INT NULL'),
+                ('datuloziste_soubory', 'zamkl', 'VARCHAR(255) NULL'),
+                ('datuloziste_soubory', 'zamceno', 'DATETIME NULL'),
+                ('datuloziste_pristupy', 'role', "VARCHAR(16) NOT NULL DEFAULT 'spravce'")):
+            cur.execute('SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() '
+                        'AND TABLE_NAME = %s AND COLUMN_NAME = %s', (tabulka, sloupec))
+            if not cur.fetchone()[0]:
+                cur.execute(f'ALTER TABLE {tabulka} ADD COLUMN {sloupec} {definice}')
         # Přístupy ke složkám, které už neexistují, pryč: starší MySQL/MariaDB po restartu
         # znovu přidělí nejvyšší smazané ID a nová složka by takový přístup zdědila.
         cur.execute('DELETE FROM datuloziste_pristupy '
@@ -145,7 +195,8 @@ def _mista(n):
 # =========================================================
 # PŘÍSTUP
 # =========================================================
-def je_spravce(prava) -> bool:
+def je_admin(prava) -> bool:
+    """Administrátor úložiště: právo `datuloziste_spravce` nebo admin `vse`."""
     return 'vse' in prava or PRAVO_SPRAVCE in prava
 
 
@@ -172,34 +223,37 @@ def _predci(rodice: dict, sid) -> list:
     return predci
 
 
-def viditelnost(rodice: dict, granty) -> tuple[set, set]:
-    """rodice: id složky → id rodiče (None = sekce); granty: ID udělených složek.
+def viditelnost(rodice: dict, granty: dict) -> tuple[set, set, set]:
+    """rodice: id složky → id rodiče (None = sekce); granty: id udělené složky → role.
 
-    Vrací (plne, pruchozi): plne = udělené složky a vše pod nimi (podsložky
-    i soubory), pruchozi = jejich předci — z nich je vidět jen větev dolů."""
-    plne = _podstrom(rodice, granty)
+    Vrací (ctene, spravovane, pruchozi): ctene = udělené složky a vše pod nimi (podsložky
+    i soubory), spravovane = totéž jen z udělení s rolí správce (role se dědí dolů, platí
+    ta vyšší), pruchozi = předci udělených složek — z nich je vidět jen větev dolů."""
+    ctene = _podstrom(rodice, granty)
+    spravovane = _podstrom(rodice, [g for g, role in granty.items() if role == ROLE_SPRAVCE])
     pruchozi = {p for g in granty if g in rodice for p in _predci(rodice, g)}
-    return plne, pruchozi - plne
+    return ctene, spravovane, pruchozi - ctene
 
 
-def _viditelne(user_id, spravce):
-    """(slozky {id: řádek}, plne, pruchozi) — čerstvě z DB."""
+def _viditelne(user_id, admin):
+    """(slozky {id: řádek}, ctene, spravovane, pruchozi) — čerstvě z DB."""
     slozky = {r['id']: r for r in _sql(_SLOZKY, vysledek='vse')}
-    if spravce:
-        return slozky, set(slozky), set()
-    granty = [r['slozka_id'] for r in _sql(
-        'SELECT slozka_id FROM datuloziste_pristupy WHERE user_id = %s', (user_id,), 'vse')]
-    plne, pruchozi = viditelnost({k: v['parent_id'] for k, v in slozky.items()}, granty)
-    return slozky, plne, pruchozi
+    if admin:
+        return slozky, set(slozky), set(slozky), set()
+    granty = {r['slozka_id']: r['role'] for r in _sql(
+        'SELECT slozka_id, role FROM datuloziste_pristupy WHERE user_id = %s', (user_id,), 'vse')}
+    return (slozky, *viditelnost({k: v['parent_id'] for k, v in slozky.items()}, granty))
 
 
-def _ma_plny_pristup(user_id, spravce, sid) -> bool:
-    return sid in _viditelne(user_id, spravce)[1]
+def _smi_menit_slozku(slozky, spravovane, admin, sid) -> bool:
+    """Složku samotnou (ne jen její obsah) přesune / smaže administrátor, nebo správce
+    nadřazené složky — přidělenou složku ani sekci tedy správce nesmaže."""
+    return sid in slozky and (admin or slozky[sid]['parent_id'] in spravovane)
 
 
 def ma_pristup_k_modulu(user_id, prava) -> bool:
-    """Brána modulu: správce, nebo kdo má přístup aspoň do jedné složky."""
-    if je_spravce(prava):
+    """Brána modulu: administrátor, nebo kdo má přístup aspoň do jedné složky."""
+    if je_admin(prava):
         return True
     if not user_id:
         return False
@@ -219,14 +273,21 @@ def _cesta(slozky, sid):
     return cesta
 
 
-def _nacti_pohled(user_id, spravce, sid):
+_SOUBORY = ('SELECT id, slozka_id, nazev, velikost, nahral, nahrano, vlozil_id, zamkl_id, zamkl, zamceno '
+            'FROM datuloziste_soubory')
+
+
+def _nacti_pohled(user_id, admin, sid):
     """Data pro vykreslení složky (sid None = kořen se sekcemi).
     False = složka neexistuje nebo do ní uživatel nesmí."""
-    slozky, plne, pruchozi = _viditelne(user_id, spravce)
-    vidi = plne | pruchozi
+    slozky, ctene, spravovane, pruchozi = _viditelne(user_id, admin)
+    vidi = ctene | pruchozi
     if sid is not None and sid not in vidi:
         return False
-    strom = [dict(slozky[i], plny=i in plne) for i in vidi]     # jen to, co smí vidět
+    # Jen to, co smí vidět. plny = vidí obsah, sprava = spravuje obsah (nahrává, maže…),
+    # muze = smí přesunout / smazat složku samotnou.
+    strom = [dict(slozky[i], plny=i in ctene, sprava=i in spravovane,
+                  muze=_smi_menit_slozku(slozky, spravovane, admin, i)) for i in vidi]
     pocty: dict = {}
     for s in strom:
         pocty[s['parent_id']] = pocty.get(s['parent_id'], 0) + 1
@@ -237,21 +298,46 @@ def _nacti_pohled(user_id, spravce, sid):
                       f'WHERE slozka_id IN ({_mista(len(s_obsahem))}) GROUP BY slozka_id',
                       tuple(s_obsahem), 'vse'):
             pocty[r['slozka_id']] = pocty.get(r['slozka_id'], 0) + int(r['n'])
-    soubory = None      # None = soubory nevidí (kořen / průchozí složka)
-    if sid is not None and sid in plne:
-        soubory = _sql('SELECT id, nazev, velikost, nahral, nahrano FROM datuloziste_soubory '
-                       'WHERE slozka_id = %s ORDER BY nazev', (sid,), 'vse')
+    soubory, popis = None, ''      # None = soubory nevidí (kořen / průchozí složka)
+    if sid is not None and sid in ctene:
+        soubory = _sql(f'{_SOUBORY} WHERE slozka_id = %s ORDER BY nazev', (sid,), 'vse')
+        popis = (_sql('SELECT popis FROM datuloziste_slozky WHERE id = %s', (sid,), 'jeden') or {}).get('popis')
     return {'id': sid, 'cesta': _cesta(slozky, sid), 'strom': strom, 'soubory': soubory,
-            'slozky': [dict(s, pocet=pocty.get(s['id'], 0)) for s in deti]}
+            'slozky': [dict(s, pocet=pocty.get(s['id'], 0)) for s in deti],
+            'sprava': admin if sid is None else sid in spravovane, 'popis': popis or ''}
+
+
+def _hledej(user_id, admin, text, limit=200):
+    """Lupa: složky a soubory, jejichž název obsahuje `text` — jen tam, kam uživatel vidí
+    obsah. Velikost písmen ani diakritika nehrají roli (u souborů to zařídí collation
+    sloupce). Vrací (složky, soubory) s cestou (misto) a příznaky jako _nacti_pohled."""
+    slozky, ctene, spravovane, _ = _viditelne(user_id, admin)
+    vzor = _abc(text)
+    nalezene = sorted((dict(s, plny=True, sprava=i in spravovane, pocet=None,
+                            muze=_smi_menit_slozku(slozky, spravovane, admin, i))
+                       for i, s in slozky.items() if i in ctene and vzor in _abc(s['nazev'])),
+                      key=lambda s: _abc(s['nazev']))[:limit]
+    soubory = []
+    if ctene:
+        like = '%' + re.sub(r'([\\%_])', r'\\\1', text.strip()) + '%'
+        kde = '' if admin else f'slozka_id IN ({_mista(len(ctene))}) AND '
+        soubory = _sql(f'{_SOUBORY} WHERE {kde}nazev LIKE %s ORDER BY nazev LIMIT {int(limit)}',
+                       (*(() if admin else ctene), like), 'vse')
+    for s in nalezene:
+        s['misto'] = _cesta_text(_cesta(slozky, s['parent_id'])) or 'Datové úložiště'
+    for f in soubory:
+        f['sprava'] = f['slozka_id'] in spravovane
+        f['misto'] = _cesta_text(_cesta(slozky, f['slozka_id']))
+    return nalezene, soubory
 
 
 def _pristupy(sid):
-    """Kdo má do složky přístup: přímo (jde odebrat) i zděděně z nadřazené složky."""
+    """Kdo má do složky přístup: přímo (jde odebrat a měnit roli) i zděděně z nadřazené složky."""
     slozky = {r['id']: r for r in _sql(_SLOZKY, vysledek='vse')}
     cesta = [s['id'] for s in _cesta(slozky, sid)]
     if not cesta:
         return []
-    radky = _sql('SELECT p.slozka_id, p.user_id, u.name, u.surname, u.email '
+    radky = _sql('SELECT p.slozka_id, p.user_id, p.role, u.name, u.surname, u.email '
                  'FROM datuloziste_pristupy p JOIN user u ON u.iduser = p.user_id '
                  f'WHERE p.slozka_id IN ({_mista(len(cesta))}) '
                  'ORDER BY u.surname, u.name', tuple(cesta), 'vse')
@@ -260,11 +346,23 @@ def _pristupy(sid):
     return radky
 
 
-def _najdi_uzivatele(adresa):
-    uid, jmeno, chyba = intranet_data.najdi_uzivatele_dle_emailu(adresa)
-    if uid and intranet_data.je_skryty_ucet(email=adresa):
-        return None, None, 'Účet v intranetu neexistuje.'
-    return uid, jmeno, chyba
+def _uzivatele():
+    """Aktivní účty intranetu pro našeptávač (bez skrytých servisních)."""
+    return [r for r in _sql('SELECT iduser, name, surname, email FROM user WHERE is_active = 1',
+                            vysledek='vse')
+            if not intranet_data.je_skryty_ucet(jmeno=f"{r['name'] or ''} {r['surname'] or ''}",
+                                                email=r['email'] or '')]
+
+
+def _napoveda(uzivatele, text, vynech=(), limit=8):
+    """Našeptávač: účty, jejichž jméno nebo e-mail obsahuje všechna slova z `text` (bez
+    ohledu na diakritiku a velikost písmen); `vynech` = ID, která už přístup mají."""
+    slova = _abc(text).split()
+    if not slova:
+        return []
+    shody = [u for u in uzivatele if u['iduser'] not in vynech and all(
+        s in _abc(f"{u['name'] or ''} {u['surname'] or ''} {u['email'] or ''}") for s in slova)]
+    return sorted(shody, key=lambda u: (_abc(u['surname'] or ''), _abc(u['name'] or '')))[:limit]
 
 
 # =========================================================
@@ -274,88 +372,180 @@ def _disk(nazev):
     return os.path.join(ADRESAR, os.path.basename(nazev))
 
 
-def _vytvor_slozku(rodic_id, nazev, kdo):
-    """True = založena, jinak text chyby pro uživatele."""
+def _zaznam(user_id, kdo, akce, nazev, misto='', detail='', slozka_id=None, soubor_id=None):
+    """Jeden záznam historie změn (viz _AKCE)."""
+    return {'user_id': user_id, 'kdo': kdo, 'akce': akce, 'nazev': nazev, 'misto': misto,
+            'detail': detail, 'slozka_id': slozka_id, 'soubor_id': soubor_id}
+
+
+# Akce historie změn: klíč → (popis, ikona, barva)
+_AKCE = {
+    'nahrano': ('Nahráno', 'upload', '#0078d4'),
+    'upraveno': ('Upraveno v Office', 'edit', '#0078d4'),
+    'prepsano': ('Přepsáno novou verzí', 'published_with_changes', '#8764b8'),
+    'presunuto': ('Přesunuto', 'drive_file_move', '#605e5c'),
+    'smazano': ('Smazáno', 'delete', '#a4262c'),
+    'zamceno': ('Uzamčeno', 'lock', '#a4262c'),
+    'odemceno': ('Odemčeno', 'lock_open', '#107c10'),
+    'odpojeno': ('Odpojen z Office', 'logout', '#a4262c'),
+    'slozka': ('Vytvořena složka', 'create_new_folder', '#605e5c'),
+    'popis': ('Změněn popis složky', 'notes', '#605e5c'),
+}
+_SLOUCIT_UPRAVY = 15            # min — opakovaná uložení z Office jednoho člověka = jeden záznam
+_HISTORIE = ('user_id', 'kdo', 'akce', 'nazev', 'misto', 'detail', 'slozka_id', 'soubor_id')
+_HISTORIE_DELKY = {'kdo': 255, 'akce': 32, 'nazev': 255, 'misto': 1024, 'detail': 1024}
+
+
+def _zapis_historie(*zaznamy):
+    """Zapíše záznamy historie změn. Chyba historie akci nezastaví — jen se vypíše."""
+    if not zaznamy:
+        return
+    conn = None
+    try:
+        conn = intranet_data.get_db_connection()
+        cur = conn.cursor()
+        cur.executemany(f'INSERT INTO datuloziste_historie ({", ".join(_HISTORIE)}) '
+                        f'VALUES ({_mista(len(_HISTORIE))})',
+                        [tuple(str(z[k] or '')[:_HISTORIE_DELKY[k]] if k in _HISTORIE_DELKY else z[k]
+                               for k in _HISTORIE) for z in zaznamy])
+        conn.commit()
+    except Exception as e:
+        print(f'[datuloziste] historie: {e}')
+    finally:
+        if conn:
+            conn.close()
+
+
+def _historie(slozka_id=None, soubor_id=None, limit=300):
+    """Historie změn, nejnovější první: souboru, složky i se vším pod ní, nebo celého úložiště."""
+    if soubor_id is not None:
+        kde, parametry = 'WHERE soubor_id = %s', (soubor_id,)
+    elif slozka_id is not None:
+        rodice = {r['id']: r['parent_id'] for r in _sql('SELECT id, parent_id FROM datuloziste_slozky',
+                                                         vysledek='vse')}
+        ids = _podstrom(rodice, [slozka_id]) or {slozka_id}
+        kde, parametry = f'WHERE slozka_id IN ({_mista(len(ids))})', tuple(ids)
+    else:
+        kde, parametry = '', ()
+    return _sql(f'SELECT id, kdy, kdo, akce, nazev, misto, detail FROM datuloziste_historie {kde} '
+                f'ORDER BY id DESC LIMIT {int(limit)}', parametry, 'vse')
+
+
+def _vytvor_slozku(user_id, admin, rodic_id, nazev, kdo):
+    """True = založena, jinak text chyby pro uživatele. Sekci zakládá administrátor,
+    podsložku i správce nadřazené složky."""
+    slozky, _, spravovane, _ = _viditelne(user_id, admin)
+    if not (admin or rodic_id in spravovane):
+        return 'Tady nové složky zakládat nemůžete.'
     if _sql('SELECT 1 AS x FROM datuloziste_slozky WHERE parent_id <=> %s AND nazev = %s',
             (rodic_id, nazev), 'jeden'):
         return 'Složka s tímto názvem tu už je.'
     if rodic_id is None:
-        _sql('INSERT INTO datuloziste_slozky (parent_id, nazev, vytvoril) VALUES (NULL, %s, %s)',
-             (nazev, kdo))
-        return True
-    # INSERT … SELECT čte rodiče se zámkem: souběžně mazaný rodič = složka nevznikne.
-    _, pocet = _sql('INSERT INTO datuloziste_slozky (parent_id, nazev, vytvoril) '
-                    'SELECT id, %s, %s FROM datuloziste_slozky WHERE id = %s', (nazev, kdo, rodic_id))
-    return True if pocet else 'Nadřazená složka mezitím zanikla.'
+        sid, pocet = _sql('INSERT INTO datuloziste_slozky (parent_id, nazev, vytvoril) VALUES (NULL, %s, %s)',
+                          (nazev, kdo))
+    else:
+        # INSERT … SELECT čte rodiče se zámkem: souběžně mazaný rodič = složka nevznikne.
+        sid, pocet = _sql('INSERT INTO datuloziste_slozky (parent_id, nazev, vytvoril) '
+                          'SELECT id, %s, %s FROM datuloziste_slozky WHERE id = %s', (nazev, kdo, rodic_id))
+    if not pocet:
+        return 'Nadřazená složka mezitím zanikla.'
+    _zapis_historie(_zaznam(user_id, kdo, 'slozka', nazev, _cesta_text(_cesta(slozky, rodic_id)), '', sid))
+    _zmeneno(rodic_id)
+    return True
 
 
-def _pridej_pristup(sid, uid, kdo):
+def _pridej_pristup(sid, uid, kdo, role):
     """'pridan' | 'ma' (přístup už má) | 'neni' (složka mezitím zanikla).
     INSERT … SELECT: přístup jen k existující složce — ke smazané nikdy."""
-    _, pocet = _sql('INSERT IGNORE INTO datuloziste_pristupy (slozka_id, user_id, udelil) '
-                    'SELECT id, %s, %s FROM datuloziste_slozky WHERE id = %s', (uid, kdo, sid))
+    _, pocet = _sql('INSERT IGNORE INTO datuloziste_pristupy (slozka_id, user_id, role, udelil) '
+                    'SELECT id, %s, %s, %s FROM datuloziste_slozky WHERE id = %s', (uid, role, kdo, sid))
     if pocet:
         return 'pridan'
     return 'ma' if _sql('SELECT 1 AS x FROM datuloziste_slozky WHERE id = %s', (sid,), 'jeden') else 'neni'
 
 
-def _soubor(user_id, spravce, soubor_id):
-    """Řádek souboru — jen když má uživatel plný přístup do jeho složky."""
-    s = _sql('SELECT id, slozka_id, nazev, disk FROM datuloziste_soubory WHERE id = %s',
-             (soubor_id,), 'jeden')
-    return s if s and _ma_plny_pristup(user_id, spravce, s['slozka_id']) else None
+def _nastav_roli(sid, uid, role):
+    """Změní roli přímého přístupu (zděděný se mění u složky, odkud pochází)."""
+    _sql('UPDATE datuloziste_pristupy SET role = %s WHERE slozka_id = %s AND user_id = %s', (role, sid, uid))
+    return True
 
 
-def _plan_mazani(user_id, spravce, klice):
-    """Co přesně smaže výběr `klice` ('s12' složka, 'f7' soubor) — jen čtení, pro potvrzení.
+def _odeber_pristup(sid, uid):
+    _sql('DELETE FROM datuloziste_pristupy WHERE slozka_id = %s AND user_id = %s', (sid, uid))
+    return True
 
-    Bere jen to, co uživatel smí: složky jen správce (i s celým obsahem), soubory
-    kdo má plný přístup do jejich složky. Složka uvnitř jiné vybrané složky
-    i soubor v mazané složce padnou s ní, samostatně se nepočítají."""
-    slozky, plne, _ = _viditelne(user_id, spravce)
+
+def _soubor(user_id, admin, soubor_id):
+    """Řádek souboru (+ sprava = smí ho měnit, misto = cesta) — jen když uživatel
+    smí číst jeho složku."""
+    s = _sql('SELECT id, slozka_id, nazev, disk, velikost, vlozil_id, zamkl_id, zamkl '
+             'FROM datuloziste_soubory WHERE id = %s', (soubor_id,), 'jeden')
+    if not s:
+        return None
+    slozky, ctene, spravovane, _ = _viditelne(user_id, admin)
+    if s['slozka_id'] not in ctene:
+        return None
+    return dict(s, sprava=s['slozka_id'] in spravovane, misto=_cesta_text(_cesta(slozky, s['slozka_id'])))
+
+
+def _plan_mazani(user_id, admin, klice):
+    """Co přesně smaže výběr `klice` ('s12' složka, 'f7' soubor) — jen čtení, pro potvrzení
+    (a pro dialog přesunu: přesun bere tentýž rozsah, uzamčené soubory ho zastaví stejně).
+
+    Bere jen to, co uživatel smí: složky správce nadřazené složky a administrátor (i s celým
+    obsahem), soubory správce jejich složky. Složka uvnitř jiné vybrané složky i soubor
+    v mazané složce padnou s ní, samostatně se nepočítají. `zamcene` = uzamčené soubory,
+    které by smazání zasáhlo — pak se nesmaže nic."""
+    slozky, _, spravovane, _ = _viditelne(user_id, admin)
     rodice = {k: v['parent_id'] for k, v in slozky.items()}
-    vybrane = {i for i in (_id(k, 's') for k in klice) if i in slozky} if spravce else set()
+    vybrane = {i for i in (_id(k, 's') for k in klice) if _smi_menit_slozku(slozky, spravovane, admin, i)}
     vrchni = sorted((i for i in vybrane if not set(_predci(rodice, i)) & vybrane),
                     key=lambda i: _abc(slozky[i]['nazev']))
     podstromy = {i: _podstrom(rodice, [i]) for i in vrchni}
     vse = set().union(*podstromy.values())
     pocty = {'soubory': {}, 'pristupy': {}}
+    zamcene = []
     if vse:
         for tab, sl in (('soubory', 'datuloziste_soubory'), ('pristupy', 'datuloziste_pristupy')):
             for r in _sql(f'SELECT slozka_id, COUNT(*) AS n FROM {sl} '
                           f'WHERE slozka_id IN ({_mista(len(vse))}) GROUP BY slozka_id', tuple(vse), 'vse'):
                 pocty[tab][r['slozka_id']] = int(r['n'])
+        zamcene = [r['nazev'] for r in _sql('SELECT nazev FROM datuloziste_soubory WHERE zamkl_id IS NOT NULL '
+                                            f'AND slozka_id IN ({_mista(len(vse))})', tuple(vse), 'vse')]
     polozky = [{'typ': 0, 'id': i, 'nazev': slozky[i]['nazev'], 'sekce': slozky[i]['parent_id'] is None,
+                'slozka_id': slozky[i]['parent_id'],
                 'misto': _cesta_text(_cesta(slozky, slozky[i]['parent_id'])),
                 'podslozky': len(podstromy[i]) - 1,
                 'soubory': sum(pocty['soubory'].get(s, 0) for s in podstromy[i]),
                 'pristupy': sum(pocty['pristupy'].get(s, 0) for s in podstromy[i])} for i in vrchni]
     soubory_ids = list(dict.fromkeys(i for i in (_id(k, 'f') for k in klice) if i is not None))
     if soubory_ids:
-        radky = _sql(f'SELECT id, slozka_id, nazev FROM datuloziste_soubory '
+        radky = _sql(f'SELECT id, slozka_id, nazev, zamkl_id FROM datuloziste_soubory '
                      f'WHERE id IN ({_mista(len(soubory_ids))})', tuple(soubory_ids), 'vse')
-        polozky += [{'typ': 1, 'id': f['id'], 'nazev': f['nazev'],
-                     'misto': _cesta_text(_cesta(slozky, f['slozka_id']))}
-                    for f in sorted(radky, key=lambda f: _abc(f['nazev']))
-                    if f['slozka_id'] in plne and f['slozka_id'] not in vse]
-    return {'polozky': polozky, 'slozky': vse}
+        radky = [f for f in sorted(radky, key=lambda f: _abc(f['nazev']))
+                 if f['slozka_id'] in spravovane and f['slozka_id'] not in vse]
+        polozky += [{'typ': 1, 'id': f['id'], 'nazev': f['nazev'], 'slozka_id': f['slozka_id'],
+                     'misto': _cesta_text(_cesta(slozky, f['slozka_id']))} for f in radky]
+        zamcene += [f['nazev'] for f in radky if f['zamkl_id']]
+    return {'polozky': polozky, 'slozky': vse, 'zamcene': zamcene}
 
 
-def _smaz_polozky(user_id, spravce, slozky_ids, soubory_ids):
-    """Smaže složky (i s celým obsahem — jen správce) a soubory v jedné transakci
-    a zruší přístupy ke smazaným složkám. Vrací (ID smazaných složek, ID smazaných souborů
-    — i těch uvnitř složek, počet zrušených přístupů).
+def _smaz_polozky(user_id, admin, slozky_ids, soubory_ids):
+    """Smaže složky (i s celým obsahem) a soubory v jedné transakci a zruší přístupy ke
+    smazaným složkám. Vrací (ID smazaných složek, ID smazaných souborů — i těch uvnitř
+    složek, počet zrušených přístupů), nebo 'zamceno', když by smazání zasáhlo uzamčený
+    soubor — pak se nesmaže nic. Oprávnění se ověří znovu (jako v _plan_mazani).
 
     Složky se zamykají vrstvu po vrstvě (FOR UPDATE = aktuální stav, ne snímek):
     souběžné založení podsložky, nahrání souboru nebo udělení přístupu do mazané
     složky (INSERT … SELECT nad ní) počká na konec transakce a pak neprojde."""
-    slozky_ids = list(slozky_ids) if spravce else []
+    mapa, _, spravovane, _ = _viditelne(user_id, admin)
+    slozky_ids = [i for i in slozky_ids if _smi_menit_slozku(mapa, spravovane, admin, i)]
     soubory_ids = list(soubory_ids)
-    plne = set() if spravce or not soubory_ids else _viditelne(user_id, False)[1]
     conn = intranet_data.get_db_connection()
     if not conn:
         raise RuntimeError('Databáze není dostupná.')
-    slozky, disky, pristupy = set(), {}, 0
+    slozky, radky, pristupy = set(), [], 0
     try:
         cur = conn.cursor(dictionary=True, buffered=True)
         vrstva = []
@@ -369,13 +559,17 @@ def _smaz_polozky(user_id, spravce, slozky_ids, soubory_ids):
                         'FOR UPDATE', tuple(vrstva))
             vrstva = [r['id'] for r in cur.fetchall() if r['id'] not in slozky]
         if slozky:
-            cur.execute(f'SELECT id, disk FROM datuloziste_soubory WHERE slozka_id IN ({_mista(len(slozky))}) '
-                        'FOR UPDATE', tuple(slozky))
-            disky.update((r['id'], r['disk']) for r in cur.fetchall())
+            cur.execute(f'SELECT id, disk, zamkl_id FROM datuloziste_soubory '
+                        f'WHERE slozka_id IN ({_mista(len(slozky))}) FOR UPDATE', tuple(slozky))
+            radky += cur.fetchall()
         if soubory_ids:
-            cur.execute(f'SELECT id, slozka_id, disk FROM datuloziste_soubory '
+            cur.execute(f'SELECT id, slozka_id, disk, zamkl_id FROM datuloziste_soubory '
                         f'WHERE id IN ({_mista(len(soubory_ids))}) FOR UPDATE', tuple(soubory_ids))
-            disky.update((r['id'], r['disk']) for r in cur.fetchall() if spravce or r['slozka_id'] in plne)
+            radky += [r for r in cur.fetchall() if r['slozka_id'] in spravovane]
+        if any(r['zamkl_id'] for r in radky):
+            conn.rollback()
+            return 'zamceno'
+        disky = {r['id']: r['disk'] for r in radky}
         if disky:
             cur.execute(f'DELETE FROM datuloziste_soubory WHERE id IN ({_mista(len(disky))})', tuple(disky))
         if slozky:
@@ -393,16 +587,205 @@ def _smaz_polozky(user_id, spravce, slozky_ids, soubory_ids):
     finally:
         conn.close()
     for disk in disky.values():     # až po commitu — při chybě DB soubory zůstanou celé
-        try:
-            os.remove(_disk(disk))
-        except OSError:
-            pass
+        _smaz_z_disku(_disk(disk))
+    _zmeneno(*slozky, *{mapa[i]['parent_id'] for i in slozky if i in mapa}, *{r.get('slozka_id') for r in radky})
     return slozky, set(disky), pristupy
 
 
-def _uloz_soubor(zdroj, slozka_id, nazev, kdo):
-    """Zkopíruje nahraný soubor na disk a zapíše ho do DB. Vrací velikost v bajtech,
-    nebo None, když cílová složka mezitím zanikla (soubor z disku zase zmizí)."""
+def _zapis_smazani(user_id, kdo, polozky, slozky, soubory):
+    """Historie po smazání: vybrané položky z plánu, které opravdu zmizely (jejich obsah
+    se nevypisuje — jen počty u složky)."""
+    _zapis_historie(*[
+        _zaznam(user_id, kdo, 'smazano', p['nazev'], p['misto'],
+                (f'složka ({_pocet(p["podslozky"], "podsložka", "podsložky", "podsložek")}, '
+                 f'{_pocet(p["soubory"], "soubor", "soubory", "souborů")})') if p['typ'] == 0 else '',
+                p['slozka_id'], None if p['typ'] == 0 else p['id'])
+        for p in polozky if p['id'] in (slozky if p['typ'] == 0 else soubory)])
+
+
+def _presun(user_id, admin, klice, cil_id, kdo, prepsat=False):
+    """Přesune položky `klice` ('s12' složka, 'f7' soubor) do složky `cil_id`. Smí správce
+    (zdrojové i cílové složky; složku samotnou jen správce nadřazené) a administrátor.
+
+    Vrací {'chyba': text} — nepřesunulo se nic; {'konflikty': [názvy]} — v cíli už jsou soubory
+    stejného jména a bez `prepsat` se nic nepřesune; jinak {'presunuto': [položky], 'cil': cesta}.
+    Složka se stejným názvem v cíli přesun vždy zastaví (slučovat složky by bylo matoucí),
+    stejně jako uzamčený soubor — vybraný i v přesouvané složce (jako u mazání)."""
+    slozky, _, spravovane, _ = _viditelne(user_id, admin)
+    if cil_id not in spravovane:
+        return {'chyba': 'Do této složky nemůžete přesouvat.'}
+    rodice = {k: v['parent_id'] for k, v in slozky.items()}
+    s_ids = list(dict.fromkeys(i for i in (_id(k, 's') for k in klice) if i in slozky))
+    f_ids = list(dict.fromkeys(i for i in (_id(k, 'f') for k in klice) if i is not None))
+    for i in s_ids:
+        if not _smi_menit_slozku(slozky, spravovane, admin, i):
+            return {'chyba': f'Složku „{slozky[i]["nazev"]}“ přesouvat nemůžete.'}
+        if cil_id in _podstrom(rodice, [i]):
+            return {'chyba': f'Složku „{slozky[i]["nazev"]}“ nejde přesunout do ní samé ani do její podsložky.'}
+    vybrane = set(s_ids)        # složka uvnitř jiné přesouvané jde s ní, stejně tak soubory v nich
+    s_ids = [i for i in s_ids if not set(_predci(rodice, i)) & vybrane]
+    uvnitr = _podstrom(rodice, s_ids)
+    soubory = []
+    if f_ids:
+        soubory = _sql(f'SELECT id, slozka_id, nazev, zamkl_id FROM datuloziste_soubory '
+                       f'WHERE id IN ({_mista(len(f_ids))})', tuple(f_ids), 'vse')
+        for f in soubory:
+            if f['slozka_id'] not in spravovane:
+                return {'chyba': f'Soubor „{f["nazev"]}“ přesouvat nemůžete.'}
+        soubory = [f for f in soubory if f['slozka_id'] not in uvnitr]
+    s_ids = [i for i in s_ids if slozky[i]['parent_id'] != cil_id]        # už v cíli jsou
+    soubory = [f for f in soubory if f['slozka_id'] != cil_id]
+    if not s_ids and not soubory:
+        return {'presunuto': [], 'cil': _cesta_text(_cesta(slozky, cil_id))}
+    zamcene = [f['nazev'] for f in soubory if f['zamkl_id']]
+    pod = _podstrom(rodice, s_ids)
+    if pod:
+        zamcene += [r['nazev'] for r in _sql('SELECT nazev FROM datuloziste_soubory WHERE zamkl_id IS NOT NULL '
+                                             f'AND slozka_id IN ({_mista(len(pod))})', tuple(pod), 'vse')]
+    if zamcene:
+        return {'chyba': _hlaska_zamcene(sorted(zamcene, key=_abc), 'přesunout')}
+    v_cili ={_abc(s['nazev']) for s in slozky.values() if s['parent_id'] == cil_id}
+    jmena = [_abc(slozky[i]['nazev']) for i in s_ids]
+    for i in s_ids:
+        if _abc(slozky[i]['nazev']) in v_cili or jmena.count(_abc(slozky[i]['nazev'])) > 1:
+            return {'chyba': f'V cílové složce by byly dvě složky „{slozky[i]["nazev"]}“.'}
+    jmena = [_abc(f['nazev']) for f in soubory]
+    if len(set(jmena)) < len(jmena):
+        return {'chyba': 'Mezi přesouvanými jsou dva soubory stejného jména.'}
+    stejne = {_abc(f['nazev']): f for f in _sql('SELECT id, nazev, zamkl_id FROM datuloziste_soubory '
+                                                'WHERE slozka_id = %s', (cil_id,), 'vse')}
+    konflikty = [stejne[j] for j in jmena if j in stejne]
+    if konflikty and not prepsat:
+        return {'konflikty': [f['nazev'] for f in konflikty]}
+    for f in konflikty:
+        if f['zamkl_id']:
+            return {'chyba': f'Soubor „{f["nazev"]}“ v cílové složce je uzamčený — nejde přepsat.'}
+        if (z := _otevreny(f['id'])):
+            return {'chyba': f'Soubor „{f["nazev"]}“ v cílové složce má právě otevřený {z["jmeno"]}.'}
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        raise RuntimeError('Databáze není dostupná.')
+    stare_disky = []
+    try:
+        cur = conn.cursor(dictionary=True, buffered=True)
+        # Cíl se zamkne: souběžné smazání počká na konec přesunu, nebo už proběhlo.
+        cur.execute('SELECT id FROM datuloziste_slozky WHERE id = %s FOR UPDATE', (cil_id,))
+        if not cur.fetchone():
+            conn.rollback()
+            return {'chyba': 'Cílová složka mezitím zanikla.'}
+        zamcene = []
+        if s_ids:
+            # Strom čerstvě a se zámky — souběžný přesun jinam nesmí vyrobit cyklus.
+            cur.execute('SELECT id, parent_id FROM datuloziste_slozky FOR UPDATE')
+            aktualni = {r['id']: r['parent_id'] for r in cur.fetchall()}
+            s_ids = [i for i in s_ids if i in aktualni]
+            if cil_id in _podstrom(aktualni, s_ids):
+                conn.rollback()
+                return {'chyba': 'Složku nejde přesunout do ní samé ani do její podsložky.'}
+            pod = _podstrom(aktualni, s_ids)
+            if pod:     # zamknou se i soubory ve složkách: souběžné uzamčení počká, nebo už je vidět
+                cur.execute(f'SELECT nazev, zamkl_id FROM datuloziste_soubory '
+                            f'WHERE slozka_id IN ({_mista(len(pod))}) FOR UPDATE', tuple(pod))
+                zamcene += [r['nazev'] for r in cur.fetchall() if r['zamkl_id']]
+        if soubory:
+            cur.execute(f'SELECT id, zamkl_id FROM datuloziste_soubory WHERE id IN ({_mista(len(soubory))}) '
+                        'FOR UPDATE', tuple(f['id'] for f in soubory))
+            zbyle = {r['id']: r['zamkl_id'] for r in cur.fetchall()}    # mezitím smazané se nepřesunou
+            soubory = [f for f in soubory if f['id'] in zbyle]
+            zamcene += [f['nazev'] for f in soubory if zbyle[f['id']]]
+        if zamcene:
+            conn.rollback()
+            return {'chyba': _hlaska_zamcene(sorted(zamcene, key=_abc), 'přesunout')}
+        if s_ids:
+            cur.execute(f'UPDATE datuloziste_slozky SET parent_id = %s WHERE id IN ({_mista(len(s_ids))})',
+                        (cil_id, *s_ids))
+        for f in konflikty:
+            cur.execute('SELECT disk, zamkl_id FROM datuloziste_soubory WHERE id = %s FOR UPDATE', (f['id'],))
+            r = cur.fetchone()
+            if r and r['zamkl_id']:
+                conn.rollback()
+                return {'chyba': f'Soubor „{f["nazev"]}“ v cílové složce je uzamčený — nejde přepsat.'}
+            if r:
+                cur.execute('DELETE FROM datuloziste_soubory WHERE id = %s', (f['id'],))
+                stare_disky.append(r['disk'])
+        if soubory:
+            cur.execute(f'UPDATE datuloziste_soubory SET slozka_id = %s '
+                        f'WHERE id IN ({_mista(len(soubory))})', (cil_id, *[f['id'] for f in soubory]))
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
+    for disk in stare_disky:
+        _smaz_z_disku(_disk(disk))
+    cil = _cesta_text(_cesta(slozky, cil_id))
+    presunuto = ([{'typ': 0, 'id': i, 'nazev': slozky[i]['nazev'],
+                   'z': _cesta_text(_cesta(slozky, slozky[i]['parent_id'])), 'z_id': slozky[i]['parent_id']}
+                  for i in s_ids]
+                 + [{'typ': 1, 'id': f['id'], 'nazev': f['nazev'], 'z': _cesta_text(_cesta(slozky, f['slozka_id'])),
+                     'z_id': f['slozka_id']} for f in soubory])
+    _zapis_historie(
+        *[_zaznam(user_id, kdo, 'presunuto', p['nazev'], cil, f'z „{p["z"] or "Datové úložiště"}“',
+                  p['id'] if not p['typ'] else cil_id, p['id'] if p['typ'] else None) for p in presunuto],
+        *[_zaznam(user_id, kdo, 'smazano', f['nazev'], cil, 'přepsán přesunutým souborem', cil_id, f['id'])
+          for f in konflikty])
+    _zmeneno(cil_id, *[p['z_id'] for p in presunuto])
+    return {'presunuto': presunuto, 'cil': cil}
+
+
+def _zamkni(user_id, admin, soubor_id, kdo, zamknout):
+    """Uzamkne / odemkne soubor proti jakékoli změně. Zamknout smí ten, kdo soubor nahrál
+    (a smí ve složce spravovat obsah), a administrátor; odemknout ten, kdo zamkl, a
+    administrátor. True, nebo text chyby."""
+    f = _soubor(user_id, admin, soubor_id)
+    if not f:
+        return 'Soubor už neexistuje.'
+    if zamknout:
+        if not (admin or (f['sprava'] and f['vlozil_id'] == user_id)):
+            return 'Uzamknout můžete jen soubory, které jste sem nahráli.'
+        if (z := _otevreny(soubor_id)):
+            return f'Soubor má právě otevřený {z["jmeno"]} — uzamknout ho půjde, až ho zavře.'
+        _, pocet = _sql('UPDATE datuloziste_soubory SET zamkl_id = %s, zamkl = %s, zamceno = NOW() '
+                        'WHERE id = %s AND zamkl_id IS NULL', (user_id, kdo, soubor_id))
+        if not pocet:
+            return 'Soubor už je uzamčený.'
+    else:
+        if not f['zamkl_id']:
+            return 'Soubor už je odemčený.'
+        if not (admin or f['zamkl_id'] == user_id):
+            return 'Odemknout ho může jen ten, kdo ho uzamkl, nebo administrátor.'
+        _sql('UPDATE datuloziste_soubory SET zamkl_id = NULL, zamkl = NULL, zamceno = NULL WHERE id = %s',
+             (soubor_id,))
+    _zapis_historie(_zaznam(user_id, kdo, 'zamceno' if zamknout else 'odemceno', f['nazev'], f['misto'],
+                            '' if zamknout or f['zamkl_id'] == user_id else f'uzamkl/a {f["zamkl"]}',
+                            f['slozka_id'], soubor_id))
+    _zmeneno(f['slozka_id'])
+    return True
+
+
+def _uloz_popis(user_id, admin, sid, popis, kdo):
+    """Popis složky (co v ní najdete) — mění ho správce složky. True, nebo text chyby."""
+    slozky, _, spravovane, _ = _viditelne(user_id, admin)
+    if sid not in spravovane:
+        return 'Popis složky může měnit jen její správce.'
+    popis = (popis or '').strip()[:MAX_POPIS]
+    _sql('UPDATE datuloziste_slozky SET popis = %s WHERE id = %s', (popis or None, sid))
+    _zapis_historie(_zaznam(user_id, kdo, 'popis', slozky[sid]['nazev'],
+                            _cesta_text(_cesta(slozky, slozky[sid]['parent_id'])),
+                            popis[:300] or '(popis smazán)', sid))
+    _zmeneno(sid)
+    return True
+
+
+def _uloz_soubor(zdroj, slozka_id, nazev, kdo, user_id):
+    """Zkopíruje nahraný soubor na disk a zapíše ho do DB. Vrací (velikost, id souboru),
+    nebo (velikost, {'disk', 'id'}), když už ve složce soubor stejného jména je — pak se
+    do DB nic nezapíše a nová verze čeká na disku, než uživatel zvolí přepsat / zrušit.
+    None, když cílová složka mezitím zanikla (soubor z disku zase zmizí)."""
     disk = uuid.uuid4().hex
     os.makedirs(ADRESAR, exist_ok=True)
     zdroj.seek(0)
@@ -410,17 +793,93 @@ def _uloz_soubor(zdroj, slozka_id, nazev, kdo):
         shutil.copyfileobj(zdroj, cil, 1024 * 1024)
         velikost = cil.tell()
     try:
+        stejny = _sql('SELECT id FROM datuloziste_soubory WHERE slozka_id = %s AND nazev = %s LIMIT 1',
+                      (slozka_id, nazev), 'jeden')
+        if stejny:
+            return velikost, {'disk': disk, 'id': stejny['id']}
         # INSERT … SELECT: zápis jen do existující složky (souběžné smazání ji zamkne).
-        _, pocet = _sql('INSERT INTO datuloziste_soubory (slozka_id, nazev, disk, velikost, nahral) '
-                        'SELECT id, %s, %s, %s, %s FROM datuloziste_slozky WHERE id = %s',
-                        (nazev, disk, velikost, kdo, slozka_id))
+        soubor_id, pocet = _sql('INSERT INTO datuloziste_soubory (slozka_id, nazev, disk, velikost, nahral, '
+                                'vlozil_id) SELECT id, %s, %s, %s, %s, %s FROM datuloziste_slozky WHERE id = %s',
+                                (nazev, disk, velikost, kdo, user_id, slozka_id))
     except Exception:
-        os.remove(_disk(disk))
+        _smaz_z_disku(_disk(disk))
         raise
     if not pocet:
-        os.remove(_disk(disk))
+        _smaz_z_disku(_disk(disk))
         return None
-    return velikost
+    return velikost, soubor_id
+
+
+# Nahrané soubory, jejichž jméno už ve složce je: (user_id, klíč okna) → [{'disk', 'id', 'nazev',
+# 'velikost', 'slozka_id', 'cesta', 'cas'}]. Čekají na rozhodnutí v okně, odkud se nahrávalo;
+# co do hodiny nikdo nevyřídí (zavřené okno), z disku zmizí. Jen v event loopu.
+_CEKAJICI: dict = {}
+_CEKANI_MAX = 3600
+
+
+def _uklid_cekajici():
+    """Čekající verze, o kterých do hodiny nikdo nerozhodl (zavřené okno), z disku pryč."""
+    ted = time.monotonic()
+    for klic in list(_CEKAJICI):
+        zbyle = []
+        for c in _CEKAJICI[klic]:
+            if ted - c['cas'] > _CEKANI_MAX:
+                _smaz_z_disku(_disk(c['disk']))
+            else:
+                zbyle.append(c)
+        if zbyle:
+            _CEKAJICI[klic] = zbyle
+        else:
+            del _CEKAJICI[klic]
+
+
+def _odloz(klic, konflikt):
+    _uklid_cekajici()
+    _CEKAJICI.setdefault(klic, []).append(dict(konflikt, cas=time.monotonic()))
+
+
+def _vyzvedni(klic, polozky):
+    """Rozhodnutí v okně: z čekajících odebere `polozky` a vrátí ty, které ještě čekaly
+    (co mezitím uklidil _uklid_cekajici, už na disku není)."""
+    vse = _CEKAJICI.get(klic, [])
+    platne = [c for c in vse if any(c is x for x in polozky)]
+    zbyle = [c for c in vse if not any(c is x for x in polozky)]
+    if zbyle:
+        _CEKAJICI[klic] = zbyle
+    else:
+        _CEKAJICI.pop(klic, None)
+    return platne
+
+
+def _prepis_nahranim(user_id, admin, c, kdo):
+    """Uživatel zvolil přepsat: existující soubor dostane čekající nahranou verzi.
+    True, nebo text chyby — čekající verze pak z disku zmizí (i když selže DB)."""
+    try:
+        f = _soubor(user_id, admin, c['id'])
+        if not os.path.isfile(_disk(c['disk'])):
+            chyba = 'čekal na rozhodnutí příliš dlouho — nahrajte ho znovu'
+        elif not f or not f['sprava']:
+            chyba = 'už neexistuje nebo ho nemůžete přepsat'
+        elif f['zamkl_id']:
+            chyba = f'je uzamčený ({f["zamkl"]})'
+        elif (z := _otevreny(c['id'])) and z['uid'] != user_id:
+            chyba = f'má právě otevřený {z["jmeno"]}'
+        else:
+            chyba = None
+    except Exception:
+        _smaz_z_disku(_disk(c['disk']))
+        raise
+    if chyba:
+        _smaz_z_disku(_disk(c['disk']))
+        return chyba
+    # Při neúspěchu (i výjimce) čekající verzi z disku uklidí _prepis_soubor sám.
+    vysledek = _prepis_soubor(c['id'], c['disk'], c['velikost'], kdo, user_id)
+    if vysledek is not True:
+        return 'mezitím někdo uzamkl' if vysledek == 'zamceno' else 'mezitím někdo smazal'
+    _zapis_historie(_zaznam(user_id, kdo, 'prepsano', f['nazev'], f['misto'],
+                            _velikost(c['velikost']), f['slozka_id'], f['id']))
+    _zmeneno(f['slozka_id'])
+    return True
 
 
 def _posli_email(adresa, cesta, sid, udelil):
@@ -438,30 +897,30 @@ def _posli_email(adresa, cesta, sid, udelil):
 # HTTP — stažení a nahrání; přístup se ověřuje při každém requestu (relace + DB)
 # =========================================================
 def _opravneni(user_id):
-    """None = nesmí nic (modul vypnut, neaktivní účet); jinak True/False = je správce."""
+    """None = nesmí nic (modul vypnut, neaktivní účet); jinak True/False = je administrátor."""
     if not user_id or not intranet_data.nacti_nastaveni_intranetu().get('datuloziste_zapnuty', True):
         return None
     prava, aktivni = intranet_data.ziskej_prava_a_aktivitu(user_id)
-    return je_spravce({p.lower() for p in prava}) if aktivni else None
+    return je_admin({p.lower() for p in prava}) if aktivni else None
 
 
 def _soubor_ke_stazeni(user_id, soubor_id):
     try:
-        spravce = _opravneni(user_id)
-        s = None if spravce is None else _soubor(user_id, spravce, soubor_id)
+        admin = _opravneni(user_id)
+        s = None if admin is None else _soubor(user_id, admin, soubor_id)
         return s if s and os.path.isfile(_disk(s['disk'])) else None
     except Exception:
         return None         # fail closed
 
 
 def _cil_nahrani(user_id, slozka_id):
-    """Text cesty cílové složky, nebo None, když do ní uživatel nahrávat nesmí."""
+    """Text cesty cílové složky, nebo None, když do ní uživatel nahrávat nesmí (jen správce)."""
     try:
-        spravce = _opravneni(user_id)
-        if spravce is None:
+        admin = _opravneni(user_id)
+        if admin is None:
             return None
-        slozky, plne, _ = _viditelne(user_id, spravce)
-        return _cesta_text(_cesta(slozky, slozka_id)) if slozka_id in plne else None
+        slozky, _, spravovane, _ = _viditelne(user_id, admin)
+        return _cesta_text(_cesta(slozky, slozka_id)) if slozka_id in spravovane else None
     except Exception:
         return None         # fail closed
 
@@ -486,7 +945,8 @@ async def _stazeni(soubor_id: int):
 @app.post('/uloziste/nahrat/{slozka_id}')
 async def _nahrani(slozka_id: int, request: Request):
     """Cílová složka je v URL každého uploadu — soubor nemůže skončit jinde,
-    ani když uživatel během nahrávání přejde do jiné složky."""
+    ani když uživatel během nahrávání přejde do jiné složky. Klíč okna (?k=) určuje,
+    kde se uživatel rozhodne o souborech, jejichž jméno už ve složce je."""
     user_id, kdo = _relace()
     cesta = await asyncio.to_thread(_cil_nahrani, user_id, slozka_id) if user_id else None
     if cesta is None:
@@ -505,9 +965,17 @@ async def _nahrani(slozka_id: int, request: Request):
         if (f.size or 0) > MAX_VELIKOST:
             return PlainTextResponse('Soubor je větší než 50 MB.', status_code=413)
         nazev = os.path.basename((f.filename or '').replace('\\', '/')).strip()[:255] or 'soubor'
-        velikost = await asyncio.to_thread(_uloz_soubor, f.file, slozka_id, nazev, kdo)
-    if velikost is None:        # složku mezitím někdo smazal
+        ulozeno = await asyncio.to_thread(_uloz_soubor, f.file, slozka_id, nazev, kdo, user_id)
+    if ulozeno is None:         # složku mezitím někdo smazal
         return PlainTextResponse('Nenalezeno', status_code=404)
+    velikost, vysledek = ulozeno
+    if isinstance(vysledek, dict):      # jméno už ve složce je — rozhodne se v okně
+        _odloz((user_id, request.query_params.get('k', '')[:64]),
+               dict(vysledek, nazev=nazev, velikost=velikost, slozka_id=slozka_id, cesta=cesta))
+        return {'upload': 'success'}
+    await asyncio.to_thread(_zapis_historie, _zaznam(user_id, kdo, 'nahrano', nazev, cesta,
+                                                     _velikost(velikost), slozka_id, vysledek))
+    _zmeneno(slozka_id)
     intranet_logger.log_activity(
         kdo, _LOG, f'Nahrán soubor „{nazev}“ ({_velikost(velikost)}) do „{cesta}“')
     return {'upload': 'success'}
@@ -550,7 +1018,18 @@ _RE_ZAMEK = re.compile(r'<(opaquelocktoken:[0-9a-fA-F-]{8,64})>')
 # v paměti (mění se jen v event loopu) — po restartu je Office při dalším uložení
 # nebo obnově převezme, rozpracované úpravy se neztratí.
 _ZAMKY: dict = {}
-_ZMENY: dict = {}               # slozka_id → čas (monotonic) posledního uložení / zámku z Office
+_ZMENY: dict = {}               # slozka_id → čas (monotonic) poslední změny — otevřená okna se překreslí
+# Odpojení administrátorem: (soubor_id, user_id) → kdy (time.time()). Office s tokenem
+# vydaným před odpojením už soubor nezamkne ani neuloží — smí jen číst.
+_ODPOJENI: dict = {}
+
+
+def _zmeneno(*slozky):
+    """Obsah složek se změnil: okna, která je mají otevřené, se do pár sekund překreslí."""
+    ted = time.monotonic()
+    for sid in slozky:
+        if sid is not None:
+            _ZMENY[sid] = ted
 
 
 def _pripona(nazev) -> str:
@@ -610,40 +1089,46 @@ def _token(soubor_id, user_id, ted=None) -> str:
 
 
 def _over_token(token, ted=None):
-    """(soubor_id, user_id) — nebo None: podvržený, poškozený nebo prošlý token."""
+    """(soubor_id, user_id, kdy vydán) — nebo None: podvržený, poškozený nebo prošlý token."""
     try:
         data, podpis = token.rsplit('.', 1)
         soubor_id, user_id, platnost = (int(x) for x in data.split('.'))
         platny = hmac.compare_digest(podpis.encode(), _podpis(data))
     except (AttributeError, ValueError):        # i UnicodeError
         return None
-    return (soubor_id, user_id) if platny and platnost >= (ted or time.time()) else None
+    if not platny or platnost < (ted or time.time()):
+        return None
+    return soubor_id, user_id, platnost - _TOKEN_PLATNOST
 
 
 # ---------- DB (blokující) ----------
 def _dav_kontext(soubor_id, user_id):
-    """Soubor pro Office (+ cesta, jméno uživatele) — None, když k němu uživatel nesmí."""
+    """Soubor pro Office (+ cesta, jméno uživatele, zapis = smí ukládat: správce složky
+    a soubor není uzamčený) — None, když k němu uživatel nesmí vůbec."""
     try:
-        spravce = _opravneni(user_id)
-        s = None if spravce is None else _sql(
-            'SELECT id, slozka_id, nazev, disk, velikost, nahrano FROM datuloziste_soubory '
+        admin = _opravneni(user_id)
+        s = None if admin is None else _sql(
+            'SELECT id, slozka_id, nazev, disk, velikost, nahrano, zamkl_id, zamkl FROM datuloziste_soubory '
             'WHERE id = %s', (soubor_id,), 'jeden')
         if not s or not os.path.isfile(_disk(s['disk'])):
             return None
-        slozky, plne, _ = _viditelne(user_id, spravce)
-        if s['slozka_id'] not in plne:
+        slozky, ctene, spravovane, _ = _viditelne(user_id, admin)
+        if s['slozka_id'] not in ctene:
             return None
         u = _sql('SELECT name, surname FROM user WHERE iduser = %s', (user_id,), 'jeden') or {}
         cesta = _cesta(slozky, s['slozka_id'])
         return dict(s, cesta=_cesta_text(cesta), slozka=cesta[-1]['nazev'] if cesta else '',
+                    zapis=s['slozka_id'] in spravovane and not s['zamkl_id'],
                     kdo=f"{u.get('name') or ''} {u.get('surname') or ''}".strip() or 'Neznámý')
     except Exception:
         return None         # fail closed
 
 
-def _prepis_soubor(soubor_id, disk, velikost, kdo) -> bool:
-    """Nová verze z Office: řádek souboru ukáže na nový soubor `disk`, starý se smaže.
-    False = soubor mezitím někdo smazal (nová verze z disku zase zmizí)."""
+def _prepis_soubor(soubor_id, disk, velikost, kdo, vlozil_id=None):
+    """Nová verze (uložení z Office, přepsání nahráním): řádek souboru ukáže na nový soubor
+    `disk`, starý se smaže. True; False = soubor mezitím někdo smazal; 'zamceno' = mezitím
+    ho někdo uzamkl (v obou případech nová verze z disku zase zmizí). `vlozil_id` = nahrání
+    nahradilo obsah — soubor pak patří tomu, kdo ho nahrál."""
     hotovo = None
     try:
         conn = intranet_data.get_db_connection()
@@ -651,14 +1136,18 @@ def _prepis_soubor(soubor_id, disk, velikost, kdo) -> bool:
             raise RuntimeError('Databáze není dostupná.')
         try:
             cur = conn.cursor(dictionary=True, buffered=True)
-            # FOR UPDATE: souběžné smazání souboru počká, nebo už proběhlo a řádek chybí.
-            cur.execute('SELECT disk FROM datuloziste_soubory WHERE id = %s FOR UPDATE', (soubor_id,))
+            # FOR UPDATE: souběžné smazání / zamčení souboru počká, nebo už proběhlo.
+            cur.execute('SELECT disk, zamkl_id FROM datuloziste_soubory WHERE id = %s FOR UPDATE',
+                        (soubor_id,))
             stary = cur.fetchone()
-            if stary:
+            if stary and stary['zamkl_id']:
+                stary = 'zamceno'
+            elif stary:
                 cur.execute('UPDATE datuloziste_soubory SET disk = %s, velikost = %s, nahral = %s, '
-                            'nahrano = NOW() WHERE id = %s', (disk, velikost, kdo, soubor_id))
+                            'nahrano = NOW(), vlozil_id = COALESCE(%s, vlozil_id) WHERE id = %s',
+                            (disk, velikost, kdo, vlozil_id, soubor_id))
             conn.commit()
-            hotovo = stary or False
+            hotovo = stary      # až po commitu — jinak by se při chybě smazala platná stará verze
         except Exception:
             try:
                 conn.rollback()
@@ -668,9 +1157,27 @@ def _prepis_soubor(soubor_id, disk, velikost, kdo) -> bool:
         finally:
             conn.close()
     finally:
-        # Po zápisu je navíc stará verze, jinak (soubor smazán / chyba) ta nová.
-        _smaz_z_disku(_disk(hotovo['disk'] if hotovo else disk))
-    return bool(hotovo)
+        # Po zápisu je navíc stará verze, jinak (soubor smazán / zamčen / chyba) ta nová.
+        _smaz_z_disku(_disk(hotovo['disk'] if isinstance(hotovo, dict) else disk))
+    return True if isinstance(hotovo, dict) else (hotovo or False)
+
+
+def _zapis_upravu(user_id, s, velikost):
+    """Uložení z Office do historie. Další uložení téhož člověka do _SLOUCIT_UPRAVY minut
+    jen posune čas posledního záznamu — Ctrl+S každou chvíli by historii zahltilo."""
+    try:
+        posledni = _sql('SELECT id, user_id, akce, kdy > NOW() - INTERVAL %s MINUTE AS cerstvy '
+                        'FROM datuloziste_historie WHERE soubor_id = %s ORDER BY id DESC LIMIT 1',
+                        (_SLOUCIT_UPRAVY, s['id']), 'jeden')
+        if posledni and posledni['akce'] == 'upraveno' and posledni['user_id'] == user_id and posledni['cerstvy']:
+            _sql('UPDATE datuloziste_historie SET kdy = NOW(), detail = %s WHERE id = %s',
+                 (_velikost(velikost), posledni['id']))
+            return
+    except Exception as e:
+        print(f'[datuloziste] historie: {e}')
+        return
+    _zapis_historie(_zaznam(user_id, s['kdo'], 'upraveno', s['nazev'], s['cesta'], _velikost(velikost),
+                            s['slozka_id'], s['id']))
 
 
 def _smaz_z_disku(cesta):
@@ -682,11 +1189,32 @@ def _smaz_z_disku(cesta):
 
 # ---------- WebDAV (jen to, co Office potřebuje) ----------
 def _zamek(soubor_id):
-    """Platný zámek souboru (prošlý zahodí), nebo None."""
+    """Platný zámek souboru (prošlý zahodí), nebo None. Jen v event loopu."""
     z = _ZAMKY.get(soubor_id)
     if z and z['do'] <= time.monotonic():
         del _ZAMKY[soubor_id]
         z = None
+    return z
+
+
+def _otevreny(soubor_id):
+    """Platný zámek z Office jen ke čtení — smí se volat i z vlákna DB."""
+    z = _ZAMKY.get(soubor_id)
+    return z if z and z['do'] > time.monotonic() else None
+
+
+def _odpoj(soubor_id, slozka_id):
+    """Administrátor odpojí toho, kdo má soubor otevřený v Office: zámek zmizí (soubor může
+    otevřít někdo jiný) a jeho Office už nic neuloží. Vrací zrušený zámek, nebo None."""
+    z = _zamek(soubor_id)
+    if not z:
+        return None
+    del _ZAMKY[soubor_id]
+    _ODPOJENI[(soubor_id, z['uid'])] = time.time()
+    ted = time.time()
+    for k in [k for k, kdy in _ODPOJENI.items() if ted - kdy > _TOKEN_PLATNOST]:
+        del _ODPOJENI[k]        # starší tokeny už stejně prošly
+    _zmeneno(slozka_id)
     return z
 
 
@@ -825,6 +1353,20 @@ async def _uloz_telo(request, cesta):
     return velikost
 
 
+def _odpojen(soubor_id, user_id, vydano) -> bool:
+    """Administrátor uživatele ze souboru odpojil až po vydání jeho tokenu."""
+    return _ODPOJENI.get((soubor_id, user_id), 0) >= vydano
+
+
+def _jen_cteni(s, user_id, href) -> Response:
+    """Odpověď na LOCK / PUT, když uživatel soubor smí jen číst (čtenář, uzamčený soubor,
+    odpojený administrátorem). Office pak dokument nechá jen pro čtení."""
+    z = _zamek(s['id'])
+    if z and z['uid'] != user_id:
+        return _zamceno(href)
+    return PlainTextResponse('Soubor je jen pro čtení.', status_code=403)
+
+
 async def _dav_zamkni(request, s, user_id, href):
     try:
         telo = await _telo_xml(request)
@@ -843,12 +1385,12 @@ async def _dav_zamkni(request, s, user_id, href):
         # přijme se stejným tokenem.
         token = min(tokeny) if tokeny and not telo.strip() else f'opaquelocktoken:{uuid.uuid4()}'
         z = _ZAMKY[s['id']] = {'token': token, 'uid': user_id, 'jmeno': s['kdo'], 'do': platnost}
-        _ZMENY[s['slozka_id']] = time.monotonic()
+        _zmeneno(s['slozka_id'])
     return _xml(f'<D:prop xmlns:D="DAV:"><D:lockdiscovery>{_xml_zamku(z, href)}</D:lockdiscovery></D:prop>',
                 200, {'Lock-Token': f'<{z["token"]}>'})
 
 
-async def _dav_uloz(request, s, user_id, href):
+async def _dav_uloz(request, s, user_id, href, vydano):
     """Uložení z Office (Ctrl+S) = nová verze souboru."""
     z = _zamek(s['id'])
     if z and z['uid'] != user_id and z['token'] not in _tokeny_zamku(request.headers.get('if')):
@@ -867,14 +1409,20 @@ async def _dav_uloz(request, s, user_id, href):
         # Office prázdný nebývá a přepsáním by se ztratil. Obsah zůstává.
         _smaz_z_disku(_disk(disk))
         return Response(status_code=204, headers={'ETag': _etag(s['disk'])})
+    if _odpojen(s['id'], user_id, vydano):      # administrátor ho odpojil během nahrávání
+        _smaz_z_disku(_disk(disk))
+        return _jen_cteni(s, user_id, href)
     try:
         ulozeno = await asyncio.to_thread(_prepis_soubor, s['id'], disk, velikost, s['kdo'])
     except Exception as e:
         print(f'[datuloziste] uložení z Office: {e}')
         return PlainTextResponse('Chyba databáze', status_code=500)
-    if not ulozeno:         # soubor mezitím někdo smazal
+    if ulozeno == 'zamceno':    # mezitím ho někdo uzamkl
+        return PlainTextResponse('Soubor je uzamčený.', status_code=403)
+    if not ulozeno:             # soubor mezitím někdo smazal
         return PlainTextResponse('Nenalezeno', status_code=404)
-    _ZMENY[s['slozka_id']] = time.monotonic()
+    _zmeneno(s['slozka_id'])
+    await asyncio.to_thread(_zapis_upravu, user_id, s, velikost)
     intranet_logger.log_activity(
         s['kdo'], _LOG, f'Upraven soubor „{s["nazev"]}“ ({_velikost(velikost)}) v „{s["cesta"]}“ (Office)')
     return Response(status_code=204, headers={'ETag': _etag(disk)})
@@ -907,11 +1455,13 @@ async def _dav(request: Request, token: str):
         return Response(headers=_DAV_HLAVICKY)
     nazev = request.path_params.get('nazev', '')
     ids = _over_token(token)
-    s = await asyncio.to_thread(_dav_kontext, *ids) if ids else None
+    s = await asyncio.to_thread(_dav_kontext, ids[0], ids[1]) if ids else None
     slozka = nazev == ''
     if not s or not (slozka or unicodedata.normalize('NFC', nazev) == unicodedata.normalize('NFC', s['nazev'])):
         return PlainTextResponse('Nenalezeno', status_code=404)
-    user_id = ids[1]
+    user_id, vydano = ids[1], ids[2]
+    # Ukládat smí správce složky do neuzamčeného souboru — a jen dokud ho administrátor neodpojí.
+    zapis = s['zapis'] and not _odpojen(s['id'], user_id, vydano)
     # href požadovaného zdroje přesně tak, jak ho klient poslal (Office je porovnává).
     href = (request.scope.get('raw_path') or b'').decode('latin-1') or request.url.path
     zaklad = f'{request.scope.get("root_path", "")}{_DAV}/{token}/'
@@ -936,17 +1486,17 @@ async def _dav(request: Request, token: str):
                             headers={'ETag': _etag(s['disk']), 'Last-Modified': _http_datum(s['nahrano']),
                                      'Cache-Control': 'no-cache'})
     if metoda == 'LOCK':
-        return await _dav_zamkni(request, s, user_id, href)
+        return await _dav_zamkni(request, s, user_id, href) if zapis else _jen_cteni(s, user_id, href)
     if metoda == 'UNLOCK':
         z = _zamek(s['id'])
         if z and z['token'] not in _tokeny_zamku(request.headers.get('lock-token')):
             return Response(status_code=409)
         if z:
             del _ZAMKY[s['id']]
-            _ZMENY[s['slozka_id']] = time.monotonic()
+            _zmeneno(s['slozka_id'])
         return Response(status_code=204)
     if metoda == 'PUT':
-        return await _dav_uloz(request, s, user_id, href)
+        return await _dav_uloz(request, s, user_id, href, vydano) if zapis else _jen_cteni(s, user_id, href)
     if metoda == 'PROPPATCH':
         # Office si tak ukládá jen pomocné atributy — stačí potvrdit.
         try:
@@ -1034,6 +1584,16 @@ def _text_mazani(plan) -> tuple[str, list]:
     return otazka, upozorneni + ['Akci nelze vrátit zpět.']
 
 
+def _hlaska_zamcene(zamcene, co) -> str:
+    """Proč nejde smazat / přesunout (`co`): uzamčené soubory, které by akce zasáhla."""
+    n = len(zamcene)
+    jmena = ', '.join(f'„{z}“' for z in zamcene[:3]) + (f' a {_pocet(n - 3, "další", "další", "dalších")}'
+                                                        if n > 3 else '')
+    ho = 'ho' if n == 1 else 'je'
+    return (f'Nejde {co} — {_pocet(n, "uzamčený soubor", "uzamčené soubory", "uzamčených souborů")}: {jmena}. '
+            f'Odemknout {ho} může ten, kdo {ho} uzamkl, nebo administrátor.')
+
+
 def _kdy(dt) -> str:
     """Čas po vzoru SharePointu: Před chvílí / Před 5 min / Včera v 9:41 / 3. března."""
     if not dt:
@@ -1085,8 +1645,10 @@ def _vyber(radek, klic, vyber):
     return radek
 
 
-def _uzly_stromu(strom, spravce, vyber=()):
-    """Uzly pro ui.tree — jen složky, které uživatel smí vidět."""
+def _uzly_stromu(strom, admin, vyber=()):
+    """Uzly pro ui.tree — jen složky, které uživatel smí vidět. Příznaky pro menu
+    a přetahování: nova = smí zakládat podsložky, cil = smí do ní přesouvat (obojí správce),
+    muze = smí složku přesunout / smazat, admin = řízení přístupu a historie změn."""
     deti: dict = {}
     for s in strom:
         deti.setdefault(s['parent_id'], []).append(s)
@@ -1094,7 +1656,8 @@ def _uzly_stromu(strom, spravce, vyber=()):
     def uzel(s):
         ikona, barva = _SEKCE if s['parent_id'] is None else _SLOZKA
         n = _vyber({'id': _klic(s['id']), 'label': s['nazev'], 'ikona': ikona, 'barva': barva,
-                    'menu': spravce, 'nova': _nova(s)}, _klic(s['id']), vyber)
+                    'menu': True, 'nova': _nova(s) if s['sprava'] else '', 'cil': bool(s['sprava']),
+                    'muze': bool(s['muze']), 'admin': admin}, _klic(s['id']), vyber)
         pod = sorted(deti.get(s['id'], ()), key=lambda x: _abc(x['nazev']))
         if pod:
             n['children'] = [uzel(x) for x in pod]
@@ -1107,44 +1670,109 @@ def _uzly_stromu(strom, spravce, vyber=()):
              'menu': False, 'children': [uzel(s) for s in sekce]}]
 
 
-def _zamcene(p) -> frozenset:
-    """Soubory zobrazené složky, které má někdo otevřené v Office."""
-    return frozenset(f['id'] for f in p['soubory'] or () if _zamek(f['id']))
+def _uzly_cilu(strom, vyloucene=frozenset()):
+    """Strom pro výběr cíle přesunu: zvolit jde jen složku, kterou uživatel spravuje a která
+    není ve `vyloucene` (přesouvané složky a vše pod nimi). Ostatní jsou vidět kvůli cestě."""
+    deti: dict = {}
+    for s in strom:
+        deti.setdefault(s['parent_id'], []).append(s)
+
+    def uzel(s):
+        ikona, barva = _SEKCE if s['parent_id'] is None else _SLOZKA
+        n = {'id': _klic(s['id']), 'label': s['nazev'], 'ikona': ikona, 'barva': barva,
+             'selectable': bool(s['sprava']) and s['id'] not in vyloucene}
+        pod = sorted(deti.get(s['id'], ()), key=lambda x: _abc(x['nazev']))
+        if pod:
+            n['children'] = [uzel(x) for x in pod]
+        return n
+
+    return [uzel(s) for s in sorted(deti.get(None, ()), key=lambda x: _abc(x['nazev']))]
 
 
-def _radky(p, spravce, vyber=(), mobil=False):
-    """Řádky seznamu: nejdřív složky, pak soubory. U souboru: v jaké aplikaci Office
-    se otevře (na mobilu žádné — stáhne se), zda jde do náhledu a kdo ho právě upravuje."""
+def _otevrene(soubory) -> frozenset:
+    """Kdo má které ze souborů otevřené v Office — změna = překreslit seznam."""
+    return frozenset((f['id'], z['jmeno']) for f in soubory or () if (z := _zamek(f['id'])))
+
+
+def _radky(p, admin, user_id, vyber=(), mobil=False):
+    """Řádky seznamu: nejdřív složky, pak soubory, s příznaky pro menu a přetahování
+    (viz _uzly_stromu). U souboru: v jaké aplikaci Office se otevře (na mobilu žádné —
+    stáhne se), zda jde do náhledu, smí-li ho uživatel měnit, kdo ho má otevřený v Office
+    a kdo ho uzamkl. Výsledky lupy nesou u každé položky umístění (misto) a právo (sprava)."""
     radky = []
     for s in sorted(p['slozky'], key=lambda x: _abc(x['nazev'])):
         ikona, barva = _SEKCE if s['parent_id'] is None else _SLOZKA
+        k = _klic(s['id'])
         radky.append(_vyber({
-            'klic': _klic(s['id']), 'typ': 0, 'nazev': s['nazev'], 'ikona': ikona,
-            'barva': barva, 'ts': s['vytvoreno'].timestamp() if s['vytvoreno'] else 0,
+            'klic': k, 'typ': 0, 'nazev': s['nazev'], 'ikona': ikona, 'barva': barva,
+            'ts': s['vytvoreno'].timestamp() if s['vytvoreno'] else 0,
             'zmeneno': _kdy(s['vytvoreno']), 'presne': _presne(s['vytvoreno']),
-            'zmenil': s['vytvoril'] or '', 'bajty': s['pocet'],
-            'velikost': _polozky(s['pocet']), 'menu': spravce, 'nova': _nova(s)}, _klic(s['id']), vyber))
+            'zmenil': s['vytvoril'] or '', 'bajty': s['pocet'] or 0,
+            'velikost': '' if s['pocet'] is None else _polozky(s['pocet']), 'misto': s.get('misto', ''),
+            'nova': _nova(s) if s['sprava'] else '', 'cil': bool(s['sprava']), 'muze': bool(s['muze']),
+            'presun': bool(s['muze']), 'admin': admin}, k, vyber))
     for f in p['soubory'] or ():
         ikona, barva = _ikona(f['nazev'])
+        k = f"f{f['id']}"
         pripona, zamek = _pripona(f['nazev']), _zamek(f['id'])
+        sprava = bool(f.get('sprava', p.get('sprava')))
+        zamceny = bool(f['zamkl_id'])
+        kdo_kdy = ', '.join(x for x in (f['zamkl'], _presne(f['zamceno'])) if x)
         radky.append(_vyber({
-            'klic': f"f{f['id']}", 'typ': 1, 'nazev': f['nazev'], 'ikona': ikona,
-            'barva': barva, 'ts': f['nahrano'].timestamp() if f['nahrano'] else 0,
+            'klic': k, 'typ': 1, 'nazev': f['nazev'], 'ikona': ikona, 'barva': barva,
+            'ts': f['nahrano'].timestamp() if f['nahrano'] else 0,
             'zmeneno': _kdy(f['nahrano']), 'presne': _presne(f['nahrano']),
             'zmenil': f['nahral'] or '', 'bajty': int(f['velikost'] or 0),
-            'velikost': _velikost(f['velikost']),
+            'velikost': _velikost(f['velikost']), 'misto': f.get('misto', ''), 'slozka_id': f['slozka_id'],
             'app': '' if mobil else _APLIKACE.get(_OFFICE.get(pripona), ''),
-            'nahled': pripona in _NAHLED, 'zamek': zamek['jmeno'] if zamek else ''}, f"f{f['id']}", vyber))
+            'nahled': pripona in _NAHLED, 'upravy': sprava and not zamceny,
+            'otevren': zamek['jmeno'] if zamek else '',
+            'zamceno': (f'Uzamčeno{f" ({kdo_kdy})" if kdo_kdy else ""} — nikdo ho nemůže měnit, '
+                        'přesunout ani smazat.' if zamceny else ''),
+            'muze': sprava, 'smaz': sprava and not zamceny, 'presun': sprava and not zamceny,
+            'zamknout': not zamceny and (admin or (sprava and f['vlozil_id'] == user_id)),
+            'odemknout': zamceny and (admin or f['zamkl_id'] == user_id),
+            'admin': admin}, k, vyber))
     return radky
 
 
-def _prazdno(p, spravce) -> str:
+def _prazdno(p, admin, hledani=None) -> str:
+    if hledani is not None:
+        return f'Nic nenalezeno — žádná dostupná složka ani soubor nemá v názvu „{hledani}“.'
     if p['id'] is None:
         return ('Zatím tu nejsou žádné sekce — první založíte pravým tlačítkem myši.'
-                if spravce else 'Nemáte přístup do žádné složky.')
+                if admin else 'Nemáte přístup do žádné složky.')
     if p['soubory'] is None:
         return 'Žádné dostupné položky.'
+    if not p['sprava']:
+        return 'Složka je prázdná.'
     return 'Složka je prázdná. Soubory sem přetáhněte nebo použijte „Nahrát“.'
+
+
+def _nadpis_presunu(nazvy) -> str:
+    return f'Přesunout „{nazvy[0]}“' if len(nazvy) == 1 else f'Přesunout {_polozky(len(nazvy))}'
+
+
+def _hlaska_presunu(vysledek) -> str:
+    presunuto = vysledek['presunuto']
+    co = f'„{presunuto[0]["nazev"]}“' if len(presunuto) == 1 else _polozky(len(presunuto))
+    return f'Přesunuto do „{vysledek["cil"]}“: {co}.'
+
+
+def _jmeno_uctu(u) -> str:
+    return f"{u['name'] or ''} {u['surname'] or ''}".strip() or u['email'] or '?'
+
+
+def _radky_historie(zaznamy):
+    """Řádky tabulky historie změn (popis, ikona a barva akce z _AKCE)."""
+    radky = []
+    for z in zaznamy:
+        popis, ikona, barva = _AKCE.get(z['akce'], (z['akce'], 'history', '#605e5c'))
+        radky.append({'id': z['id'], 'ts': z['kdy'].timestamp() if z['kdy'] else 0, 'kdy': _kdy(z['kdy']),
+                      'presne': _presne(z['kdy']), 'akce': popis, 'ikona': ikona, 'barva': barva,
+                      'nazev': z['nazev'], 'misto': z['misto'] or 'Datové úložiště', 'kdo': z['kdo'] or '',
+                      'detail': z['detail'] or ''})
+    return radky
 
 
 # =========================================================
@@ -1154,102 +1782,148 @@ def _prazdno(p, spravce) -> str:
 # stromu byl animační obal, ne samotný strom.
 # Pravý klik na položku, která je součástí výběru (Ctrl+klik) víc položek.
 _MENU_VYBERU = r'''
+<q-item clickable v-close-popup @click="EMIT('akce', {a: 'presun_vyber'})">
+  <q-item-section avatar><q-icon name="drive_file_move" /></q-item-section>
+  <q-item-section>Přesunout vybrané ({{ X.nvyb }})…</q-item-section>
+</q-item>
 <q-item clickable v-close-popup class="du-cervena" @click="EMIT('akce', {a: 'smaz_vyber'})">
   <q-item-section avatar><q-icon name="delete" /></q-item-section>
   <q-item-section>Smazat vybrané ({{ X.nvyb }})</q-item-section>
 </q-item>
+<q-separator />
 <q-item clickable v-close-popup @click="EMIT('akce', {a: 'zrus_vyber'})">
   <q-item-section avatar><q-icon name="deselect" /></q-item-section>
   <q-item-section>Zrušit výběr</q-item-section>
 </q-item>
 '''
 
-# data-k: klíč pro Ctrl+klik a pravý klik mimo popisek (JS na kořeni modulu).
+# Menu složky — stejné ve stromu i v seznamu (X. = props.node. / props.row., KLIC = klíč složky).
+_MENU_SLOZKY = r'''
+<q-item clickable v-close-popup @click="EMIT('akce', {a: 'otevri', k: KLIC})">
+  <q-item-section avatar><q-icon name="folder_open" /></q-item-section>
+  <q-item-section>Otevřít</q-item-section>
+</q-item>
+<q-item v-if="X.misto" clickable v-close-popup @click="EMIT('akce', {a: 'umisteni', k: KLIC})">
+  <q-item-section avatar><q-icon name="folder" /></q-item-section>
+  <q-item-section>Otevřít umístění</q-item-section>
+</q-item>
+<q-item v-if="X.nova" clickable v-close-popup @click="EMIT('akce', {a: 'nova', k: KLIC})">
+  <q-item-section avatar><q-icon name="create_new_folder" /></q-item-section>
+  <q-item-section>{{ X.nova }}</q-item-section>
+</q-item>
+<q-item v-if="X.muze" clickable v-close-popup @click="EMIT('akce', {a: 'presun', k: KLIC})">
+  <q-item-section avatar><q-icon name="drive_file_move" /></q-item-section>
+  <q-item-section>Přesunout…</q-item-section>
+</q-item>
+<template v-if="X.admin">
+  <q-item clickable v-close-popup @click="EMIT('akce', {a: 'pristup', k: KLIC})">
+    <q-item-section avatar><q-icon name="manage_accounts" /></q-item-section>
+    <q-item-section>Řízení přístupu</q-item-section>
+  </q-item>
+  <q-item clickable v-close-popup @click="EMIT('akce', {a: 'historie', k: KLIC})">
+    <q-item-section avatar><q-icon name="history" /></q-item-section>
+    <q-item-section>Historie změn</q-item-section>
+  </q-item>
+</template>
+<template v-if="X.muze">
+  <q-separator />
+  <q-item clickable v-close-popup class="du-cervena" @click="EMIT('akce', {a: 'smaz', k: KLIC})">
+    <q-item-section avatar><q-icon name="delete" /></q-item-section>
+    <q-item-section>Smazat</q-item-section>
+  </q-item>
+</template>
+'''
+
+_MENU_SOUBORU = r'''
+<q-item v-if="props.row.app || props.row.nahled" clickable v-close-popup
+        @click="EMIT('akce', {a: 'otevri', k: props.row.klic})">
+  <q-item-section avatar><q-icon :name="props.row.ikona" :style="{color: props.row.barva}" /></q-item-section>
+  <q-item-section>{{ props.row.app ? 'Otevřít v aplikaci ' + props.row.app : 'Otevřít' }}</q-item-section>
+</q-item>
+<q-item clickable v-close-popup @click="EMIT('akce', {a: 'stahni', k: props.row.klic})">
+  <q-item-section avatar><q-icon name="download" /></q-item-section>
+  <q-item-section>Stáhnout</q-item-section>
+</q-item>
+<q-item v-if="props.row.misto" clickable v-close-popup @click="EMIT('akce', {a: 'umisteni', k: props.row.klic})">
+  <q-item-section avatar><q-icon name="folder" /></q-item-section>
+  <q-item-section>Otevřít umístění</q-item-section>
+</q-item>
+<q-item v-if="props.row.presun" clickable v-close-popup @click="EMIT('akce', {a: 'presun', k: props.row.klic})">
+  <q-item-section avatar><q-icon name="drive_file_move" /></q-item-section>
+  <q-item-section>Přesunout…</q-item-section>
+</q-item>
+<q-item v-if="props.row.zamknout" clickable v-close-popup @click="EMIT('akce', {a: 'zamkni', k: props.row.klic})">
+  <q-item-section avatar><q-icon name="lock" /></q-item-section>
+  <q-item-section>Uzamknout soubor</q-item-section>
+</q-item>
+<q-item v-if="props.row.odemknout" clickable v-close-popup @click="EMIT('akce', {a: 'odemkni', k: props.row.klic})">
+  <q-item-section avatar><q-icon name="lock_open" /></q-item-section>
+  <q-item-section>Odemknout soubor</q-item-section>
+</q-item>
+<template v-if="props.row.admin">
+  <q-item v-if="props.row.otevren" clickable v-close-popup @click="EMIT('akce', {a: 'odpoj', k: props.row.klic})">
+    <q-item-section avatar><q-icon name="logout" /></q-item-section>
+    <q-item-section>Odpojit uživatele ({{ props.row.otevren }})</q-item-section>
+  </q-item>
+  <q-item clickable v-close-popup @click="EMIT('akce', {a: 'historie', k: props.row.klic})">
+    <q-item-section avatar><q-icon name="history" /></q-item-section>
+    <q-item-section>Historie souboru</q-item-section>
+  </q-item>
+</template>
+<template v-if="props.row.smaz">
+  <q-separator />
+  <q-item clickable v-close-popup class="du-cervena" @click="EMIT('akce', {a: 'smaz', k: props.row.klic})">
+    <q-item-section avatar><q-icon name="delete" /></q-item-section>
+    <q-item-section>Smazat</q-item-section>
+  </q-item>
+</template>
+'''
+
+# data-k: klíč pro Ctrl+klik a pravý klik mimo popisek (JS na kořeni modulu);
+# draggable / data-cil: co jde táhnout a kam pustit (přesun).
 _SLOT_UZEL = r'''
 <div class="du-uzel row items-center no-wrap" :class="{'du-vybrano': props.node.vyb}"
-     :data-k="props.node.id" :title="props.node.label">
+     :data-k="props.node.id" :data-cil="props.node.cil ? props.node.id : null"
+     :draggable="!!props.node.muze" :title="props.node.label">
   <q-icon :name="props.node.ikona" size="20px" :style="{color: props.node.barva}" class="q-mr-sm" />
   <span class="ellipsis">{{ props.node.label }}</span>
   <q-icon v-if="props.node.vyb" name="check_circle" size="16px" class="du-check q-ml-xs" />
   <q-menu v-if="props.node.menu" context-menu touch-position>
     <q-list dense class="du-menu">
-     <template v-if="props.node.vyb && props.node.nvyb > 1">VYBER</template>
-     <template v-else>
-      <q-item clickable v-close-popup @click="EMIT('akce', {a: 'otevri', k: props.node.id})">
-        <q-item-section avatar><q-icon name="folder_open" /></q-item-section>
-        <q-item-section>Otevřít</q-item-section>
-      </q-item>
-      <q-item clickable v-close-popup @click="EMIT('akce', {a: 'nova', k: props.node.id})">
-        <q-item-section avatar><q-icon name="create_new_folder" /></q-item-section>
-        <q-item-section>{{ props.node.nova }}</q-item-section>
-      </q-item>
-      <q-item clickable v-close-popup @click="EMIT('akce', {a: 'pristup', k: props.node.id})">
-        <q-item-section avatar><q-icon name="manage_accounts" /></q-item-section>
-        <q-item-section>Řízení přístupu</q-item-section>
-      </q-item>
-      <q-separator />
-      <q-item clickable v-close-popup class="du-cervena" @click="EMIT('akce', {a: 'smaz', k: props.node.id})">
-        <q-item-section avatar><q-icon name="delete" /></q-item-section>
-        <q-item-section>Smazat</q-item-section>
-      </q-item>
-     </template>
+      <template v-if="props.node.vyb && props.node.nvyb > 1">VYBER</template>
+      <template v-else>SLOZKA</template>
     </q-list>
   </q-menu>
 </div>
-'''.replace('VYBER', _MENU_VYBERU.replace('X.', 'props.node.'))
+'''.replace('VYBER', _MENU_VYBERU.replace('X.', 'props.node.')) \
+   .replace('SLOZKA', _MENU_SLOZKY.replace('X.', 'props.node.').replace('KLIC', 'props.node.id'))
 
 _MENU_RADKU = r'''
 <q-list dense class="du-menu">
   <template v-if="props.row.vyb && props.row.nvyb > 1">VYBER</template>
-  <template v-else-if="props.row.typ === 0">
-    <q-item clickable v-close-popup @click="EMIT('akce', {a: 'otevri', k: props.row.klic})">
-      <q-item-section avatar><q-icon name="folder_open" /></q-item-section>
-      <q-item-section>Otevřít</q-item-section>
-    </q-item>
-    <template v-if="props.row.menu">
-      <q-item clickable v-close-popup @click="EMIT('akce', {a: 'nova', k: props.row.klic})">
-        <q-item-section avatar><q-icon name="create_new_folder" /></q-item-section>
-        <q-item-section>{{ props.row.nova }}</q-item-section>
-      </q-item>
-      <q-item clickable v-close-popup @click="EMIT('akce', {a: 'pristup', k: props.row.klic})">
-        <q-item-section avatar><q-icon name="manage_accounts" /></q-item-section>
-        <q-item-section>Řízení přístupu</q-item-section>
-      </q-item>
-      <q-separator />
-      <q-item clickable v-close-popup class="du-cervena" @click="EMIT('akce', {a: 'smaz', k: props.row.klic})">
-        <q-item-section avatar><q-icon name="delete" /></q-item-section>
-        <q-item-section>Smazat</q-item-section>
-      </q-item>
-    </template>
-  </template>
-  <template v-else>
-    <q-item v-if="props.row.app || props.row.nahled" clickable v-close-popup
-            @click="EMIT('akce', {a: 'otevri', k: props.row.klic})">
-      <q-item-section avatar><q-icon :name="props.row.ikona" :style="{color: props.row.barva}" /></q-item-section>
-      <q-item-section>{{ props.row.app ? 'Otevřít v aplikaci ' + props.row.app : 'Otevřít' }}</q-item-section>
-    </q-item>
-    <q-item clickable v-close-popup @click="EMIT('akce', {a: 'stahni', k: props.row.klic})">
-      <q-item-section avatar><q-icon name="download" /></q-item-section>
-      <q-item-section>Stáhnout</q-item-section>
-    </q-item>
-    <q-separator />
-    <q-item clickable v-close-popup class="du-cervena" @click="EMIT('akce', {a: 'smaz', k: props.row.klic})">
-      <q-item-section avatar><q-icon name="delete" /></q-item-section>
-      <q-item-section>Smazat</q-item-section>
-    </q-item>
-  </template>
+  <template v-else-if="props.row.typ === 0">SLOZKA</template>
+  <template v-else>SOUBOR</template>
 </q-list>
-'''.replace('VYBER', _MENU_VYBERU.replace('X.', 'props.row.'))
+'''.replace('VYBER', _MENU_VYBERU.replace('X.', 'props.row.')) \
+   .replace('SLOZKA', _MENU_SLOZKY.replace('X.', 'props.row.').replace('KLIC', 'props.row.klic')) \
+   .replace('SOUBOR', _MENU_SOUBORU)
 
 _SLOT_RADEK = r'''
 <q-tr :props="props" class="du-radek" :class="{'du-vybrano': props.row.vyb}" :data-k="props.row.klic"
+      :data-cil="props.row.cil ? props.row.klic : null" :draggable="!!props.row.presun"
       @contextmenu.stop @click="EMIT('akce', {a: 'otevri', k: props.row.klic})">
   <q-td key="nazev" :props="props">
     <div class="row items-center no-wrap">
       <q-icon :name="props.row.ikona" size="22px" :style="{color: props.row.barva}" class="q-mr-md" />
-      <span class="du-nazev ellipsis">{{ props.row.nazev }}</span>
-      <q-icon v-if="props.row.zamek" name="lock" size="16px" class="du-zamek q-ml-sm">
-        <q-tooltip>Právě upravuje {{ props.row.zamek }}</q-tooltip>
+      <div class="du-jmeno column no-wrap">
+        <span class="du-nazev ellipsis">{{ props.row.nazev }}</span>
+        <span v-if="props.row.misto" class="du-misto ellipsis">{{ props.row.misto }}</span>
+      </div>
+      <q-icon v-if="props.row.zamceno" name="lock" size="16px" class="du-zamceno q-ml-sm">
+        <q-tooltip>{{ props.row.zamceno }}</q-tooltip>
+      </q-icon>
+      <q-icon v-if="props.row.otevren" name="edit" size="16px" class="du-otevren q-ml-sm">
+        <q-tooltip>Právě upravuje {{ props.row.otevren }}</q-tooltip>
       </q-icon>
       <q-icon v-if="props.row.vyb" name="check_circle" size="18px" class="du-check q-ml-sm" />
       <q-btn flat round dense size="sm" icon="more_vert" class="du-tri q-ml-auto" title="Zobrazit akce" @click.stop>
@@ -1264,10 +1938,47 @@ _SLOT_RADEK = r'''
 </q-tr>
 '''.replace('MENU', _MENU_RADKU)
 
-# Ctrl+klik (na Macu Cmd+klik) na složku / soubor ji přidá do výběru, nebo z něj odebere.
-# Zachytává se na kořeni modulu už ve fázi capture — strom ani řádek seznamu klik
-# nedostanou, takže se nic neotevře (ani u nevybíratelné položky — výběr se tím neztratí).
-# Šipka dál jen rozbaluje; kořen nejde vybrat, složky vybírá jen správce.
+# Strom v dialogu „Přesunout…“ — složky, kam přesouvat nejde, jsou šedé a nejdou zvolit.
+_SLOT_CIL = r'''
+<div class="row items-center no-wrap" :class="{'du-nelze': !props.node.selectable}">
+  <q-icon :name="props.node.ikona" size="20px" class="q-mr-sm"
+          :style="{color: props.node.selectable ? props.node.barva : '#c8c6c4'}" />
+  <span class="ellipsis">{{ props.node.label }}</span>
+</div>
+'''
+
+_SLOUPCE_HISTORIE = (
+    {'name': 'kdy', 'label': 'Kdy', 'field': 'ts', 'align': 'left', 'sortable': True,
+     'style': 'width: 120px', 'headerStyle': 'width: 120px'},
+    {'name': 'akce', 'label': 'Akce', 'field': 'akce', 'align': 'left', 'sortable': True},
+    {'name': 'nazev', 'label': 'Položka', 'field': 'nazev', 'align': 'left', 'sortable': True},
+    {'name': 'kdo', 'label': 'Kdo', 'field': 'kdo', 'align': 'left', 'sortable': True},
+    {'name': 'detail', 'label': 'Podrobnosti', 'field': 'detail', 'align': 'left'},
+)
+
+_SLOT_HISTORIE = r'''
+<q-tr :props="props">
+  <q-td key="kdy" :props="props"><span :title="props.row.presne">{{ props.row.kdy }}</span></q-td>
+  <q-td key="akce" :props="props">
+    <div class="row items-center no-wrap">
+      <q-icon :name="props.row.ikona" size="18px" :style="{color: props.row.barva}" class="q-mr-sm" />
+      <span>{{ props.row.akce }}</span>
+    </div>
+  </q-td>
+  <q-td key="nazev" :props="props">
+    <div class="du-h-nazev">{{ props.row.nazev }}</div>
+    <div class="du-misto">{{ props.row.misto }}</div>
+  </q-td>
+  <q-td key="kdo" :props="props">{{ props.row.kdo }}</q-td>
+  <q-td key="detail" :props="props"><div class="du-h-detail">{{ props.row.detail }}</div></q-td>
+</q-tr>
+'''
+
+_ROLE_VOLBY = {ROLE_CTENAR: _ROLE[ROLE_CTENAR], ROLE_SPRAVCE: _ROLE[ROLE_SPRAVCE]}
+
+# Ctrl+klik (na Macu Cmd+klik) na složku / soubor ji přidá do výběru, nebo z něj odebere
+# (co vybrat nejde, rozhodne server). Zachytává se na kořeni modulu už ve fázi capture —
+# strom ani řádek seznamu klik nedostanou, takže se nic neotevře. Šipka dál jen rozbaluje.
 _JS_VYBER = '''(e) => {
   if (!(e.ctrlKey || e.metaKey) || e.button !== 0 || e.target.closest('.q-tree__arrow')) return;
   const radek = e.target.closest('.q-tree__node-header');
@@ -1276,8 +1987,7 @@ _JS_VYBER = '''(e) => {
   e.preventDefault();
   e.stopPropagation();
   if (!e.currentTarget.contains(document.activeElement)) e.currentTarget.focus({preventScroll: true});
-  const k = el.dataset.k;
-  if (k !== 'koren' && (SPRAVCE || k[0] === 'f')) emit(k);
+  if (el.dataset.k !== 'koren') emit(el.dataset.k);
 }'''
 
 # Delete smaže výběr, Esc ho zruší — když je modul zaměřený (klik do něj), mimo textová pole
@@ -1299,7 +2009,40 @@ _JS_MENU_RADKU_STROMU = '''(e) => {
     clientX: e.clientX, clientY: e.clientY, screenX: e.screenX, screenY: e.screenY}));
 }'''
 
-_MAX_V_DIALOGU = 8      # kolik mazaných položek dialog vypíše jménem
+# Přetahování složek a souborů do jiné složky (strom, seznam, drobečková navigace). Táhnout
+# jde, co uživatel smí přesunout (draggable), pustit na složku, kterou spravuje (data-cil).
+# Klíč tažené položky si pamatuje kořen modulu — dataTransfer při dragover číst nejde.
+# Soubory přetažené z počítače (nahrávání) si řeší seznam sám, tady se jich nic netýká.
+_JS_TAH_START = '''(e) => {
+  const el = e.target.closest ? e.target.closest('[data-k][draggable="true"]') : null;
+  if (!el) return;
+  e.currentTarget.dataset.tah = el.dataset.k;
+  e.dataTransfer.setData('application/x-du', el.dataset.k);
+  e.dataTransfer.effectAllowed = 'move';
+}'''
+
+_JS_TAH = '''(e) => {
+  const koren = e.currentTarget, tah = koren.dataset.tah;
+  if (!tah) return;
+  const vycisti = (krome) => koren.querySelectorAll('.du-cil').forEach((x) => {
+    if (x !== krome) x.classList.remove('du-cil');
+  });
+  if (e.type === 'dragend') { delete koren.dataset.tah; vycisti(null); return; }
+  if (e.type === 'dragleave') { if (!koren.contains(e.relatedTarget)) vycisti(null); return; }
+  const radek = e.target.closest ? e.target.closest('.q-tree__node-header') : null;
+  const cil = (e.target.closest ? e.target.closest('[data-cil]') : null)
+    || (radek ? radek.querySelector('[data-cil]') : null);
+  const ok = !!cil && cil.dataset.cil !== tah;
+  const box = ok ? (cil.closest('.q-tree__node-header') || cil) : null;
+  e.preventDefault();
+  e.dataTransfer.dropEffect = ok ? 'move' : 'none';
+  vycisti(e.type === 'drop' ? null : box);
+  if (!ok) return;
+  if (e.type === 'drop') { delete koren.dataset.tah; emit({k: tah, cil: cil.dataset.cil}); }
+  else box.classList.add('du-cil');
+}'''
+
+_MAX_V_DIALOGU = 8      # kolik položek dialog (mazání, přepsání) vypíše jménem
 
 _SLOUPCE = (
     {'name': 'nazev', 'label': 'Název', 'field': 'nazev', 'align': 'left', 'sortable': True},
@@ -1357,18 +2100,31 @@ _CSS = r'''
 .du-strom .q-tree__node-header:has(.du-vybrano) { background: #deecf9; }
 .du-strom .q-tree__node-header:has(.du-vybrano):hover { background: #c7e0f4; }
 .du-check { color: #0078d4; flex-shrink: 0; }
-.du-zamek { color: #a4262c; flex-shrink: 0; }
+.du-otevren { color: #ca5010; flex-shrink: 0; }
+.du-zamceno { color: #a4262c; flex-shrink: 0; }
 .du-vyber { gap: 2px; padding: 0 2px 0 10px; border-radius: 4px; background: #deecf9; color: #323130; font-size: 14px; white-space: nowrap; }
+.du-cteni { gap: 4px; padding: 3px 10px; border-radius: 12px; background: #f3f2f1; color: #605e5c; font-size: 13px; white-space: nowrap; cursor: default; }
 
 .du-hlava { padding: 12px 12px 6px 16px; min-height: 56px; }
+.du-drobky { overflow: hidden; }
 .du-drobek { font-size: 20px; line-height: 28px; padding: 0 6px; border-radius: 4px; color: #605e5c; cursor: pointer; white-space: nowrap; }
 .du-drobek:hover { background: #f3f2f1; color: #323130; }
 .du-drobek-akt { color: #323130; font-weight: 600; }
 .du-drobky-sep { color: #8a8886; font-size: 18px; }
-@media (max-width: 767.98px) { .du-drobek { font-size: 16px; line-height: 24px; } .du-drobky-sep { font-size: 16px; } }
 .du-btn { color: #323130 !important; font-size: 14px; padding: 4px 10px; }
 .du-btn .q-icon { color: #0078d4; font-size: 20px; }
+.du-hledani { width: 260px; flex-shrink: 0; }
+@media (max-width: 767.98px) {
+  .du-drobek { font-size: 16px; line-height: 24px; }
+  .du-drobky-sep { font-size: 16px; }
+  .du-hlava { flex-wrap: wrap; }
+  .du-hledani { width: 100%; order: 10; }
+}
 .du-info { margin: 0 18px 8px; padding: 8px 12px; gap: 8px; background: #f3f2f1; border-radius: 4px; font-size: 13px; color: #605e5c; }
+.du-popis { margin: 0 18px 8px; padding: 10px 8px 10px 14px; gap: 10px; background: #f3f2f1; border-left: 3px solid #0078d4; border-radius: 2px; }
+.du-popis-ikona { color: #0078d4; flex-shrink: 0; margin-top: 1px; }
+.du-popis-text { font-size: 14px; line-height: 20px; color: #323130; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 30vh; overflow: auto; }
+.du-pridat-popis { align-self: flex-start; margin: -2px 0 6px 12px; color: #605e5c !important; font-size: 13px; }
 
 /* Seznam se posouvá uvnitř (q-table__middle); drobečky i hlavička tabulky zůstávají nahoře. */
 .du-tabulka { flex: 1 1 0; min-height: 0; background: transparent; color: #323130; }
@@ -1378,7 +2134,9 @@ _CSS = r'''
 .du-radek:hover > td { background: #f3f2f1; }
 .du-radek.du-vybrano > td { background: #deecf9; }
 .du-radek.du-vybrano:hover > td { background: #c7e0f4; }
+.du-jmeno { min-width: 0; }
 .du-nazev { color: #323130; min-width: 0; }
+.du-misto { font-size: 12px; line-height: 16px; color: #8a8886; }
 .du-radek:hover .du-nazev { text-decoration: underline; }
 .du-tri { opacity: 0; color: #605e5c; }
 .du-radek:hover .du-tri, .du-tri:focus { opacity: 1; }
@@ -1390,6 +2148,22 @@ _CSS = r'''
 .du-menu .du-cervena, .du-menu .du-cervena .q-item__section--avatar { color: #a4262c; }
 .du-drop { outline: 2px dashed #0078d4; outline-offset: -8px; background: #eff6fc; }
 .du-skryty { position: absolute !important; width: 1px !important; height: 1px !important; overflow: hidden; opacity: 0; pointer-events: none; }
+
+/* Přetahování: cílová složka ve stromu, v seznamu i v drobečkové navigaci. */
+.du-strom .q-tree__node-header.du-cil, .du-drobek.du-cil { background: #c7e0f4 !important; box-shadow: inset 0 0 0 2px #0078d4; color: #201f1e; }
+.du-radek.du-cil > td { background: #c7e0f4 !important; }
+.du-radek.du-cil { outline: 2px solid #0078d4; outline-offset: -2px; }
+
+/* Dialogy (Quasar je přesouvá mimo modul — proto bez předpony .du). */
+.du-cile { max-height: 50vh; overflow: auto; border: 1px solid #edebe9; border-radius: 4px; padding: 6px 4px; }
+.du-nelze { color: #a19f9d; }
+.du-napoveda { max-height: 280px; overflow: auto; }
+.du-role { min-width: 92px; }
+.du-historie .q-table__middle { max-height: 62vh; }
+.du-historie thead th { position: sticky; top: 0; z-index: 1; background: #fff; font-weight: 600; }
+.du-historie tbody td { vertical-align: top; white-space: normal; font-size: 13px; }
+.du-h-nazev { color: #323130; overflow-wrap: anywhere; }
+.du-h-detail { max-width: 240px; overflow-wrap: anywhere; color: #605e5c; }
 '''
 
 
@@ -1399,12 +2173,18 @@ _CSS = r'''
 async def vykresli(user_id, user_name, vsechna_prava):
     """Vstupní bod modulu (volá intranet.py)."""
     await asyncio.to_thread(inicializace_db)
-    spravce = je_spravce(vsechna_prava)
-    # vyber: klíče položek vybraných Ctrl+klikem ('s12' složka, 'f7' soubor).
-    # nacteno: kdy se pohled naposledy četl z DB; zamky: zamčené soubory v zobrazeném seznamu.
-    st = {'pohled': None, 'mapa': {}, 'radky': {}, 'nahravani': False, 'notif': None, 'vyber': set(),
-          'nacteno': 0.0, 'zamky': frozenset()}
-    menu_vyberu = []    # (oddělovač, „Smazat vybrané“, její popisek, „Zrušit výběr“) v menu volné plochy
+    admin = je_admin(vsechna_prava)
+    # pohled: otevřená složka (_nacti_pohled); hledani: výsledky lupy, nebo None; mapa: viditelné
+    # složky (s právy) podle id; radky: zobrazené řádky podle klíče; vyber: klíče vybrané
+    # Ctrl+klikem ('s12' složka, 'f7' soubor); nacteno: kdy se pohled naposledy četl z DB;
+    # zamky: kdo má zobrazené soubory otevřené v Office; cil: naposledy žádaný pohled (složka,
+    # hledaný text) — i když se ještě načítá; verze / nacita: novější načtení přebije starší
+    # a hlídač během načítání nečte; menu: co je v kontextových menu plochy.
+    st = {'pohled': None, 'hledani': None, 'mapa': {}, 'radky': {}, 'vyber': set(), 'nacteno': 0.0,
+          'zamky': frozenset(), 'cil': None, 'verze': 0, 'nacita': 0, 'nahravani': False, 'notif': None,
+          'menu': {}}
+    # Nahrané soubory, jejichž jméno už ve složce je, čekají na rozhodnutí v tomhle okně.
+    klic_okna = secrets.token_hex(8)
     # Telefon / tablet: desktopový Office přes WebDAV tam není — dokumenty se stahují.
     ua = ui.context.client.request.headers.get('user-agent', '') if ui.context.client.request else ''
     mobil = any(z in ua for z in ('Mobi', 'Android', 'iPhone', 'iPad'))
@@ -1429,69 +2209,133 @@ async def vykresli(user_id, user_name, vsechna_prava):
             return None
 
     def aktualni():
+        """Otevřená složka (s právy), v kořeni None."""
         p = st['pohled']
-        return p['cesta'][-1] if p and p['cesta'] else None
+        return st['mapa'].get(p['id']) if p and p['id'] is not None else None
 
     def muze_nahravat():
         p = st['pohled']
-        return bool(p) and p['id'] is not None and p['soubory'] is not None and not st['nahravani']
+        return (bool(p) and p['id'] is not None and p['soubory'] is not None and p['sprava']
+                and st['hledani'] is None and not st['nahravani'])
 
-    # ---------- navigace ----------
-    async def otevri(sid):
-        st['nacteno'] = time.monotonic()    # změna z Office během čtení → hlidej() načte znovu
-        p = await db(_nacti_pohled, user_id, spravce, sid)
-        if p is False:
-            zprava('Ke složce nemáte přístup nebo už neexistuje.')
-            p = await db(_nacti_pohled, user_id, spravce, None)
-        if not p:
-            return
-        if not st['pohled'] or p['id'] != st['pohled']['id']:
-            st['vyber'].clear()     # přechod do jiné složky = nový výběr (jako v Průzkumníku)
-        st['pohled'] = p
-        st['mapa'] = {s['id']: s for s in p['strom']}
-        # Z výběru pryč, co už neexistuje (smazané, soubory jiné složky).
-        st['vyber'] &= ({_klic(i) for i in st['mapa']} if spravce else set()) \
-            | {f"f{f['id']}" for f in p['soubory'] or ()}
+    def muze_hybat(k):
+        """Smí uživatel položku (klíč z prohlížeče) přesunout / smazat — podle toho, co právě vidí."""
+        s = st['mapa'].get(_id(k, 's'))
+        if s is not None:
+            return bool(s['muze'])
+        r = st['radky'].get(k)
+        return bool(r and r['typ'] == 1 and r['muze'])
+
+    def nazev_klice(k):
+        s = st['mapa'].get(_id(k, 's'))
+        return s['nazev'] if s is not None else st['radky'][k]['nazev'] if k in st['radky'] else k
+
+    # ---------- načtení a vykreslení ----------
+    async def otevri(sid, hledat=None, z_lupy=False):
+        """Načte složku `sid` (s `hledat` i výsledky lupy) a překreslí stránku. Otevření
+        složky lupu zavře (i vyprázdní její pole — ne když hledání ukončil text v něm samém);
+        novější načtení přebije starší, které ještě běží."""
+        st['verze'] += 1
+        verze = st['verze']
+        predchozi, st['cil'] = st['cil'], (sid, hledat)
+        st['nacita'] += 1
+        try:
+            nacteno = time.monotonic()      # změna během čtení → hlidej() načte znovu
+            p = await db(_nacti_pohled, user_id, admin, sid)
+            if p is False:
+                zprava('Ke složce nemáte přístup nebo už neexistuje.')
+                p = await db(_nacti_pohled, user_id, admin, None)
+            h = None
+            if p and hledat:
+                nalez = await db(_hledej, user_id, admin, hledat)
+                if nalez is None:
+                    return
+                h = {'text': hledat, 'slozky': nalez[0], 'soubory': nalez[1]}
+            if not p or verze != st['verze']:
+                return
+        finally:
+            st['nacita'] -= 1
+        stary, stare = st['pohled'], st['hledani']
+        if not stary or p['id'] != stary['id'] or (h and h['text']) != (stare and stare['text']):
+            st['vyber'].clear()     # jiná složka / jiné hledání = nový výběr (jako v Průzkumníku)
+        st.update(pohled=p, hledani=h, nacteno=nacteno, mapa={s['id']: s for s in p['strom']},
+                  cil=(p['id'], hledat if h else None))   # nepřístupná složka → kořen
+        # Z výběru pryč, co už neexistuje nebo s čím uživatel už hýbat nesmí.
+        st['vyber'] &= ({_klic(i) for i, s in st['mapa'].items() if s['muze']}
+                        | {f"f{f['id']}" for f in (h or p)['soubory'] or () if f.get('sprava', p['sprava'])})
+        if h is None and predchozi and predchozi[1] and not z_lupy:
+            hledani.value = ''
+        zobraz()
+
+    def zobraz():
+        """Překreslí stránku podle st (bez dotazu do DB)."""
+        p, h = st['pohled'], st['hledani']
         prekresli()
-        strom.select(_klic(p['id']))
+        if h:
+            strom.deselect()        # ve výsledcích lupy klik na kteroukoli složku lupu zavře
+        else:
+            strom.select(_klic(p['id']))
         strom.expand(['koren'] + [_klic(s['id']) for s in p['cesta']])
-        prazdno.set_text(_prazdno(p, spravce))
-        upl.props['url'] = f'/uloziste/nahrat/{p["id"] or 0}'
+        prazdno.set_text(_prazdno(p, admin, h['text'] if h else None))
+        upl.props['url'] = f'/uloziste/nahrat/{p["id"] or 0}?k={klic_okna}'
         if muze_nahravat():
             obsah.classes(add='du-nahravani')
         else:
             obsah.classes(remove='du-nahravani')
-        if menu_plochy:
-            menu_plochy.set_text(_nova(aktualni()))
         zahlavi.refresh()
+        pod_hlavou.refresh()
 
     def prekresli():
-        """Strom, seznam a menu výběru podle st (bez dotazu do DB)."""
-        p = st['pohled']
-        uzly = _uzly_stromu(p['strom'], spravce, st['vyber'])
+        """Strom, seznam a kontextová menu podle st (bez dotazu do DB)."""
+        p, h = st['pohled'], st['hledani']
+        uzly = _uzly_stromu(p['strom'], admin, st['vyber'])
         if strom.props['nodes'] != uzly:
             strom.props['nodes'] = uzly
             strom.update()
-        radky = _radky(p, spravce, st['vyber'], mobil)
+        radky = _radky(h or p, admin, user_id, st['vyber'], mobil)
         st['radky'] = {r['klic']: r for r in radky}
-        st['zamky'] = _zamcene(p)
+        st['zamky'] = _otevrene((h or p)['soubory'])
         tabulka.update_rows(radky)
-        n = len(st['vyber'])
-        for oddelovac, smazat, popisek, zrusit in menu_vyberu:
-            for prvek in (oddelovac, smazat, zrusit):
-                prvek.set_visibility(n > 0)
-            popisek.set_text(f'Smazat vybrané ({n})')
+        obnov_menu()
+
+    async def obnov():
+        """Znovu načte naposledy žádaný pohled (složku, příp. s výsledky lupy) — po vlastní akci
+        i po změně odjinud. Žádaný, ne zobrazený: rozběhnuté hledání se tím nezahodí."""
+        if st['cil'] is not None:
+            await otevri(*st['cil'])
+
+    async def hlidej():
+        """Změna odjinud (uložení z Office, nahrání, přesun…) v zobrazených složkách →
+        přenačíst z DB; jiný stav otevření v Office → jen překreslit."""
+        p, h = st['pohled'], st['hledani']
+        if not p or st['nahravani'] or st['nacita']:
+            return
+        slozky = ({f['slozka_id'] for f in h['soubory']} | {s['parent_id'] for s in h['slozky']}
+                  if h else {p['id']})
+        if any(_ZMENY.get(s, 0) > st['nacteno'] for s in slozky if s is not None):
+            await obnov()
+        elif _otevrene((h or p)['soubory']) != st['zamky']:
+            prekresli()
+
+    # ---------- lupa ----------
+    async def hledej(text):
+        """Hledá od dvou znaků v názvech všeho, kam uživatel vidí; kratší text výsledky zavře
+        (i rozběhnuté hledání). Porovnává se s žádaným pohledem, ne se zobrazeným."""
+        text = ' '.join(str(text or '').split())[:100]
+        hledat = text if len(text) >= 2 else None
+        if st['cil'] is not None and st['cil'][1] != hledat:
+            await otevri(st['cil'][0], hledat, z_lupy=True)
+
+    async def zavri_hledani():
+        hledani.value = ''
+        await hledej('')
 
     # ---------- výběr Ctrl+klikem ----------
     def prepni_vyber(e):
-        """Ctrl+klik na složku / soubor: přidat do výběru, nebo z něj odebrat.
-        Klíč přichází z prohlížeče — bere se jen to, co uživatel právě vidí."""
+        """Ctrl+klik na složku / soubor: přidat do výběru, nebo z něj odebrat. Vybrat jde
+        jen to, s čím uživatel smí hýbat (přesunout, smazat)."""
         k = e.args if isinstance(e.args, str) else None
-        if not st['pohled'] or not k:
-            return
-        slozka = spravce and _id(k, 's') in st['mapa']
-        soubor = _id(k, 'f') is not None and k in st['radky']
-        if slozka or soubor:
+        if st['pohled'] and k and muze_hybat(k):
             st['vyber'] ^= {k}
             prekresli()
             zahlavi.refresh()
@@ -1503,7 +2347,10 @@ async def vykresli(user_id, user_name, vsechna_prava):
             zahlavi.refresh()
 
     async def smaz_vyber():
-        await smaz(list(st['vyber']))
+        await smaz(sorted(st['vyber']))
+
+    async def presun_vyber():
+        await dialog_presunu(sorted(st['vyber']))
 
     async def klavesa(e):
         if e.args == 'Escape':
@@ -1519,74 +2366,84 @@ async def vykresli(user_id, user_name, vsechna_prava):
 
     def otevri_soubor(radek):
         """Klik na soubor jako v SharePointu: dokument Office v desktopové aplikaci (uložení
-        zapíše novou verzi sem), PDF / obrázek / text v nové záložce, ostatní se stáhne."""
-        fid, nazev = _id(radek['klic'], 'f'), radek['nazev']
+        zapíše novou verzi sem; čtenáři a uzamčený soubor jen pro čtení), PDF / obrázek /
+        text v nové záložce, ostatní se stáhne."""
+        fid, jmeno = _id(radek['klic'], 'f'), radek['nazev']
         if radek['app']:
             # Adresu serveru doplní prohlížeč (location.origin) — Office se připojí přesně
             # tam, kam uživatel (testovací i ostrý portál, desktopová aplikace).
-            cesta = f'{_DAV}/{_token(fid, user_id)}/{quote(nazev, safe="")}'
-            schema = f'{_OFFICE[_pripona(nazev)]}:ofe|u|'
+            cesta = f'{_DAV}/{_token(fid, user_id)}/{quote(jmeno, safe="")}'
+            schema = f'{_OFFICE[_pripona(jmeno)]}:{"ofe" if radek["upravy"] else "ofv"}|u|'
             ui.run_javascript(f'window.location.href = {json.dumps(schema)} + location.origin + {json.dumps(cesta)}')
+            pozn = ('Uložením (Ctrl+S) se změny propíší sem.' if radek['upravy']
+                    else 'Jen pro čtení — změny se sem neuloží.')
             with koren:
                 ui.notify(f'Otevírám v aplikaci {radek["app"]}…', type='info', position='top',
-                          caption=f'Uložením (Ctrl+S) se změny propíší sem. Když se {radek["app"]} '
-                                  'nespustí, soubor si stáhněte.')
+                          caption=f'{pozn} Když se {radek["app"]} nespustí, soubor si stáhněte.')
         elif radek['nahled']:
-            ui.navigate.to(f'/uloziste/nahled/{fid}/{quote(nazev, safe="")}', new_tab=True)
+            ui.navigate.to(f'/uloziste/nahled/{fid}/{quote(jmeno, safe="")}', new_tab=True)
         else:
             ui.download.from_url(f'/uloziste/soubor/{fid}')
 
-    async def hlidej():
-        """Uložení / zámek z Office v otevřené složce → přenačíst z DB; prošlý zámek
-        (Office spadl) → jen překreslit."""
-        p = st['pohled']
-        if not p or p['id'] is None or st['nahravani']:
-            return
-        if _ZMENY.get(p['id'], 0) > st['nacteno']:
-            await otevri(p['id'])
-        elif _zamcene(p) != st['zamky']:
-            prekresli()
-
     async def vyber(e):
-        if st['pohled'] and e.value not in (None, _klic(st['pohled']['id'])):
+        """Klik ve stromu (Quasar posílá klíč i při odznačení — pak zůstává aktuální)."""
+        p = st['pohled']
+        if p and e.value is not None and (st['hledani'] or e.value != _klic(p['id'])):
             await otevri_klic(e.value)
 
     async def akce(e):
-        """Akce z kontextových menu stromu i seznamu. Klíč přichází z prohlížeče —
-        bere se jen to, co uživatel právě vidí, a DB funkce přístup ověří znovu."""
+        """Akce z kontextových menu stromu i seznamu. Klíč přichází z prohlížeče — bere se jen
+        to, co uživatel právě vidí, s právy spočtenými tady; DB funkce je ověří znovu."""
         args = e.args if isinstance(e.args, dict) else {}
         a, k = args.get('a'), args.get('k')
         radek = st['radky'].get(k)
+        soubor = radek if radek and radek['typ'] == 1 else None
         slozka = st['mapa'].get(_id(k, 's'))
-        if a == 'otevri' and radek and radek['typ'] == 1:
-            otevri_soubor(radek)
+        if a == 'otevri' and soubor:
+            otevri_soubor(soubor)
         elif a == 'otevri':
             await otevri_klic(k)
-        elif a == 'stahni' and radek and radek['typ'] == 1:
+        elif a == 'stahni' and soubor:
             ui.download.from_url(f'/uloziste/soubor/{_id(k, "f")}')
-        elif a == 'smaz' and radek and radek['typ'] == 1:
-            await smaz([k])
+        elif a == 'umisteni' and (soubor or slozka):
+            await otevri(soubor['slozka_id'] if soubor else slozka['parent_id'])
         elif a == 'smaz_vyber':
             await smaz_vyber()
+        elif a == 'presun_vyber':
+            await presun_vyber()
         elif a == 'zrus_vyber':
             zrus_vyber()
-        elif not spravce:
-            return
-        elif a == 'nova' and (k == 'koren' or slozka):
+        elif a == 'smaz' and (soubor['smaz'] if soubor else slozka and slozka['muze']):
+            await smaz([k])
+        elif a == 'presun' and muze_hybat(k):
+            await dialog_presunu([k])
+        elif a == 'nova' and (slozka['sprava'] if slozka else k == 'koren' and admin):
             dialog_nova_slozka(slozka)
+        elif a in ('zamkni', 'odemkni') and soubor and soubor['zamknout' if a == 'zamkni' else 'odemknout']:
+            await zamkni(soubor, a == 'zamkni')
+        elif not admin:
+            return
         elif a == 'pristup' and slozka:
             await dialog_pristupu(slozka)
-        elif a == 'smaz' and slozka:
-            await smaz([k])
+        elif a == 'historie' and slozka:
+            await dialog_historie(_cesta_text(_cesta(st['mapa'], slozka['id'])), slozka_id=slozka['id'])
+        elif a == 'historie' and soubor:
+            misto = soubor['misto'] or _cesta_text(st['pohled']['cesta'])
+            await dialog_historie(f'{misto} / {soubor["nazev"]}', soubor_id=_id(k, 'f'))
+        elif a == 'odpoj' and soubor and soubor['otevren']:
+            dialog_odpojeni(soubor)
 
     # ---------- mazání (jedna položka z menu i celý výběr) ----------
     async def smaz(klice):
-        plan = await db(_plan_mazani, user_id, spravce, klice)
+        plan = await db(_plan_mazani, user_id, admin, klice)
         if plan is None:
             return
         if not plan['polozky']:
-            zprava('Není co mazat — položky už neexistují nebo k nim nemáte přístup.')
-            await otevri(st['pohled']['id'])
+            zprava('Není co mazat — položky už neexistují nebo je smazat nemůžete.')
+            await obnov()
+            return
+        if plan['zamcene']:
+            zprava(_hlaska_zamcene(plan['zamcene'], 'smazat'))
             return
         otazka, upozorneni = _text_mazani(plan)
         polozky = plan['polozky']
@@ -1618,11 +2475,16 @@ async def vykresli(user_id, user_name, vsechna_prava):
 
     async def proved_mazani(plan):
         polozky = plan['polozky']
-        vysledek = await db(_smaz_polozky, user_id, spravce,
+        vysledek = await db(_smaz_polozky, user_id, admin,
                             [p['id'] for p in polozky if not p['typ']], [p['id'] for p in polozky if p['typ']])
         if vysledek is None:
             return
+        if vysledek == 'zamceno':
+            zprava('Mezitím někdo uzamkl soubor, kterého se mazání týká — nic se nesmazalo.')
+            await obnov()
+            return
         smazane, smazane_soubory, _ = vysledek
+        await db(_zapis_smazani, user_id, user_name, polozky, smazane, smazane_soubory)
         # Jen to, co smazalo právě tohle volání (souběžně mohl mazat i někdo jiný).
         polozky = [p for p in polozky if p['id'] in (smazane_soubory if p['typ'] else smazane)]
         if polozky:
@@ -1643,147 +2505,139 @@ async def vykresli(user_id, user_name, vsechna_prava):
         st['vyber'] -= {_klic(p['id']) if not p['typ'] else f"f{p['id']}" for p in polozky}
         # Smazaná otevřená složka → nejbližší nadřazená, která zůstala.
         cil = next((c['id'] for c in reversed(st['pohled']['cesta']) if c['id'] not in smazane), None)
-        await otevri(cil)
+        await otevri(cil, st['cil'][1] if st['cil'] else None)
 
-    # ---------- složky (jen správce) ----------
-    def dialog_nova_slozka(rodic):
-        """rodic = řádek složky, None = kořen (nová sekce)."""
-        if not spravce:
+    # ---------- přesun (přetažením, z menu i celého výběru) ----------
+    async def presun(klice, cil, prepsat=False):
+        vysledek = await db(_presun, user_id, admin, klice, cil, user_name, prepsat)
+        if vysledek is None:
             return
-        with koren, ui.dialog() as dlg, ui.card().classes('w-96 max-w-full'):
-            ui.label(_nova(rodic)).classes('text-lg font-bold text-gray-800')
-            if rodic:
-                ui.label(f'v „{rodic["nazev"]}“').classes('text-sm text-gray-500 -mt-2')
-            vstup = ui.input('Název').props('outlined dense autofocus maxlength=255') \
-                .classes('w-full')
-
-            async def vytvor():
-                nazev = ' '.join((vstup.value or '').split())
-                if not nazev:
-                    zprava('Zadejte název.')
-                    return
-                ok = await db(_vytvor_slozku, rodic['id'] if rodic else None, nazev, user_name)
-                if ok is False:
-                    zprava('Složka s tímto názvem tu už je.')
-                if not ok:
-                    return
+        if 'konflikty' in vysledek:
+            misto = _cesta_text(_cesta(st['mapa'], cil))
+            dialog_prepsani([(n, misto) for n in vysledek['konflikty']],
+                            'Přepsat je přesouvanými soubory? Původní obsah se ztratí.',
+                            lambda: presun(klice, cil, True))
+            return
+        if 'chyba' in vysledek:
+            zprava(vysledek['chyba'])
+        elif not vysledek['presunuto']:
+            zprava('Položky už v cílové složce jsou.', 'info')
+        else:
+            for x in vysledek['presunuto']:
                 intranet_logger.log_activity(
-                    user_name, _LOG, f'Vytvořena složka „{nazev}“'
-                    + (f' v „{rodic["nazev"]}“' if rodic else ' (sekce)'))
-                dlg.close()
-                if rodic:
-                    strom.expand([_klic(rodic['id'])])     # ať je nová složka ve stromu vidět
-                await otevri(st['pohled']['id'])
+                    user_name, _LOG, f'{"Přesunut soubor" if x["typ"] else "Přesunuta složka"} „{x["nazev"]}“ '
+                                     f'z „{x["z"] or "Datové úložiště"}“ do „{vysledek["cil"]}“')
+            zprava(_hlaska_presunu(vysledek), 'positive')
+            st['vyber'] -= set(klice)
+        await obnov()
 
-            vstup.on('keydown.enter', vytvor)
+    async def pretazeni(e):
+        """Puštění tažené složky / souboru (s celým výběrem, když je jeho součástí) na složku."""
+        args = e.args if isinstance(e.args, dict) else {}
+        k, cil = args.get('k'), _id(args.get('cil'), 's')
+        if not st['pohled'] or not isinstance(k, str) or cil not in st['mapa'] or not st['mapa'][cil]['sprava']:
+            return
+        klice = [x for x in (sorted(st['vyber']) if k in st['vyber'] else [k]) if muze_hybat(x)]
+        if klice:
+            await presun(klice, cil)
+
+    async def dialog_presunu(klice):
+        """Přesunout… — výběr cílové složky; zvolit jde jen složku, kterou uživatel spravuje.
+        Uzamčený soubor ve výběru (i ve vybrané složce) přesun zastaví hned, ještě před volbou cíle."""
+        klice = [k for k in klice if muze_hybat(k)]
+        if not klice or not st['pohled']:
+            return
+        plan = await db(_plan_mazani, user_id, admin, klice)     # přesun bere stejný rozsah jako mazání
+        if plan is None:
+            return
+        if plan['zamcene']:
+            zprava(_hlaska_zamcene(plan['zamcene'], 'přesunout'))
+            return
+        p = st['pohled']
+        vyloucene =_podstrom({s['id']: s['parent_id'] for s in p['strom']},
+                              [i for i in (_id(k, 's') for k in klice) if i is not None])
+        cile = {s['id'] for s in p['strom'] if s['sprava'] and s['id'] not in vyloucene}
+        if not cile:
+            zprava('Nemáte žádnou složku, kam by šlo přesouvat.')
+            return
+        zvoleno = {'cil': None}
+        with koren, ui.dialog() as dlg, ui.card().classes('w-[30rem] max-w-full gap-3'):
+            ui.label(_nadpis_presunu([nazev_klice(k) for k in klice])) \
+                .classes('text-lg font-bold text-gray-800 break-words')
+            ui.label('Vyberte cílovou složku:').classes('text-sm text-gray-600 -mt-2')
+            vyber_cile = ui.tree(_uzly_cilu(p['strom'], vyloucene), node_key='id',
+                                 on_select=lambda e: zvol(e.value)) \
+                .props('no-connectors icon=chevron_right').classes('du-strom du-cile w-full')
+            vyber_cile.add_slot('default-header', _SLOT_CIL)
+            vyber_cile.expand([_klic(s['id']) for s in p['cesta']]
+                              + [_klic(s['id']) for s in p['strom'] if not s['plny']])
+            kam = ui.label('').classes('text-sm text-gray-600 break-words')
+
+            def zvol(k):
+                sid = _id(k, 's')
+                zvoleno['cil'] = sid if sid in cile else None
+                tlacitko.set_enabled(zvoleno['cil'] is not None)
+                kam.set_text(f'Do „{_cesta_text(_cesta(st["mapa"], sid))}“' if zvoleno['cil'] is not None else '')
+
+            async def ano():
+                if zvoleno['cil'] is not None:
+                    dlg.close()
+                    await presun(klice, zvoleno['cil'])
+
             with ui.row().classes('w-full justify-end gap-2'):
                 ui.button('Zrušit', on_click=dlg.close).props('flat')
-                ui.button('Vytvořit', on_click=vytvor).props('color=primary')
+                tlacitko = ui.button('Přesunout sem', icon='drive_file_move', on_click=ano).props('color=primary')
+                tlacitko.disable()
         dlg.on('hide', dlg.delete)
         dlg.open()
 
-    async def dialog_pristupu(s):
-        if not spravce or not s:
-            return
-        cesta_txt = _cesta_text(_cesta(st['mapa'], s['id']))
-        stav = {'radky': []}
-        with koren, ui.dialog() as dlg, ui.card().classes('w-[36rem] max-w-full gap-3'):
-            ui.label('Řízení přístupu').classes('text-lg font-bold text-gray-800')
-            ui.label(cesta_txt).classes('text-sm text-gray-500 -mt-2 break-words')
-            ui.label('Přístup mají (správci dat vidí vše):') \
-                .classes('text-sm font-semibold text-gray-700 mt-2')
+    def dialog_prepsani(polozky, otazka, ano, ne=None):
+        """Soubory stejného jména už v cílové složce jsou: přepsat (ano), nebo zrušit (ne — i když
+        se dialog jen zavře). polozky = [(název, umístění)]."""
+        stav = {'vyrizeno': False}
+        with koren, ui.dialog() as dlg, ui.card().classes('w-[30rem] max-w-full gap-3'):
+            jeden = len(polozky) == 1
+            ui.label('Soubor už existuje' if jeden else 'Soubory už existují') \
+                .classes('text-lg font-bold text-gray-800')
+            ui.label('V cílové složce už je soubor stejného jména:' if jeden
+                     else 'V cílové složce už jsou soubory stejného jména:').classes('text-sm text-gray-700')
+            with ui.column().classes('w-full gap-2'):
+                for jmeno, misto in polozky[:_MAX_V_DIALOGU]:
+                    ikona, barva = _ikona(jmeno)
+                    with ui.row().classes('w-full items-center no-wrap gap-3'):
+                        ui.icon(ikona, size='22px').style(f'color: {barva}')
+                        with ui.column().classes('min-w-0 gap-0'):
+                            ui.label(jmeno).classes('text-sm text-gray-800 truncate max-w-full')
+                            ui.label(misto or 'Datové úložiště').classes('text-xs text-gray-500 truncate max-w-full')
+                if len(polozky) > _MAX_V_DIALOGU:
+                    ui.label(f'… a další ({len(polozky) - _MAX_V_DIALOGU})').classes('text-sm text-gray-500')
+            ui.label(otazka).classes('text-sm text-gray-700')
 
-            @ui.refreshable
-            def seznam():
-                if not stav['radky']:
-                    ui.label('Zatím nikdo.').classes('text-sm text-gray-400 italic')
-                for r in stav['radky']:
-                    with ui.row().classes('w-full items-center gap-2 no-wrap'):
-                        ui.icon('person', color='grey-6')
-                        with ui.column().classes('flex-1 min-w-0 gap-0'):
-                            ui.label(f"{r['name']} {r['surname']}") \
-                                .classes('text-sm text-gray-800 truncate')
-                            zdedeno = f" · zděděno ze složky „{r['zdedeno']}“" if r['zdedeno'] else ''
-                            ui.label(f"{r['email']}{zdedeno}").classes('text-xs text-gray-500 truncate')
-                        if not r['zdedeno']:
-                            ui.button(icon='person_remove', on_click=lambda r=r: odeber(r)) \
-                                .props('flat round dense color=negative').tooltip('Odebrat přístup')
-
-            seznam()
-            ui.separator()
-            with ui.row().classes('w-full items-center gap-2 no-wrap'):
-                vstup = ui.input('E-mail uživatele').props('outlined dense').classes('flex-1')
-                ui.button('Vyhledat', icon='search', on_click=lambda: hledej()) \
-                    .props('color=primary no-caps')
-            nalez = ui.row().classes('w-full items-center gap-2 no-wrap')
-            with ui.row().classes('w-full justify-end'):
-                ui.button('Zavřít', on_click=dlg.close).props('flat')
-
-        async def nacti():
-            radky = await db(_pristupy, s['id'])
-            if radky is not None:
-                stav['radky'] = radky
-                seznam.refresh()
-
-        async def hledej():
-            adresa = (vstup.value or '').strip().lower()
-            nalez.clear()
-            if not adresa:
-                return
-            vysledek = await db(_najdi_uzivatele, adresa)
-            if not vysledek:
-                return
-            uid, jmeno, chyba = vysledek
-            with nalez:
-                if not uid:
-                    ui.label(chyba or 'Uživatel nenalezen.').classes('text-sm text-red-600')
-                    return
-                ui.icon('person', color='primary')
-                ui.label(f'{jmeno} ({adresa})').classes('text-sm flex-1 min-w-0 truncate')
-                ui.button('Potvrdit přidání přístupu', icon='check',
-                          on_click=lambda: pridej(uid, jmeno, adresa)).props('color=positive no-caps')
-
-        async def pridej(uid, jmeno, adresa):
-            r = await db(_pridej_pristup, s['id'], uid, user_name)
-            if r is None:
-                return
-            if r == 'neni':
-                zprava('Složka mezitím zanikla — přístup nebyl přidán.', 'negative')
+            async def prepsat():
+                stav['vyrizeno'] = True
                 dlg.close()
-                await otevri(st['pohled']['id'])
-                return
-            if r == 'pridan':
-                background_tasks.create(
-                    asyncio.to_thread(_posli_email, adresa, cesta_txt, s['id'], user_name),
-                    name='datuloziste.email')
-                intranet_logger.log_activity(user_name, _LOG, f'Přístup do „{cesta_txt}“ pro {jmeno}')
-                zprava(f'Přístup přidán — {jmeno} dostane e-mail s odkazem.', 'positive')
-            else:
-                zprava(f'{jmeno} už do této složky přístup má.', 'info')
-            vstup.value = ''
-            nalez.clear()
-            await nacti()
+                await ano()
 
-        async def odeber(r):
-            if await db(_sql, 'DELETE FROM datuloziste_pristupy WHERE slozka_id = %s AND user_id = %s',
-                        (s['id'], r['user_id'])) is None:
-                return
-            intranet_logger.log_activity(
-                user_name, _LOG, f"Odebrán přístup do „{cesta_txt}“: {r['name']} {r['surname']}")
-            await nacti()
+            with ui.row().classes('w-full justify-end gap-2'):
+                ui.button('Zrušit', on_click=dlg.close).props('flat')
+                ui.button('Přepsat', icon='published_with_changes', on_click=prepsat).props('color=primary')
 
-        vstup.on('keydown.enter', hledej)
-        dlg.on('hide', dlg.delete)
-        await nacti()
+        async def zavreno():
+            dlg.delete()
+            if not stav['vyrizeno'] and ne:
+                await ne()
+
+        dlg.on('hide', zavreno)
         dlg.open()
 
-    # ---------- soubory ----------
+    # ---------- nahrávání ----------
     def nahravani_start():
         # Během nahrávání nejde přidat další soubory (Quasar by je jen zařadil
         # do fronty a po skončení zahodil).
         st['nahravani'] = True
         obsah.classes(remove='du-nahravani')
         zahlavi.refresh()
+        obnov_menu()
         if st['notif'] is None:
             with koren:
                 st['notif'] = ui.notification('Nahrávám soubory…', spinner=True, timeout=None,
@@ -1795,56 +2649,426 @@ async def vykresli(user_id, user_name, vsechna_prava):
             st['notif'].dismiss()
             st['notif'] = None
         upl.reset()     # jinak by Quasar stejný soubor podruhé nepřijal
-        await otevri(st['pohled']['id'])
+        # Soubory, jejichž jméno už ve složce je: přepsat / zrušit (každý se nabídne jen jednou).
+        nove = [c for c in _CEKAJICI.get((user_id, klic_okna), []) if not c.get('ukazano')]
+        for c in nove:
+            c['ukazano'] = True
+        await obnov()
+        if nove:
+            dialog_prepsani([(c['nazev'], c['cesta']) for c in nove],
+                            'Přepsat je nově nahranou verzí? Původní obsah se ztratí.',
+                            lambda: prepis_nahrane(nove), lambda: zahod_nahrane(nove))
+
+    async def prepis_nahrane(nove):
+        hotovo, chyby = [], []
+        for c in _vyzvedni((user_id, klic_okna), nove):
+            r = await db(_prepis_nahranim, user_id, admin, c, user_name)
+            if r is True:
+                hotovo.append(c['nazev'])
+                intranet_logger.log_activity(user_name, _LOG, f'Přepsán soubor „{c["nazev"]}“ '
+                                             f'({_velikost(c["velikost"])}) v „{c["cesta"]}“')
+            elif r:
+                chyby.append(f'Soubor „{c["nazev"]}“ {r}.')
+        if hotovo:
+            zprava(f'Přepsáno: „{hotovo[0]}“.' if len(hotovo) == 1
+                   else f'Přepsáno: {_pocet(len(hotovo), "soubor", "soubory", "souborů")}.', 'positive')
+        for text in chyby:
+            zprava(text, 'negative')
+        await obnov()
+
+    async def zahod_nahrane(nove):
+        for c in _vyzvedni((user_id, klic_okna), nove):
+            await asyncio.to_thread(_smaz_z_disku, _disk(c['disk']))
+
+    # ---------- zámky a Office ----------
+    async def zamkni(radek, zamknout):
+        r = await db(_zamkni, user_id, admin, _id(radek['klic'], 'f'), user_name, zamknout)
+        if r is None:
+            return
+        if r is True:
+            misto = radek['misto'] or _cesta_text(st['pohled']['cesta'])
+            intranet_logger.log_activity(user_name, _LOG, f'{"Uzamčen" if zamknout else "Odemčen"} soubor '
+                                                          f'„{radek["nazev"]}“ v „{misto}“')
+            zprava(f'Soubor „{radek["nazev"]}“ je uzamčený — nikdo ho teď nemůže měnit, přesunout ani smazat.'
+                   if zamknout else f'Soubor „{radek["nazev"]}“ je odemčený.', 'positive')
+        else:
+            zprava(r)
+        await obnov()
+
+    def dialog_odpojeni(radek):
+        """Administrátor odpojí toho, kdo má soubor otevřený v Office."""
+        with koren, ui.dialog() as dlg, ui.card().classes('w-[30rem] max-w-full gap-3'):
+            ui.label('Odpojit uživatele?').classes('text-lg font-bold text-gray-800')
+            ui.label(f'Soubor „{radek["nazev"]}“ má otevřený {radek["otevren"]}.') \
+                .classes('text-sm text-gray-800 break-words')
+            ui.label('Jeho Office už do souboru nic neuloží — neuložené změny si může uložit jen jako '
+                     'kopii. Soubor pak může otevřít a upravovat někdo jiný.').classes('text-sm text-gray-700')
+
+            async def ano():
+                dlg.close()
+                await odpoj(radek)
+
+            with ui.row().classes('w-full justify-end gap-2'):
+                ui.button('Zrušit', on_click=dlg.close).props('flat')
+                ui.button('Odpojit', icon='logout', on_click=ano).props('color=negative')
+        dlg.on('hide', dlg.delete)
+        dlg.open()
+
+    async def odpoj(radek):
+        fid = _id(radek['klic'], 'f')
+        z = _odpoj(fid, radek['slozka_id'])         # zámky Office žijí jen v event loopu
+        if not z:
+            zprava('Soubor už nikdo otevřený nemá.', 'info')
+        else:
+            misto = radek['misto'] or _cesta_text(st['pohled']['cesta'])
+            await db(_zapis_historie, _zaznam(user_id, user_name, 'odpojeno', radek['nazev'], misto,
+                                              z['jmeno'], radek['slozka_id'], fid))
+            intranet_logger.log_activity(user_name, _LOG, f'Odpojen uživatel {z["jmeno"]} od souboru '
+                                                          f'„{radek["nazev"]}“ v „{misto}“')
+            zprava(f'Odpojeno — {z["jmeno"]} už do „{radek["nazev"]}“ nic neuloží.', 'positive')
+        await obnov()
+
+    # ---------- složky ----------
+    def dialog_nova_slozka(rodic):
+        """rodic = složka (s právy), None = kořen (nová sekce — jen administrátor)."""
+        if not (rodic['sprava'] if rodic else admin):
+            return
+        with koren, ui.dialog() as dlg, ui.card().classes('w-96 max-w-full'):
+            ui.label(_nova(rodic)).classes('text-lg font-bold text-gray-800')
+            if rodic:
+                ui.label(f'v „{rodic["nazev"]}“').classes('text-sm text-gray-500 -mt-2')
+            vstup = ui.input('Název').props('outlined dense autofocus maxlength=255') \
+                .classes('w-full')
+
+            async def vytvor():
+                jmeno = ' '.join((vstup.value or '').split())
+                if not jmeno:
+                    zprava('Zadejte název.')
+                    return
+                ok = await db(_vytvor_slozku, user_id, admin, rodic['id'] if rodic else None, jmeno, user_name)
+                if ok is None:
+                    return
+                if ok is not True:
+                    zprava(ok)
+                    return
+                intranet_logger.log_activity(
+                    user_name, _LOG, f'Vytvořena složka „{jmeno}“'
+                    + (f' v „{_cesta_text(_cesta(st["mapa"], rodic["id"]))}“' if rodic else ' (sekce)'))
+                dlg.close()
+                if rodic:
+                    strom.expand([_klic(rodic['id'])])     # ať je nová složka ve stromu vidět
+                await obnov()
+
+            vstup.on('keydown.enter', vytvor)
+            with ui.row().classes('w-full justify-end gap-2'):
+                ui.button('Zrušit', on_click=dlg.close).props('flat')
+                ui.button('Vytvořit', on_click=vytvor).props('color=primary')
+        dlg.on('hide', dlg.delete)
+        dlg.open()
+
+    def dialog_popisu():
+        """Popis otevřené složky (co v ní najdete) — píše ho správce složky."""
+        p = st['pohled']
+        if not p or p['id'] is None or not p['sprava'] or p['soubory'] is None or st['hledani']:
+            return
+        sid, cesta_txt = p['id'], _cesta_text(p['cesta'])
+        with koren, ui.dialog() as dlg, ui.card().classes('w-[34rem] max-w-full gap-3'):
+            ui.label('Popis složky').classes('text-lg font-bold text-gray-800')
+            ui.label(cesta_txt).classes('text-sm text-gray-500 -mt-2 break-words')
+            vstup = ui.textarea(placeholder='Co v této složce najdete a k čemu slouží…', value=p['popis']) \
+                .props(f'outlined autogrow autofocus counter maxlength={MAX_POPIS}').classes('w-full')
+
+            async def uloz():
+                r = await db(_uloz_popis, user_id, admin, sid, vstup.value or '', user_name)
+                if r is None:
+                    return
+                if r is not True:
+                    zprava(r)
+                    return
+                dlg.close()
+                intranet_logger.log_activity(user_name, _LOG, f'Změněn popis složky „{cesta_txt}“')
+                await obnov()
+
+            with ui.row().classes('w-full justify-end gap-2'):
+                ui.button('Zrušit', on_click=dlg.close).props('flat')
+                ui.button('Uložit', on_click=uloz).props('color=primary')
+        dlg.on('hide', dlg.delete)
+        dlg.open()
+
+    async def dialog_pristupu(s):
+        """Řízení přístupu ke složce (jen administrátor): kdo v ní je čtenář a kdo správce."""
+        if not admin or not s:
+            return
+        sid = s['id']
+        cesta_txt = _cesta_text(_cesta(st['mapa'], sid))
+        uzivatele = await db(_uzivatele)
+        if uzivatele is None:
+            return
+        stav = {'radky': [], 'shody': []}
+        with koren, ui.dialog() as dlg, ui.card().classes('w-[38rem] max-w-full gap-3'):
+            ui.label('Řízení přístupu').classes('text-lg font-bold text-gray-800')
+            ui.label(cesta_txt).classes('text-sm text-gray-500 -mt-2 break-words')
+            with ui.row().classes('w-full items-center gap-2 no-wrap'):
+                vstup = ui.input(placeholder='Přidat osobu — jméno nebo e-mail') \
+                    .props('outlined dense clearable autofocus').classes('flex-1')
+                role = ui.toggle(dict(_ROLE_VOLBY), value=ROLE_CTENAR) \
+                    .props('no-caps unelevated toggle-color=primary')
+            napoveda = ui.list().props('dense bordered separator').classes('w-full du-napoveda')
+            napoveda.set_visibility(False)
+            ui.label('Čtenář složku prohlíží a stahuje. Správce v ní navíc nahrává, upravuje, maže, '
+                     'přesouvá, zamyká a píše popis. Role platí i pro podsložky.') \
+                .classes('text-xs text-gray-500')
+            ui.label('Přístup mají (administrátoři úložiště vidí vše):') \
+                .classes('text-sm font-semibold text-gray-700 mt-1')
+
+            @ui.refreshable
+            def seznam():
+                if not stav['radky']:
+                    ui.label('Zatím nikdo.').classes('text-sm text-gray-400 italic')
+                for r in stav['radky']:
+                    with ui.row().classes('w-full items-center gap-2 no-wrap'):
+                        ui.icon('person', color='grey-6')
+                        with ui.column().classes('flex-1 min-w-0 gap-0'):
+                            ui.label(_jmeno_uctu(r)).classes('text-sm text-gray-800 truncate')
+                            zdedeno = f" · zděděno ze složky „{r['zdedeno']}“" if r['zdedeno'] else ''
+                            ui.label(f"{r['email'] or ''}{zdedeno}").classes('text-xs text-gray-500 truncate')
+                        if r['zdedeno'] or r['role'] not in _ROLE_VOLBY:
+                            ui.label(_ROLE.get(r['role'], r['role'])).classes('du-role text-sm text-gray-500')
+                        else:
+                            ui.select(dict(_ROLE_VOLBY), value=r['role'],
+                                      on_change=lambda e, r=r: zmen_roli(r, e.value)) \
+                                .props('dense borderless options-dense').classes('du-role')
+                        if not r['zdedeno']:
+                            ui.button(icon='person_remove', on_click=lambda r=r: odeber(r)) \
+                                .props('flat round dense color=negative').tooltip('Odebrat přístup')
+
+            seznam()
+            with ui.row().classes('w-full justify-end'):
+                ui.button('Zavřít', on_click=dlg.close).props('flat')
+
+        def napovez(text):
+            """Našeptávač: aktivní účty podle jména / e-mailu (od dvou znaků), bez těch,
+            kdo už do složky přístup mají přímo."""
+            text = str(text or '')
+            hledat = len(_abc(text).strip()) >= 2
+            vynech = {r['user_id'] for r in stav['radky'] if not r['zdedeno']}
+            stav['shody'] = _napoveda(uzivatele, text, vynech) if hledat else []
+            napoveda.clear()
+            with napoveda:
+                for u in stav['shody']:
+                    with ui.item(on_click=lambda u=u: pridej(u)):
+                        with ui.item_section().props('avatar'):
+                            ui.icon('person_add', color='primary')
+                        with ui.item_section():
+                            ui.item_label(_jmeno_uctu(u))
+                            ui.item_label(u['email'] or '').props('caption')
+                if hledat and not stav['shody']:
+                    with ui.item():
+                        ui.item_section('Nikdo takový — nebo už přístup má.').classes('text-sm text-gray-500')
+            napoveda.set_visibility(hledat)
+
+        async def nacti():
+            radky = await db(_pristupy, sid)
+            if radky is not None:
+                stav['radky'] = radky
+                seznam.refresh()
+
+        async def pridej(u):
+            nova = role.value if role.value in _ROLE_VOLBY else ROLE_CTENAR
+            jmeno = _jmeno_uctu(u)
+            r = await db(_pridej_pristup, sid, u['iduser'], user_name, nova)
+            if r is None:
+                return
+            if r == 'neni':
+                zprava('Složka mezitím zanikla — přístup nebyl přidán.', 'negative')
+                dlg.close()
+                await obnov()
+                return
+            if r == 'pridan':
+                if u['email']:
+                    background_tasks.create(
+                        asyncio.to_thread(_posli_email, u['email'], cesta_txt, sid, user_name),
+                        name='datuloziste.email')
+                intranet_logger.log_activity(user_name, _LOG, f'Přístup do „{cesta_txt}“ pro {jmeno} '
+                                                              f'({_ROLE[nova].lower()})')
+                zprava(f'Přístup přidán — {jmeno} ({_ROLE[nova].lower()}) dostane e-mail s odkazem.', 'positive')
+            else:
+                zprava(f'{jmeno} už do této složky přístup má — roli změníte v seznamu.', 'info')
+            vstup.value = ''
+            napovez('')
+            await nacti()
+
+        async def zmen_roli(r, nova):
+            if nova == r['role'] or nova not in _ROLE_VOLBY:
+                return
+            if await db(_nastav_roli, sid, r['user_id'], nova) is None:
+                return
+            intranet_logger.log_activity(user_name, _LOG, f'Změněna role v „{cesta_txt}“: '
+                                                          f'{_jmeno_uctu(r)} → {_ROLE[nova].lower()}')
+            zprava(f'{_jmeno_uctu(r)}: {_ROLE[nova].lower()}.', 'positive')
+            await nacti()
+
+        async def odeber(r):
+            if await db(_odeber_pristup, sid, r['user_id']) is None:
+                return
+            intranet_logger.log_activity(user_name, _LOG, f'Odebrán přístup do „{cesta_txt}“: {_jmeno_uctu(r)}')
+            await nacti()
+
+        vstup.on('update:model-value', lambda e: napovez(e.args), throttle=0.2, leading_events=False)
+        vstup.on('keydown.enter', lambda: pridej(stav['shody'][0]) if stav['shody'] else None)
+        dlg.on('hide', dlg.delete)
+        await nacti()
+        dlg.open()
+
+    async def dialog_historie(nazev, slozka_id=None, soubor_id=None):
+        """Historie změn (jen administrátor): souboru, složky se vším pod ní, nebo celého úložiště."""
+        if not admin:
+            return
+        zaznamy = await db(_historie, slozka_id, soubor_id)
+        if zaznamy is None:
+            return
+        with koren, ui.dialog() as dlg, ui.card().classes('w-[60rem] max-w-full gap-2'):
+            with ui.row().classes('w-full items-center no-wrap gap-3'):
+                ui.icon('history', size='26px').style('color: #0078d4')
+                with ui.column().classes('min-w-0 flex-1 gap-0'):
+                    ui.label('Historie změn').classes('text-lg font-bold text-gray-800')
+                    ui.label(nazev).classes('text-sm text-gray-500 break-words')
+                ui.button(icon='close', on_click=dlg.close).props('flat round dense')
+            tab = ui.table(columns=[dict(c) for c in _SLOUPCE_HISTORIE], rows=_radky_historie(zaznamy),
+                           row_key='id').props('flat dense hide-pagination').classes('du-historie w-full')
+            tab.add_slot('body', _SLOT_HISTORIE)
+            with tab.add_slot('no-data'):
+                ui.label('Zatím žádné změny.').classes('du-prazdno')
+            if len(zaznamy) >= 300:
+                ui.label('Zobrazeno posledních 300 změn.').classes('text-xs text-gray-500')
+        dlg.on('hide', dlg.delete)
+        dlg.open()
+
+    async def historie_slozky():
+        p = st['pohled']
+        if admin and p:
+            if p['id'] is None:
+                await dialog_historie('Celé úložiště')
+            else:
+                await dialog_historie(_cesta_text(p['cesta']), slozka_id=p['id'])
 
     # ---------- části stránky ----------
-    def polozka_menu(ikona, text, akce_klik, cervena=False):
-        """Položka kontextového menu volné plochy; vrací (položku, její popisek)."""
-        with ui.menu_item(on_click=akce_klik) as polozka:
+    def polozka_menu(ikona, text, klik, cervena=False):
+        """Položka kontextového menu volné plochy; klik = funkce, nebo JS (běží hned v prohlížeči —
+        výběr souborů k nahrání chce čerstvé gesto uživatele)."""
+        js = isinstance(klik, str)
+        with ui.menu_item(on_click=None if js else klik) as polozka:
             with ui.item_section().props('avatar'):
                 ui.icon(ikona)
-            popisek = ui.item_section(text)
+            ui.item_section(text)
+        if js:
+            polozka.on('click', js_handler=klik)
         if cervena:
             polozka.classes('du-cervena')
-        return polozka, popisek
+        return polozka
 
-    def pridej_menu_vyberu():
-        oddelovac = ui.separator()
-        smazat, popisek = polozka_menu('delete', '', smaz_vyber, cervena=True)
-        zrusit, _ = polozka_menu('deselect', 'Zrušit výběr', zrus_vyber)
-        for prvek in (oddelovac, smazat, zrusit):
-            prvek.set_visibility(False)
-        menu_vyberu.append((oddelovac, smazat, popisek, zrusit))
+    def nastav_menu(menu, polozky):
+        """Obsah kontextového menu (None = oddělovač); bez položek se neotevře vůbec
+        a zůstane menu prohlížeče."""
+        while polozky and polozky[0] is None:
+            polozky = polozky[1:]
+        podpis = tuple(x and (x[0], x[1], x[3]) for x in polozky)
+        if st['menu'].get(menu.id) == podpis:
+            return
+        st['menu'][menu.id] = podpis
+        menu.clear()
+        with menu:
+            for x in polozky:
+                if x is None:
+                    ui.separator()
+                else:
+                    polozka_menu(*x)
+        menu.props.set_bool('no-parent-event', not polozky)
+
+    def obnov_menu():
+        """Kontextová menu volné plochy seznamu a lišty se stromem podle toho, co teď jde."""
+        p, h = st['pohled'], st['hledani']
+        n = len(st['vyber'])
+        vyber = [None, ('drive_file_move', f'Přesunout vybrané ({n})…', presun_vyber, False),
+                 ('delete', f'Smazat vybrané ({n})', smaz_vyber, True),
+                 None, ('deselect', 'Zrušit výběr', zrus_vyber, False)] if n else []
+        plocha = []
+        if p and not h and p['sprava']:         # v kořeni sprava = administrátor (nová sekce)
+            plocha.append(('create_new_folder', _nova(aktualni()), lambda: dialog_nova_slozka(aktualni()), False))
+        if muze_nahravat():
+            plocha.append(('upload', 'Nahrát soubory', f'() => runMethod({upl.id}, "pickFiles", [])', False))
+        if p and not h and p['id'] is not None and p['sprava']:
+            plocha.append(('notes', 'Upravit popis složky' if p['popis'] else 'Přidat popis složky',
+                           dialog_popisu, False))
+        if admin and p and not h:
+            plocha.append(('history', 'Historie změn', historie_slozky, False))
+        nastav_menu(menu_plochy, plocha + vyber)
+        nastav_menu(menu_panelu, ([('create_new_folder', _nova(None), lambda: dialog_nova_slozka(None), False)]
+                                  if admin else []) + vyber)
 
     @ui.refreshable
     def zahlavi():
-        p = st['pohled']
-        body = [('koren', 'Datové úložiště')] + [(_klic(s['id']), s['nazev']) for s in (p['cesta'] if p else [])]
-        with ui.row().classes('du-hlava w-full items-center no-wrap gap-2'):
-            ui.button(icon='account_tree', color=None).props('flat round dense').classes('du-btn du-jen-mobil') \
-                .tooltip('Strom složek') \
-                .on('click', js_handler=f'() => getHtmlElement({panel.id}).classList.toggle("du-otevren")')
-            with ui.row().classes('items-center gap-0 min-w-0 flex-1'):
-                for i, (k, nazev) in enumerate(body):
+        """Drobečková navigace (ve výsledcích lupy jejich nadpis) a příkazy nad seznamem."""
+        p, h = st['pohled'], st['hledani']
+        with ui.row().classes('du-drobky items-center gap-0 min-w-0 flex-1 no-wrap'):
+            if h:
+                n = len(h['slozky']) + len(h['soubory'])
+                ui.label(f'Výsledky hledání „{h["text"]}“').classes('du-drobek du-drobek-akt ellipsis')
+                ui.label(f'({n}{"+" if len(h["soubory"]) >= 200 else ""})').classes('du-drobek')
+                ui.button(icon='close', color=None, on_click=zavri_hledani).props('flat round dense') \
+                    .classes('du-btn').tooltip('Zavřít hledání (Esc)')
+            else:
+                body = [(None, 'Datové úložiště')] + [(s['id'], s['nazev']) for s in (p['cesta'] if p else [])]
+                for i, (sid, jmeno) in enumerate(body):
                     if i:
                         ui.icon('chevron_right').classes('du-drobky-sep')
-                    ui.label(nazev).classes('du-drobek' + (' du-drobek-akt' if i == len(body) - 1 else '')) \
-                        .on('click', lambda k=k: otevri_klic(k))
-            if st['vyber']:     # lišta výběru (Ctrl+klik) — jako příkazový řádek SharePointu
-                with ui.row().classes('du-vyber items-center no-wrap'):
-                    ui.icon('check_circle', size='18px').classes('du-check')
-                    ui.label(_pocet(len(st['vyber']), 'vybraná položka', 'vybrané položky', 'vybraných položek'))
-                    ui.button('Smazat', icon='delete', color=None, on_click=smaz_vyber) \
-                        .props('flat dense no-caps').classes('du-btn').tooltip('Smazat vybrané (Delete)')
-                    ui.button(icon='close', color=None, on_click=zrus_vyber) \
-                        .props('flat round dense').classes('du-btn').tooltip('Zrušit výběr (Esc)')
-            if muze_nahravat():
-                ui.button('Nahrát', icon='upload', color=None).props('flat no-caps').classes('du-btn') \
-                    .on('click', js_handler=f'() => runMethod({upl.id}, "pickFiles", [])')
-        if p and p['id'] is not None and p['soubory'] is None:
+                    posledni = i == len(body) - 1
+                    drobek = ui.label(jmeno).classes('du-drobek' + (' du-drobek-akt' if posledni else '')) \
+                        .on('click', lambda sid=sid: otevri(sid))
+                    if not posledni and sid is not None and st['mapa'].get(sid, {}).get('sprava'):
+                        drobek.props(f'data-cil={_klic(sid)}')        # i sem jde položku přetáhnout
+        if st['vyber']:     # lišta výběru (Ctrl+klik) — jako příkazový řádek SharePointu
+            with ui.row().classes('du-vyber items-center no-wrap'):
+                ui.icon('check_circle', size='18px').classes('du-check')
+                ui.label(_pocet(len(st['vyber']), 'vybraná položka', 'vybrané položky', 'vybraných položek'))
+                ui.button('Přesunout', icon='drive_file_move', color=None, on_click=presun_vyber) \
+                    .props('flat dense no-caps').classes('du-btn').tooltip('Přesunout vybrané do jiné složky')
+                ui.button('Smazat', icon='delete', color=None, on_click=smaz_vyber) \
+                    .props('flat dense no-caps').classes('du-btn').tooltip('Smazat vybrané (Delete)')
+                ui.button(icon='close', color=None, on_click=zrus_vyber) \
+                    .props('flat round dense').classes('du-btn').tooltip('Zrušit výběr (Esc)')
+        if p and not h and p['soubory'] is not None and not p['sprava']:
+            with ui.row().classes('du-cteni items-center no-wrap'):
+                ui.icon('visibility', size='16px')
+                ui.label('Jen ke čtení')
+                ui.tooltip('Soubory si můžete prohlížet a stahovat; měnit je může správce složky.')
+        if muze_nahravat():
+            ui.button('Nahrát', icon='upload', color=None).props('flat no-caps').classes('du-btn') \
+                .on('click', js_handler=f'() => runMethod({upl.id}, "pickFiles", [])')
+        if admin and p and not h:
+            ui.button(icon='history', color=None, on_click=historie_slozky).props('flat round dense') \
+                .classes('du-btn').tooltip('Historie změn' + ('' if p['id'] is not None else ' celého úložiště'))
+
+    @ui.refreshable
+    def pod_hlavou():
+        """Pod záhlavím: popis složky (správce ho píše), nebo upozornění u průchozí složky."""
+        p = st['pohled']
+        if not p or st['hledani'] or p['id'] is None:
+            return
+        if p['soubory'] is None:
             with ui.row().classes('du-info items-center no-wrap'):
                 ui.icon('info', size='18px').style('color: #0078d4')
                 ui.label('Vidíte jen cestu ke složkám, do kterých máte přístup.')
+        elif p['popis']:
+            with ui.row().classes('du-popis items-start no-wrap'):
+                ui.icon('notes', size='20px').classes('du-popis-ikona')
+                ui.label(p['popis']).classes('du-popis-text flex-1 min-w-0')
+                if p['sprava']:
+                    ui.button(icon='edit', color=None, on_click=dialog_popisu).props('flat round dense size=sm') \
+                        .classes('du-btn').tooltip('Upravit popis složky')
+        elif p['sprava']:
+            ui.button('Přidat popis složky', icon='add', color=None, on_click=dialog_popisu) \
+                .props('flat dense no-caps size=sm').classes('du-pridat-popis')
 
     with koren:
         upl = ui.upload(multiple=True, auto_upload=True, max_file_size=MAX_VELIKOST,
@@ -1860,14 +3084,20 @@ async def vykresli(user_id, user_name, vsechna_prava):
                     .props('no-connectors no-selection-unset icon=chevron_right').classes('du-strom')
                 strom.add_slot('default-header', _SLOT_UZEL.replace('EMIT', f'$root.$refs.r{strom.id}.$emit'))
                 strom.on('akce', akce)
-                if spravce:     # pravý klik kamkoli do lišty mimo složky (i na kořen) = nová sekce
-                    with ui.context_menu().classes('du-menu'):
-                        polozka_menu('create_new_folder', _nova(None), lambda: dialog_nova_slozka(None))
-                        pridej_menu_vyberu()
-                    panel.on('contextmenu.capture', js_handler=_JS_MENU_RADKU_STROMU)
+                menu_panelu = ui.context_menu().classes('du-menu')     # pravý klik do volné části lišty
+                panel.on('contextmenu.capture', js_handler=_JS_MENU_RADKU_STROMU)
 
             with ui.element('div').classes('du-obsah') as obsah:
-                zahlavi()
+                with ui.row().classes('du-hlava w-full items-center no-wrap gap-2'):
+                    ui.button(icon='account_tree', color=None).props('flat round dense') \
+                        .classes('du-btn du-jen-mobil').tooltip('Strom složek') \
+                        .on('click', js_handler=f'() => getHtmlElement({panel.id}).classList.toggle("du-otevren")')
+                    zahlavi()
+                    hledani = ui.input(placeholder='Hledat v úložišti') \
+                        .props('dense outlined clearable bg-color=white').classes('du-hledani')
+                    with hledani.add_slot('prepend'):
+                        ui.icon('search', size='20px')
+                pod_hlavou()
                 tabulka = ui.table(columns=[dict(c) for c in _SLOUPCE], rows=[], row_key='klic') \
                     .props('flat').classes('du-tabulka w-full')
                 tabulka.props[':sort-method'] = _RAZENI
@@ -1875,33 +3105,40 @@ async def vykresli(user_id, user_name, vsechna_prava):
                 with tabulka.add_slot('no-data'):
                     prazdno = ui.label('Načítám…').classes('du-prazdno')
                 tabulka.on('akce', akce)
+                menu_plochy = ui.context_menu().classes('du-menu')     # řádky mají svá menu
+            nastav_menu(menu_panelu, [])
+            nastav_menu(menu_plochy, [])
 
-                menu_plochy = None
-                if spravce:     # pravý klik do volné plochy (řádky si menu řeší samy)
-                    with ui.context_menu().classes('du-menu'):
-                        _, menu_plochy = polozka_menu('create_new_folder', _nova(None),
-                                                      lambda: dialog_nova_slozka(aktualni()))
-                        pridej_menu_vyberu()
-
-            # Přetažení souborů do seznamu = nahrání (jen ve složce s plným přístupem);
-            # jinde se drop jen zablokuje, aby prohlížeč soubor neotevřel místo aplikace.
-            obsah.on('dragover', js_handler='(e) => { e.preventDefault(); '
-                     'const ok = e.currentTarget.classList.contains("du-nahravani"); '
+            # Soubory přetažené z počítače do seznamu = nahrání (jen tam, kam uživatel smí
+            # nahrávat); jinde se drop jen zablokuje, aby prohlížeč soubor neotevřel místo
+            # aplikace. Přetahování položek uvnitř úložiště řeší kořen modulu (_JS_TAH).
+            obsah.on('dragover', js_handler='(e) => { if (!e.dataTransfer.types.includes("Files")) return; '
+                     'e.preventDefault(); const ok = e.currentTarget.classList.contains("du-nahravani"); '
                      'e.dataTransfer.dropEffect = ok ? "copy" : "none"; '
                      'e.currentTarget.classList.toggle("du-drop", ok); }')
             obsah.on('dragleave', js_handler='(e) => { if (!e.currentTarget.contains(e.relatedTarget)) '
                      'e.currentTarget.classList.remove("du-drop"); }')
-            obsah.on('drop', js_handler='(e) => { e.preventDefault(); e.currentTarget.classList.remove("du-drop"); '
+            obsah.on('drop', js_handler='(e) => { if (!e.dataTransfer.types.includes("Files")) return; '
+                     'e.preventDefault(); e.currentTarget.classList.remove("du-drop"); '
                      'if (e.currentTarget.classList.contains("du-nahravani") && e.dataTransfer.files.length) '
                      f'runMethod({upl.id}, "addFiles", [e.dataTransfer.files]); }}')
-            panel.on('dragover', js_handler='(e) => { e.preventDefault(); e.dataTransfer.dropEffect = "none"; }')
+            panel.on('dragover', js_handler='(e) => { if (e.dataTransfer.types.includes("Files")) { '
+                     'e.preventDefault(); e.dataTransfer.dropEffect = "none"; } }')
 
-    # Výběr Ctrl+klikem a klávesy Delete / Esc (tabindex: klik do modulu ho zaměří).
+    # Výběr Ctrl+klikem, klávesy Delete / Esc (tabindex: klik do modulu ho zaměří), přetahování.
     koren.props('tabindex=-1')
-    koren.on('click.capture', prepni_vyber, js_handler=_JS_VYBER.replace('SPRAVCE', str(spravce).lower()))
+    koren.on('click.capture', prepni_vyber, js_handler=_JS_VYBER)
     koren.on('keydown', klavesa, js_handler=_JS_KLAVESA)
+    koren.on('dragstart', js_handler=_JS_TAH_START)
+    for udalost in ('dragover', 'dragleave', 'dragend'):
+        koren.on(udalost, js_handler=_JS_TAH)
+    koren.on('drop', pretazeni, js_handler=_JS_TAH)
+    # Lupa hledá už při psaní (s malou prodlevou), Enter hned, Esc ji zavře.
+    hledani.on('update:model-value', lambda e: hledej(e.args), throttle=0.4, leading_events=False)
+    hledani.on('keydown.enter', lambda: hledej(hledani.value))
+    hledani.on('keydown.esc', zavri_hledani)
     with koren:
-        ui.timer(3, hlidej)     # uložení z Office se v otevřené složce ukáže samo
+        ui.timer(3, hlidej)     # změny odjinud (Office, další uživatelé) se v otevřené složce ukážou samy
 
     await otevri(start if isinstance(start, int) else None)
     # Průchozí složky (cesta k vlastním složkám) rovnou rozbalit — uživatel vidí jen svou větev.
@@ -1911,22 +3148,69 @@ async def vykresli(user_id, user_name, vsechna_prava):
 if __name__ == '__main__':
     # ASM(1) → Obchod(2) → Nákupčí(3) → Novák(4) / Novotný(5); Novák → Archiv(6); Logistika(7)
     r = {1: None, 2: 1, 3: 2, 4: 3, 5: 3, 6: 4, 7: None}
-    assert viditelnost(r, [4]) == ({4, 6}, {1, 2, 3})       # Novotný(5) ani Logistika(7) ne
-    assert viditelnost(r, [99]) == (set(), set())            # neexistující složka nic neotevře
-    assert viditelnost(r, [2, 4]) == ({2, 3, 4, 5, 6}, {1})
-    _strom = [{'id': i, 'parent_id': p, 'nazev': n} for i, p, n in
-              ((1, None, 'ASM'), (2, 1, 'Obchod'), (3, 2, 'Nákupčí'), (4, 3, 'Novák'))]
+    S, C = ROLE_SPRAVCE, ROLE_CTENAR
+    assert viditelnost(r, {4: C}) == ({4, 6}, set(), {1, 2, 3})         # Novotný(5) ani Logistika(7) ne
+    assert viditelnost(r, {99: S}) == (set(), set(), set())              # neexistující složka nic neotevře
+    assert viditelnost(r, {2: C, 4: S}) == ({2, 3, 4, 5, 6}, {4, 6}, {1})
+    assert viditelnost(r, {2: S, 4: C}) == ({2, 3, 4, 5, 6}, {2, 3, 4, 5, 6}, {1})    # platí vyšší role
+    assert _podstrom(r, [3]) == {3, 4, 5, 6} and _podstrom(r, [99]) == set()
+    assert _predci(r, 6) == [4, 3, 2, 1] and _predci({1: 2, 2: 1}, 1) == [2, 1]     # cyklus nezacyklí
+    # Uživatel spravuje Nákupčího (3): ASM a Obchod jsou jen cesta, Nováka smí přesunout, Nákupčího ne.
+    _strom = [{'id': i, 'parent_id': p, 'nazev': n, 'plny': i >= 3, 'sprava': i >= 3, 'muze': i >= 4}
+              for i, p, n in ((1, None, 'ASM'), (2, 1, 'Obchod'), (3, 2, 'Nákupčí'), (4, 3, 'Novák'))]
     _u = _uzly_stromu(_strom, False)[0]
-    assert _u['id'] == 'koren' and _u['children'][0]['children'][0]['children'][0]['label'] == 'Nákupčí'
+    _asm = _u['children'][0]
+    _nakupci = _asm['children'][0]['children'][0]
+    assert _u['id'] == 'koren' and _u['menu'] is False and _nakupci['label'] == 'Nákupčí'
+    assert (_asm['nova'], _asm['cil'], _asm['muze']) == ('', False, False)
+    assert (_nakupci['nova'], _nakupci['cil'], _nakupci['muze']) == ('Vytvořit podsložku', True, False)
+    assert _nakupci['children'][0]['muze'] and not _nakupci['admin']
+    _u = _uzly_stromu(_strom, True, {'s2', 's4'})[0]
+    _obchod = _u['children'][0]['children'][0]
+    assert _obchod['vyb'] and _obchod['nvyb'] == 2 and not _u['children'][0].get('vyb') and _obchod['admin']
+    _c = _uzly_cilu(_strom, _podstrom({s['id']: s['parent_id'] for s in _strom}, [4]))[0]
+    _c3 = _c['children'][0]['children'][0]
+    assert (_c['selectable'], _c3['selectable'], _c3['children'][0]['selectable']) == (False, True, False)
     assert [_id('s12', 's'), _id('f7', 'f'), _id('s12', 'f'), _id('sx', 's'), _id(None, 's')] == [12, 7, None, None, None]
     assert [_polozky(n) for n in (0, 1, 3, 5)] == ['0 položek', '1 položka', '3 položky', '5 položek']
     assert [_nova(None), _nova(_strom[0], True), _nova(_strom[1])] == ['Vytvořit sekci', 'Nová složka', 'Vytvořit podsložku']
-    assert _podstrom(r, [3]) == {3, 4, 5, 6} and _podstrom(r, [99]) == set()
-    assert _predci(r, 6) == [4, 3, 2, 1] and _predci({1: 2, 2: 1}, 1) == [2, 1]     # cyklus nezacyklí
-    _u = _uzly_stromu(_strom, True, {'s2', 's4'})[0]
-    assert _u['menu'] is False                                  # kořen = menu lišty, ne vlastní
-    _obchod = _u['children'][0]['children'][0]
-    assert _obchod['vyb'] and _obchod['nvyb'] == 2 and not _u['children'][0].get('vyb')
+    # Soubory: zamknout smí, kdo nahrál (a je správce), odemknout, kdo zamkl; administrátor vše.
+    _ted = datetime.datetime.now()
+    _soubory = [{'id': i, 'slozka_id': 3, 'nazev': f'{i}.xlsx', 'velikost': 2048, 'nahral': 'Jan', 'nahrano': _ted,
+                 'vlozil_id': v, 'zamkl_id': z, 'zamkl': 'Eva' if z else None, 'zamceno': _ted if z else None}
+                for i, v, z in ((1, 5, None), (2, 6, None), (3, 5, 6))]
+    _p = {'id': 3, 'sprava': True, 'slozky': [], 'soubory': _soubory}
+    _r = {x['klic']: x for x in _radky(_p, False, 5)}
+    assert [_r[k]['zamknout'] for k in ('f1', 'f2', 'f3')] == [True, False, False]
+    assert (_r['f3']['odemknout'], _r['f3']['smaz'], _r['f3']['muze'], _r['f3']['upravy']) == (False, False, True, False)
+    assert not _r['f3']['presun'] and _r['f1']['presun']       # uzamčený: bez „Přesunout…“, nejde táhnout
+    assert 'Eva' in _r['f3']['zamceno'] and _r['f1']['app'] == 'Excel' and _r['f1']['upravy']
+    assert _radky(_p, False, 6)[2]['odemknout'] and _radky(_p, True, 1)[1]['zamknout']
+    assert _radky(_p, False, 5, mobil=True)[0]['app'] == ''
+    _p['sprava'] = False        # čtenář: jen otevřít a stáhnout
+    assert not any(x['muze'] or x['smaz'] or x['presun'] or x['zamknout'] or x['upravy'] for x in _radky(_p, False, 5))
+    # Výsledky lupy: právo a umístění nese každý soubor zvlášť.
+    _h = _radky({'slozky': [], 'soubory': [dict(_soubory[0], sprava=True, misto='ASM / Obchod')]}, False, 5)
+    assert _h[0]['muze'] and _h[0]['misto'] == 'ASM / Obchod'
+    _lide = [{'iduser': 1, 'name': 'Šimon', 'surname': 'Novák', 'email': 'simon.novak@x.cz'},
+             {'iduser': 2, 'name': 'Jana', 'surname': 'Nováková', 'email': 'jana@x.cz'},
+             {'iduser': 3, 'name': 'Petr', 'surname': 'Svoboda', 'email': 'petr@x.cz'}]
+    assert [u['iduser'] for u in _napoveda(_lide, 'novak')] == [1, 2]
+    assert [u['iduser'] for u in _napoveda(_lide, 'SIMON nov')] == [1] and _napoveda(_lide, '  ') == []
+    assert [u['iduser'] for u in _napoveda(_lide, 'nov', vynech={1})] == [2]
+    assert _jmeno_uctu(_lide[0]) == 'Šimon Novák' and _jmeno_uctu({'name': None, 'surname': '', 'email': 'a@b'}) == 'a@b'
+    assert _nadpis_presunu(['a.pdf']) == 'Přesunout „a.pdf“' and _nadpis_presunu(['a', 'b', 'c']) == 'Přesunout 3 položky'
+    assert _hlaska_presunu({'presunuto': [{'nazev': 'a'}, {'nazev': 'b'}], 'cil': 'ASM'}) == 'Přesunuto do „ASM“: 2 položky.'
+    _hist = _radky_historie([{'id': 1, 'kdy': _ted, 'kdo': 'Jan', 'akce': 'zamceno', 'nazev': 'a.xlsx',
+                              'misto': '', 'detail': None}])
+    assert (_hist[0]['akce'], _hist[0]['ikona'], _hist[0]['misto'], _hist[0]['detail']) == ('Uzamčeno', 'lock', 'Datové úložiště', '')
+    # Čekající nahrané verze: každou jde vyzvednout jen jednou.
+    _CEKAJICI.clear()
+    _odloz(('u', 'k'), {'disk': 'x1', 'id': 1})
+    _odloz(('u', 'k'), {'disk': 'x2', 'id': 2})
+    _a = list(_CEKAJICI[('u', 'k')])
+    assert _vyzvedni(('u', 'k'), _a[:1]) == _a[:1] and _CEKAJICI[('u', 'k')] == _a[1:]
+    assert _vyzvedni(('u', 'k'), _a[:1]) == [] and _vyzvedni(('u', 'k'), _a) == _a[1:] and ('u', 'k') not in _CEKAJICI
     _plan = {'polozky': [{'typ': 0, 'id': 2, 'nazev': 'Obchod', 'sekce': False, 'misto': 'ASM',
                           'podslozky': 3, 'soubory': 1, 'pristupy': 2},
                          {'typ': 1, 'id': 7, 'nazev': 'a.pdf', 'misto': 'ASM'}]}
@@ -1934,9 +3218,15 @@ if __name__ == '__main__':
                                    ['Smaže se i obsah: 3 podsložky a 1 soubor.',
                                     'Zruší se 2 udělené přístupy.', 'Akci nelze vrátit zpět.'])
     assert _text_mazani({'polozky': _plan['polozky'][1:]})[0] == 'Opravdu smazat soubor „a.pdf“?'
+    assert _hlaska_zamcene(['a.xlsx'], 'přesunout') == ('Nejde přesunout — 1 uzamčený soubor: „a.xlsx“. '
+                                                        'Odemknout ho může ten, kdo ho uzamkl, nebo administrátor.')
+    assert _hlaska_zamcene(list('abcd'), 'smazat') == ('Nejde smazat — 4 uzamčené soubory: „a“, „b“, „c“ a 1 další. '
+                                                       'Odemknout je může ten, kdo je uzamkl, nebo administrátor.')
+    # Šablony: všechny zástupné značky nahrazené.
+    assert not any(z in _SLOT_UZEL + _SLOT_RADEK for z in ('VYBER', 'SLOZKA', 'SOUBOR', 'KLIC', 'X.'))
     # Token pro Office: platný, prošlý, podvržený, nesmysl.
     _t = _token(7, 3, ted=1000)
-    assert _over_token(_t, ted=1000) == (7, 3) and _over_token(_t, ted=1001 + _TOKEN_PLATNOST) is None
+    assert _over_token(_t, ted=1000) == (7, 3, 1000) and _over_token(_t, ted=1001 + _TOKEN_PLATNOST) is None
     assert _over_token('8' + _t[1:], ted=1000) is None
     assert all(_over_token(x) is None for x in (None, '', 'a.b', '1.2.3', '1.2.x.yy', 'č.ř'))
     assert [_timeout(x) for x in ('Second-120', 'Infinite, Second-4100000000', 'Second-5', None, 'Second-x')] \
