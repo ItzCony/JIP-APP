@@ -2,7 +2,7 @@
 
   • KUPI   (Kupi …-vše.xlsm,               list „porovnání")
   • MAKRO  (Makro-…-vše.xlsm,              listy „makro-akce" + „makro-ceny")
-  • VO     (Monitor VO letáky …-vše.xlsm,  list „porovnání")
+  • VO     (Monitor VO letáky …-vše.xlsb,  list „porovnání"; formáty z monitor_vo_sablona.xlsx)
   • TAMDA  (Porovnání tamda …-vše.xlsb,    list „porovnání")
 
 Princip je stejný jako u Sankcí → „Nedodávky dod. k vyjádření": nahraje se
@@ -31,6 +31,7 @@ import intranet_sankce
 from intranet_ui_utils import prekryv_kolecko, refreshable_na_klienta
 import datetime
 import hashlib
+import os
 import inspect
 import io
 import re
@@ -83,6 +84,8 @@ MONITORY = OrderedDict([
     ('vo', {
         'nazev': 'VO letáky', 'emoji': '📰', 'tabulka': 'monitor_vo',
         'listy': ('porovnání',), 'klic': ('kod', 'k2', 'id', 'dodavatel'),
+        # Sestava chodí jako .xlsb, který styly nenese — formáty bere odsud.
+        'sablona_xlsb': 'monitor_vo_sablona.xlsx',
         'border': 'border-emerald-200', 'btn': 'bg-emerald-600 hover:bg-emerald-700',
     }),
     ('tamda', {
@@ -172,35 +175,82 @@ def _obdobi_z_nazvu(nazev: str) -> tuple:
 # všechno podstatné — styly, vzorce, podmíněné formátování, šířky sloupců,
 # příčky. Export pak jen dosype řádky a vzorce přeloží na jejich čísla řádků.
 # Zároveň si vytáhnu formáty čísel a CF pravidla pro zobrazení v gridu.
+_ADRESAR = os.path.dirname(os.path.abspath(__file__))
 _SABLONA_MAX = 8 * 1024 * 1024        # pojistka proti obřím sešitům v DB
+_CHYBY_XL = {'#N/A', '#DIV/0!', '#VALUE!', '#REF!', '#NAME?', '#NUM!', '#NULL!'}
 _CF_ZNAK = {'lessThan': '<', 'lessThanOrEqual': '<=', 'greaterThan': '>',
             'greaterThanOrEqual': '>=', 'equal': '==', 'notEqual': '!='}
 
 
-def _barva(o):
+def _paleta(wb) -> list:
+    """Barvy motivu sešitu v pořadí, jak je čísluje `theme=` v buňkách.
+    Excel prohazuje první dvě dvojice: 0=lt1, 1=dk1, 2=lt2, 3=dk2, pak
+    accent1–6, hlink, folHlink — v XML jsou ale dk1, lt1, dk2, lt2, …"""
+    import xml.etree.ElementTree as ET
+    try:
+        koren = ET.fromstring(wb.loaded_theme)
+    except Exception:
+        return []
+    a = '{http://schemas.openxmlformats.org/drawingml/2006/main}'
+    schema = koren.find(f'.//{a}clrScheme')
+    if schema is None:
+        return []
+    barvy = {}
+    for el in schema:
+        for c in el:
+            hexa = c.get('lastClr') or c.get('val')
+            if hexa and len(hexa) == 6:
+                barvy[el.tag.replace(a, '')] = hexa.upper()
+    poradi = ['lt1', 'dk1', 'lt2', 'dk2', 'accent1', 'accent2', 'accent3',
+              'accent4', 'accent5', 'accent6', 'hlink', 'folHlink']
+    return [barvy.get(n) for n in poradi]
+
+
+def _odstin(hexa: str, tint: float) -> str:
+    """Excelový tint: zesvětlení/ztmavení v HLS (stejně jako Excel a POI)."""
+    import colorsys
+    r, g, b = (int(hexa[i:i + 2], 16) / 255 for i in (0, 2, 4))
+    h, l, s = colorsys.rgb_to_hls(r, g, b)
+    l = l * (1 + tint) if tint < 0 else l * (1 - tint) + tint
+    return '%02X%02X%02X' % tuple(round(x * 255) for x in colorsys.hls_to_rgb(h, l, s))
+
+
+def _barva(o, paleta: list = None):
     """openpyxl Color → '#RRGGBB', nebo None. Color.rgb vrací u theme/auto
     barev místo None hlášku descriptoru ("Values must be of type <class
     'str'>"). Ta je pravdivostně true, takže se z ní dřív skládalo CSS
-    `#'str'>` a prohlížeč pravidlo zahodil. Beru jen skutečný hex — theme
-    barvy grid nekreslí, v exportu zůstanou přes šablonu."""
-    rgb = getattr(o, 'rgb', None) if o is not None else None
-    if not isinstance(rgb, str) or len(rgb) not in (6, 8):
+    `#'str'>` a prohlížeč pravidlo zahodil — proto se dívám na `type`.
+    Theme barvy se dopočtou z `paleta` (viz `_paleta`), bez ní se zahodí."""
+    if o is None:
         return None
-    hexa = rgb[-6:]
+    typ = getattr(o, 'type', None)
+    hexa = None
+    if typ == 'rgb' and isinstance(o.rgb, str) and len(o.rgb) in (6, 8):
+        hexa = o.rgb[-6:]
+    elif typ == 'theme' and paleta and isinstance(o.theme, int) \
+            and o.theme < len(paleta):
+        hexa = paleta[o.theme]
+    elif typ == 'indexed' and isinstance(o.indexed, int) and o.indexed < 64:
+        from openpyxl.styles.colors import COLOR_INDEX
+        hexa = COLOR_INDEX[o.indexed][-6:]
+    if not hexa:
+        return None
     try:
         int(hexa, 16)
     except ValueError:
         return None
-    return '#' + hexa
+    if o.tint:
+        hexa = _odstin(hexa, o.tint)
+    return '#' + hexa.upper()
 
 
-def _bunka_styl(bunka) -> dict:
+def _bunka_styl(bunka, paleta: list = None) -> dict:
     """Statický styl buňky ze sešitu → CSS dict pro grid. Bílou výplň a černé
     písmo vynechávám — to grid kreslí tak jako tak a jen by to nafouklo meta."""
     s = {}
     f = bunka.fill
     if f is not None and f.patternType == 'solid':
-        bg = _barva(f.fgColor)
+        bg = _barva(f.fgColor, paleta)
         if bg and bg != '#FFFFFF':
             s['backgroundColor'] = bg
     font = bunka.font
@@ -209,7 +259,7 @@ def _bunka_styl(bunka) -> dict:
             s['fontWeight'] = 'bold'
         if font.i:
             s['fontStyle'] = 'italic'
-        fg = _barva(font.color)
+        fg = _barva(font.color, paleta)
         if fg and fg != '#000000':
             s['color'] = fg
     al = bunka.alignment.horizontal if bunka.alignment is not None else None
@@ -218,20 +268,22 @@ def _bunka_styl(bunka) -> dict:
     return s
 
 
-def _cf_pravidlo(r):
+def _cf_pravidlo(r, paleta: list = None):
     """CF pravidlo z openpyxl → jednoduchý dict pro grid, nebo None (dataBary,
     barevné škály a pravidla bez viditelného formátu grid nekreslí — v exportu
-    zůstanou, ty jedou přes šablonu)."""
+    zůstanou, ty jedou přes šablonu). `prio`/`stop` nesou pořadí a stopIfTrue,
+    podle nich `_cf_js` skládá styl stejně jako Excel."""
 
     dxf = getattr(r, 'dxf', None)
     if dxf is None:
         return None
-    bg = _barva(dxf.fill.bgColor) if dxf.fill is not None else None
-    fg = _barva(dxf.font.color) if dxf.font is not None else None
+    bg = _barva(dxf.fill.bgColor, paleta) if dxf.fill is not None else None
+    fg = _barva(dxf.font.color, paleta) if dxf.font is not None else None
     tucne = bool(dxf.font.b) if dxf.font is not None else False
     if not (bg or fg or tucne):
         return None
-    p = {'bg': bg, 'fg': fg, 'b': tucne}
+    p = {'bg': bg, 'fg': fg, 'b': tucne, 'prio': r.priority or 0,
+         'stop': bool(r.stopIfTrue)}
     if r.type == 'containsText' and r.text:
         return dict(p, op='contains', v=r.text)
     if r.type == 'cellIs' and r.formula:
@@ -256,6 +308,7 @@ def _sablona_a_styly(raw: bytes):
         return None, {}
 
     styly = {}
+    paleta = _paleta(wb)
     for ws in wb.worksheets:
         fmt, cf, hdr, bunky = {}, {}, {}, {}
         for c in range(1, (ws.max_column or 0) + 1):
@@ -264,23 +317,29 @@ def _sablona_a_styly(raw: bytes):
             if f and f != 'General':
                 fmt[pismeno] = f
             # Hlavička z řádku 1, statický styl dat ze vzorového řádku 2.
-            h = _bunka_styl(ws.cell(1, c))
+            h = _bunka_styl(ws.cell(1, c), paleta)
             if h:
                 hdr[pismeno] = h
-            b = _bunka_styl(ws.cell(2, c))
+            b = _bunka_styl(ws.cell(2, c), paleta)
             if b:
                 bunky[pismeno] = b
         for rng in ws.conditional_formatting:
             for r in rng.rules:
-                pravidlo = _cf_pravidlo(r)
+                pravidlo = _cf_pravidlo(r, paleta)
                 if not pravidlo:
                     continue
                 for sq in str(rng.sqref).split():
                     c1, _, c2, _ = range_boundaries(sq)
                     for c in range(c1, c2 + 1):
                         cf.setdefault(get_column_letter(c), []).append(pravidlo)
+        # Priorita je v Excelu napříč celým listem — pravidla z různých
+        # rozsahů na jednom sloupci se řadí podle ní, ne podle pořadí v XML.
+        for pravidla in cf.values():
+            pravidla.sort(key=lambda p: p['prio'])
         styly[_norm(ws.title)] = {'fmt': fmt, 'cf': cf, 'hdr': hdr,
-                                  'bunka': bunky}
+                                  'bunka': bunky,
+                                  'hlavicka': [_s(ws.cell(1, c).value).strip()
+                                               for c in range(1, (ws.max_column or 0) + 1)]}
 
         # Ořez na hlavičku + vzorový řádek. `_cells` sahám záměrně přímo —
         # delete_rows() přeskládává buňky po jedné a u 20 tisíc řádků to trvá
@@ -453,6 +512,19 @@ def _uloz_sablonu(tabulka: str, pripona: str, data: bytes):
         conn.close()
 
 
+def _smaz_sablonu(tabulka: str):
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return
+    try:
+        cur = conn.cursor()
+        cur.execute(f'DELETE FROM {_SABLONA_TABULKA} WHERE tabulka=%s', (tabulka,))
+        conn.commit()
+        cur.close()
+    finally:
+        conn.close()
+
+
 def _nacti_sablonu(tabulka: str):
     """(bajty, přípona) posledního importovaného sešitu, nebo (None, None)."""
     conn = intranet_data.get_db_connection()
@@ -580,13 +652,20 @@ def _importuj_sync(raw: bytes, typ: str, obdobi: str, od_iso: str, do_iso: str,
     celkem, hotove = 0, []
 
     # Šablona pro export 1:1. .xlsb openpyxl neotevře a pyxlsb styly nečte —
-    # tam zůstane export bez formátů (viz _export_monitor_xlsx).
+    # u monitorů s přibalenou šablonou (převod originálu do .xlsx) se formáty,
+    # barvy i CF vezmou z ní, jinak zůstane export bez formátů.
     pripona = (nazev_souboru.rsplit('.', 1)[-1] or '').lower()
-    styly_listu = {}
+    styly_listu, sablona_xlsb = {}, None
     if pripona in ('xlsx', 'xlsm'):
         sablona, styly_listu = _sablona_a_styly(raw)
         if sablona:
             _uloz_sablonu(tabulka, pripona, sablona)
+    elif spec.get('sablona_xlsb'):
+        try:
+            with open(os.path.join(_ADRESAR, spec['sablona_xlsb']), 'rb') as f:
+                sablona_xlsb, styly_listu = _sablona_a_styly(f.read())
+        except OSError as e:
+            print(f'[monitory] Přibalená šablona chybí ({e}) — import bez formátů.')
 
     conn = intranet_data.get_db_connection()
     if not conn:
@@ -630,6 +709,10 @@ def _importuj_sync(raw: bytes, typ: str, obdobi: str, od_iso: str, do_iso: str,
                         if not txt:
                             continue
                         data[k] = txt
+                        # Chyba vzorce o typu sloupce nerozhoduje — Makro má
+                        # #N/A ve 40 % řádků a marže by jinak byly „text".
+                        if txt in _CHYBY_XL:
+                            continue
                         cisla[k][1] += 1
                         if _f(txt) is not None:
                             cisla[k][0] += 1
@@ -677,6 +760,23 @@ def _importuj_sync(raw: bytes, typ: str, obdobi: str, od_iso: str, do_iso: str,
             st = styly_listu.get(_norm(nazev_listu))
             if st is None and len(styly_listu) == 1:
                 st = next(iter(styly_listu.values()))
+            if sablona_xlsb:
+                # Přibalená šablona platí jen pro hlavičku, ze které vznikla —
+                # styly i export jdou po pozici sloupce, posunutý sloupec by
+                # dostal cizí formát.
+                def _hl(seznam):
+                    hl = [_norm(_s(h).strip()) for h in seznam]
+                    while hl and not hl[-1]:
+                        hl.pop()
+                    return hl
+                if st and _hl(st.get('hlavicka', [])) == _hl(header):
+                    _uloz_sablonu(tabulka, 'xlsx', sablona_xlsb)
+                else:
+                    # Stará šablona v DB by v exportu nalila data pod cizí nadpisy.
+                    print(f'[monitory] Hlavička „{nazev_listu}" neodpovídá přibalené '
+                          f'šabloně — import bez formátů, aktualizuj {spec["sablona_xlsb"]}.')
+                    _smaz_sablonu(tabulka)
+                    st = None
             _uloz_meta(tabulka, nazev_listu, [
                 {'k': k, 'h': h, 'num': cisla[k][1] > 0 and cisla[k][0] >= cisla[k][1] * 0.8}
                 for k, h in zip(klice, popisky)
@@ -969,9 +1069,12 @@ def _fmt_js(fmt: str):
 
 
 def _cf_js(pravidla: list, zaklad: dict = None):
-    """CF pravidla → JS cellStyle. První pravidlo, které sedí, vyhrává —
-    stejné pořadí jako v Excelu. `zaklad` je statický styl buňky: CF v Excelu
-    přepíše jen to, co dxf nese, zbytek (tučné, zarovnání) zůstává."""
+    """CF pravidla → JS cellStyle, sémantika jako v Excelu: pravidla jdou
+    podle priority a platí všechna, která sedí; o stejnou vlastnost (pozadí,
+    písmo, tučné) rozhoduje to s vyšší prioritou a stopIfTrue další utne.
+    Makro tak má na marži „< 0 růžová, stop" před „< 0,13 tučně" — dřív
+    vyhrálo první shodné v pořadí z XML a záporné marže nezrůžověly.
+    `zaklad` je statický styl buňky: CF přepíše jen to, co dxf nese."""
     vetve = []
     for p in pravidla:
         if p.get('op') == 'contains':
@@ -983,18 +1086,24 @@ def _cf_js(pravidla: list, zaklad: dict = None):
             if not znak or p.get('v') is None:
                 continue
             podm = f"!isNaN(v) && v {znak} {p['v']}"
-        styl = dict(zaklad or {})
+        styl = {}
         if p.get('bg'):
             styl['backgroundColor'] = p['bg']
         if p.get('fg'):
             styl['color'] = p['fg']
         if p.get('b'):
             styl['fontWeight'] = 'bold'
-        vetve.append(f"if ({podm}) return {json.dumps(styl)};")
+        konec = ' return h();' if p.get('stop') else ''
+        vetve.append(f"if ({podm}) {{ d({json.dumps(styl)});{konec} }}")
     if not vetve:
         return None
-    return ("(p) => { const v = Number(p.value); " + ' '.join(vetve)
-            + f" return {json.dumps(zaklad) if zaklad else 'null'}; }}")
+    # d() doplní jen vlastnosti, které ještě nastavilo žádné silnější pravidlo.
+    return ("(p) => { const v = Number(p.value); const s = {}; "
+            "const d = (o) => { for (const k in o) if (!(k in s)) s[k] = o[k]; }; "
+            f"const h = () => Object.keys(s).length "
+            f"? Object.assign({json.dumps(zaklad or {})}, s) "
+            f": {json.dumps(zaklad) if zaklad else 'null'}; "
+            + ' '.join(vetve) + " return h(); }")
 
 
 def _col_defs(sloupce: list, editovatelne: bool, styly: dict = None) -> list:
@@ -1243,6 +1352,15 @@ async def _vykresli_typ(typ: str, user_id, user_name: str, vsechna_prava):
         ui.switch('Jen bez vyjádření', value=False).on_value_change(_on_bez) \
             .tooltip('Zobrazí pouze řádky, ke kterým zatím nikdo nic nenapsal.')
 
+        # Ukotvení sloupců — stejné tlačítko jako v Nedodávkách. Volba se pamatuje
+        # zvlášť pro každý monitor i list (Makro má na listech jiné sloupce);
+        # 👁 a Období jsou připnuté vždy.
+        def _defs_s_kotvou(k):
+            return intranet_sankce._s_kotvou(
+                _col_defs(sloupce, psat_vse, vsechny_styly.get(aktualni_list)), k)
+        _, kotva = intranet_sankce._kotva_tlacitko(
+            f'monitor_{typ}_kotva_{_norm(aktualni_list)}', _defs_s_kotvou, lambda: grid)
+
         ui.space()
         info = ui.label(_info_text()).classes('text-sm text-gray-500')
         ui.button(icon='download', text='Export', on_click=_export) \
@@ -1261,7 +1379,7 @@ async def _vykresli_typ(typ: str, user_id, user_name: str, vsechna_prava):
                  'ale můžete.').classes('text-xs text-gray-500 mb-1')
 
     grid = ui.aggrid({
-        'columnDefs': _col_defs(sloupce, psat_vse, vsechny_styly.get(aktualni_list)),
+        'columnDefs': _defs_s_kotvou(kotva),
         'rowData': _zobrazene(),
         'defaultColDef': {'resizable': True, 'sortable': False, 'filter': True},
         'rowHeight': 32,
