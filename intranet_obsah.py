@@ -8,6 +8,7 @@ import intranet_narozeniny
 import intranet_okruhy
 import intranet_2fa
 import intranet_lupa
+import intranet_datuloziste
 import intranet_session
 import os
 import zipfile
@@ -715,6 +716,11 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
         'gastrokurzy_ctenar' in vsechna_prava
     ) and nastaveni.get('gastrokurzy_zapnuty', True)
 
+    ma_pristup_uloziste = (
+        nastaveni.get('datuloziste_zapnuty', True)
+        and intranet_datuloziste.ma_pristup_k_modulu(user_id, vsechna_prava)
+    )
+
     nazev_kviz       = "Zkouškový Kvíz"
     nazev_dochazka   = "Docházka a Volno"
     nazev_veletrh    = "Plán Veletrh 2027"
@@ -835,6 +841,8 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
            _akce('lupa', f'lupa_pohled_{user_id}')),
         _d('gastrokurzy', ma_pristup_gastrokurzy, '👨‍🍳', 'Gastrokurzy', '#f97316',
            _akce('gastrokurzy')),
+        _d('uloziste', ma_pristup_uloziste, '🗄️', 'Datové úložiště', '#64748b',
+           _akce('uloziste')),
     ) if d]
 
     podle_klice = {d['klic']: d for d in dlazdice}

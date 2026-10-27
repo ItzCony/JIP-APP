@@ -530,6 +530,7 @@ MODULY = {
     'lupa_zapnuty':          ('🔍 Modul Lupou na obchod',        'Lupou na obchod'),
     'schuzky_zapnuty':       ('🗓️ Modul Schůzky s vedoucími',    'Schůzky s vedoucími'),
     'gastrokurzy_zapnuty':   ('👨‍🍳 Modul Gastrokurzy',            'Gastrokurzy'),
+    'datuloziste_zapnuty':   ('🗄️ Modul Datové úložiště',        'Datové úložiště'),
     'monitor_zapnuty':       ('📈 Modul Monitor',                'Monitor'),
     'zalistovaci_zapnuty':   ('🗳️ Modul Zalistovací komise',     'Zalistovací komise'),
     'manualy_zapnuty':       ('📖 Modul Manuály',                'Manuály'),

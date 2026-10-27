@@ -167,6 +167,8 @@ ZAKLADNI_PRAVA = {
     'gastrokurzy_zapisovatel': {'kategorie': 'Modul Gastrokurzy', 'nazev': 'Zapisovatel (ASM / vedoucí pobočky)', 'popis': 'Zapisuje pozvané zákazníky na kurzy. Upravovat a rušit smí jen zápisy, které sám zadal. Nemůže měnit termíny kurzů.', 'ikona': 'person_add'},
     'gastrokurzy_ctenar':      {'kategorie': 'Modul Gastrokurzy', 'nazev': 'Čtenář', 'popis': 'Vidí termíny kurzů i prezenční listiny pouze pro čtení. Nemůže zapisovat ani rušit zápisy.', 'ikona': 'visibility'},
 
+    'datuloziste_spravce':     {'kategorie': 'Modul Datové úložiště', 'nazev': 'Správce Dat', 'popis': 'Vidí všechny sekce a složky Datového úložiště, zakládá je (pravým tlačítkem myši) a přiděluje uživatelům přístup k jejich složkám. Ostatní vidí jen složky, do kterých jim přístup přidělil správce.', 'ikona': 'folder_shared'},
+
     'spolvecer_schvalovatel': {'kategorie': 'Modul Společenský večer', 'nazev': 'Schvalovatel', 'popis': 'Vidí všechny pobočky, komunikuje v chatu a schvaluje náklady (mění stav na Schváleno).', 'ikona': 'verified'},
     'spolvecer_ctenar':       {'kategorie': 'Modul Společenský večer', 'nazev': 'Čtenář', 'popis': 'Vidí všechny pobočky pouze pro čtení a může psát do chatu. Nemůže editovat tabulku ani schvalovat.', 'ikona': 'visibility'},
 
@@ -314,6 +316,7 @@ _MODUL_KATEGORIE = {
     'Modul Zalistovací komise':  'zalistovaci_zapnuty',
     'Modul Manuály':             'manualy_zapnuty',
     'Modul Gastrokurzy':         'gastrokurzy_zapnuty',
+    'Modul Datové úložiště':     'datuloziste_zapnuty',
     'Modul Společenský večer':   'spolvecer_zapnuty',
     'Modul Vizitky a podpisy':   'vizitky_zapnuty',
     'Modul Cenopřípad':          'cenopripad_zapnuty',
