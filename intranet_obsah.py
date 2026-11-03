@@ -9,6 +9,7 @@ import intranet_okruhy
 import intranet_2fa
 import intranet_lupa
 import intranet_datuloziste
+import intranet_naklady_veletrh
 import intranet_session
 import os
 import zipfile
@@ -211,8 +212,11 @@ def render_prava_kategorie(zakladni_prava, vybrana_prava_list, lazy=False, zamce
         pod = stav['pod'].get(kat)
         if not pod:
             return kategorie[kat]
+        # Samostatná podskupina (vlastní správce) → bez globálních práv kategorie.
+        globalni = (kat, pod) not in intranet_prava.SAMOSTATNE_PODSKUPINY
         return {k: v for k, v in kategorie[kat].items()
-                if v.get('podskupina') in (None, pod)}
+                if v.get('podskupina') == pod
+                or (globalni and v.get('podskupina') is None)}
 
     # Pre-deklarace pro nonlocal v _postav_ui (lazy build) — closury níže
     # (_aktualizuj_total, vyber_kat) tyto názvy čtou.
@@ -685,7 +689,9 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
             'cenopripad_office_nakup', 'cenopripad_office_obchod',
             'cenopripad_office_obchod_ovozel',
             'cenopripad_spravce_nakup', 'cenopripad_spravce',
-            'cenopripad_spravce_bez_emailu', 'cenopripad_vkladatel')) or
+            'cenopripad_spravce_bez_emailu', 'cenopripad_vkladatel',
+            'cenopripad_zadatel_oprava', 'cenopripad_office_oprava',
+            'cenopripad_spravce_oprava')) or
         any(p.startswith('cenopripad_wp_') for p in vsechna_prava)   # Leták – WebPortál
     ) and nastaveni.get('cenopripad_zapnuty', True)
     # Schůzky s vedoucími jsou dlaždice uvnitř Formulářů ASM → kdo má právo jen
@@ -720,6 +726,9 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
         nastaveni.get('datuloziste_zapnuty', True)
         and intranet_datuloziste.ma_pristup_k_modulu(user_id, vsechna_prava)
     )
+
+    # Náklady veletrh — samostatná dlaždice, s Plánem Veletrh 2027 nesouvisí.
+    ma_pristup_naklady_veletrh = intranet_naklady_veletrh.ma_pristup_k_modulu(vsechna_prava)
 
     nazev_kviz       = "Zkouškový Kvíz"
     nazev_dochazka   = "Docházka a Volno"
@@ -808,6 +817,10 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
         except Exception:
             _pocet_ukolu = 0
 
+    # Čeká na mé rozhodnutí (schvalovatel) + moje vrácené k doplnění (zadavatel).
+    _pocet_naklady_veletrh = (intranet_naklady_veletrh.pocet_akci(user_id, vsechna_prava)
+                              if ma_pristup_naklady_veletrh else 0)
+
     # klíč = název tabu, tedy to, co zapisuje prepni_tab do historie
     dlazdice = [d for d in (
         _d('kviz', ma_pristup_kviz, '👨‍🎓', nazev_kviz, '#22c55e', _otevri_kviz),
@@ -837,12 +850,14 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
         _d('cenopripad', ma_pristup_cenopripad, '🏷️', 'Cenopřípad', '#22c55e',
            _akce('cenopripad', 'cenopripad_pohled')),
         _d('asm', ma_pristup_asm, '📝', 'Formuláře ASM', '#6366f1', _akce('asm', 'asm_pohled')),
-        _d('lupa', ma_pristup_lupa, '🔍', 'Lupou na obchod', '#a855f7',
+        _d('lupa', ma_pristup_lupa, '🔍', 'Lupopřípad', '#a855f7',
            _akce('lupa', f'lupa_pohled_{user_id}')),
         _d('gastrokurzy', ma_pristup_gastrokurzy, '👨‍🍳', 'Gastrokurzy', '#f97316',
            _akce('gastrokurzy')),
         _d('uloziste', ma_pristup_uloziste, '🗄️', 'Datové úložiště', '#64748b',
            _akce('uloziste')),
+        _d('naklady_veletrh', ma_pristup_naklady_veletrh, '🧾', 'Náklady veletrh', '#0d9488',
+           _akce('naklady_veletrh'), _pocet_naklady_veletrh),
     ) if d]
 
     podle_klice = {d['klic']: d for d in dlazdice}

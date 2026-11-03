@@ -69,7 +69,7 @@ intranet_static.chranene_soubory('/sankce_prilohy', SANKCE_PRILOHY_DIR)
 
 # Whitelist přípon — kontroluje se na serveru, `accept` v prohlížeči je jen nápověda.
 PRILOHA_POVOLENE = ('.png', '.jpg', '.jpeg', '.pdf', '.xlsx', '.xls',
-                    '.docx', '.doc', '.eml')
+                    '.docx', '.doc', '.eml', '.msg')   # .msg = e-mail přetažený z Outlooku
 PRILOHA_MAX_BYTU = 15 * 1024 * 1024                  # 15 MB / soubor
 _PRILOHA_OBRAZKY = ('.png', '.jpg', '.jpeg')
 _PRILOHA_SIRKA = 'width:260px;max-width:100%'      # strop náhledu i karty v bublině
@@ -3601,7 +3601,7 @@ def _otevri_chat(tabulka, row_hash, popis, user_id, user_name, on_badge,
                             _radek(f'Od: {od}')
                         if kdy_:
                             _radek(kdy_)
-            ikona = {'.pdf': 'picture_as_pdf', '.eml': 'mail',
+            ikona = {'.pdf': 'picture_as_pdf', '.eml': 'mail', '.msg': 'mail',
                      '.xlsx': 'table_chart', '.xls': 'table_chart',
                      '.docx': 'description', '.doc': 'description'}.get(ext, 'image')
             with ui.row().classes('items-center gap-1 no-wrap w-full') \
@@ -3760,9 +3760,13 @@ def _otevri_chat(tabulka, row_hash, popis, user_id, user_name, on_badge,
                         .props('dense outline color=primary').tooltip(polozka[0])
 
         with ui.row().classes('w-full px-4 pb-3'):
-            upl = ui.upload(label='Přidat přílohu (PNG, JPG, PDF, XLSX, DOCX, EML — max 15 MB)',
+            # on_rejected: prohlížeč soubor mimo `accept` / nad limit zahodí potichu
+            upl = ui.upload(label='Přidat přílohu (PNG, JPG, PDF, XLSX, DOCX, EML, MSG — max 15 MB)',
                             on_upload=_nahraj, auto_upload=True, multiple=True,
-                            max_file_size=PRILOHA_MAX_BYTU) \
+                            max_file_size=PRILOHA_MAX_BYTU,
+                            on_rejected=lambda: ui.notify(
+                                'Soubor je větší než 15 MB nebo má nepodporovaný typ.',
+                                type='warning')) \
                 .props(f'accept="{",".join(PRILOHA_POVOLENE)}" flat dense color=blue-grey') \
                 .classes('w-full')
 

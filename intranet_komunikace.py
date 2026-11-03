@@ -3,8 +3,10 @@
 #   Komunikační portál JIP — místnosti (dlaždice), nástěnka, chat
 # ═══════════════════════════════════════════════════════════════════════════════
 import asyncio
+import io
 import os
 import uuid
+import zipfile
 from datetime import datetime
 
 import intranet_data
@@ -12,7 +14,7 @@ import intranet_emaily
 import intranet_notifikace
 from nicegui import ui
 
-# Adresář pro přílohy komentářů
+# Adresář pro přílohy příspěvků a komentářů
 KOM_PRILOHY_DIR = 'kom_prilohy'
 
 # ───────────────────────────────────────────────────────────────────────────────
@@ -44,8 +46,8 @@ def _broadcast(vyjimka=None):
 
 
 def _broadcast_feed(skupina_id, vyjimka=None):
-    """Překreslí jen feed příspěvků klientům, kteří mají otevřenou stejnou
-    místnost. Nesahá na rozepsaný text v hlavním vstupu (ten je mimo feed)."""
+    """Překreslí panely místnosti (nástěnka, soubory, archiv) klientům, kteří mají
+    otevřenou stejnou místnost. Nesahá na rozepsaný text v hlavním vstupu (ten je mimo feed)."""
     for cid, info in list(_KLIENTI.items()):
         if cid == vyjimka or info.get('skupina_id') != skupina_id:
             continue
@@ -151,17 +153,34 @@ def _init_db():
             conn.commit()
         except Exception:
             pass  # sloupec již existuje
-        # Migrace: archivace místností
+        # Migrace: archivace místností a vláken, přílohy vložené přímo do příspěvku
         for _ddl in (
             "ALTER TABLE kom_skupiny ADD COLUMN archivovano TINYINT(1) DEFAULT 0",
             "ALTER TABLE kom_skupiny ADD COLUMN datum_archivace DATETIME NULL",
             "ALTER TABLE kom_skupiny ADD COLUMN archivoval_id INT NULL",
+            "ALTER TABLE kom_prispevky ADD COLUMN archivovano TINYINT(1) DEFAULT 0",
+            "ALTER TABLE kom_prispevky ADD COLUMN datum_archivace DATETIME NULL",
+            "ALTER TABLE kom_prilohy ADD COLUMN prispevek_id VARCHAR(36) NULL",
+            "ALTER TABLE kom_prilohy ADD INDEX idx_prispevek (prispevek_id)",
         ):
             try:
                 cur.execute(_ddl)
                 conn.commit()
             except Exception:
                 pass  # sloupec již existuje
+        # Příloha příspěvku nemá komentář → komentar_id musí jít NULL (DDL jen jednou)
+        try:
+            cur.execute("""
+                SELECT IS_NULLABLE FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'kom_prilohy'
+                  AND COLUMN_NAME = 'komentar_id'
+            """)
+            row = cur.fetchone()
+            if row and row[0] == 'NO':
+                cur.execute("ALTER TABLE kom_prilohy MODIFY komentar_id VARCHAR(36) NULL")
+                conn.commit()
+        except Exception as e:
+            print(f'[Komunikace] migrace kom_prilohy.komentar_id: {e}')
         _DB_INIT = True
         _ensure_jip_room(cur, conn)
     except Exception as e:
@@ -569,7 +588,8 @@ def ziskej_clenove(skupina_id):
         if conn: conn.close()
 
 
-def ziskej_prispevky(skupina_id, limit=60):
+def ziskej_prispevky(skupina_id, limit=60, archivovane=False):
+    """Příspěvky (vlákna) místnosti od nejnovějšího — z nástěnky, nebo z archivu."""
     _init_db()
     conn = intranet_data.get_db_connection()
     if not conn:
@@ -578,9 +598,10 @@ def ziskej_prispevky(skupina_id, limit=60):
     try:
         cur = conn.cursor(dictionary=True)
         cur.execute("""
-            SELECT * FROM kom_prispevky WHERE skupina_id = %s
+            SELECT * FROM kom_prispevky
+            WHERE skupina_id = %s AND COALESCE(archivovano, 0) = %s
             ORDER BY datum DESC LIMIT %s
-        """, (skupina_id, limit))
+        """, (skupina_id, int(archivovane), limit))
         return cur.fetchall()
     except Exception as e:
         print(f'[Komunikace] ziskej_prispevky: {e}')
@@ -630,7 +651,8 @@ def ziskej_prilohy_komentare(komentar_id):
 
 
 def ziskej_prilohy_skupiny(skupina_id):
-    """Vrátí všechny přílohy v místnosti seřazené od nejnovější."""
+    """Vrátí přílohy v místnosti (z příspěvků i komentářů) seřazené od nejnovější.
+    Přílohy archivovaných vláken vynechá — ty má správce v záložce Archiv."""
     _init_db()
     conn = intranet_data.get_db_connection()
     if not conn:
@@ -644,9 +666,15 @@ def ziskej_prilohy_skupiny(skupina_id):
             FROM kom_prilohy pr
             JOIN kom_komentare k ON k.id = pr.komentar_id
             JOIN kom_prispevky p ON p.id = k.prispevek_id
-            WHERE p.skupina_id = %s
-            ORDER BY pr.datum DESC
-        """, (skupina_id,))
+            WHERE p.skupina_id = %s AND COALESCE(p.archivovano, 0) = 0
+            UNION ALL
+            SELECT pr.id, pr.soubor_nazev, pr.soubor_cesta, pr.datum,
+                   p.autor_jmeno, p.autor_id
+            FROM kom_prilohy pr
+            JOIN kom_prispevky p ON p.id = pr.prispevek_id
+            WHERE p.skupina_id = %s AND COALESCE(p.archivovano, 0) = 0
+            ORDER BY datum DESC
+        """, (skupina_id, skupina_id))
         return cur.fetchall()
     except Exception as e:
         print(f'[Komunikace] ziskej_prilohy_skupiny: {e}')
@@ -654,6 +682,80 @@ def ziskej_prilohy_skupiny(skupina_id):
     finally:
         if cur:  cur.close()
         if conn: conn.close()
+
+
+def ziskej_prilohy_prispevku(prispevek_ids):
+    """Přílohy vložené přímo do příspěvků → {prispevek_id: [přílohy]} (jeden dotaz)."""
+    if not prispevek_ids:
+        return {}
+    _init_db()
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return {}
+    cur = None
+    try:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT * FROM kom_prilohy WHERE prispevek_id IN ("
+                    + ','.join(['%s'] * len(prispevek_ids)) + ") ORDER BY datum",
+                    tuple(prispevek_ids))
+        vysledek = {}
+        for r in cur.fetchall():
+            vysledek.setdefault(r['prispevek_id'], []).append(r)
+        return vysledek
+    except Exception as e:
+        print(f'[Komunikace] ziskej_prilohy_prispevku: {e}')
+        return {}
+    finally:
+        if cur:  cur.close()
+        if conn: conn.close()
+
+
+def ziskej_prilohy_vlakna(prispevek_id):
+    """Všechny přílohy vlákna — vložené do příspěvku i do jeho komentářů."""
+    _init_db()
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return []
+    cur = None
+    try:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("""
+            SELECT soubor_nazev, soubor_cesta FROM kom_prilohy
+            WHERE prispevek_id = %s
+               OR komentar_id IN (SELECT id FROM kom_komentare WHERE prispevek_id = %s)
+            ORDER BY datum
+        """, (prispevek_id, prispevek_id))
+        return cur.fetchall()
+    except Exception as e:
+        print(f'[Komunikace] ziskej_prilohy_vlakna: {e}')
+        return []
+    finally:
+        if cur:  cur.close()
+        if conn: conn.close()
+
+
+def _bezpecny_nazev(nazev):
+    """Název souboru bez lomítek a znaků, které Windows v názvu nesnese."""
+    s = ''.join('_' if c in '<>:"/\\|?*' or ord(c) < 32 else c for c in (nazev or ''))
+    return s.strip().rstrip('.') or 'soubor'
+
+
+def _zip_priloh(prilohy):
+    """Zabalí soubory příloh do ZIPu (bajty); None, když žádný není na disku.
+    Stejné názvy rozliší pořadím: „faktura (2).pdf"."""
+    buf = io.BytesIO()
+    pouzite = set()
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for pr in prilohy:
+            if not os.path.isfile(pr['soubor_cesta']):
+                continue
+            zaklad, ext = os.path.splitext(_bezpecny_nazev(pr['soubor_nazev']))
+            jmeno, i = zaklad + ext, 2
+            while jmeno.lower() in pouzite:
+                jmeno, i = f'{zaklad} ({i}){ext}', i + 1
+            pouzite.add(jmeno.lower())
+            zf.write(pr['soubor_cesta'], jmeno)
+    return buf.getvalue() if pouzite else None
 
 
 def pocet_prispevku(skupina_id):
@@ -664,7 +766,8 @@ def pocet_prispevku(skupina_id):
     cur = None
     try:
         cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM kom_prispevky WHERE skupina_id = %s", (skupina_id,))
+        cur.execute("SELECT COUNT(*) FROM kom_prispevky "
+                    "WHERE skupina_id = %s AND COALESCE(archivovano, 0) = 0", (skupina_id,))
         row = cur.fetchone()
         return int(row[0]) if row else 0
     except Exception:
@@ -883,12 +986,15 @@ def vrat_skupinu(skupina_id, komentar, schvalil_id):
         if conn: conn.close()
 
 
-def uloz_prilohu(komentar_id, soubor_nazev, obsah_bytes):
-    """Uloží přílohu na disk a zapíše záznam do DB. Vrátí id nebo None."""
+def uloz_prilohu(komentar_id, soubor_nazev, obsah_bytes, prispevek_id=None):
+    """Uloží přílohu na disk a zapíše záznam do DB. Vrátí id nebo None.
+    Příloha patří komentáři (komentar_id), nebo přímo příspěvku (prispevek_id)."""
     _init_db()
     os.makedirs(KOM_PRILOHY_DIR, exist_ok=True)
     priloha_id = str(uuid.uuid4())
-    ext = os.path.splitext(soubor_nazev)[1]
+    # Přípona jde do URL odkazu → jen písmena, číslice a tečka
+    ext = ''.join(c for c in os.path.splitext(soubor_nazev)[1]
+                  if c.isascii() and (c.isalnum() or c == '.'))[:16]
     soubor_cesta = os.path.join(KOM_PRILOHY_DIR, f'{priloha_id}{ext}')
     try:
         with open(soubor_cesta, 'wb') as f:
@@ -903,9 +1009,9 @@ def uloz_prilohu(komentar_id, soubor_nazev, obsah_bytes):
     try:
         cur = conn.cursor()
         cur.execute("""
-            INSERT INTO kom_prilohy (id, komentar_id, soubor_nazev, soubor_cesta)
-            VALUES (%s, %s, %s, %s)
-        """, (priloha_id, komentar_id, soubor_nazev, soubor_cesta))
+            INSERT INTO kom_prilohy (id, komentar_id, prispevek_id, soubor_nazev, soubor_cesta)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (priloha_id, komentar_id, prispevek_id, soubor_nazev, soubor_cesta))
         conn.commit()
         return priloha_id
     except Exception as e:
@@ -965,12 +1071,13 @@ def pridej_komentar(prispevek_id, skupina_id, text, autor_id, autor_jmeno):
     cur = None
     try:
         cur = conn.cursor(dictionary=True)
-        cur.execute("SELECT autor_id, autor_jmeno FROM kom_prispevky WHERE id = %s", (prispevek_id,))
+        cur.execute("SELECT autor_id, autor_jmeno, archivovano FROM kom_prispevky WHERE id = %s",
+                    (prispevek_id,))
         prispevek = cur.fetchone()
         cur.execute("SELECT nazev, archivovano, je_verejna FROM kom_skupiny WHERE id = %s",
                     (skupina_id,))
         sk = cur.fetchone()
-        if not prispevek or (sk and sk['archivovano']):
+        if not prispevek or prispevek['archivovano'] or (sk and sk['archivovano']):
             return False
         cur = conn.cursor()
         cur.execute("""
@@ -1032,7 +1139,14 @@ def smazat_prispevek(prispevek_id, autor_id, muze_vse=False):
     cur = None
     try:
         cur = conn.cursor()
+        # Přílohy příspěvku i jeho komentářů (dřív než komentáře, přes ně se hledají)
+        smaz_prilohy = """
+            DELETE FROM kom_prilohy
+            WHERE prispevek_id = %s
+               OR komentar_id IN (SELECT id FROM kom_komentare WHERE prispevek_id = %s)
+        """
         if muze_vse:
+            cur.execute(smaz_prilohy, (prispevek_id, prispevek_id))
             cur.execute("DELETE FROM kom_komentare WHERE prispevek_id = %s", (prispevek_id,))
             cur.execute("DELETE FROM kom_prispevky WHERE id = %s", (prispevek_id,))
         else:
@@ -1040,11 +1154,49 @@ def smazat_prispevek(prispevek_id, autor_id, muze_vse=False):
                 "DELETE FROM kom_prispevky WHERE id = %s AND autor_id = %s",
                 (prispevek_id, autor_id))
             if cur.rowcount > 0:
+                cur.execute(smaz_prilohy, (prispevek_id, prispevek_id))
                 cur.execute("DELETE FROM kom_komentare WHERE prispevek_id = %s", (prispevek_id,))
         conn.commit()
         return True
     except Exception as e:
         print(f'[Komunikace] smazat_prispevek: {e}')
+        return False
+    finally:
+        if cur:  cur.close()
+        if conn: conn.close()
+
+
+def archivuj_prispevek(prispevek_id, user_id, muze_vse=False, obnovit=False):
+    """Přesune vlákno (příspěvek i s komentáři) do archivu místnosti, s obnovit=True
+    ho vrátí na nástěnku. Jen tvůrce/správce místnosti nebo admin; v archivované
+    místnosti (jen pro čtení) nelze."""
+    _init_db()
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return False
+    cur = None
+    try:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("""
+            SELECT s.vytvoril_id, s.archivovano
+            FROM kom_prispevky p JOIN kom_skupiny s ON s.id = p.skupina_id
+            WHERE p.id = %s
+        """, (prispevek_id,))
+        sk = cur.fetchone()
+        if not sk or sk['archivovano']:
+            return False
+        if not muze_vse and sk['vytvoril_id'] != user_id:
+            return False
+        if obnovit:
+            cur.execute("UPDATE kom_prispevky SET archivovano = 0, datum_archivace = NULL "
+                        "WHERE id = %s", (prispevek_id,))
+        else:
+            cur.execute("UPDATE kom_prispevky SET archivovano = 1, datum_archivace = NOW() "
+                        "WHERE id = %s", (prispevek_id,))
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f'[Komunikace] archivuj_prispevek: {e}')
         return False
     finally:
         if cur:  cur.close()
@@ -1134,6 +1286,13 @@ def smazat_skupinu(skupina_id, user_id, muze_vse=False):
             return False
         cur = conn.cursor()
         # Smazat v pořadí FK závislostí
+        cur.execute("""
+            DELETE FROM kom_prilohy
+            WHERE prispevek_id IN (SELECT id FROM kom_prispevky WHERE skupina_id = %s)
+               OR komentar_id IN (SELECT k.id FROM kom_komentare k
+                                  JOIN kom_prispevky p ON p.id = k.prispevek_id
+                                  WHERE p.skupina_id = %s)
+        """, (skupina_id, skupina_id))
         cur.execute("""
             DELETE k FROM kom_komentare k
             JOIN kom_prispevky p ON k.prispevek_id = p.id
@@ -1608,7 +1767,279 @@ async def _vykresli_telo(user_id, user_name, vsechna_prava, muj_refresh):
 
         def _zpet():
             st['aktivni_skupina_id'] = None
+            st.pop('rozbalene_komentare', None)   # po návratu do místnosti zase sbalené
             muj_refresh()   # jen lokální navigace
+
+        # ── Vlákna — společné pro Nástěnku a Archiv ───────────────────────────
+        # Komentáře jsou výchozí sbalené; set drží rozbalená vlákna přes překreslení
+        rozbalene = st.setdefault('rozbalene_komentare', set())
+        _panely = []   # refreshable panely místnosti (nástěnka, soubory, archiv) — viz níže
+
+        def _obnov_panely():
+            """Překreslí nástěnku, soubory i archiv (po vlastní změně i z broadcastu)."""
+            for panel in _panely:
+                panel.refresh()
+
+        def _po_zmene():
+            _obnov_panely()
+            _broadcast_feed(sid_aktivni, vyjimka=_cid)
+
+        def _nacti_vlakna(archivovane=False):
+            # Příspěvky + komentáře + přílohy jedním průchodem
+            # ve vlákně (dřív dotaz per příspěvek/komentář na loopu)
+            prispevky = ziskej_prispevky(sid_aktivni, limit=200 if archivovane else 60,
+                                         archivovane=archivovane)
+            komentare_map = {p['id']: ziskej_komentare(p['id']) for p in prispevky}
+            prilohy_map = {k['id']: ziskej_prilohy_komentare(k['id'])
+                           for koms in komentare_map.values() for k in koms}
+            prilohy_pr = ziskej_prilohy_prispevku([p['id'] for p in prispevky])
+            return prispevky, komentare_map, prilohy_map, prilohy_pr
+
+        async def _archivuj_vlakno(prispevek_id, obnovit=False):
+            ok = await asyncio.to_thread(archivuj_prispevek, prispevek_id, user_id,
+                                         muze_schvalovat, obnovit)
+            if not ok:
+                ui.notify('Vlákno se nepodařilo ' + ('obnovit.' if obnovit else 'archivovat.'),
+                          type='negative')
+                return
+            ui.notify('Vlákno vráceno na nástěnku.' if obnovit
+                      else 'Vlákno přesunuto do archivu.', type='positive')
+            _po_zmene()
+
+        async def _stahni_prilohy_vlakna(prispevek_id, datum):
+            prilohy = await asyncio.to_thread(ziskej_prilohy_vlakna, prispevek_id)
+            data = await asyncio.to_thread(_zip_priloh, prilohy)
+            if not data:
+                ui.notify('Soubory příloh se nepodařilo najít.', type='warning')
+                return
+            from intranet_sankce import _stahni_pres_http   # ZIP po HTTP, ne přes WebSocket
+            _stahni_pres_http(data, _bezpecny_nazev(   # název jde i do cesty dočasného souboru
+                f'prilohy_{sk["nazev"][:60].strip()}_{str(datum)[:10]}.zip'))
+
+        def _odkaz_prilohy(pr, velky=False):
+            nazev = pr['soubor_nazev'] or 'soubor'
+            ext = os.path.splitext(nazev)[1].lower()
+            ikona = ('image' if ext in ('.jpg', '.jpeg', '.png', '.gif', '.webp')
+                     else 'picture_as_pdf' if ext == '.pdf' else 'attach_file')
+            n = 40 if velky else 30
+            # ui.link dá href rovnou do props (ne skládáním řetězce props)
+            with ui.link(target=f'/kom_prilohy/{os.path.basename(pr["soubor_cesta"])}',
+                         new_tab=True) \
+                    .classes('flex items-center gap-1 text-blue-600 bg-blue-50 border '
+                             'border-blue-200 rounded hover:bg-blue-100 no-underline '
+                             + ('text-sm px-2.5 py-1' if velky else 'text-xs px-2 py-0.5'),
+                             remove='nicegui-link'):
+                ui.icon(ikona).classes('text-base' if velky else 'text-sm')
+                ui.label(nazev[:n] + ('…' if len(nazev) > n else ''))
+
+        def _karta_vlakna(p, komentare, prilohy_map, prilohy_p, archivni=False):
+            """Příspěvek + jeho přílohy (vidět vždy) + sbalitelné komentáře + vstup
+            pro komentář. archivni=True → karta v záložce Archiv (jen pro čtení)."""
+            jen_cteni = je_archiv or archivni
+            je_autor_p = (p['autor_id'] == user_id)
+            barva_p = _avatar_color(p['autor_jmeno'] or '')
+            pocet_priloh = len(prilohy_p) + sum(len(prilohy_map.get(k['id'], []))
+                                                for k in komentare)
+            with ui.card().classes('w-full bg-white border border-gray-200 '
+                                   'p-4 rounded-xl shadow-sm'):
+                with ui.row().classes('items-start gap-3 w-full'):
+                    # Avatar
+                    ui.element('div') \
+                        .classes('w-8 h-8 rounded-full flex-shrink-0 mt-0.5') \
+                        .style(
+                            f'background:{barva_p};display:flex;'
+                            f'align-items:center;justify-content:center;'
+                            f'color:white;font-weight:700;font-size:.65rem') \
+                        .tooltip(p['autor_jmeno'] or '') \
+                        .text = _initials(p['autor_jmeno'] or '')
+
+                    with ui.column().classes('flex-1 gap-1 min-w-0'):
+                        # Záhlaví příspěvku
+                        with ui.row().classes('w-full items-center gap-2 '
+                                              'justify-between'):
+                            with ui.row().classes('items-center gap-2'):
+                                ui.label(p['autor_jmeno'] or '') \
+                                    .classes('font-bold text-sm text-gray-800')
+                                ui.label(_fmt_datum(p['datum'])) \
+                                    .classes('text-xs text-gray-400')
+                                if archivni and p.get('datum_archivace'):
+                                    ui.label(f'· archivováno {_fmt_datum(p["datum_archivace"])}') \
+                                        .classes('text-xs text-gray-400 italic')
+                            with ui.row().classes('items-center gap-1'):
+                                # Jen správce: stažení všech příloh vlákna + archivace
+                                if muze_spravovat and pocet_priloh:
+                                    ui.button(f'Stáhnout přílohy ({pocet_priloh})',
+                                              icon='download', color=None,
+                                              on_click=lambda: _stahni_prilohy_vlakna(
+                                                  p['id'], p['datum'])) \
+                                        .props('flat dense no-caps size=sm') \
+                                        .classes('text-gray-500') \
+                                        .tooltip('Všechny přílohy vlákna (příspěvek i komentáře) jako ZIP')
+                                if muze_spravovat and not je_archiv:
+                                    ui.button('Obnovit' if archivni else 'Archivovat',
+                                              icon='unarchive' if archivni else 'inventory_2',
+                                              color=None,
+                                              on_click=lambda: _archivuj_vlakno(
+                                                  p['id'], obnovit=archivni)) \
+                                        .props('flat dense no-caps size=sm') \
+                                        .classes('text-gray-500') \
+                                        .tooltip('Vrátit vlákno na nástěnku' if archivni
+                                                 else 'Přesunout vlákno do archivu (vidí jen správce)')
+                                if (je_autor_p or muze_schvalovat) and not jen_cteni:
+                                    with ui.button(icon='more_vert') \
+                                            .props('flat round dense') \
+                                            .classes('text-gray-300'):
+                                        with ui.menu():
+                                            ui.menu_item(
+                                                '🗑️ Smazat příspěvek',
+                                                on_click=lambda: (
+                                                    smazat_prispevek(
+                                                        p['id'], user_id, muze_schvalovat),
+                                                    _po_zmene()))
+
+                        # Text příspěvku
+                        ui.label(p['text']) \
+                            .classes('text-sm text-gray-700 whitespace-pre-wrap mt-1')
+
+                        # Přílohy příspěvku — vidět vždy, i se sbalenými komentáři
+                        if prilohy_p:
+                            with ui.row().classes('flex-wrap gap-2 mt-1'):
+                                for pr in prilohy_p:
+                                    _odkaz_prilohy(pr, velky=True)
+
+                        # Komentáře — výchozí stav sbalený (rozbalení drží `rozbalene`)
+                        if komentare:
+                            btn_kom = ui.button(color=None) \
+                                .props('flat dense no-caps size=sm') \
+                                .classes('text-blue-600 mt-1')
+                            with ui.column().classes('pl-3 border-l-2 '
+                                                     'border-blue-100 gap-1.5') as kom_box:
+                                for k in komentare:
+                                    barva_k = _avatar_color(k['autor_jmeno'] or '')
+                                    with ui.row().classes('items-start gap-2'):
+                                        ui.element('div') \
+                                            .classes('w-5 h-5 rounded-full '
+                                                     'flex-shrink-0 mt-0.5') \
+                                            .style(
+                                                f'background:{barva_k};display:flex;'
+                                                f'align-items:center;justify-content:center;'
+                                                f'color:white;font-weight:700;font-size:.5rem') \
+                                            .tooltip(k['autor_jmeno'] or '') \
+                                            .text = _initials(k['autor_jmeno'] or '')
+                                        with ui.column().classes('gap-0 flex-1'):
+                                            with ui.row().classes('items-center gap-1.5 w-full justify-between'):
+                                                with ui.row().classes('items-baseline gap-1.5'):
+                                                    ui.label(k['autor_jmeno'] or '') \
+                                                        .classes('text-xs font-bold '
+                                                                 'text-blue-700')
+                                                    ui.label(_fmt_datum(k['datum'])) \
+                                                        .classes('text-xs text-gray-300')
+                                                if (k['autor_id'] == user_id or muze_schvalovat) and not jen_cteni:
+                                                    kid2 = k['id']
+                                                    ui.button(
+                                                        icon='delete_outline',
+                                                        on_click=lambda _kid=kid2: (
+                                                            smazat_komentar(_kid, user_id, muze_schvalovat),
+                                                            _po_zmene()),
+                                                    ).props('flat round dense') \
+                                                     .classes('text-gray-300 hover:text-red-400') \
+                                                     .tooltip('Smazat komentář')
+                                            ui.label(k['text']) \
+                                                .classes('text-xs text-gray-600')
+                                            # Přílohy komentáře
+                                            prilohy_k = prilohy_map.get(k['id'], [])
+                                            if prilohy_k:
+                                                with ui.row().classes('flex-wrap gap-1.5 mt-1'):
+                                                    for pr in prilohy_k:
+                                                        _odkaz_prilohy(pr)
+
+                            def _rozbal(otevrit):
+                                if otevrit:
+                                    rozbalene.add(p['id'])
+                                else:
+                                    rozbalene.discard(p['id'])
+                                kom_box.set_visibility(otevrit)
+                                btn_kom.set_text(f'{"Skrýt" if otevrit else "Zobrazit"} '
+                                                 f'komentáře ({len(komentare)})')
+                                btn_kom.set_icon('expand_less' if otevrit else 'expand_more')
+
+                            _rozbal(p['id'] in rozbalene)
+                            btn_kom.on_click(lambda: _rozbal(p['id'] not in rozbalene))
+
+                        # Input pro nový komentář + příloha — vidět i se sbalenými
+                        # komentáři; v archivu ani v archivované diskuzi není
+                        if jen_cteni:
+                            return
+                        pid2 = p['id']
+                        _pending = {'bytes': None, 'nazev': None}
+                        _refs    = {}
+
+                        with ui.column().classes('w-full gap-1 mt-3'):
+                            lbl_priloha = ui.label('').classes(
+                                'text-xs text-green-600 italic')
+
+                            with ui.row().classes('w-full gap-2 items-center'):
+                                _refs['ki'] = ui.input(
+                                    placeholder='Přidat komentář… '
+                                                '(@ označí člena, Enter odešle)') \
+                                    .classes('flex-1').props('outlined dense')
+                                _pripoj_mention(_refs['ki'], kandidati_mention)
+
+                                async def _nahrat_prilohu(e, _p=_pending,
+                                                          _lbl=lbl_priloha):
+                                    _p['bytes'] = await e.file.read()
+                                    _p['nazev'] = e.file.name
+                                    _lbl.set_text(f'📎 {e.file.name[:30]}')
+
+                                def _odesli_kom(_r=_refs, _pid=pid2,
+                                                _p=_pending, _lbl=lbl_priloha):
+                                    v = (_r['ki'].value or '').strip()
+                                    if not v and not _p.get('bytes'):
+                                        return
+                                    text_k = v or '(příloha)'
+                                    kid = pridej_komentar(
+                                        _pid, sid_aktivni, text_k,
+                                        user_id, user_name)
+                                    if kid and _p.get('bytes'):
+                                        nazev_souboru = _p['nazev']
+                                        uloz_prilohu(
+                                            kid, nazev_souboru, _p['bytes'])
+                                        _p['bytes'] = None
+                                        _p['nazev']  = None
+                                        _lbl.set_text('')
+                                        _notify_members(
+                                            sid_aktivni,
+                                            f'📎 {user_name} nahrál/a přílohu '
+                                            f'„{nazev_souboru}" v místnosti '
+                                            f'„{sk["nazev"]}".',
+                                            vyjimka_id=user_id)
+                                    _r['ki'].set_value('')
+                                    rozbalene.add(_pid)   # ať autor svůj komentář hned vidí
+                                    _po_zmene()
+
+                                _refs['ki'].on(
+                                    'keydown.enter',
+                                    lambda e, fn=_odesli_kom: fn(),
+                                    js_handler=MENTION_JS_MIMO)
+                                _upl = ui.upload(
+                                    auto_upload=True,
+                                    on_upload=_nahrat_prilohu,
+                                ).props('accept="*/*"') \
+                                 .style('display:none')
+
+                                async def _otevri_soubor(_u=_upl):
+                                    await ui.run_javascript(
+                                        f'document.querySelector'
+                                        f'("#c{_u.id} input[type=file]").click()')
+
+                                ui.button(icon='add') \
+                                    .props('flat round dense') \
+                                    .classes('text-gray-400') \
+                                    .on('click', _otevri_soubor) \
+                                    .tooltip('Přiložit soubor')
+                                ui.button(icon='send', on_click=_odesli_kom) \
+                                    .props('flat round dense') \
+                                    .classes('text-blue-500')
 
         with ui.column().classes('w-full h-full gap-0'):
 
@@ -1682,6 +2113,8 @@ async def _vykresli_telo(user_id, user_name, vsechna_prava, muj_refresh):
                              'flex-shrink-0 px-2') as room_tabs:
                 ui.tab('nastenska', label='Nástěnka', icon='campaign')
                 ui.tab('soubory', label='Soubory', icon='attach_file')
+                if muze_spravovat:
+                    ui.tab('archiv', label='Archiv', icon='inventory_2')
 
             with ui.tab_panels(room_tabs, value='nastenska') \
                     .classes('w-full flex-1 flex flex-col') \
@@ -1714,16 +2147,8 @@ async def _vykresli_telo(user_id, user_name, vsechna_prava, muj_refresh):
 
                             @ui.refreshable
                             async def feed():
-                                def _nacti_feed():
-                                    # Příspěvky + komentáře + přílohy jedním průchodem
-                                    # ve vlákně (dřív dotaz per příspěvek/komentář na loopu)
-                                    prispevky = ziskej_prispevky(sid_aktivni)
-                                    komentare_map = {p['id']: ziskej_komentare(p['id']) for p in prispevky}
-                                    prilohy_map = {k['id']: ziskej_prilohy_komentare(k['id'])
-                                                   for koms in komentare_map.values() for k in koms}
-                                    return prispevky, komentare_map, prilohy_map
-
-                                prispevky, komentare_map, prilohy_map = await asyncio.to_thread(_nacti_feed)
+                                prispevky, komentare_map, prilohy_map, prilohy_pr = \
+                                    await asyncio.to_thread(_nacti_vlakna)
                                 if not prispevky:
                                     with ui.column().classes('w-full items-center py-16 gap-3'):
                                         ui.icon('campaign').classes('text-gray-300 text-5xl')
@@ -1734,205 +2159,99 @@ async def _vykresli_telo(user_id, user_name, vsechna_prava, muj_refresh):
                                     return
 
                                 for p in prispevky:
-                                    je_autor_p = (p['autor_id'] == user_id)
-                                    barva_p = _avatar_color(p['autor_jmeno'] or '')
-                                    with ui.card().classes('w-full bg-white border border-gray-200 '
-                                                           'p-4 rounded-xl shadow-sm'):
-                                        with ui.row().classes('items-start gap-3 w-full'):
-                                            # Avatar
-                                            ui.element('div') \
-                                                .classes('w-8 h-8 rounded-full flex-shrink-0 mt-0.5') \
-                                                .style(
-                                                    f'background:{barva_p};display:flex;'
-                                                    f'align-items:center;justify-content:center;'
-                                                    f'color:white;font-weight:700;font-size:.65rem') \
-                                                .tooltip(p['autor_jmeno'] or '') \
-                                                .text = _initials(p['autor_jmeno'] or '')
-
-                                            with ui.column().classes('flex-1 gap-1 min-w-0'):
-                                                # Záhlaví příspěvku
-                                                with ui.row().classes('w-full items-center gap-2 '
-                                                                      'justify-between'):
-                                                    with ui.row().classes('items-center gap-2'):
-                                                        ui.label(p['autor_jmeno'] or '') \
-                                                            .classes('font-bold text-sm text-gray-800')
-                                                        ui.label(_fmt_datum(p['datum'])) \
-                                                            .classes('text-xs text-gray-400')
-                                                    if (je_autor_p or muze_schvalovat) and not je_archiv:
-                                                        pid = p['id']
-                                                        with ui.button(icon='more_vert') \
-                                                                .props('flat round dense') \
-                                                                .classes('text-gray-300'):
-                                                            with ui.menu():
-                                                                ui.menu_item(
-                                                                    '🗑️ Smazat příspěvek',
-                                                                    on_click=lambda _pid=pid: (
-                                                                        smazat_prispevek(
-                                                                            _pid, user_id, muze_schvalovat),
-                                                                        feed.refresh(),
-                                                                        _broadcast_feed(
-                                                                            sid_aktivni,
-                                                                            vyjimka=_cid)))
-
-                                                # Text příspěvku
-                                                ui.label(p['text']) \
-                                                    .classes('text-sm text-gray-700 whitespace-pre-wrap mt-1')
-
-                                                # Komentáře
-                                                komentare = komentare_map.get(p['id'], [])
-                                                if komentare:
-                                                    with ui.column().classes('mt-3 pl-3 border-l-2 '
-                                                                             'border-blue-100 gap-1.5'):
-                                                        for k in komentare:
-                                                            barva_k = _avatar_color(k['autor_jmeno'] or '')
-                                                            with ui.row().classes('items-start gap-2'):
-                                                                ui.element('div') \
-                                                                    .classes('w-5 h-5 rounded-full '
-                                                                             'flex-shrink-0 mt-0.5') \
-                                                                    .style(
-                                                                        f'background:{barva_k};display:flex;'
-                                                                        f'align-items:center;justify-content:center;'
-                                                                        f'color:white;font-weight:700;font-size:.5rem') \
-                                                                    .tooltip(k['autor_jmeno'] or '') \
-                                                                    .text = _initials(k['autor_jmeno'] or '')
-                                                                with ui.column().classes('gap-0 flex-1'):
-                                                                    with ui.row().classes('items-center gap-1.5 w-full justify-between'):
-                                                                        with ui.row().classes('items-baseline gap-1.5'):
-                                                                            ui.label(k['autor_jmeno'] or '') \
-                                                                                .classes('text-xs font-bold '
-                                                                                         'text-blue-700')
-                                                                            ui.label(_fmt_datum(k['datum'])) \
-                                                                                .classes('text-xs text-gray-300')
-                                                                        if (k['autor_id'] == user_id or muze_schvalovat) and not je_archiv:
-                                                                            kid2 = k['id']
-                                                                            ui.button(
-                                                                                icon='delete_outline',
-                                                                                on_click=lambda _kid=kid2: (
-                                                                                    smazat_komentar(_kid, user_id, muze_schvalovat),
-                                                                                    feed.refresh(),
-                                                                                    _broadcast_feed(sid_aktivni, vyjimka=_cid)),
-                                                                            ).props('flat round dense') \
-                                                                             .classes('text-gray-300 hover:text-red-400') \
-                                                                             .tooltip('Smazat komentář')
-                                                                    ui.label(k['text']) \
-                                                                        .classes('text-xs text-gray-600')
-                                                                    # Přílohy komentáře
-                                                                    prilohy_k = prilohy_map.get(k['id'], [])
-                                                                    if prilohy_k:
-                                                                        with ui.row().classes('flex-wrap gap-1.5 mt-1'):
-                                                                            for pr in prilohy_k:
-                                                                                ext = os.path.splitext(pr['soubor_nazev'])[1].lower()
-                                                                                ikona = 'image' if ext in ('.jpg', '.jpeg', '.png', '.gif', '.webp') else 'attach_file'
-                                                                                url = f'/kom_prilohy/{os.path.basename(pr["soubor_cesta"])}'
-                                                                                with ui.element('a').props(f'href="{url}" target="_blank"') \
-                                                                                        .classes('flex items-center gap-1 text-xs text-blue-600 '
-                                                                                                 'bg-blue-50 border border-blue-200 '
-                                                                                                 'rounded px-2 py-0.5 hover:bg-blue-100 '
-                                                                                                 'no-underline'):
-                                                                                    ui.icon(ikona).classes('text-sm')
-                                                                                    ui.label(pr['soubor_nazev'][:30] + ('…' if len(pr['soubor_nazev']) > 30 else ''))
-
-                                                # Input pro nový komentář + příloha
-                                                # (v archivované diskuzi se nezobrazuje)
-                                                if je_archiv:
-                                                    continue
-                                                pid2 = p['id']
-                                                _pending = {'bytes': None, 'nazev': None}
-                                                _refs    = {}
-
-                                                with ui.column().classes('w-full gap-1 mt-3'):
-                                                    lbl_priloha = ui.label('').classes(
-                                                        'text-xs text-green-600 italic')
-
-                                                    with ui.row().classes('w-full gap-2 items-center'):
-                                                        _refs['ki'] = ui.input(
-                                                            placeholder='Přidat komentář… '
-                                                                        '(@ označí člena, Enter odešle)') \
-                                                            .classes('flex-1').props('outlined dense')
-                                                        _pripoj_mention(_refs['ki'], kandidati_mention)
-
-                                                        async def _nahrat_prilohu(e, _p=_pending,
-                                                                                  _lbl=lbl_priloha):
-                                                            _p['bytes'] = await e.file.read()
-                                                            _p['nazev'] = e.file.name
-                                                            _lbl.set_text(f'📎 {e.file.name[:30]}')
-
-                                                        def _odesli_kom(_r=_refs, _pid=pid2,
-                                                                        _p=_pending, _lbl=lbl_priloha):
-                                                            v = (_r['ki'].value or '').strip()
-                                                            if not v and not _p.get('bytes'):
-                                                                return
-                                                            text_k = v or '(příloha)'
-                                                            kid = pridej_komentar(
-                                                                _pid, sid_aktivni, text_k,
-                                                                user_id, user_name)
-                                                            if kid and _p.get('bytes'):
-                                                                nazev_souboru = _p['nazev']
-                                                                uloz_prilohu(
-                                                                    kid, nazev_souboru, _p['bytes'])
-                                                                _p['bytes'] = None
-                                                                _p['nazev']  = None
-                                                                _lbl.set_text('')
-                                                                _notify_members(
-                                                                    sid_aktivni,
-                                                                    f'📎 {user_name} nahrál/a přílohu '
-                                                                    f'„{nazev_souboru}" v místnosti '
-                                                                    f'„{sk["nazev"]}".',
-                                                                    vyjimka_id=user_id)
-                                                            _r['ki'].set_value('')
-                                                            feed.refresh()
-                                                            _broadcast_feed(sid_aktivni,
-                                                                            vyjimka=_cid)
-
-                                                        _refs['ki'].on(
-                                                            'keydown.enter',
-                                                            lambda e, fn=_odesli_kom: fn(),
-                                                            js_handler=MENTION_JS_MIMO)
-                                                        _upl = ui.upload(
-                                                            auto_upload=True,
-                                                            on_upload=_nahrat_prilohu,
-                                                        ).props('accept="*/*"') \
-                                                         .style('display:none')
-
-                                                        async def _otevri_soubor(_u=_upl):
-                                                            await ui.run_javascript(
-                                                                f'document.querySelector'
-                                                                f'("#c{_u.id} input[type=file]").click()')
-
-                                                        ui.button(icon='add') \
-                                                            .props('flat round dense') \
-                                                            .classes('text-gray-400') \
-                                                            .on('click', _otevri_soubor) \
-                                                            .tooltip('Přiložit soubor')
-                                                        ui.button(icon='send', on_click=_odesli_kom) \
-                                                            .props('flat round dense') \
-                                                            .classes('text-blue-500')
+                                    _karta_vlakna(p, komentare_map.get(p['id'], []),
+                                                  prilohy_map, prilohy_pr.get(p['id'], []))
 
                             await feed()
-                            if _reg is not None:
-                                _reg['feed'] = feed.refresh   # živé příspěvky pro ostatní v místnosti
+                            _panely.append(feed)
 
                     # ── Vstup nového příspěvku (sticky dole) ──────────────────
                     if je_clen and not je_archiv:
-                        with ui.row().classes('w-full items-end gap-3 px-5 py-4 bg-white '
-                                              'border-t border-gray-200 shadow-lg flex-shrink-0'):
-                            post_in = ui.textarea(
-                                placeholder='Napište příspěvek na nástěnku… '
-                                            '(@ označí člena, Ctrl+Enter odešle)') \
-                                .classes('flex-1').props('outlined rows=2 auto-grow')
-                            _pripoj_mention(post_in, kandidati_mention)
+                        _nove_prilohy = []   # [(název, bajty)] čekající na odeslání příspěvku
 
-                            def _odesli_post():
-                                v = (post_in.value or '').strip()
-                                if not v: return
-                                pridej_prispevek(sid_aktivni, v, user_id, user_name)
-                                post_in.set_value('')
-                                feed.refresh()
-                                _broadcast_feed(sid_aktivni, vyjimka=_cid)
+                        with ui.column().classes('w-full gap-2 px-5 py-4 bg-white '
+                                                 'border-t border-gray-200 shadow-lg flex-shrink-0'):
 
-                            post_in.on('keydown.ctrl.enter', lambda e, fn=_odesli_post: fn())
-                            ui.button(icon='send', text='Vložit', on_click=_odesli_post) \
-                                .classes('bg-blue-600 text-white font-bold h-11 flex-shrink-0')
+                            @ui.refreshable
+                            def _nove_prilohy_ui():
+                                if not _nove_prilohy:
+                                    return
+                                with ui.row().classes('w-full flex-wrap gap-1'):
+                                    for i, (nazev, _) in enumerate(_nove_prilohy):
+                                        ui.chip(nazev[:40] + ('…' if len(nazev) > 40 else ''),
+                                                icon='attach_file', removable=True,
+                                                color='blue-1', text_color='blue-9',
+                                                on_value_change=lambda _, _i=i: _odeber_prilohu(_i)) \
+                                            .props('dense')
+
+                            def _odeber_prilohu(i):
+                                _nove_prilohy.pop(i)
+                                _nove_prilohy_ui.refresh()
+                                # QUploader by stejný soubor podruhé tiše odmítl jako duplikát
+                                upl_post.run_method('removeUploadedFiles')
+
+                            _nove_prilohy_ui()
+
+                            with ui.row().classes('w-full items-end gap-3'):
+                                post_in = ui.textarea(
+                                    placeholder='Napište příspěvek na nástěnku… '
+                                                '(@ označí člena, Ctrl+Enter odešle)') \
+                                    .classes('flex-1').props('outlined rows=2 auto-grow')
+                                _pripoj_mention(post_in, kandidati_mention)
+
+                                async def _pridat_soubor(e):
+                                    _nove_prilohy.append((e.file.name, await e.file.read()))
+                                    _nove_prilohy_ui.refresh()
+
+                                upl_post = ui.upload(multiple=True, auto_upload=True,
+                                                     on_upload=_pridat_soubor) \
+                                    .props('accept="*/*"').style('display:none')
+
+                                async def _vybrat_soubory():
+                                    await ui.run_javascript(
+                                        f'document.querySelector'
+                                        f'("#c{upl_post.id} input[type=file]").click()')
+
+                                async def _odesli_post():
+                                    v = (post_in.value or '').strip()
+                                    soubory = list(_nove_prilohy)
+                                    if not v and not soubory:
+                                        return
+                                    # Vyčistit hned — druhé odeslání během ukládání nic nezdvojí
+                                    post_in.set_value('')
+                                    _nove_prilohy.clear()
+                                    _nove_prilohy_ui.refresh()
+                                    # (ne reset() — ten by přerušil případné rozběhlé nahrávání)
+                                    upl_post.run_method('removeUploadedFiles')
+
+                                    def _uloz():
+                                        pid = pridej_prispevek(sid_aktivni, v or '(příloha)',
+                                                               user_id, user_name)
+                                        chyby = 0
+                                        for nazev, data in (soubory if pid else []):
+                                            if not uloz_prilohu(None, nazev, data, prispevek_id=pid):
+                                                chyby += 1
+                                        return pid, chyby
+
+                                    pid, chyby = await asyncio.to_thread(_uloz)
+                                    if not pid:
+                                        post_in.set_value(v)
+                                        _nove_prilohy.extend(soubory)
+                                        _nove_prilohy_ui.refresh()
+                                        ui.notify('Příspěvek se nepodařilo uložit.', type='negative')
+                                        return
+                                    if chyby:
+                                        ui.notify(f'Nepodařilo se uložit {chyby} z {len(soubory)} příloh.',
+                                                  type='warning')
+                                    _po_zmene()
+
+                                post_in.on('keydown.ctrl.enter', _odesli_post)
+                                ui.button(icon='attach_file', color=None, on_click=_vybrat_soubory) \
+                                    .props('flat round') \
+                                    .classes('text-gray-500 flex-shrink-0') \
+                                    .tooltip('Přiložit soubory k příspěvku')
+                                ui.button(icon='send', text='Vložit', on_click=_odesli_post) \
+                                    .classes('bg-blue-600 text-white font-bold h-11 flex-shrink-0')
 
                 # ── Panel: Soubory ────────────────────────────────────────────
                 with ui.tab_panel('soubory') \
@@ -1947,7 +2266,7 @@ async def _vykresli_telo(user_id, user_name, vsechna_prava, muj_refresh):
                                 ui.icon('folder_open').classes('text-gray-300 text-5xl')
                                 ui.label('Zatím žádné soubory') \
                                     .classes('text-gray-400 font-semibold text-lg')
-                                ui.label('Soubory přiložte ke komentářům v záložce Nástěnka.') \
+                                ui.label('Soubory přiložte k příspěvku nebo komentáři v záložce Nástěnka.') \
                                     .classes('text-sm text-gray-400')
                             return
 
@@ -1979,6 +2298,44 @@ async def _vykresli_telo(user_id, user_name, vsechna_prava, muj_refresh):
                                                 .classes('text-xs text-gray-400')
 
                     await soubory_panel()
+                    _panely.append(soubory_panel)
+
+                # ── Panel: Archiv vláken (vidí jen správce) ───────────────────
+                if muze_spravovat:
+                    with ui.tab_panel('archiv') \
+                            .classes('p-0 h-full overflow-y-auto bg-gray-50') \
+                            .style('min-height:0'):
+
+                        @ui.refreshable
+                        async def archiv_panel():
+                            if room_tabs.value != 'archiv':   # načte se až při otevření záložky
+                                return
+                            prispevky, komentare_map, prilohy_map, prilohy_pr = \
+                                await asyncio.to_thread(_nacti_vlakna, True)
+                            if not prispevky:
+                                with ui.column().classes('w-full items-center py-16 gap-3'):
+                                    ui.icon('inventory_2').classes('text-gray-300 text-5xl')
+                                    ui.label('Archiv je prázdný') \
+                                        .classes('text-gray-400 font-semibold text-lg')
+                                    ui.label('Vlákno sem přesunete tlačítkem Archivovat '
+                                             'u příspěvku na nástěnce.') \
+                                        .classes('text-sm text-gray-400')
+                                return
+                            with ui.column().classes('w-full p-5 gap-4'):
+                                for p in prispevky:
+                                    _karta_vlakna(p, komentare_map.get(p['id'], []),
+                                                  prilohy_map, prilohy_pr.get(p['id'], []),
+                                                  archivni=True)
+
+                        await archiv_panel()
+                        _panely.append(archiv_panel)
+
+                    room_tabs.on_value_change(
+                        lambda e: archiv_panel.refresh() if e.value == 'archiv' else None)
+
+            # Živé změny od ostatních v místnosti (viz _broadcast_feed)
+            if _reg is not None:
+                _reg['feed'] = _obnov_panely
 
     else:
         # ── SEZNAM DLAŽDIC ────────────────────────────────────────────────────

@@ -3,6 +3,7 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.image import MIMEImage
+from email.mime.application import MIMEApplication
 from email.header import Header
 import imaplib
 import mimetypes
@@ -77,7 +78,8 @@ def otestuj_spojeni():
     return True, f"Kontrolní e-mail odeslán na {prijemce} ({smtp['smtp_server']}:{smtp['smtp_port']})."
 
 
-def odesli_upozorneni_email(prijemce, predmet, text):
+def odesli_upozorneni_email(prijemce, predmet, text, prilohy=None):
+    """`prilohy` = [(název souboru, bajty)] — připojí se jako soubory ke stažení."""
     sys_log(f"=== START ODESÍLÁNÍ E-MAILU PRO: {prijemce} ===")
     try:
         sys_log("[KROK 1] Čtení SMTP konfigurace z prostředí...")
@@ -93,7 +95,7 @@ def odesli_upozorneni_email(prijemce, predmet, text):
         smtp_password = smtp["smtp_password"]
 
         sys_log("[KROK 3] Sestavování e-mailové zprávy...")
-        msg = MIMEMultipart('related')
+        msg = MIMEMultipart('mixed' if prilohy else 'related')
         msg['From'] = smtp_user
         msg['To'] = prijemce
         msg['Subject'] = Header(predmet, 'utf-8')
@@ -101,6 +103,10 @@ def odesli_upozorneni_email(prijemce, predmet, text):
         msg.attach(alt)
         alt.attach(MIMEText(text, 'plain', 'utf-8'))
         alt.attach(MIMEText(_text_na_html(text), 'html', 'utf-8'))
+        for nazev, data in prilohy or ():
+            soubor = MIMEApplication(data)
+            soubor.add_header('Content-Disposition', 'attachment', filename=nazev)
+            msg.attach(soubor)
 
         sys_log(f"[KROK 4] Připojování a přihlašování k SMTP {smtp_server}:{smtp_port} (Timeout 15s)...")
         server = _spoj_smtp(smtp)

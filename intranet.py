@@ -32,6 +32,7 @@ import intranet_monitory
 import intranet_zalistovaci
 import intranet_manualy
 import intranet_datuloziste
+import intranet_naklady_veletrh
 import intranet_halloween
 
 import time
@@ -712,6 +713,7 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
         'lupa':          'lupa_zapnuty',
         'gastrokurzy':   'gastrokurzy_zapnuty',
         'uloziste':      'datuloziste_zapnuty',
+        'naklady_veletrh': 'naklady_veletrh_zapnuty',
         'monitor':       'monitor_zapnuty',
         'zalistovaci':   'zalistovaci_zapnuty',
 
@@ -914,7 +916,9 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
             'cenopripad_office_obchod_ovozel',
             'cenopripad_spravce_nakup', 'cenopripad_spravce',
             'cenopripad_spravce_bez_emailu', 'cenopripad_vkladatel',
-            'cenopripad_zobrazeni_oddeleni')) or
+            'cenopripad_zobrazeni_oddeleni',
+            'cenopripad_zadatel_oprava', 'cenopripad_office_oprava',
+            'cenopripad_spravce_oprava')) or
         # Schvalovatel – oddělení: dynamické právo cp_schval_odd_<oddělení>
         any(p.startswith('cp_schval_odd_') for p in vsechna_prava) or
         # Leták – WebPortál: vlastní práva (zadavatel / správa / nákup po kódech)
@@ -960,6 +964,10 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
     if (nastaveni.get('datuloziste_zapnuty', True)
             and intranet_datuloziste.ma_pristup_k_modulu(user_id, vsechna_prava)):
         dostupne_taby.append('uloziste')
+
+    # Náklady veletrh (zadavatel / schvalovatel / čtenář) — s Plánem Veletrh 2027 nesouvisí.
+    if intranet_naklady_veletrh.ma_pristup_k_modulu(vsechna_prava):
+        dostupne_taby.append('naklady_veletrh')
 
     if not user_id:
         # Deep-link z e-mailu musí přežít i přesměrování přes firemní účet (OIDC) —
@@ -1597,8 +1605,10 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
                         ui.tab('manualy', label='📖  Manuály').classes('justify-start text-lg text-gray-800')
                     if 'uloziste' in dostupne_taby:
                         ui.tab('uloziste', label='🗄️  Datové úložiště').classes('justify-start text-lg text-gray-800')
+                    if 'naklady_veletrh' in dostupne_taby:
+                        ui.tab('naklady_veletrh', label='🧾  Náklady veletrh').classes('justify-start text-lg text-gray-800')
                     if 'lupa' in dostupne_taby:
-                        tab_lupa = ui.tab('lupa', label='🔍  Lupou na obchod').classes('justify-start text-lg text-gray-800')
+                        tab_lupa = ui.tab('lupa', label='🔍  Lupopřípad').classes('justify-start text-lg text-gray-800')
 
                     if ma_vse or "uzivatele" in vsechna_prava:
                         tab_uzivatele = ui.tab('uzivatele', label='👥  Správa uživatelů').classes('justify-start text-lg text-gray-800')
@@ -1679,6 +1689,7 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
                 if 'lupa'       in dostupne_taby: _RENDER_FNS['lupa']       = lambda: intranet_lupa.vykresli_lupa(user_id, user_name, vsechna_prava)
                 if 'gastrokurzy' in dostupne_taby: _RENDER_FNS['gastrokurzy'] = lambda: intranet_gastrokurzy.vykresli(user_id, user_name, vsechna_prava)
                 if 'uloziste'   in dostupne_taby: _RENDER_FNS['uloziste']   = lambda: intranet_datuloziste.vykresli(user_id, user_name, vsechna_prava)
+                if 'naklady_veletrh' in dostupne_taby: _RENDER_FNS['naklady_veletrh'] = lambda: intranet_naklady_veletrh.vykresli(user_id, user_name, vsechna_prava)
 
                 if tab_logy:        _RENDER_FNS['logy']          = lambda: intranet_logger.vykresli_logy(user_name, vsechna_prava)
                 if tab_server:      _RENDER_FNS['server']        = lambda: intranet_monitor.vykresli_monitor(vsechna_prava)
@@ -1861,6 +1872,17 @@ async def route_uloziste(client: Client, slozka: str = ''):
         except (TypeError, ValueError):
             pass
     await vykresli_kompletni_intranet(client, 'uloziste')
+
+@ui.page('/naklady_veletrh')
+async def route_naklady_veletrh(client: Client, naklad: str = ''):
+    # Deep-link z e-mailu (/naklady_veletrh?naklad=<id>). Je to jen přání — modul
+    # náklad otevře, jen když ho uživatel smí vidět; jinak ukáže hlášku.
+    if naklad:
+        try:
+            app.storage.user['naklady_veletrh_naklad'] = int(naklad)
+        except (TypeError, ValueError):
+            pass
+    await vykresli_kompletni_intranet(client, 'naklady_veletrh')
 
 @ui.page('/logout')
 def route_logout(client: Client):
