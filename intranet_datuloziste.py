@@ -1952,6 +1952,7 @@ _SLOUPCE_HISTORIE = (
      'style': 'width: 120px', 'headerStyle': 'width: 120px'},
     {'name': 'akce', 'label': 'Akce', 'field': 'akce', 'align': 'left', 'sortable': True},
     {'name': 'nazev', 'label': 'Položka', 'field': 'nazev', 'align': 'left', 'sortable': True},
+    {'name': 'misto', 'label': 'Umístění', 'field': 'misto', 'align': 'left', 'sortable': True},
     {'name': 'kdo', 'label': 'Kdo', 'field': 'kdo', 'align': 'left', 'sortable': True},
     {'name': 'detail', 'label': 'Podrobnosti', 'field': 'detail', 'align': 'left'},
 )
@@ -1965,10 +1966,8 @@ _SLOT_HISTORIE = r'''
       <span>{{ props.row.akce }}</span>
     </div>
   </q-td>
-  <q-td key="nazev" :props="props">
-    <div class="du-h-nazev">{{ props.row.nazev }}</div>
-    <div class="du-misto">{{ props.row.misto }}</div>
-  </q-td>
+  <q-td key="nazev" :props="props"><div class="du-h-nazev">{{ props.row.nazev }}</div></q-td>
+  <q-td key="misto" :props="props"><div class="du-h-misto">{{ props.row.misto }}</div></q-td>
   <q-td key="kdo" :props="props">{{ props.row.kdo }}</q-td>
   <q-td key="detail" :props="props"><div class="du-h-detail">{{ props.row.detail }}</div></q-td>
 </q-tr>
@@ -2163,6 +2162,7 @@ _CSS = r'''
 .du-historie thead th { position: sticky; top: 0; z-index: 1; background: #fff; font-weight: 600; }
 .du-historie tbody td { vertical-align: top; white-space: normal; font-size: 13px; }
 .du-h-nazev { color: #323130; overflow-wrap: anywhere; }
+.du-h-misto { color: #605e5c; overflow-wrap: anywhere; }
 .du-h-detail { max-width: 240px; overflow-wrap: anywhere; color: #605e5c; }
 '''
 
@@ -2701,8 +2701,8 @@ async def vykresli(user_id, user_name, vsechna_prava):
             ui.label('Odpojit uživatele?').classes('text-lg font-bold text-gray-800')
             ui.label(f'Soubor „{radek["nazev"]}“ má otevřený {radek["otevren"]}.') \
                 .classes('text-sm text-gray-800 break-words')
-            ui.label('Jeho Office už do souboru nic neuloží — neuložené změny si může uložit jen jako '
-                     'kopii. Soubor pak může otevřít a upravovat někdo jiný.').classes('text-sm text-gray-700')
+            ui.label('Verze uživatele se neuloží — neuložené změny si může uložit jen jako kopii. '
+                     'Soubor pak může otevřít a upravovat někdo jiný.').classes('text-sm text-gray-700')
 
             async def ano():
                 dlg.close()
@@ -2808,11 +2808,8 @@ async def vykresli(user_id, user_name, vsechna_prava):
         with koren, ui.dialog() as dlg, ui.card().classes('w-[38rem] max-w-full gap-3'):
             ui.label('Řízení přístupu').classes('text-lg font-bold text-gray-800')
             ui.label(cesta_txt).classes('text-sm text-gray-500 -mt-2 break-words')
-            with ui.row().classes('w-full items-center gap-2 no-wrap'):
-                vstup = ui.input(placeholder='Přidat osobu — jméno nebo e-mail') \
-                    .props('outlined dense clearable autofocus').classes('flex-1')
-                role = ui.toggle(dict(_ROLE_VOLBY), value=ROLE_CTENAR) \
-                    .props('no-caps unelevated toggle-color=primary')
+            vstup = ui.input(placeholder='Přidat osobu — jméno nebo e-mail') \
+                .props('outlined dense clearable autofocus').classes('w-full')
             napoveda = ui.list().props('dense bordered separator').classes('w-full du-napoveda')
             napoveda.set_visibility(False)
             ui.label('Čtenář složku prohlíží a stahuje. Správce v ní navíc nahrává, upravuje, maže, '
@@ -2856,7 +2853,7 @@ async def vykresli(user_id, user_name, vsechna_prava):
             napoveda.clear()
             with napoveda:
                 for u in stav['shody']:
-                    with ui.item(on_click=lambda u=u: pridej(u)):
+                    with ui.item(on_click=lambda u=u: potvrd(u)):
                         with ui.item_section().props('avatar'):
                             ui.icon('person_add', color='primary')
                         with ui.item_section():
@@ -2873,8 +2870,34 @@ async def vykresli(user_id, user_name, vsechna_prava):
                 stav['radky'] = radky
                 seznam.refresh()
 
-        async def pridej(u):
-            nova = role.value if role.value in _ROLE_VOLBY else ROLE_CTENAR
+        def potvrd(u):
+            """Výběr z našeptávače přístup ještě nepřidá: e-mail s odkazem odejde hned a vzít
+            zpět nejde, tak se osoba i role (výchozí čtenář) nejdřív potvrdí."""
+            with koren, ui.dialog() as okno, ui.card().classes('w-[26rem] max-w-full gap-3'):
+                ui.label('Přidat přístup?').classes('text-lg font-bold text-gray-800')
+                with ui.row().classes('w-full items-center gap-2 no-wrap'):
+                    ui.icon('person', color='primary')
+                    with ui.column().classes('flex-1 min-w-0 gap-0'):
+                        ui.label(_jmeno_uctu(u)).classes('text-sm text-gray-800 truncate')
+                        ui.label(u['email'] or '').classes('text-xs text-gray-500 truncate')
+                ui.label(f'do „{cesta_txt}“').classes('text-sm text-gray-600 break-words')
+                volba = ui.toggle(dict(_ROLE_VOLBY), value=ROLE_CTENAR) \
+                    .props('no-caps unelevated toggle-color=primary')
+                ui.label('Dostane e-mail s odkazem do složky.' if u['email'] else
+                         'Nemá e-mail — oznámení nedostane.').classes('text-xs text-gray-500')
+
+                async def ano():
+                    okno.close()
+                    await pridej(u, volba.value)
+
+                with ui.row().classes('w-full justify-end gap-2'):
+                    ui.button('Zrušit', on_click=okno.close).props('flat')
+                    ui.button('Přidat', icon='person_add', on_click=ano).props('color=primary')
+            okno.on('hide', okno.delete)
+            okno.open()
+
+        async def pridej(u, nova):
+            nova = nova if nova in _ROLE_VOLBY else ROLE_CTENAR
             jmeno = _jmeno_uctu(u)
             r = await db(_pridej_pristup, sid, u['iduser'], user_name, nova)
             if r is None:
@@ -2915,7 +2938,7 @@ async def vykresli(user_id, user_name, vsechna_prava):
             await nacti()
 
         vstup.on('update:model-value', lambda e: napovez(e.args), throttle=0.2, leading_events=False)
-        vstup.on('keydown.enter', lambda: pridej(stav['shody'][0]) if stav['shody'] else None)
+        vstup.on('keydown.enter', lambda: potvrd(stav['shody'][0]) if stav['shody'] else None)
         dlg.on('hide', dlg.delete)
         await nacti()
         dlg.open()
@@ -3204,6 +3227,7 @@ if __name__ == '__main__':
     _hist = _radky_historie([{'id': 1, 'kdy': _ted, 'kdo': 'Jan', 'akce': 'zamceno', 'nazev': 'a.xlsx',
                               'misto': '', 'detail': None}])
     assert (_hist[0]['akce'], _hist[0]['ikona'], _hist[0]['misto'], _hist[0]['detail']) == ('Uzamčeno', 'lock', 'Datové úložiště', '')
+    assert all(f'key="{c["name"]}"' in _SLOT_HISTORIE and c['field'] in _hist[0] for c in _SLOUPCE_HISTORIE)
     # Čekající nahrané verze: každou jde vyzvednout jen jednou.
     _CEKAJICI.clear()
     _odloz(('u', 'k'), {'disk': 'x1', 'id': 1})

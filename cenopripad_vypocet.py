@@ -528,6 +528,11 @@ def nacti_master(zdroj_data, op_mapa, list_nazev="DATA_POROVNANI") -> dict:
                     "sortiment": sort_s,
                     # S (Nak) = kód nákupčího (DR/SK/CK…) — párování fronty Leták – WebPortál
                     "nak": (str(d.get(18)).strip().upper() or None) if d.get(18) else None,
+                    # K, L = dodavatel (Lupou na nákup páruje odběry na dodavatele),
+                    # AB = Skupina2-popis (kategorie v měsíčním reportu nákupčím).
+                    "dodavatel": normalizuj_kod(d.get(10)),
+                    "dodavatel_popis": d.get(11),
+                    "skupina2_popis": d.get(27),
                     # OP: VÝHRADNĚ z OP souboru (obchodní podmínky) přes sortiment;
                     # není-li sortiment v OP souboru -> None -> engine počítá s 0.
                     "op": op_mapa.get(sort_s) if sort_s is not None else None,

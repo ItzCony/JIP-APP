@@ -915,9 +915,19 @@ def _ocisti_html(html_text: str) -> str:
     return _JS_ODKAZ.sub('', cisty)
 
 
-def uloz_kapitolu(manual: dict, index: int, html_text: str, user_name: str) -> None:
-    """Přepíše kapitolu z editoru — se zálohou předchozí podoby a zápisem do logu."""
+def uloz_kapitolu(manual: dict, index: int, html_text: str, user_name: str,
+                  nadpis: str | None = None) -> None:
+    """Přepíše kapitolu z editoru — se zálohou předchozí podoby a zápisem do logu.
+
+    Nový nadpis mění jen zobrazený název; id zůstává, ať odkazy a kotvy platí.
+    """
     kapitola = manual['kapitoly'][index]
+    puvodni = kapitola['nadpis']
+    if nadpis is not None:
+        nadpis = nadpis.strip()
+        if not nadpis:
+            raise ValueError('Kapitola musí mít nadpis.')
+        kapitola['nadpis'] = nadpis
     kapitola['html'] = _ocisti_html(html_text)
     text = _html.unescape(re.sub(r'<[^>]+>', ' ', kapitola['html']))
     text = re.sub(r'\s+', ' ', text).strip()
@@ -928,10 +938,12 @@ def uloz_kapitolu(manual: dict, index: int, html_text: str, user_name: str) -> N
     kapitola['kotvy'] = [k for k in kapitola.get('kotvy', []) if k['id'] in zbyle]
     manual['upraveno'] = datetime.datetime.now().strftime('%d.%m.%Y %H:%M')
     manual['upravil'] = user_name
-    zaloz_verzi(f"úprava kapitoly „{kapitola['nadpis']}“")
+    popis = f"kapitoly „{kapitola['nadpis']}“"
+    if kapitola['nadpis'] != puvodni:
+        popis = f"kapitoly „{puvodni}“ → „{kapitola['nadpis']}“"
+    zaloz_verzi(f'úprava {popis}')
     _zapis_json(manual)
-    intranet_logger.log_activity(user_name, 'Manuály',
-                                 f"Upravena kapitola „{kapitola['nadpis']}“")
+    intranet_logger.log_activity(user_name, 'Manuály', f'Upravena {popis}')
 
 
 def _volne_id(kapitoly: list, nadpis: str) -> str:
@@ -1641,9 +1653,8 @@ def vykresli_manualy(user_id, user_name, vsechna_prava):
                 ui.card().classes('w-full h-full flex flex-col p-3 gap-2'):
             with ui.row().classes('w-full items-center gap-2'):
                 ui.icon('edit').classes('text-emerald-700')
-                ui.label(f"Úprava kapitoly: {kapitola.get('nadpis') or ''}") \
-                    .classes('text-base font-bold')
-                ui.space()
+                nadpis_i = ui.input('Nadpis kapitoly', value=kapitola.get('nadpis') or '') \
+                    .props('outlined dense').classes('flex-1 text-base font-bold')
                 ui.button(icon='close', on_click=dlg.close).props('flat dense round')
             editor = ui.editor(value=f'<style>{_css_editoru(manual)}</style>'
                                      + (kapitola.get('html') or '')) \
@@ -1652,13 +1663,14 @@ def vykresli_manualy(user_id, user_name, vsechna_prava):
                 ui.label('Každá úprava se zapisuje do logu a zakládá novou verzi.') \
                     .classes('text-xs text-gray-400 self-center mr-auto')
                 ui.button('Zrušit', on_click=dlg.close).props('flat no-caps')
-                ui.button('Uložit úpravy', icon='save', on_click=lambda: _uloz(editor, index, dlg)) \
+                ui.button('Uložit úpravy', icon='save',
+                          on_click=lambda: _uloz(editor, nadpis_i, index, dlg)) \
                     .props('unelevated no-caps').classes('bg-emerald-600')
         dlg.open()
 
-    def _uloz(editor, index: int, dlg):
+    def _uloz(editor, nadpis_i, index: int, dlg):
         try:
-            uloz_kapitolu(manual, index, editor.value, user_name)
+            uloz_kapitolu(manual, index, editor.value, user_name, nadpis_i.value)
         except Exception as chyba:
             ui.notify(f'Uložení se nepovedlo: {chyba}', type='negative')
             return

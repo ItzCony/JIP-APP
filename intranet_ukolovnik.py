@@ -3462,7 +3462,7 @@ async def _vykresli_ukoly(user_id, user_name, vsechna_prava, dialog_anchor=None,
                         with ui.column().classes('flex-1 min-w-0 gap-0.5'):
                             nazev_cls = 'text-base font-bold text-gray-800' + (' line-through text-gray-400' if je_hotovo else '')
                             ui.label(uk['nazev']).classes(f'{nazev_cls} line-clamp-1')
-                            if uk.get('posledni_poznamka') and not _pohled['hotove']:
+                            if uk.get('posledni_poznamka'):
                                 ui.label(uk['posledni_poznamka']).classes('text-xs text-gray-400 line-clamp-1')
                             with ui.row().classes('gap-1 flex-wrap items-center'):
                                 if uk.get('porada_id'):

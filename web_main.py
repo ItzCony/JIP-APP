@@ -172,6 +172,9 @@ if __name__ == "__main__":
     # Podklady VŘ — e-mail vybraným lidem X dní před koncem platnosti.
     import intranet_podklady_vr
     app.on_startup(lambda: asyncio.create_task(intranet_podklady_vr.bg_upozorneni()))
+    # Lupou na nákup — k 10. dni v měsíci Excel s prodeji každému nákupčímu.
+    import intranet_lupa
+    app.on_startup(lambda: asyncio.create_task(intranet_lupa.bg_nakup_report()))
     # Nahrané soubory jen pro přihlášené (viz intranet_static)
     intranet_static.chranene_soubory('/znacky_foto', 'znacky_foto')
     intranet_static.chranene_soubory(znacky_provoz.foto_route, znacky_provoz.foto_dir)

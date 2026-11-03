@@ -169,6 +169,11 @@ ZAKLADNI_PRAVA = {
 
     'datuloziste_spravce':     {'kategorie': 'Modul Datové úložiště', 'nazev': 'Administrátor', 'popis': 'Vidí a spravuje všechny sekce a složky Datového úložiště, zakládá sekce a přiděluje uživatelům ke složkám roli správce (nahrává, upravuje, maže, přesouvá, zamyká) nebo čtenáře (prohlíží a stahuje). Vidí historii změn a může odpojit uživatele od otevřeného souboru. Ostatní vidí jen složky, ke kterým mají přidělenou roli.', 'ikona': 'folder_shared'},
 
+    'naklady_veletrh_zadavatel':    {'kategorie': 'Modul Náklady veletrh', 'nazev': 'Zadavatel nákladu', 'popis': 'Zadává náklady veletrhu (popis, kategorie, dodavatel, částka, přílohy), ukládá je jako koncept a odesílá ke schválení. Své neschválené náklady upravuje nebo stahuje zpět, vrácené doplní a odešle znovu. Vidí přehled rozpočtu, grafy a všechny odeslané náklady, píše komentáře a exportuje reporty.', 'ikona': 'post_add'},
+    'naklady_veletrh_schvalovatel': {'kategorie': 'Modul Náklady veletrh', 'nazev': 'Schvalovatel nákladu', 'popis': 'Schvaluje, zamítá a vrací k doplnění náklady ve frontě Ke schválení (o vlastních nerozhoduje), označuje je jako uhrazené a nastavuje celkový rozpočet i rozpočty kategorií. Dostává e-maily o nových nákladech a připomínky čekajících.', 'ikona': 'verified'},
+    'naklady_veletrh_spravce':      {'kategorie': 'Modul Náklady veletrh', 'nazev': 'Částečný Správce', 'popis': 'Stejná práva jako Schvalovatel nákladu: vidí všechny odeslané náklady, nastavuje celkový rozpočet i rozpočty kategorií, označuje schválené náklady jako uhrazené, píše komentáře a exportuje reporty. Rozdíl: náklady NESCHVALUJE, nezamítá ani nevrací (nevidí frontu Ke schválení) a nechodí mu e-maily o nákladech ke schválení.', 'ikona': 'manage_accounts'},
+    'naklady_veletrh_ctenar':       {'kategorie': 'Modul Náklady veletrh', 'nazev': 'Čtenář', 'popis': 'Vidí přehled, grafy, seznam a detail nákladů včetně příloh a historie a exportuje reporty (Excel, PDF). Nic nezadává, nemění ani neschvaluje.', 'ikona': 'visibility'},
+
     'spolvecer_schvalovatel': {'kategorie': 'Modul Společenský večer', 'nazev': 'Schvalovatel', 'popis': 'Vidí všechny pobočky, komunikuje v chatu a schvaluje náklady (mění stav na Schváleno).', 'ikona': 'verified'},
     'spolvecer_ctenar':       {'kategorie': 'Modul Společenský večer', 'nazev': 'Čtenář', 'popis': 'Vidí všechny pobočky pouze pro čtení a může psát do chatu. Nemůže editovat tabulku ani schvalovat.', 'ikona': 'visibility'},
 
@@ -199,6 +204,7 @@ ZAKLADNI_PRAVA = {
     'cenopripad_zadatel_oprava': {'kategorie': 'Modul Cenopřípad', 'podskupina': 'Oprava cen', 'nazev': 'Žadatel – Oprava cen', 'popis': 'OPRAVA CEN – podává žádosti o opravu ceny (vzorový formulář Oprava_ceny_2026.xlsx), vidí jen své žádosti a jejich stavy, opravuje a znovu odesílá vrácené žádosti nebo trvá na svém a vrací je zpět na Office. Může vlastní nevyřízenou žádost stornovat.', 'ikona': 'sell'},
     'cenopripad_oprava_bez_pcstd': {'kategorie': 'Modul Cenopřípad', 'podskupina': 'Oprava cen', 'nazev': 'Žadatel – Oprava cen bez standardní PC', 'popis': 'MIMOŘÁDNÉ PRÁVO k Oprava cen: ve formuláři nemusí vyplnit sloupec G „Standartní prodejní cena“ — žádost projde i s prázdným sloupcem. V detailu případu se pak u takových řádků zobrazí „—“ místo ceny a nedopočítá se % ani absolutní odchylka.', 'ikona': 'money_off'},
     'cenopripad_office_oprava':  {'kategorie': 'Modul Cenopřípad', 'podskupina': 'Oprava cen', 'nazev': 'Office – Oprava cen', 'popis': 'OPRAVA CEN – vidí všechny žádosti, zpracuje je, vrací žadateli k opravě, uzavírá je nebo postupuje správci k odsouhlasení; může je stornovat s uvedením důvodu. Dostává e-maily a notifikace o nových žádostech.', 'ikona': 'task_alt'},
+    'cenopripad_spravce_oprava': {'kategorie': 'Modul Cenopřípad', 'podskupina': 'Oprava cen', 'nazev': 'Správce – Oprava cen', 'popis': 'OPRAVA CEN – plná správa JEN této dlaždice: vše jako Office, navíc odsouhlasuje žádosti postoupené správci a smí žádosti mazat. Dostává notifikace a e-maily o žádostech ke schválení. NEDÁVÁ žádná práva ke zbytku modulu Cenopřípad (případy, OP a marže, import dat…).', 'ikona': 'admin_panel_settings'},
     'cenopripad_ctenar_nc':      {'kategorie': 'Modul Cenopřípad', 'podskupina': 'NC OVOZEL', 'nazev': 'Čtenář – NC OVOZEL', 'popis': 'NC OVOZEL — Pouze pro čtení: vidí všechny žádosti o změnu nákupní ceny (import cen i delist), jejich tabulky a průběh. NEMŮŽE zakládat žádosti, vracet je k opravě, měnit stav, exportovat do skladu ani mazat.', 'ikona': 'visibility'},
     'cenopripad_spravce_nakup':  {'kategorie': 'Modul Cenopřípad', 'podskupina': 'Případy (nákup/obchod)', 'nazev': 'Správce nákup',  'popis': 'Plná správa nákupních (letákových) dlaždic — vidí vše včetně OP a marží v %, schvaluje druhou kontrolu. Vidí jen dlaždice leták/sklad6/mimoleták/paima.', 'ikona': 'admin_panel_settings'},
     'cenopripad_spravce':        {'kategorie': 'Modul Cenopřípad', 'nazev': 'Správce (vše)',  'popis': 'Plná správa celého modulu vč. importu dat — vidí vše včetně OP a marží v % ve všech dlaždicích. OP a procenta vidí pouze správci (tato role + Správce nákup u letákových dlaždic), NIKDY žadatel ani office.', 'ikona': 'local_police'},
@@ -221,9 +227,9 @@ ZAKLADNI_PRAVA = {
     # Lupou na obchod — přístup ASM a vedoucích se NEUDĚLUJE právem. Odvozuje se:
     # ASM se páruje s uživatelem podle příjmení, vedoucí vidí ASM svého oddělení
     # (právo hlavni_vedouci_{oddělení}). Zde jsou jen role nad rámec toho.
-    'lupa_extra':     {'kategorie': 'Modul Lupou na obchod', 'nazev': 'Extra čtenář',  'popis': 'Vidí data všech ASM a smí vkládat komentáře k jejich poznámkám. Nemůže nahrávat data.', 'ikona': 'visibility'},
-    'lupa_vkladatel': {'kategorie': 'Modul Lupou na obchod', 'nazev': 'Vkladatel dat', 'popis': 'Smí nahrávat soubory GIST prodejů (dávkově). Nevidí data ASM, ke kterým nemá přístup jinou cestou.', 'ikona': 'upload'},
-    'lupa_admin':     {'kategorie': 'Modul Lupou na obchod', 'nazev': 'Správce',       'popis': 'Plná práva k modulu: všechna ASM, import, komentáře, audit výjezdů.', 'ikona': 'local_police'},
+    'lupa_extra':     {'kategorie': 'Modul Lupopřípad', 'nazev': 'Extra čtenář',  'popis': 'Vidí data všech ASM a smí vkládat komentáře k jejich poznámkám. Nemůže nahrávat data.', 'ikona': 'visibility'},
+    'lupa_vkladatel': {'kategorie': 'Modul Lupopřípad', 'nazev': 'Vkladatel dat', 'popis': 'Smí nahrávat soubory GIST prodejů (dávkově) i data GIST pro Lupou na nákup. Nevidí data ASM, ke kterým nemá přístup jinou cestou.', 'ikona': 'upload'},
+    'lupa_admin':     {'kategorie': 'Modul Lupopřípad', 'nazev': 'Správce',       'popis': 'Plná práva k modulu: všechna ASM, import, komentáře, audit výjezdů.', 'ikona': 'local_police'},
 
     # Rezervace ind. schůzky s vedoucími — schůzka je vždy společná, kdo má právo
     # `schuzky_vedouci`, tomu žádost přijde a odklikne si účast (nic se nehardcoduje).
@@ -278,6 +284,33 @@ for _v in ZAKLADNI_PRAVA.values():
     if _v.get('kategorie') == 'Modul Formuláře ASM':
         _v.setdefault('podskupina', 'Formuláře')
 
+# Lupou na nákup — dlaždice v modulu Lupa, ve správě uživatelů podsekce
+# „Oprávnění zobrazení“. Zkratka nákupčího = sloupec S „Nak“ z DATA_POROVNANI,
+# dopárovaná k odběrům GIST podle kódu produktu: nákupčí vidí jen dodavatele
+# a zboží svých zkratek, Správce vše. Prefix a správce musí sedět s
+# intranet_lupa.NAKUP_PREFIX / NAKUP_SPRAVCE. Zkratka, která v datech přibude
+# bez práva tady, zůstane vidět jen Správci (Lupa na to v Importu upozorní).
+LUPA_NAKUP_POD = 'Oprávnění zobrazení'
+LUPA_NAKUP_KODY = ('CK', 'DR', 'HV', 'KO', 'LT', 'ML', 'MR', 'NP', 'OZ', 'RD', 'SK',
+                   'UP', 'VI', 'VN', 'XX')
+ZAKLADNI_PRAVA['lupa_nakup_spravce'] = {
+    'kategorie': 'Modul Lupopřípad', 'podskupina': LUPA_NAKUP_POD, 'nazev': 'Správce',
+    'popis': 'Lupou na nákup: vidí odběry všech dodavatelů všech nákupčích, včetně zboží, '
+             'které se s DATA_POROVNANI nespárovalo. Zapíná měsíční e-mail nákupčím '
+             'a volí, co obsahuje.',
+    'ikona': 'local_police'}
+for _k in LUPA_NAKUP_KODY:
+    ZAKLADNI_PRAVA[f'lupa_nakup_{_k.lower()}'] = {
+        'kategorie': 'Modul Lupopřípad', 'podskupina': LUPA_NAKUP_POD,
+        'nazev': f'Nákupčí {_k}',
+        'popis': f'Lupou na nákup: vidí jen dodavatele a zboží se zkratkou nákupčího {_k} '
+                 '(sloupec S „Nak“ v DATA_POROVNANI). Dodavatele ostatních nákupčích nevidí.',
+        'ikona': 'assignment_ind'}
+# Dvě podskupiny = ve správě uživatelů přepínač; dosavadní práva Lupy patří do první.
+for _v in ZAKLADNI_PRAVA.values():
+    if _v.get('kategorie') == 'Modul Lupopřípad':
+        _v.setdefault('podskupina', 'Lupou na obchod')
+
 
 def ma_pristup_zalistovaci(prava) -> bool:
     """Vstup do modulu dává jen role (ne samotná zkratka nákupčího)."""
@@ -317,11 +350,12 @@ _MODUL_KATEGORIE = {
     'Modul Manuály':             'manualy_zapnuty',
     'Modul Gastrokurzy':         'gastrokurzy_zapnuty',
     'Modul Datové úložiště':     'datuloziste_zapnuty',
+    'Modul Náklady veletrh':     'naklady_veletrh_zapnuty',
     'Modul Společenský večer':   'spolvecer_zapnuty',
     'Modul Vizitky a podpisy':   'vizitky_zapnuty',
     'Modul Cenopřípad':          'cenopripad_zapnuty',
     'Modul Formuláře ASM':       'asm_zapnuty',
-    'Modul Lupou na obchod':     'lupa_zapnuty',
+    'Modul Lupopřípad':          'lupa_zapnuty',
 }
 # Značky mají v jedné kategorii dva moduly (podskupiny).
 _MODUL_PODSKUPINA = {
@@ -330,6 +364,11 @@ _MODUL_PODSKUPINA = {
 }
 # Schůzky sdílí kategorii s ASM, ale mají vlastní přepínač.
 _MODUL_PREFIX = (('schuzky_', 'schuzky_zapnuty'),)
+
+# Podskupiny s vlastním správcem: globální práva kategorie (bez 'podskupina',
+# např. „Správce (vše)") se v nich v editoru práv nezobrazují — zaškrtnutí tam
+# nesmí omylem dát práva celému modulu.
+SAMOSTATNE_PODSKUPINY = frozenset({('Modul Cenopřípad', 'Oprava cen')})
 
 
 def modul_prava(klic, meta):

@@ -708,6 +708,8 @@ def inicializace_cenopripad_db():
                 nazev VARCHAR(255),
                 nc DOUBLE, nc2 DOUBLE, nc3 DOUBLE, nc4 DOUBLE, nc5 DOUBLE, dnc DOUBLE,
                 dph DOUBLE, id_kod VARCHAR(40), op DOUBLE, nak VARCHAR(10),
+                dodavatel VARCHAR(40), dodavatel_popis VARCHAR(255),
+                skupina2_popis VARCHAR(255),
                 INDEX idx_sortiment (sortiment)
             ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
         """)
@@ -1033,7 +1035,12 @@ def inicializace_cenopripad_db():
             cur.execute("ALTER TABLE cenopripad_radky ADD COLUMN neschvaleno TINYINT DEFAULT 0")
         # Migrace: Leták – WebPortál — kód nákupčího (sloupec S „Nak“ z DATA_POROVNANI)
         # v masteru i na řádku případu + vyjádření nákupčího k položce ve frontě.
+        # + dodavatel (sloupce K, L) pro Lupu „Lupou na nákup“ — páruje odběry na dodavatele,
+        # + Skupina2-popis (AB) = kategorie v měsíčním reportu nákupčím.
         for _t, _col, _typ in (("cenopripad_master", "nak", "VARCHAR(10)"),
+                               ("cenopripad_master", "dodavatel", "VARCHAR(40)"),
+                               ("cenopripad_master", "dodavatel_popis", "VARCHAR(255)"),
+                               ("cenopripad_master", "skupina2_popis", "VARCHAR(255)"),
                                ("cenopripad_radky", "nak", "VARCHAR(10)"),
                                ("cenopripad_radky", "wp_vyjadreni", "TEXT"),
                                ("cenopripad_radky", "wp_vyjadril", "VARCHAR(255)"),
@@ -1161,13 +1168,16 @@ def _importuj_sync(op_raw, data_raw, op_name, data_name, user_name):
             # DATA importována → kompletní náhrada masteru (op už dle `mapa`)
             cur.execute("DELETE FROM cenopripad_master")
             cols = ("kod", "sortiment", "sortiment_popis", "nazev", "nc", "nc2", "nc3", "nc4",
-                    "nc5", "dnc", "dph", "id_kod", "op", "nak")
+                    "nc5", "dnc", "dph", "id_kod", "op", "nak", "dodavatel", "dodavatel_popis",
+                    "skupina2_popis")
             sql = (f"INSERT INTO cenopripad_master ({','.join(cols)}) "
                    f"VALUES ({','.join(['%s'] * len(cols))})")
             davka = [(kod, _str(m["sortiment"], 40), _str(m["sortiment_popis"], 255),
                       _str(m["nazev"], 255),
                       m["nc"], m["nc2"], m["nc3"], m["nc4"], m["nc5"], m["dnc"],
-                      m["dph"], _str(m["id"], 40), m["op"], _str(m.get("nak"), 10))
+                      m["dph"], _str(m["id"], 40), m["op"], _str(m.get("nak"), 10),
+                      _str(m.get("dodavatel"), 40), _str(m.get("dodavatel_popis"), 255),
+                      _str(m.get("skupina2_popis"), 255))
                      for kod, m in master.items()]
             for i in range(0, len(davka), 2000):
                 cur.executemany(sql, davka[i:i + 2000])
@@ -7463,13 +7473,21 @@ def _oprava_bez_pcstd(p):
 
 def _oprava_pristup(p):
     """Smí do dlaždice „Oprava cen"."""
-    return _je_spravce(p) or "cenopripad_zadatel_oprava" in p \
-        or _oprava_office(p)
+    return "cenopripad_zadatel_oprava" in p or _oprava_office(p)
 
 
 def _oprava_office(p):
     """Office oprava cen: vidí všechny žádosti, zpracuje je nebo postoupí správci."""
-    return _je_spravce(p) or "cenopripad_office_oprava" in p
+    return _oprava_spravce(p) or "cenopripad_office_oprava" in p
+
+
+def _oprava_spravce(p):
+    """Správce oprava cen: jako office + odsouhlasuje postoupené žádosti a maže.
+    Globální správce modulu NEBO „Správce – Oprava cen" (jen tato dlaždice)."""
+    return _je_spravce(p) or OPRAVA_PRAVO_SPRAVCE in p
+
+
+OPRAVA_PRAVO_SPRAVCE = "cenopripad_spravce_oprava"
 
 
 # ── Výpočet ─────────────────────────────────────────────────────────────────
@@ -7895,8 +7913,8 @@ def _oprava_sekce_nova(user_id, user_name, prava):
                 f"Oprava cen: nová žádost {cislo} ({name}) — {len(radky)} řádků")
             _cp_zvonecek(f"🧾 Oprava cen {cislo} od {user_name}: {len(radky)} řádků, "
                              f"dopad {_castka(suma)} Kč.", "info",
-                             "cenopripad_office_oprava", "cenopripad_spravce", "vse",
-                             krome_uid=user_id)
+                             "cenopripad_office_oprava", "cenopripad_spravce",
+                             OPRAVA_PRAVO_SPRAVCE, "vse", krome_uid=user_id)
             _oprava_mail_office(
                 pid, f"Oprava cen — nová žádost {cislo}",
                 f"Žadatel {user_name} podal žádost o opravu ceny {cislo}.\n"
@@ -7952,7 +7970,7 @@ def _oprava_detail(pid, user_id, user_name, prava):
             ui.notify("K této žádosti nemáte oprávnění.", type="warning")
         _refresh()
         return
-    je_spravce = _je_spravce(prava)
+    je_spravce = _oprava_spravce(prava)
     je_vlastnik = p.get("zadavatel_id") == user_id
     stav = p.get("stav")
     radky = _oprava_nacti_radky(pid)
@@ -8232,9 +8250,9 @@ def _oprava_workflow(p, pid, stav, je_vlastnik, je_office, je_spravce, user_name
                         _oprava_zapis_historie(pid, "Postoupeno správci", user_name, txt)
                         _cp_zvonecek(f"🧾 Oprava cen {cislo} čeká na odsouhlasení "
                                          f"správcem.", "warning",
-                                         "cenopripad_spravce", "vse")
+                                         "cenopripad_spravce", OPRAVA_PRAVO_SPRAVCE, "vse")
                         _odesli_emaily(
-                            _emaily_spravce("obchod"),
+                            _emaily_s_pravy("cenopripad_spravce", OPRAVA_PRAVO_SPRAVCE),
                             f"Oprava cen — žádost {cislo} ke schválení",
                             f"Office ({user_name}) postoupil žádost {cislo} k rozhodnutí.\n"
                             f"Řádků: {p.get('pocet_radku', 0)} · dopad: "
