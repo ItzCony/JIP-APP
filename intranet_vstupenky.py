@@ -23,7 +23,7 @@ PRAVO_ZADATEL = 'vstupenky_zadatel'
 PRAVO_KONTROLA = 'vstupenky_kontrola'
 ROK_OBRATU = 2026        # obrat z Lupy se sčítá za dostupné měsíce tohoto roku
 MAX_POCET = 50
-NA_STRANU = 25           # žádostí na stránku v seznamu
+NA_STRANU = 20           # žádostí na stránku v seznamu (jednotně s frontami ASM)
 VAROVANI_POBOCKA = 'Zadané IČO neodpovídá Vaší pobočce'
 
 _STAVY = {

@@ -1898,12 +1898,48 @@ def _refresh():
 def _nav(kam):
     app.storage.user["asm_pohled"] = kam
     app.storage.user["asm_sekce"] = "seznam"
+    app.storage.user.pop("asm_strana", None)   # nová dlaždice začíná na 1. stránce
     _refresh()
 
 
 def _badge(stav):
     popis, barva = _STAV_BADGE.get(stav, (stav, "grey"))
     ui.badge(popis, color=barva).props("rounded").classes("px-2 py-1 text-xs")
+
+
+NA_STRANU = 20   # případů na stránku ve frontách dlaždic
+
+
+def _nastav_stranu(pohled, n):
+    # Strana žije v app.storage.user, ne v closure: akce v detailu volají _refresh()
+    # (překreslí celou dlaždici) a posuzovatel nemá být vyhozen zpět na 1. stránku.
+    s = dict(app.storage.user.get("asm_strana") or {})
+    s[pohled] = n
+    app.storage.user["asm_strana"] = s
+
+
+def _stranka(rows, pohled):
+    """Výřez fronty pro aktuální stránku → (řádky, strana, počet stran)."""
+    stran = max(1, (len(rows) + NA_STRANU - 1) // NA_STRANU)
+    strana = (app.storage.user.get("asm_strana") or {}).get(pohled, 1)
+    strana = min(max(int(strana), 1), stran)
+    return rows[(strana - 1) * NA_STRANU:strana * NA_STRANU], strana, stran
+
+
+def _strankovani(pohled, strana, stran, celkem, obnov):
+    if stran <= 1:
+        return
+
+    def _zmena(e):
+        _nastav_stranu(pohled, e.value)
+        obnov()
+
+    od = (strana - 1) * NA_STRANU + 1
+    do = min(strana * NA_STRANU, celkem)
+    with ui.row().classes("w-full items-center justify-center gap-3 mt-2"):
+        ui.pagination(1, stran, direction_links=True, value=strana, on_change=_zmena) \
+            .props("max-pages=7 boundary-numbers")
+        ui.label(f"{od}–{do} z {celkem} případů").classes("text-xs text-gray-400")
 
 
 def _date_input(label, value=""):
@@ -3710,6 +3746,10 @@ async def _oz_prehled(user_id, user_name, vsechna_prava):
         "defaultColDef": {"resizable": True, "sortable": True, "filter": True,
                           "wrapHeaderText": False, "autoHeaderHeight": False},
         "rowHeight": 32,
+        # Stránkování po NA_STRANU záznamech — jednotně s frontami ostatních dlaždic.
+        "pagination": True,
+        "paginationPageSize": NA_STRANU,
+        "paginationPageSizeSelector": False,
         ":getRowId": "(p) => String(p.data._id)",
         # Nekompletní záznam (chybí povinné pole) svítí červeně — bod 10 zadání.
         ":getRowStyle": "(p) => p.data._chybi ? {background:'#fef2f2'} : null",
@@ -4312,8 +4352,9 @@ async def _view_zmena(user_id, user_name, prava):
             ui.label("Žádné případy neodpovídají filtru.").classes("text-gray-400 italic p-4")
             return
 
+        vyrez, strana, stran = _stranka(rows, "zmena")
         with ui.column().classes("w-full gap-2"):
-            for p in rows:
+            for p in vyrez:
                 with ui.card().classes("w-full p-3 rounded-xl shadow-sm hover:shadow-md "
                                        "transition-shadow"):
                     with ui.row().classes("w-full items-center gap-3 no-wrap"):
@@ -4332,9 +4373,14 @@ async def _view_zmena(user_id, user_name, prava):
                         ui.button(icon="visibility",
                                   on_click=lambda _=None, pid=p["id"]: _detail_dialog(pid, user_id, user_name, prava)) \
                             .props("flat round color=grey-7").tooltip("Detail / průběh")
+        _strankovani("zmena", strana, stran, len(rows), _tabulka.refresh)
+
+    def _po_filtru(_=None):
+        _nastav_stranu("zmena", 1)   # jiný filtr → zpět na 1. stránku
+        _tabulka.refresh()
 
     for f in (filtr_stav, filtr_asm, filtr_oz):
-        f.on("update:model-value", lambda _=None: _tabulka.refresh())
+        f.on("update:model-value", _po_filtru)
     await _tabulka()
 
     # Auto-obnova fronty à 10 s: otisk dat se počítá ve vlákně a tabulka se
@@ -4875,8 +4921,9 @@ async def _view_formular(formular, user_id, user_name, prava):
         if not rows:
             ui.label("Žádné případy neodpovídají filtru.").classes("text-gray-400 italic p-4")
             return
+        vyrez, strana, stran = _stranka(rows, formular)
         with ui.column().classes("w-full gap-2"):
-            for p, d in rows:
+            for p, d in vyrez:
                 with ui.card().classes("w-full p-3 rounded-xl shadow-sm hover:shadow-md transition-shadow"):
                     with ui.row().classes("w-full items-center gap-3 no-wrap"):
                         with ui.column().classes("gap-0 min-w-28"):
@@ -4891,9 +4938,14 @@ async def _view_formular(formular, user_id, user_name, prava):
                         ui.button(icon="visibility",
                                   on_click=lambda _=None, pid=p["id"]: _detail_dialog(pid, user_id, user_name, prava)) \
                             .props("flat round color=grey-7").tooltip("Detail / průběh")
+        _strankovani(formular, strana, stran, len(rows), _tabulka.refresh)
+
+    def _po_filtru(_=None):
+        _nastav_stranu(formular, 1)   # jiný filtr → zpět na 1. stránku
+        _tabulka.refresh()
 
     for f in (filtr_stav, filtr_text):
-        f.on("update:model-value", lambda _=None: _tabulka.refresh())
+        f.on("update:model-value", _po_filtru)
     await _tabulka()
 
     # Auto-obnova fronty à 10 s (viz _view_zmena) — otisk ve vlákně, překreslení
