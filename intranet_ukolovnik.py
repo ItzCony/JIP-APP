@@ -3210,7 +3210,7 @@ async def _vykresli_ukoly(user_id, user_name, vsechna_prava, dialog_anchor=None,
     _filtry = ukoly_stav.setdefault('filtry', {
         'stav': '', 'typ': '', 'termin': 'dnes',
         'moje': '', 'osoba': [], 'odd': '', 'od': '', 'do': ''})
-    _TERMIN_OPTS = {'': 'Termín: Vše', 'po': 'Po termínu', 'dnes': 'Dnes',
+    _TERMIN_OPTS = {'': 'Termín: Vše', 'dnes': 'Dnes',
                     'tyden': 'Tento týden', 'budouci': 'Budoucí'}
 
     def _termin_opts():
@@ -3247,6 +3247,18 @@ async def _vykresli_ukoly(user_id, user_name, vsechna_prava, dialog_anchor=None,
                     ).props('range first-day-of-week=1 today-btn')
                     with ui.row().classes('w-full justify-end px-2 pb-2'):
                         ui.button('Vymazat', on_click=lambda: termin_kal.set_value(None)).props('flat dense no-caps')
+
+        def _prepni_po_terminu(e):
+            _rezim['po_terminu'] = e.value
+            # Osobní předvolba jako režim kanban/seznam — platí i další dny, zápis na pozadí.
+            background_tasks.create(asyncio.to_thread(
+                intranet_data.uloz_predvolbu, user_id, 'ukoly_po_terminu', e.value))
+            _stranka['p'] = 1
+            prekresli()
+
+        ui.switch('Úkoly po termínu', value=_rezim.get('po_terminu', False),
+                  on_change=_prepni_po_terminu).props('dense').classes('text-sm text-gray-600').tooltip(
+            'Vždy zobrazit i nedokončené úkoly po termínu, bez ohledu na filtr Termín')
 
     with ui.row().classes('w-full gap-2 mb-3 flex-wrap items-center'):
         filtr_moje = ui.select(
@@ -3336,14 +3348,17 @@ async def _vykresli_ukoly(user_id, user_name, vsechna_prava, dialog_anchor=None,
     def _filtruj_termin(u, ft):
         if not ft: return True
         t = u.get('termin')
-        if ft == 'po':
-            return t and (t - dnes).days < 0 and u['stav'] not in ('Hotovo', 'Zrušen')
+        # Přepínač „Úkoly po termínu" přidá nedokončené úkoly po termínu ke každé volbě
+        if _rezim.get('po_terminu') and t and t < dnes and u['stav'] not in ('Hotovo', 'Zrušen'):
+            return True
         if ft == 'dnes':
             return t and t == dnes
+        # Kalendářní týden Po–Ne (stejně jako kalendář first-day-of-week=1)
+        nedele = dnes + datetime.timedelta(days=6 - dnes.weekday())
         if ft == 'tyden':
-            return t and 0 <= (t - dnes).days <= 7
+            return t and nedele - datetime.timedelta(days=6) <= t <= nedele
         if ft == 'budouci':
-            return t and (t - dnes).days > 7
+            return t and t > nedele
         if ft == 'obdobi':
             od, do = _filtry.get('od'), _filtry.get('do')
             return not od or (t and od <= t.isoformat() <= do)
@@ -7508,7 +7523,9 @@ async def vykresli_ukolovnik(user_id, user_name, vsechna_prava):
                 # Zapamatované rozložení (kanban/seznam) — jediný DB dotaz, jen pro toho,
                 # kdo sekci opravdu vidí. _vykresli_ukoly bere hodnotu přes setdefault.
                 ukoly_stav['rezim'] = {'kanban': bool(await asyncio.to_thread(
-                    intranet_data.nacti_predvolbu, user_id, 'ukoly_rezim', True))}
+                    intranet_data.nacti_predvolbu, user_id, 'ukoly_rezim', True)),
+                    'po_terminu': bool(await asyncio.to_thread(
+                    intranet_data.nacti_predvolbu, user_id, 'ukoly_po_terminu', False))}
                 # Kontejner pro dialogy MIMO refreshable – přežije _vykresli_ukoly.refresh()
                 _dlg_anchor = ui.element('div')
                 await _vykresli_ukoly(user_id, user_name, vsechna_prava, _dlg_anchor, ukoly_stav)
