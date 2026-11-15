@@ -8,6 +8,7 @@ import intranet_narozeniny
 import intranet_okruhy
 import intranet_2fa
 import intranet_lupa
+import intranet_nos
 import intranet_datuloziste
 import intranet_naklady_veletrh
 import intranet_session
@@ -676,6 +677,7 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
         'vse' in vsechna_prava or
         'spolvecer_ctenar' in vsechna_prava or
         'spolvecer_schvalovatel' in vsechna_prava or
+        'spolvecer_ucetni' in vsechna_prava or
         any(p.startswith('spolvecer_organizator_') for p in vsechna_prava)
     ) and nastaveni.get('spolvecer_zapnuty', True)
     # Žadatelem je automaticky každý uživatel → dlaždice pro všechny (když je modul zapnutý).
@@ -713,6 +715,9 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
     ma_pristup_lupa = (
         nastaveni.get('lupa_zapnuty', True)
         and intranet_lupa.ma_pristup(user_id, vsechna_prava)
+    )
+    ma_pristup_nos = (
+        nastaveni.get('nos_zapnuty', True) and intranet_nos.ma_pristup(vsechna_prava)
     )
 
     ma_pristup_gastrokurzy = (
@@ -852,6 +857,7 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
         _d('asm', ma_pristup_asm, '📝', 'Formuláře ASM', '#6366f1', _akce('asm', 'asm_pohled')),
         _d('lupa', ma_pristup_lupa, '🔍', 'Lupopřípad', '#a855f7',
            _akce('lupa', f'lupa_pohled_{user_id}')),
+        _d('nos', ma_pristup_nos, '💼', 'NOS', '#0d9488', _akce('nos', f'nos_dlazdice_{user_id}')),
         _d('gastrokurzy', ma_pristup_gastrokurzy, '👨‍🍳', 'Gastrokurzy', '#f97316',
            _akce('gastrokurzy')),
         _d('uloziste', ma_pristup_uloziste, '🗄️', 'Datové úložiště', '#64748b',
@@ -1118,6 +1124,12 @@ def vykresli_osobni_nastaveni(user_id, user_email, user_name):
                                 intranet_2fa.zahaj_aktivaci, user_id, user_email)
                             obsah.clear()
                             if not secret:
+                                if await asyncio.to_thread(intranet_2fa.ma_aktivni_2fa, user_id):
+                                    # Zapnuto mezitím jinde (jiná karta) — jen ukázat aktuální stav.
+                                    ui.notify('Dvoufaktorové ověření už je zapnuté.', position='top')
+                                    dlg.close()
+                                    ui.timer(0, vykresli_osobni_nastaveni.refresh, once=True)
+                                    return
                                 with obsah:
                                     ui.label('Spojení s databází selhalo.').classes('text-red-600 font-bold')
                                 return
@@ -1141,11 +1153,15 @@ def vykresli_osobni_nastaveni(user_id, user_email, user_name):
                                     .classes('w-full text-sm text-slate-600 mb-4 self-start')
 
                                 async def potvrdit_aktivaci():
-                                    kody = await asyncio.to_thread(
+                                    kody, duvod = await asyncio.to_thread(
                                         intranet_2fa.potvrd_aktivaci, user_id, kod_inp.value)
                                     if not kody:
-                                        ui.notify('Kód nesouhlasí — zkontrolujte aplikaci a zkuste to znovu.',
-                                                  type='negative', position='top')
+                                        zprava = {
+                                            'kod': 'Kód nesouhlasí. Opište kód z nejnovější položky „Moje JIPka“ '
+                                                   'v aplikaci a zkontrolujte, že má telefon automatický čas.',
+                                            'aktivni': 'Dvoufaktorové ověření už je zapnuté.',
+                                        }.get(duvod, 'Aktivaci se nepodařilo uložit (chyba databáze). Zkuste to znovu.')
+                                        ui.notify(zprava, type='negative', position='top', timeout=8000)
                                         return
                                     stav['hotovo'] = True
                                     intranet_logger.log_activity(user_name, "Osobní profil", "Aktivováno dvoufaktorové ověření (2FA)")

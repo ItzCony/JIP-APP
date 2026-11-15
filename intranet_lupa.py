@@ -4020,9 +4020,24 @@ _NAKUP_DIMENZE = (
     ('odberatel', 'Odběratel (IČO, jméno)'),
     ('produkt', 'Produkt (kód, název)'),
     ('dodavatel', 'Dodavatel'),
+    ('sortiment', 'Popis sortimentu'),
     ('nak', 'Nákupčí'),
 )
-_NAKUP_DIMENZE_VYCHOZI = ['mesic', 'divize', 'pobocka', 'odberatel', 'produkt']
+_NAKUP_DIMENZE_VYCHOZI = ['odberatel', 'dodavatel', 'sortiment']
+# Sloupce s čísly výjezdu, v pořadí, v jakém je chtějí nákupčí (B = předešlé
+# období podle přepínače Srovnat). Volí se ve výběru „Seskupit podle“, ale
+# seskupení nemění — jen přidají sloupce. Sloupce z _NAKUP_VYJEZD_B potáhnou
+# i data B, takže přibudou řádky s obratem jen v B.
+_NAKUP_VYJEZD_SROVNANI = (
+    ('kc_b', 'Nákup předešlý (Kč)'), ('kc', 'Nákup aktuální (Kč)'),
+    ('mj_b', 'Nákup předešlý (MJ)'), ('mj', 'Nákup aktuální (MJ)'),
+    ('rozdil', 'Rozdíl Kč'), ('zmena', 'Rozdíl Kč %'),
+    ('rozdil_mj', 'Rozdíl MJ'), ('zmena_mj', 'Rozdíl MJ %'),
+    ('podil', 'Podíl %'),
+)
+_NAKUP_VYJEZD_B = ('kc_b', 'mj_b', 'rozdil', 'zmena', 'rozdil_mj', 'zmena_mj')
+# Výchozí sloupce (bez uloženého filtru): všechny kromě Podílu %.
+_NAKUP_VYJEZD_SL_VYCHOZI = [k for k, _n in _NAKUP_VYJEZD_SROVNANI if k != 'podil']
 
 # Srovnání: klíč → (popisek, 2. pád mn. č., výraz klíče, výraz názvu,
 #                   filtr pro proklik, rozpad v prokliku)
@@ -4415,6 +4430,42 @@ def _nakup_obdobi_ab(f, posledni):
     return a_od, a_do, b_od, b_do
 
 
+def _nakup_prvni():
+    """První měsíc v datech nákupu (yyyymm), 0 = prázdno. ORDER BY jde po idx_obd."""
+    r = _dotaz('SELECT rok*100+mesic FROM lupa_nakup_obrat ORDER BY rok, mesic LIMIT 1')
+    return int(r[0][0]) if r else 0
+
+
+def _nakup_srovnatelne(f, posledni, prvni=None):
+    """A a B oříznuté na měsíce s protějškem v datech — srovnání nesmí sahat před
+    první měsíc dat (výběr od 2025M01 by se jinak srovnával s nulami roku 2024).
+    → (a_od, a_do, s_od, b_od, b_do): A celé, s_od = začátek srovnatelné části A,
+    B oříznuté. Bez jediného srovnatelného měsíce s_od = b_od = b_do = None."""
+    a_od, a_do, b_od, b_do = _nakup_obdobi_ab(f, posledni)
+    if prvni is None:
+        prvni = _nakup_prvni()
+    if not prvni or b_od >= prvni:
+        return a_od, a_do, a_od, b_od, b_do
+    if b_do < prvni:
+        return a_od, a_do, None, None, None
+    if f.get('srovnat') == 'vlastni' and _obd_int(f.get('b_od')) and _obd_int(f.get('b_do')):
+        return a_od, a_do, a_od, prvni, b_do
+    # Rok/měsíc: B je A posunuté o pevný počet měsíců → ořízne se začátek obou.
+    posun = (a_od // 100 - b_od // 100) * 12 + a_od % 100 - b_od % 100
+    return a_od, a_do, _nakup_posun(prvni, posun), prvni, b_do
+
+
+def _nakup_srovnani_popis(f, posledni, prvni):
+    """Text vedle přepínače Srovnat — co se s čím skutečně srovná."""
+    a_od, a_do, s_od, b_od, b_do = _nakup_srovnatelne(f, posledni, prvni)
+    if s_od is None:
+        return '→ srovnávací období v datech není'
+    if s_od > a_od:
+        return (f'→ srovnává se {_nakup_rozsah_txt(s_od, a_do)} s {_nakup_rozsah_txt(b_od, b_do)}'
+                ' (starší data nejsou)')
+    return f'→ srovnává se s {_nakup_rozsah_txt(b_od, b_do)}'
+
+
 def _nakup_in(sloupec, hodnoty, kde, par):
     """`sloupec IN (…)`; volba _BEZ = nespárováno (NULL)."""
     hodnoty = [h for h in (hodnoty or []) if h is not None]
@@ -4496,9 +4547,6 @@ def _nakup_volby(kody):
             "SELECT DISTINCT divize FROM lupa_nakup_obrat WHERE divize <> '' ORDER BY divize")},
         'pobocka': {d: d for (d,) in _dotaz(
             "SELECT DISTINCT pobocka FROM lupa_nakup_obrat WHERE pobocka <> '' ORDER BY pobocka")},
-        'ico': {i: (f'{j} ({i})' if j else i) for i, j in _dotaz(
-            "SELECT ico, MAX(jmeno) FROM lupa_nakup_obrat WHERE ico <> '' "
-            'GROUP BY ico ORDER BY MAX(jmeno), ico')},
     }
     if kody is None:
         kde, par = '1=1', []
@@ -4544,14 +4592,50 @@ def _nakup_popis(f, volby, kody, s_dims=True):
 
 
 def _nakup_vyjezd_sql(f, kody):
-    """SELECT výjezdu podle zvoleného seskupení → (sql, par, cols)."""
+    """SELECT výjezdu podle zvoleného seskupení → (sql, souhrn_sql, par, cols, od_srov).
+    Obrat je za celé období A (Od–Do), vedle něj srovnávací období B jako ve Srovnání
+    — jen z měsíců, které mají v datech protějšek (viz _nakup_srovnatelne).
+    od_srov: řádky měsíců před ním nemají s čím srovnat (B a rozdíly prázdné)."""
+    # Bez uzavřeného měsíce je Od prázdné; výjezd je pak prázdný tak jako tak
+    # (_nakup_where neuzavřené měsíce vyřazuje), 0 jen drží čísla v SQL.
+    a_od, a_do, s_od, b_od, b_do = _nakup_srovnatelne(f, 0)
+    srovnat = s_od is not None
+    castecne = srovnat and s_od > a_od        # protějšek v datech má jen konec A
+    v_a = f'(o.rok*100+o.mesic) BETWEEN {a_od} AND {a_do}'
+    v_b = f'(o.rok*100+o.mesic) BETWEEN {b_od} AND {b_do}' if srovnat else '0=1'
+    v_s = f'(o.rok*100+o.mesic) BETWEEN {s_od} AND {a_do}' if srovnat else '0=1'
+    a_txt = _nakup_rozsah_txt(a_od, a_do)
+    b_txt = _nakup_rozsah_txt(b_od, b_do) if srovnat else ''
+    s_txt = _nakup_rozsah_txt(s_od, a_do) if castecne else ''
     vybrane = f.get('dims') or _NAKUP_DIMENZE_VYCHOZI
     dims = [d for d, _n in _NAKUP_DIMENZE if d in vybrane] or list(_NAKUP_DIMENZE_VYCHOZI)
+    # Uložený filtr z doby před volbou sloupců (bez klíče) = všechny.
+    sloupce = f.get('sloupce')
+
+    def ukazat(k):
+        if k in ('kc_s', 'mj_s'):          # srovnatelná část A — jen když není celé A
+            return castecne and ukazat(k[:2])
+        if k in _NAKUP_VYJEZD_B and not srovnat:   # B mimo data → srovnávací pryč
+            return False
+        return sloupce is None or k in sloupce
+
+    s_b = any(ukazat(k) for k in _NAKUP_VYJEZD_B)
+    join, c_a, c_b, c_s = _NAKUP_JOIN, v_a, v_b, v_s
     sel, grp, poradi, cols = [], [], [], []
     if 'mesic' in dims:
-        sel.append("CONCAT(o.rok, 'M', LPAD(o.mesic, 2, '0')) AS mesic")
-        grp += ['o.rok', 'o.mesic']
-        poradi += ['o.rok', 'o.mesic']
+        # Měsíc z B se posune na odpovídající měsíc A, ať A a B leží na jednom řádku.
+        # A a B se můžou překrývat (Od–Do přes 12 měsíců) → každý záznam jde přes
+        # role r.b (0 = A na svůj řádek, 1 = B posunuté), tedy případně na dva řádky.
+        # Posun se měří od srovnatelného začátku A — B je oříznuté stejně.
+        if s_b:
+            posun = (s_od // 100 - b_od // 100) * 12 + s_od % 100 - b_od % 100
+            join += ' CROSS JOIN (SELECT 0 AS b UNION ALL SELECT 1) r'
+            c_a, c_b, c_s = f'(r.b=0 AND {v_a})', f'(r.b=1 AND {v_b})', f'(r.b=0 AND {v_s})'
+        i = f'(o.rok*12+o.mesic-1+r.b*{posun})' if s_b else '(o.rok*12+o.mesic-1)'
+        mes = f"CONCAT({i} DIV 12, 'M', LPAD(MOD({i}, 12) + 1, 2, '0'))"
+        sel.append(f'{mes} AS mesic')
+        grp.append(mes)
+        poradi.append(mes)
         cols.append(('Měsíc', 'mesic', 'text', 9))
     if 'divize' in dims:
         sel.append('o.divize AS divize')
@@ -4580,21 +4664,75 @@ def _nakup_vyjezd_sql(f, kody):
             poradi.append('dodavatel_nazev')
         cols += [('Dodavatel', 'dodavatel', 'text', 10),
                  ('Dodavatel – název', 'dodavatel_nazev', 'text', 28)]
+    if 'sortiment' in dims:
+        sel.append('p.sortiment_popis AS sortiment')
+        grp.append('p.sortiment_popis')
+        if 'produkt' not in dims:
+            poradi.append('sortiment')
+        cols.append(('Popis sortimentu', 'sortiment', 'text', 28))
     if 'nak' in dims or 'produkt' in dims:
         sel.append('p.nak AS nak')
         grp.append('p.nak')
         if 'produkt' not in dims and 'dodavatel' not in dims:
             poradi.append('p.nak')
         cols.append(('Nákupčí', 'nak', 'text', 8))
+    def soucty(a, b, s):
+        vys = [f'SUM(CASE WHEN {a} THEN o.obrat_mj ELSE 0 END) AS mj',
+               f'SUM(CASE WHEN {a} THEN o.obrat_kc ELSE 0 END) AS kc',
+               f'SUM(CASE WHEN {b} THEN o.obrat_kc ELSE 0 END) AS kc_b',
+               f'SUM(CASE WHEN {b} THEN o.obrat_mj ELSE 0 END) AS mj_b']
+        if castecne:                        # rozdíly jen ze srovnatelné části A
+            vys += [f'SUM(CASE WHEN {s} THEN o.obrat_kc ELSE 0 END) AS kc_s',
+                    f'SUM(CASE WHEN {s} THEN o.obrat_mj ELSE 0 END) AS mj_s']
+        return vys
     if 'produkt' not in dims:
-        sel.append('COUNT(DISTINCT o.kod) AS polozek')
+        sel.append(f'COUNT(DISTINCT CASE WHEN {c_a} THEN o.kod END) AS polozek')
         cols.append(('Položek', 'polozek', 'int', 9))
-    sel += ['SUM(o.obrat_mj) AS mj', 'SUM(o.obrat_kc) AS kc']
-    cols += [('Obrat MJ', 'mj', 'num', 13), ('Obrat Kč bez DPH', 'kc', 'money', 16)]
-    kde, par = _nakup_where(f, kody)
-    sql = (f"SELECT {', '.join(sel)} {_NAKUP_JOIN} WHERE {kde} "
-           f"GROUP BY {', '.join(grp)} ORDER BY {', '.join(poradi + ['kc DESC'])}")
-    return sql, par, cols
+    sel += soucty(c_a, c_b, c_s)
+    # Pořadí jako _NAKUP_VYJEZD_SROVNANI; Kč bez DPH. Srovnatelná část A hned za A.
+    cols += [c for c in ((f'Nákup Kč {b_txt}', 'kc_b', 'money', 16),
+                         (f'Nákup Kč {a_txt}', 'kc', 'money', 16),
+                         (f'Nákup Kč {s_txt}', 'kc_s', 'money', 16),
+                         (f'Nákup MJ {b_txt}', 'mj_b', 'num', 13),
+                         (f'Nákup MJ {a_txt}', 'mj', 'num', 13),
+                         (f'Nákup MJ {s_txt}', 'mj_s', 'num', 13),
+                         ('Rozdíl Kč', 'rozdil', 'money', 14), ('Rozdíl Kč %', 'zmena', 'num', 11),
+                         ('Rozdíl MJ', 'rozdil_mj', 'num', 12), ('Rozdíl MJ %', 'zmena_mj', 'num', 11),
+                         ('Podíl %', 'podil', 'num', 8))
+             if ukazat(c[1])]
+    kde, par = _nakup_where(f, kody, s_obdobim=False)
+    # Bez sloupců B data loňska vůbec nečteme — rychlejší a bez řádků jen z B.
+    kde_s = f'{kde} AND ({v_a} OR {v_b})' if s_b else f'{kde} AND {v_a}'
+    kde_r = f'{kde} AND ({c_a} OR {c_b})' if s_b else kde_s
+    # Řazení od největšího nákupu v aktuálním období; skupiny jen při shodě.
+    sql = (f"SELECT {', '.join(sel)} {join} WHERE {kde_r} "
+           f"GROUP BY {', '.join(grp)} ORDER BY {', '.join(['kc DESC'] + poradi)}")
+    # Celkový součet bez rolí — každý záznam jednou za A a jednou za B.
+    souhrn_sql = (f"SELECT {', '.join(soucty(v_a, v_b, v_s))}, "
+                  f"COUNT(DISTINCT CASE WHEN {v_a} THEN o.kod END) AS polozek "
+                  f"{_NAKUP_JOIN} WHERE {kde_s}")
+    od_srov = s_od if castecne and 'mesic' in dims else None
+    return sql, souhrn_sql, par, cols, od_srov
+
+
+def _nakup_dopocti(r, tot_a, od_srov=None):
+    """Řádek výjezdu: rozdíly A proti B a podíl na odběrech A (jako ve Srovnání).
+    Rozdíly ze srovnatelné části A (kc_s/mj_s), když je A delší než data dovolí."""
+    # Zaokrouhlení maže plovoucí šum součtů — viz _nakup_srovnani_data.
+    for k, des in (('kc', 2), ('kc_b', 2), ('mj', 3), ('mj_b', 3), ('kc_s', 2), ('mj_s', 3)):
+        if k in r or k in ('kc', 'kc_b', 'mj', 'mj_b'):
+            r[k] = round(float(r.get(k) or 0), des)
+    kc_s, mj_s = r.get('kc_s', r['kc']), r.get('mj_s', r['mj'])
+    r['rozdil'] = round(kc_s - r['kc_b'], 2)
+    r['zmena'] = _zmena_pct(kc_s, r['kc_b'])
+    r['rozdil_mj'] = round(mj_s - r['mj_b'], 3)
+    r['zmena_mj'] = _zmena_pct(mj_s, r['mj_b'])
+    r['podil'] = r['kc'] / tot_a * 100.0 if tot_a else None
+    # Měsíc, jehož protějšek v datech není — srovnání prázdné, ne nula.
+    if od_srov and r.get('mesic') and (_obd_int(r['mesic']) or 0) < od_srov:
+        for k in ('kc_s', 'kc_b', 'rozdil', 'zmena', 'mj_s', 'mj_b', 'rozdil_mj', 'zmena_mj'):
+            r[k] = None
+    return r
 
 
 def _nakup_celkem(cols, souhrn, popisek='CELKEM'):
@@ -4613,8 +4751,7 @@ def _nakup_vyjezd_data(f, kody, limit):
     """Náhled: prvních `limit` řádků + přesný počet v jednom průchodu. LIMIT a pak
     COUNT nad seskupeným dotazem by stály dvě stejně drahá GROUP BY (celý měsíc
     v plném detailu = 130 tis. řádků, každé ~2,5 s). Chyba DB letí ven — UI ji ukáže."""
-    sql, par, cols = _nakup_vyjezd_sql(f, kody)
-    kde, par2 = _nakup_where(f, kody)
+    sql, souhrn_sql, par, cols, od_srov = _nakup_vyjezd_sql(f, kody)
     conn = intranet_data.get_db_connection()
     if not conn:
         raise RuntimeError('Není spojení s databází.')
@@ -4626,14 +4763,15 @@ def _nakup_vyjezd_data(f, kody, limit):
             pocet += 1
         cur = conn.cursor(dictionary=True)
         try:
-            cur.execute('SELECT SUM(o.obrat_mj) AS mj, SUM(o.obrat_kc) AS kc, '
-                        f'COUNT(DISTINCT o.kod) AS polozek {_NAKUP_JOIN} WHERE {kde}', par2)
+            cur.execute(souhrn_sql, par)
             souhrn = cur.fetchone() or {}
         finally:
             cur.close()
     finally:
         conn.close()
-    return {'rows': rows, 'cols': cols, 'total': _nakup_celkem(cols, souhrn),
+    tot_a = float(souhrn.get('kc') or 0)
+    return {'rows': [_nakup_dopocti(r, tot_a, od_srov) for r in rows], 'cols': cols,
+            'total': _nakup_celkem(cols, _nakup_dopocti(souhrn, tot_a)),
             'celkem_radku': pocet}
 
 
@@ -4652,12 +4790,14 @@ def _nakup_iter(conn, sql, par, davka=2000):
 
 
 def _nakup_vyjezd_xlsx(f, kody, cesta, total):
-    sql, par, cols = _nakup_vyjezd_sql(f, kody)
+    sql, _souhrn_sql, par, cols, od_srov = _nakup_vyjezd_sql(f, kody)
+    tot_a = float(total.get('kc') or 0)
     conn = intranet_data.get_db_connection()
     if not conn:
         raise RuntimeError('Není spojení s databází.')
     try:
-        return _xlsx_na_disk(cesta, cols, _nakup_iter(conn, sql, par), total, sheet='Výjezd')
+        radky = (_nakup_dopocti(r, tot_a, od_srov) for r in _nakup_iter(conn, sql, par))
+        return _xlsx_na_disk(cesta, cols, radky, total, sheet='Výjezd')
     finally:
         conn.close()
 
@@ -4690,7 +4830,13 @@ def _nakup_srovnani_data(f, kody, rozpad, posledni):
     proti srovnávacímu B + řada po měsících pro meziroční graf."""
     rozpad = rozpad if rozpad in _NAKUP_ROZPADY else 'dodavatel'
     _popisek, _gen, klic_sql, nazev_sql, _fk, _pod = _NAKUP_ROZPADY[rozpad]
-    a_od, a_do, b_od, b_do = _nakup_obdobi_ab(f, posledni)
+    # Srovnává se jen část A s protějškem v datech; bez něj A celé a B prázdné.
+    a_od, a_do, s_od, b_od, b_do = _nakup_srovnatelne(f, posledni)
+    srovnat = s_od is not None
+    if srovnat:
+        a_od = s_od
+    else:
+        b_od = b_do = 0                               # BETWEEN 0 AND 0 = nic
     kde, par = _nakup_where(f, kody, s_obdobim=False)
     v_a = v_b = '(o.rok*100+o.mesic) BETWEEN %s AND %s'
     nazev_expr = nazev_sql or "''"
@@ -4727,7 +4873,8 @@ def _nakup_srovnani_data(f, kody, rozpad, posledni):
         r['podil'] = r['kc_a'] / tot_a * 100.0 if tot_a else None
     mesice = _dotaz(f'SELECT o.rok*100+o.mesic AS klic, SUM(o.obrat_kc) AS kc {_NAKUP_JOIN} '
                     f'WHERE {kde} GROUP BY o.rok, o.mesic ORDER BY klic', par, slovnik=True)
-    a_txt, b_txt = _nakup_rozsah_txt(a_od, a_do), _nakup_rozsah_txt(b_od, b_do)
+    a_txt = _nakup_rozsah_txt(a_od, a_do)
+    b_txt = _nakup_rozsah_txt(b_od, b_do) if srovnat else 'srovnání (není v datech)'
     mj_a = round(sum(r['mj_a'] for r in rows), 3)
     mj_b = round(sum(r['mj_b'] for r in rows), 3)
     celkem = {'_celkem': True, 'klic': 'CELKEM', 'nazev': '', 'kc_a': tot_a, 'kc_b': tot_b,
@@ -4735,6 +4882,10 @@ def _nakup_srovnani_data(f, kody, rozpad, posledni):
               'podil': 100.0 if tot_a else None,
               'mj_a': mj_a, 'mj_b': mj_b, 'rozdil_mj': round(mj_a - mj_b, 3),
               'zmena_mj': _zmena_pct(mj_a, mj_b)}
+    if not srovnat:                                   # prázdné, ne nula
+        for r in rows + [celkem]:
+            for k in ('kc_b', 'rozdil', 'zmena', 'mj_b', 'rozdil_mj', 'zmena_mj'):
+                r[k] = None
     return {'rows': rows, 'cols': _nakup_cols_srovnani(rozpad, a_txt, b_txt),
             'celkem': celkem, 'mesice': mesice, 'rozpad': rozpad,
             'a_txt': a_txt, 'b_txt': b_txt,
@@ -4754,12 +4905,12 @@ _NAKUP_REPORT_LISTY = {'mesic': 'Minulý měsíc',
                        'rok': 'Od začátku roku do minulého měsíce'}
 # Datové sloupce (pole, záhlaví, typ, šířka); {loni}/{letos} = roky, ve volbě slovy.
 # IČO ani nákupní ceny v datech nejsou: dodavatel je kód z DATA_POROVNANI,
-# prodej je obrat GIST v Kč bez DPH.
+# nákup je obrat GIST v Kč bez DPH.
 _NAKUP_REPORT_SLOUPCE = [
-    ('kc_b', 'Prodej {loni} (Kč bez DPH)', 'money', 17),
-    ('kc_a', 'Prodej {letos} (Kč bez DPH)', 'money', 17),
-    ('mj_b', 'Prodej {loni} (MJ)', 'num', 13),
-    ('mj_a', 'Prodej {letos} (MJ)', 'num', 13),
+    ('kc_b', 'Nákup {loni} (Kč bez DPH)', 'money', 17),
+    ('kc_a', 'Nákup {letos} (Kč bez DPH)', 'money', 17),
+    ('mj_b', 'Nákup {loni} (MJ)', 'num', 13),
+    ('mj_a', 'Nákup {letos} (MJ)', 'num', 13),
     ('rozdil', 'Rozdíl Kč v Kč', 'money', 15),
     ('zmena', 'Rozdíl Kč v %', 'num', 11),
     ('rozdil_mj', 'Rozdíl MJ v množství', 'num', 14),
@@ -4795,7 +4946,7 @@ def _nakup_report_uloz(zapnuto, listy=None, sloupce=None):
 
 
 def _nakup_report_volba(pole):
-    """Název sloupce pro výběr a log („Prodej loni (MJ)“)."""
+    """Název sloupce pro výběr a log („Nákup loni (MJ)“)."""
     return next(h for p, h, *_ in _NAKUP_REPORT_SLOUPCE if p == pole) \
         .format(loni='loni', letos='letos')
 
@@ -4832,7 +4983,7 @@ def _nakup_report_dotaz(sql, params):
 
 
 def _nakup_report_data(kod, rok, mesice):
-    """Prodej zboží nákupčího `kod` po dodavateli × popisu sortimentu × kategorii
+    """Nákup zboží nákupčího `kod` po dodavateli × popisu sortimentu × kategorii
     (Skupina2-popis): měsíce `mesice` roku `rok` (…_a) proti stejným měsícům
     loni (…_b). Kategorie je v klíči řádku, protože stejný popis sortimentu často
     spadá do víc kategorií — jen tak jdou součty kategorií v Excelu sečíst
@@ -4858,7 +5009,7 @@ def _nakup_report_data(kod, rok, mesice):
              'sortiment': r['sort_popis'] or '—', 'kategorie': r['kategorie'] or '',
              'kc_a': round(float(r['kc_a'] or 0), 2), 'kc_b': round(float(r['kc_b'] or 0), 2),
              'mj_a': round(float(r['mj_a'] or 0), 3), 'mj_b': round(float(r['mj_b'] or 0), 3)}
-        # Řádek, kde vratky prodej v obou letech vynulovaly, je jen šum.
+        # Řádek, kde vratky nákup v obou letech vynulovaly, je jen šum.
         if not (r['kc_a'] or r['kc_b'] or r['mj_a'] or r['mj_b']):
             continue
         # Kolace DB slučuje kategorie bez ohledu na velikost písmen, Excel je
@@ -4877,7 +5028,7 @@ def _nakup_report_data(kod, rok, mesice):
 
 def _nakup_report_kategorie(rows):
     """Součty kategorií v Kč (stejně jako je Excel sečte z řádků), seřazené od
-    největšího letošního prodeje; „Bez kategorie“ na konec. Prázdné, dokud
+    největšího letošního nákupu; „Bez kategorie“ na konec. Prázdné, dokud
     DATA_POROVNANI nebyla nahrána znovu — jediný blok „Bez kategorie“ by jen
     zopakoval celkový součet."""
     if all(r['kategorie'] == 'Bez kategorie' for r in rows):
@@ -4984,11 +5135,11 @@ def _nakup_report_xlsx(kod, listy):
                 bunka(r, j, v, typ, field, tucne=True, vypln=vypln)
 
         n = len(rows)
-        m = tabulka(f'Prodeje_{klic}', 'TableStyleMedium2', 1, cols, rows)
+        m = tabulka(f'Nakupy_{klic}', 'TableStyleMedium2', 1, cols, rows)
         ws.row_dimensions[1].height = 32
         ws.freeze_panes = 'A2'
         if not rows:
-            ws.cell(2, 1, 'Za toto období nákupčí nemá žádný prodej.')
+            ws.cell(2, 1, 'Za toto období nákupčí nemá žádný nákup.')
             continue
         if not se_soucty:
             continue
@@ -5108,7 +5259,7 @@ def _nakup_report_text(kod, rok, mesic, nazvy, nast, vynechat, loni_neuplny):
     def rozsah(r):
         return f'{mesic}/{r}' if mesic == 1 else f'1–{mesic}/{r}'
     radky = ['Dobrý den,', '',
-             f'v příloze je přehled prodejů zboží nákupčího {kod} ve srovnání '
+             f'v příloze je přehled nákupů zboží nákupčího {kod} ve srovnání '
              f's rokem {rok - 1}:']
     if 'mesic' in nazvy:
         radky.append(f'• list „{nazvy["mesic"]}“: {mesic}/{rok} proti {mesic}/{rok - 1}')
@@ -5117,8 +5268,8 @@ def _nakup_report_text(kod, rok, mesic, nazvy, nast, vynechat, loni_neuplny):
     soucet = ('; vedle tabulky jsou součty po kategoriích (Skupina 2 popis), pod ní '
               'celkový součet nákupčího' if not _NAKUP_REPORT_CELKEM.isdisjoint(nast['sloupce']) else '')
     radky += ['', 'Řádky jsou po dodavatelích a popisu sortimentu, seřazené od největšího '
-                  f'prodeje v roce {rok}{soucet}. '
-                  'Prodej je obrat podle dat GIST v Kč bez DPH a v MJ.']
+                  f'nákupu v roce {rok}{soucet}. '
+                  'Nákup je obrat podle dat GIST v Kč bez DPH a v MJ.']
     if vynechat and 'rok' in nazvy:
         cisla = ', '.join(str(m) for m in sorted(vynechat))
         kdo = f'měsíc {cisla} (v obou letech) – jeho' if len(vynechat) == 1 else \
@@ -5131,7 +5282,7 @@ def _nakup_report_text(kod, rok, mesic, nazvy, nast, vynechat, loni_neuplny):
     if intranet_data.APP_URL:
         radky += ['', f'Podrobnosti najdete v modulu Lupopřípad: {intranet_data.APP_URL}/lupa']
     radky += ['', f'Tento e-mail se posílá automaticky každý měsíc k {_NAKUP_REPORT_DEN}. dni.']
-    predmet = f'Lupou na nákup – prodeje {kod} za {_MESICE_CELE[mesic - 1]} {rok}'
+    predmet = f'Lupou na nákup – nákupy {kod} za {_MESICE_CELE[mesic - 1]} {rok}'
     return predmet, '\n'.join(radky)
 
 
@@ -5229,7 +5380,7 @@ async def _nakup_report_kolo(obd):
 
 
 async def bg_nakup_report():
-    """Od 10. dne v měsíci (od 7:00) pošle každému nákupčímu Excel s prodeji jeho
+    """Od 10. dne v měsíci (od 7:00) pošle každému nákupčímu Excel s nákupy jeho
     zboží za předchozí měsíc (list 1) a od začátku roku do toho měsíce (list 2),
     obojí proti stejnému období loni. Jen když ho Správce v sekci zapne (výchozí
     vypnuto); listy a sloupce podle jeho výběru.
@@ -5254,7 +5405,7 @@ async def _nakup_report_vyber(zapinam):
     with ui.dialog() as dlg, ui.card().classes('w-full max-w-lg p-5 gap-2'):
         dlg.on('hide', dlg.delete)
         ui.label('Měsíční e-mail nákupčím').classes('text-lg font-bold text-gray-800')
-        ui.label(f'Od {_NAKUP_REPORT_DEN}. dne v měsíci dostane každý nákupčí Excel s prodeji '
+        ui.label(f'Od {_NAKUP_REPORT_DEN}. dne v měsíci dostane každý nákupčí Excel s nákupy '
                  'svého zboží za předchozí měsíc proti stejnému období loni — jakmile je '
                  'měsíc uzavřený a data GIST nahraná.').classes('text-sm text-gray-600')
         ui.label('Listy v Excelu').classes('text-sm font-semibold text-gray-800 mt-2')
@@ -5400,7 +5551,7 @@ def _nakup_graf_top(d, n=15):
         {'name': d['a_txt'], 'type': 'bar', 'itemStyle': {'color': '#4338CA'},
          'data': [round(r['kc_a']) for r in top]},
         {'name': d['b_txt'], 'type': 'bar', 'itemStyle': {'color': '#A5B4FC'},
-         'data': [round(r['kc_b']) for r in top]},
+         'data': [round(r['kc_b'] or 0) for r in top]},
     ]
     return opt
 
@@ -5500,12 +5651,45 @@ def _nakup_jmeno(co):
     return f'lupa_nakup_{co}_{datetime.datetime.now():%Y%m%d_%H%M}'
 
 
+_NAKUP_CIPY = 4  # do tolika vybraných hodnot čipy, nad to souhrn „Vše“ / „K z N“
+
+
 def _nakup_multi(label, volby, hodnota, sirka):
-    val = [v for v in (hodnota or []) if v in volby]
-    return ui.select(volby, label=label, multiple=True, with_input=True, clearable=True,
-                     value=val) \
-        .props('dense outlined options-dense use-chips') \
+    """Multivýběr filtru, výchozí = vše zaškrtnuté (uložený výběr se obnoví).
+    Prázdný = taky vše; po zavření nabídky se zaškrtne zpět. Stovky čipů
+    dodavatelů by rozhodily řádek — nad pár hodnot jen souhrnný text."""
+    val = [v for v in (hodnota or []) if v in volby] or list(volby)
+    sel = ui.select(volby, label=label, multiple=True, with_input=True, clearable=True,
+                    value=val) \
+        .props('dense outlined options-dense') \
         .style(f'min-width: {sirka}px; max-width: 460px')
+
+    def zobraz():
+        n, celkem = len(sel.value or []), len(volby)
+        # Vše = vždy „Vše“, i u krátkých seznamů (Divize má jen 3 hodnoty).
+        if 0 < n < celkem and n <= _NAKUP_CIPY:
+            sel.props(remove='display-value')
+            sel.props('use-chips')
+        else:
+            txt = 'Vše' if n in (0, celkem) else f'{n} z {celkem}'
+            sel.props(remove='use-chips')
+            sel.props(f'display-value="{txt}"')
+
+    def doplnit_vse():
+        if not sel.value:
+            sel.value = list(volby)
+
+    zobraz()
+    sel.on_value_change(lambda _e: zobraz())
+    sel.on('popup-hide', doplnit_vse)
+    return sel
+
+
+def _nakup_vybrane(sel, volby):
+    """Hodnota multivýběru do filtru: vše (i nic) = bez omezení → [] — jinak by šel
+    do SQL IN se stovkami dodavatelů a do popisu „(+295 dalších)“."""
+    v = [x for x in (sel.value or []) if x in volby]
+    return [] if len(v) >= len(volby) else v
 
 
 def _nakup_kpi(popisek, hodnota, barva='text-gray-800'):
@@ -5548,18 +5732,13 @@ def _vykresli_nakup(user_id, user_name, vsechna_prava):
             with ui.tab_panel('srovnani').classes('px-0'):
                 _nakup_srovnani(user_id, user_name, kody, mesice, volby)
 
-    if mesice and vidi:
-        rozsah = ('všechny nákupčí včetně nespárovaného zboží' if kody is None
-                  else 'zboží nákupčích ' + ', '.join(sorted(kody)))
-        ui.label(f'Odběry z GIST {mesice[0]} – {mesice[-1]} · vidíte {rozsah}.') \
-            .classes('text-gray-500 mb-3')
-        if kody is None:
-            r = _dotaz('SELECT SUM(o.obrat_kc), SUM(CASE WHEN p.dodavatel IS NULL '
-                       f'THEN o.obrat_kc ELSE 0 END) {_NAKUP_JOIN}')
-            if r and r[0][0] and float(r[0][1] or 0) > 0.05 * float(r[0][0]):
-                ui.label(f'Bez dodavatele je {_cz(float(r[0][1]) / float(r[0][0]) * 100, 1)} % '
-                         'odběrů. Dodavatel se páruje ze sloupců K/L DATA_POROVNANI — nahrajte je '
-                         'v Cenopřípadu znovu.').classes('text-sm text-amber-700 mb-3')
+    if mesice and vidi and kody is None:
+        r = _dotaz('SELECT SUM(o.obrat_kc), SUM(CASE WHEN p.dodavatel IS NULL '
+                   f'THEN o.obrat_kc ELSE 0 END) {_NAKUP_JOIN}')
+        if r and r[0][0] and float(r[0][1] or 0) > 0.05 * float(r[0][0]):
+            ui.label(f'Bez dodavatele je {_cz(float(r[0][1]) / float(r[0][0]) * 100, 1)} % '
+                     'odběrů. Dodavatel se páruje ze sloupců K/L DATA_POROVNANI — nahrajte je '
+                     'v Cenopřípadu znovu.').classes('text-sm text-amber-700 mb-3')
     _vykresli_uzavrene_mesice(user_name, je_vkladatel(vsechna_prava),
                               _UZAVRENE_NAKUP_PREFIX, 'odběry GIST', zalozky.refresh)
     if not vidi:
@@ -5583,29 +5762,48 @@ def _nakup_vyjezdy(user_id, user_name, kody, mesice, volby):
 
     hotove = _nakup_hotove(mesice)
     posl = hotove[-1] if hotove else None
+    prvni = hotove[0] if hotove else None
+    prvni_dat = _obd_int(mesice[0]) if mesice else 0     # dřív srovnávat nejde
 
     def mesic(klic, vychozi):
         v = ulozeny.get(klic)
         return v if v in hotove else vychozi
 
     dims = dict(_NAKUP_DIMENZE)
+    srov = dict(_NAKUP_VYJEZD_SROVNANI)
     with ui.row().classes('w-full items-end gap-3 mb-2 flex-wrap'):
         sel_od = _nakup_sel('Od měsíce', mesice, mesic('od', posl))
         sel_do = _nakup_sel('Do měsíce', mesice, mesic('do', posl))
+        ui.label('Srovnat:').classes('text-sm text-gray-600 self-center ml-2')
+        tgl = ui.toggle({'rok': 'Rok/rok', 'mesic': 'Měsíc/měsíc', 'vlastni': 'Vlastní'},
+                        value=ulozeny.get('srovnat') if ulozeny.get('srovnat') in
+                        ('rok', 'mesic', 'vlastni') else 'rok') \
+            .props('no-caps unelevated dense toggle-color=indigo-7').classes('self-center')
+        sel_b_od = _nakup_sel('Srovnat od', mesice, mesic('b_od', prvni))
+        sel_b_do = _nakup_sel('do', mesice, mesic('b_do', prvni))
+        b_popis = ui.label('').classes('text-xs text-gray-500 self-center')
+    with ui.row().classes('w-full items-end gap-3 mb-2 flex-wrap'):
         sel_div = _nakup_multi('Divize', volby['divize'], ulozeny.get('divize'), 170)
         sel_pob = _nakup_multi('Pobočka', volby['pobocka'], ulozeny.get('pobocka'), 220)
-        sel_ico = _nakup_multi('Odběratel (IČO, jméno)', volby['ico'], ulozeny.get('ico'), 260)
     with ui.row().classes('w-full items-end gap-3 mb-2 flex-wrap'):
         sel_dod = _nakup_multi('Dodavatel', volby['dodavatel'], ulozeny.get('dodavatel'), 300)
         sel_nak = _nakup_multi('Nákupčí', volby['nak'], ulozeny.get('nak'), 140)
         inp_prod = ui.input('Produkt — kód nebo část názvu', value=ulozeny.get('produkt') or '') \
             .props('dense outlined clearable').style('min-width: 260px') \
             .tooltip('Víc kódů nebo názvů oddělte čárkou.')
-        sel_dims = ui.select(dims, label='Seskupit podle', multiple=True,
+        ulozene_sl = ulozeny.get('sloupce')
+        if 'dims' not in ulozeny:                    # bez uloženého filtru
+            ulozene_sl = _NAKUP_VYJEZD_SL_VYCHOZI
+        elif ulozene_sl is not None and not ulozeny.get('sl_v2'):
+            ulozene_sl = list(ulozene_sl) + ['kc', 'mj']   # dřív byly vždy, ne na výběr
+        sel_dims = ui.select({**dims, **srov}, label='Seskupit podle', multiple=True,
                              value=[d for d in (ulozeny.get('dims') or _NAKUP_DIMENZE_VYCHOZI)
-                                    if d in dims]) \
+                                    if d in dims]
+                             + [k for k in srov if ulozene_sl is None or k in ulozene_sl]) \
             .props('dense outlined options-dense use-chips').style('min-width: 340px') \
-            .tooltip('Řádek výjezdu = kombinace zvolených údajů. Všechny = zrnitost GIST.')
+            .tooltip('Řádek výjezdu = kombinace zvolených údajů. Všechny = zrnitost GIST. '
+                     'Volby od „Nákup předešlý (Kč)“ dál jen volí sloupce s čísly '
+                     '(předešlé období podle přepínače Srovnat).')
     with ui.row().classes('w-full items-center gap-2 mb-3 flex-wrap'):
         btn_nacti = ui.button('Generovat výjezd', icon='play_arrow') \
             .props('unelevated color=indigo-7')
@@ -5613,7 +5811,6 @@ def _nakup_vyjezdy(user_id, user_name, kody, mesice, volby):
         btn_pdf = ui.button('PDF', icon='picture_as_pdf').props('outline color=red-7')
         btn_xlsx = ui.button('Excel', icon='table_view').props('outline color=green-7') \
             .tooltip('Celý výjezd bez omezení počtu řádků.')
-        info = ui.label('').classes('text-sm text-gray-500 ml-2')
     exporty = (btn_tisk, btn_pdf, btn_xlsx)
     for b in exporty:
         b.disable()
@@ -5623,19 +5820,34 @@ def _nakup_vyjezdy(user_id, user_name, kody, mesice, volby):
             .classes('text-sm text-gray-400')
 
     def soucasny_filtr():
-        return {'od': sel_od.value, 'do': sel_do.value,
-                'divize': list(sel_div.value or []), 'pobocka': list(sel_pob.value or []),
-                'ico': list(sel_ico.value or []), 'dodavatel': list(sel_dod.value or []),
-                'nak': list(sel_nak.value or []), 'produkt': (inp_prod.value or '').strip(),
-                'dims': list(sel_dims.value or [])}
+        return {'od': sel_od.value, 'do': sel_do.value, 'srovnat': tgl.value,
+                'b_od': sel_b_od.value, 'b_do': sel_b_do.value,
+                'divize': _nakup_vybrane(sel_div, volby['divize']),
+                'pobocka': _nakup_vybrane(sel_pob, volby['pobocka']),
+                'dodavatel': _nakup_vybrane(sel_dod, volby['dodavatel']),
+                'nak': _nakup_vybrane(sel_nak, volby['nak']),
+                'produkt': (inp_prod.value or '').strip(),
+                'dims': [v for v in (sel_dims.value or []) if v in dims],
+                'sloupce': [v for v in (sel_dims.value or []) if v in srov], 'sl_v2': True}
+
+    def prepni_b():
+        vlastni = tgl.value == 'vlastni'
+        sel_b_od.set_visibility(vlastni)
+        sel_b_do.set_visibility(vlastni)
+        if vlastni or not sel_od.value:
+            b_popis.text = ''
+            return
+        b_popis.text = _nakup_srovnani_popis(soucasny_filtr(), 0, prvni_dat)
+
+    for prvek in (tgl, sel_od, sel_do):
+        prvek.on_value_change(lambda _e: prepni_b())
+    prepni_b()
 
     def vykresli():
         vysledek.clear()
         rows = stav['rows']
         for b in exporty:
             b.set_enabled(bool(rows))
-        info.text = (f"{stav['celkem_radku']:,} řádků · ".replace(',', ' ')
-                     + _kc(float(stav['total'].get('kc') or 0)))
         with vysledek:
             if not rows:
                 with ui.column().classes('items-center py-16 gap-2 w-full'):
@@ -5737,6 +5949,7 @@ def _nakup_srovnani(user_id, user_name, kody, mesice, volby):
     posledni = _obd_int(posl)
     od_vychozi = next((m for m in hotove if m[:4] == posl[:4]), posl)
     prvni = hotove[0] if hotove else None
+    prvni_dat = _obd_int(mesice[0]) if mesice else 0     # dřív srovnávat nejde
     stav = {'data': None, 'filtr': None, 'popis': ''}
 
     def mesic(klic, vychozi):
@@ -5757,7 +5970,6 @@ def _nakup_srovnani(user_id, user_name, kody, mesice, volby):
     with ui.row().classes('w-full items-end gap-3 mb-2 flex-wrap'):
         sel_div = _nakup_multi('Divize', volby['divize'], ulozeny.get('divize'), 170)
         sel_pob = _nakup_multi('Pobočka', volby['pobocka'], ulozeny.get('pobocka'), 220)
-        sel_ico = _nakup_multi('Odběratel (IČO, jméno)', volby['ico'], ulozeny.get('ico'), 240)
         sel_dod = _nakup_multi('Dodavatel', volby['dodavatel'], ulozeny.get('dodavatel'), 280)
         sel_nak = _nakup_multi('Nákupčí', volby['nak'], ulozeny.get('nak'), 140)
         inp_prod = ui.input('Produkt — kód nebo část názvu', value=ulozeny.get('produkt') or '') \
@@ -5784,9 +5996,11 @@ def _nakup_srovnani(user_id, user_name, kody, mesice, volby):
     def soucasny_filtr():
         return {'od': sel_od.value, 'do': sel_do.value, 'srovnat': tgl.value,
                 'b_od': sel_b_od.value, 'b_do': sel_b_do.value,
-                'divize': list(sel_div.value or []), 'pobocka': list(sel_pob.value or []),
-                'ico': list(sel_ico.value or []), 'dodavatel': list(sel_dod.value or []),
-                'nak': list(sel_nak.value or []), 'produkt': (inp_prod.value or '').strip(),
+                'divize': _nakup_vybrane(sel_div, volby['divize']),
+                'pobocka': _nakup_vybrane(sel_pob, volby['pobocka']),
+                'dodavatel': _nakup_vybrane(sel_dod, volby['dodavatel']),
+                'nak': _nakup_vybrane(sel_nak, volby['nak']),
+                'produkt': (inp_prod.value or '').strip(),
                 'rozpad': sel_rozpad.value}
 
     def prepni_b():
@@ -5796,8 +6010,7 @@ def _nakup_srovnani(user_id, user_name, kody, mesice, volby):
         if vlastni:
             b_popis.text = ''
             return
-        _a1, _a2, b1, b2 = _nakup_obdobi_ab(soucasny_filtr(), posledni)
-        b_popis.text = f'→ srovnává se s {_nakup_rozsah_txt(b1, b2)}'
+        b_popis.text = _nakup_srovnani_popis(soucasny_filtr(), posledni, prvni_dat)
 
     for prvek in (tgl, sel_od, sel_do):
         prvek.on_value_change(lambda _e: prepni_b())
@@ -5818,7 +6031,8 @@ def _nakup_srovnani(user_id, user_name, kody, mesice, volby):
             popisek = _NAKUP_ROZPADY[d['rozpad']][0]
             with ui.row().classes('w-full gap-3 mb-3 flex-wrap'):
                 _nakup_kpi(f"Odběry {d['a_txt']}", _kc(k['kc_a']), 'text-indigo-800')
-                _nakup_kpi(f"Odběry {d['b_txt']}", _kc(k['kc_b']), 'text-gray-600')
+                _nakup_kpi(f"Odběry {d['b_txt']}", '—' if k['kc_b'] is None else _kc(k['kc_b']),
+                           'text-gray-600')
                 _nakup_kpi('Změna', _nakup_zmena_txt(k['zmena']), _nakup_barva_zmeny(k['zmena']))
                 _nakup_kpi(f'{popisek} s odběrem', f"{d['aktivnich']:,}".replace(',', ' '))
             with ui.row().classes('w-full gap-4 flex-wrap lg:flex-nowrap'):
@@ -5882,7 +6096,8 @@ def _nakup_srovnani(user_id, user_name, kody, mesice, volby):
                 ui.button(icon='close', on_click=dlg.close).props('flat round')
             with ui.row().classes('w-full gap-3 flex-wrap'):
                 _nakup_kpi(f"Odběry {det['a_txt']}", _kc(k['kc_a']), 'text-indigo-800')
-                _nakup_kpi(f"Odběry {det['b_txt']}", _kc(k['kc_b']), 'text-gray-600')
+                _nakup_kpi(f"Odběry {det['b_txt']}", '—' if k['kc_b'] is None else _kc(k['kc_b']),
+                           'text-gray-600')
                 _nakup_kpi('Změna', _nakup_zmena_txt(k['zmena']), _nakup_barva_zmeny(k['zmena']))
             ui.echart(_nakup_graf_mesice(det['mesice'], 'Odběry po měsících (Kč bez DPH)')) \
                 .classes('w-full').style('height: 300px')

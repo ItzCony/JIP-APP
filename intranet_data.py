@@ -528,6 +528,7 @@ MODULY = {
     'cenopripad_zapnuty':    ('🏷️ Modul Cenopřípad',             'Cenopřípad'),
     'asm_zapnuty':           ('📝 Modul Formuláře ASM',          'Formuláře ASM'),
     'lupa_zapnuty':          ('🔍 Modul Lupopřípad',             'Lupopřípad'),
+    'nos_zapnuty':           ('💼 Modul NOS',                    'NOS'),
     'schuzky_zapnuty':       ('🗓️ Modul Schůzky s vedoucími',    'Schůzky s vedoucími'),
     'gastrokurzy_zapnuty':   ('👨‍🍳 Modul Gastrokurzy',            'Gastrokurzy'),
     'datuloziste_zapnuty':   ('🗄️ Modul Datové úložiště',        'Datové úložiště'),
@@ -1185,7 +1186,7 @@ def inicializace_db():
 
         cursor.execute("SELECT COUNT(*) FROM user")
         if cursor.fetchone()[0] == 0:
-            for p in ['vse', 'kviz', 'dochazka_zadosti', 'dochazka_admin', 'dochazka_schvalovat_sebe', 'dochazka_mazani', 'dochazka_export', 'dochazka_email', 'vystup_osobni', 'vystup_vse', 'uzivatele', 'mysql', 'dlazdice', 'slozky_vse', 'kalendar_vse', 'dlazdice_dochazka_zaklad', 'tisk_vse', 'tisk_odd_vse', 'veletrh_admin', 'veletrh_uzivatel', 'veletrh_pristup', 'admin_logy', 'admin_server']:
+            for p in ['vse', 'kviz', 'dochazka_zadosti', 'dochazka_admin', 'dochazka_schvalovat_sebe', 'dochazka_mazani', 'dochazka_export', 'dochazka_email', 'vystup_osobni', 'vystup_vse', 'uzivatele', 'mysql', 'dlazdice', 'slozky_vse', 'kalendar_vse', 'dlazdice_dochazka_zaklad', 'tisk_vse', 'tisk_odd_vse', 'veletrh_admin', 'veletrh_uzivatel', 'veletrh_pristup', 'admin_logy']:
                 cursor.execute("INSERT IGNORE INTO privileges (name) VALUES (%s)", (p,))
 
             cursor.execute("INSERT IGNORE INTO jobPosition (name) VALUES ('Administrátor')")

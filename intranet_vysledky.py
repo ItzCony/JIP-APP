@@ -330,46 +330,51 @@ _STREDISKA_NAME_FALLBACK = {
 }
 _PREDPIS_RE = re.compile(r'^(\d[\dx]*\.[\dx]*)\s+(.*\S)')
 
-# (db_sloupec, zobrazený_název, index_v_excelu, šířka_px)
-# Názvy sloupců přesně dle souboru „Tabulka nákladů_Vzor.xlsx".
+# (db_sloupec, zobrazený_název, hlavička_v_excelu, šířka_px)
+# Zobrazené názvy dle „Tabulka nákladů_Vzor.xlsx"; import hledá sloupce podle
+# hlavičky v „Tabulka nákladů_DATA.xlsx" (ne podle pozice – ta se mění).
 _SOUHRN_COLS = [
-    ('obrat_nc',            'Obrat v NC',                 5,  130),
-    ('zisk_vydajove',       'Zisk výdajové doklady',      7,  180),
-    ('zisk_prijmove',       'Zisk příjmové doklady',      11, 180),
-    ('naklad_odvody',       'Náklad odvody sítě',         27, 160),
-    ('kompenzace',          'Kompenzace',                 44, 120),
-    ('zr',                  'Zr',                         19,  80),
-    ('odberatelske_bonusy', 'Odběratelské bonusy',        25, 165),
-    ('sankce',              'Sankce',                     23, 100),
-    ('vysledek',            'Výsledek',                   54, 125),
-    ('mzdy',                'Mzdy',                       53, 115),
+    ('obrat_nc',            'Obrat v NC',                 'Obrat v NC',             130),
+    ('zisk_vydajove',       'Zisk výdajové doklady',      'Zisk výdajové doklady',  180),
+    ('zisk_prijmove',       'Zisk příjmové doklady',      'Zisk příjmové doklady',  180),
+    ('naklad_odvody',       'Náklad odvody sítě',         'Náklad odvody sítě',     160),
+    ('jamaro',              'JAMARO',                     'JAMARO',                 110),
+    ('mj_foods',            'MJ Foods',                   'MJ Foods',               110),
+    ('kompenzace',          'Kompenzace',                 'Kompenzace',             120),
+    ('zr',                  'Zr',                         'Zr',                      80),
+    ('odberatelske_bonusy', 'Odběratelské bonusy',        'Odběratelské bonusy',    165),
+    ('sankce',              'Sankce',                     'Sankce celkem',          100),
+    ('vysledek',            'Výsledek',                   'Výsledek',               125),
+    ('mzdy',                'Mzdy',                       'Mzdy',                   115),
     # po mzdy se vloží vypočítaný sloupec "Podíl mzdy v %"
-    ('inventura',           'Inventura',                  14, 115),
-    ('inventura_zaplaceno', 'Inventura z toho zaplaceno', 17, 200),
-    ('likvidace',           'Likvidace',                  15, 110),
-    ('nahrady',             'Náhrady',                    16, 105),
-    ('repre_spotreba',      'Repre + spotřeba',           18, 145),
-    ('naklady',             'Náklady',                    52, 110),
-    ('total',               'Total',                      55, 115),
+    ('inventura',           'Inventura',                  'Inventura',              115),
+    ('inventura_zaplaceno', 'Inventura z toho zaplaceno', 'Inventura zaplaceno',    200),
+    ('likvidace',           'Likvidace',                  'Likvidace',              110),
+    ('nahrady',             'Náhrady',                    'Náhrady',                105),
+    ('repre_spotreba',      'Repre + spotřeba',           'Repre + spotřeba',       145),
+    ('naklady',             'Náklady',                    'Náklady',                110),
+    ('total',               'Total',                      'Total',                  115),
     # po total se vloží vypočítaný sloupec "%"
-    ('zasoby',              'Zásoby',                     26, 130),
+    ('zasoby',              'Zásoby',                     'Zásoby',                 130),
 ]
+# Sloupce, které starší soubory nemají → v DB NULL, v tabulce/exportu „-".
+_SOUHRN_VOLITELNE = {'jamaro', 'mj_foods'}
 
 # Kg sloupce – ukládají se do DB pro grafy „Přehled pro vedení", ale NEzobrazují
-# se v tabulce nákladů (proto nejsou v _SOUHRN_COLS). (db_sloupec, index_v_excelu)
+# se v tabulce nákladů (proto nejsou v _SOUHRN_COLS). (db_sloupec, hlavička_v_excelu)
 _KG_COLS = [
-    ('obrat_kg_celkem',      56),
-    ('obrat_kg',             57),
-    ('obrat_kg_dcery',       58),
-    ('obrat_kg_site',        59),
-    ('obrat_kg_staropramen', 60),
-    ('obrat_kg_ostatni',     61),
-    ('operace',              63),
-    ('operace_dcery',        64),
-    ('operace_site',         65),
+    ('obrat_kg_celkem',      'Obrat v Kg celkem'),
+    ('obrat_kg',             'Obrat v Kg'),
+    ('obrat_kg_dcery',       'Obrat v Kg dcery'),
+    ('obrat_kg_site',        'Obrat v Kg sítě'),
+    ('obrat_kg_staropramen', 'Obrat v Kg Staropramen'),
+    ('obrat_kg_ostatni',     'Obrat v Kg Ostatní'),
+    ('operace',              'Operace'),
+    ('operace_dcery',        'Operace dcery'),
+    ('operace_site',         'Operace sítě'),
 ]
-# Kompletní sada importovaných sloupců (zobrazované + Kg): (db_sloupec, index_v_excelu)
-_IMPORT_COLS = [(c, idx) for c, _, idx, _ in _SOUHRN_COLS] + _KG_COLS
+# Kompletní sada importovaných sloupců (zobrazované + Kg): (db_sloupec, hlavička_v_excelu)
+_IMPORT_COLS = [(c, h) for c, _, h, _ in _SOUHRN_COLS] + _KG_COLS
 
 _PCT_FMT = (
     "function(p){"
@@ -502,6 +507,8 @@ def inicializace_vysledky_db():
                 zisk_prijmove        DECIMAL(18,2) NOT NULL DEFAULT 0,
                 naklad_odvody        DECIMAL(18,2) NOT NULL DEFAULT 0,
                 kompenzace           DECIMAL(18,2) NOT NULL DEFAULT 0,
+                jamaro               DECIMAL(18,2) NULL DEFAULT NULL,
+                mj_foods             DECIMAL(18,2) NULL DEFAULT NULL,
                 zr                   DECIMAL(18,2) NOT NULL DEFAULT 0,
                 odberatelske_bonusy  DECIMAL(18,2) NOT NULL DEFAULT 0,
                 sankce               DECIMAL(18,2) NOT NULL DEFAULT 0,
@@ -622,6 +629,12 @@ def inicializace_vysledky_db():
             if _kgc not in _existing:
                 cur.execute(f'ALTER TABLE tabulka_nakladu_mesice '
                             f'ADD COLUMN {_kgc} DECIMAL(18,2) NOT NULL DEFAULT 0')
+        # Migrace: JAMARO / MJ Foods (sloupce AS, AT) – stávající data zůstanou
+        # NULL, tabulka je zobrazí jako „-".
+        for _vc in sorted(_SOUHRN_VOLITELNE):
+            if _vc not in _existing:
+                cur.execute(f'ALTER TABLE tabulka_nakladu_mesice '
+                            f'ADD COLUMN {_vc} DECIMAL(18,2) NULL DEFAULT NULL')
         # Migrace: skupina VARCHAR(10)→VARCHAR(20) kvůli 'zalozni_sklad'
         # (užší sloupec hodnotu tiše ořezával na 'zalozni_sk') + oprava
         # už oříznutých řádků.
@@ -1355,98 +1368,6 @@ def _oz_year(v):
     return None
 
 
-def _importuj_souhrn_sync(zdroj, pobocka: str) -> tuple[int, str]:
-    """Import měsíčního souhrnu nákladů z per-pobočkového souboru
-    „Tabulka nákladů_DATA.xlsx" do tabulky tabulka_nakladu_mesice.
-
-    `zdroj` = cesta nebo file-like (BytesIO). Volejte přes asyncio.to_thread –
-    blokující I/O! Importují se pouze řádky patřící zadané pobočce; dříve nahraná
-    data této pobočky se nahradí, aby zobrazení odpovídalo nahranému souboru.
-    Vrátí (počet_uložených_řádků, chybová_zpráva_nebo_prázdný_řetězec)."""
-    try:
-        import openpyxl
-        wb = openpyxl.load_workbook(zdroj, data_only=True, read_only=True)
-        ws = wb.active
-    except Exception as exc:
-        return 0, f'Nelze otevřít soubor: {exc}'
-
-    # Pobočka může mít více dílčích jednotek (např. „011 - Praha" + „903 - Praha,
-    # záložní sklad") sdílejících stejný popis pobočky. Hodnoty za měsíc proto
-    # sčítáme přes všechny dílčí jednotky → jeden řádek na (rok, měsíc).
-    nalezene_pobocky: set[str] = set()
-    agg: dict[tuple[int, int], list[float]] = {}
-    try:
-        for row in ws.iter_rows(min_row=2, values_only=True):
-            if not row:
-                continue
-            pb = POBOCKY_EXCEL_MAPPING.get(row[0])
-            if pb is None and row[0] is not None:
-                pb = _POBOCKY_EXCEL_NORM.get(' '.join(str(row[0]).split()).lower())
-            if pb is None:
-                continue
-            nalezene_pobocky.add(pb)
-            if pb != pobocka:
-                continue
-            rok, mesic = row[1], row[4]
-            if not (rok and mesic):
-                continue
-            key = (int(rok), int(mesic))
-            vals = [_s(row[idx]) for _, idx in _IMPORT_COLS]
-            acc = agg.get(key)
-            if acc is None:
-                agg[key] = vals
-            else:
-                for i, v in enumerate(vals):
-                    acc[i] += v
-    except Exception as exc:
-        return 0, f'Chyba čtení dat: {exc}'
-    finally:
-        try:
-            wb.close()
-        except Exception:
-            pass
-
-    radky: list[tuple] = [
-        tuple([pobocka, rok, mesic, *vals])
-        for (rok, mesic), vals in sorted(agg.items())
-    ]
-
-    if not radky:
-        if nalezene_pobocky:
-            return 0, (f'Soubor neobsahuje data pro pobočku „{pobocka}". '
-                       f'Nalezena data poboček: {", ".join(sorted(nalezene_pobocky))}.')
-        return 0, ('V souboru nebyly nalezeny žádné rozpoznatelné řádky '
-                   '(zkontrolujte, že jde o soubor „Tabulka nákladů_DATA.xlsx").')
-
-    conn = intranet_data.get_db_connection()
-    if not conn:
-        return 0, 'Nelze se připojit k databázi.'
-
-    col_names    = ', '.join(c for c, _ in _IMPORT_COLS)
-    placeholders = ', '.join(['%s'] * len(_IMPORT_COLS))
-    updates      = ', '.join(f'{c}=VALUES({c})' for c, _ in _IMPORT_COLS)
-    sql = (
-        f"INSERT INTO tabulka_nakladu_mesice "
-        f"(pobocka, rok, mesic, {col_names}) "
-        f"VALUES (%s, %s, %s, {placeholders}) "
-        f"ON DUPLICATE KEY UPDATE {updates}"
-    )
-    try:
-        cur = conn.cursor()
-        cur.execute('DELETE FROM tabulka_nakladu_mesice WHERE pobocka=%s', (pobocka,))
-        cur.executemany(sql, radky)
-        conn.commit()
-        return len(radky), ''
-    except Exception as exc:
-        return 0, str(exc)
-    finally:
-        try:
-            cur.close()
-        except Exception:
-            pass
-        conn.close()
-
-
 def _importuj_souhrn_vse_sync(zdroj) -> tuple[int, list[str], str]:
     """Import dat pro VŠECHNY rozpoznané pobočky z jednoho souboru
     „Tabulka nákladů_DATA.xlsx". Řádky se rozdělí podle „Pobočka popis" a dílčí
@@ -1459,27 +1380,41 @@ def _importuj_souhrn_vse_sync(zdroj) -> tuple[int, list[str], str]:
     except Exception as exc:
         return 0, [], f'Nelze otevřít soubor: {exc}'
 
-    agg: dict[tuple[str, int, int], list[float]] = {}
+    agg: dict[tuple[str, int, int], list[float | None]] = {}
     try:
-        for row in ws.iter_rows(min_row=2, values_only=True):
+        radky_ws = ws.iter_rows(values_only=True)
+        hlavicka = next(radky_ws, None) or ()
+        idx = {' '.join(str(v).split()).lower(): i
+               for i, v in enumerate(hlavicka) if v is not None}
+        i_pob, i_rok, i_mes = (idx.get(h) for h in ('pobočka popis', 'rok', 'měsíc'))
+        sloupce = [idx.get(h.lower()) for _, h in _IMPORT_COLS]
+        chybi = [h for h, i in (('Pobočka popis', i_pob), ('Rok', i_rok), ('Měsíc', i_mes))
+                 if i is None]
+        chybi += [h for (c, h), i in zip(_IMPORT_COLS, sloupce)
+                  if i is None and c not in _SOUHRN_VOLITELNE]
+        if chybi:
+            return 0, [], 'V souboru chybí sloupce: ' + ', '.join(chybi)
+        for row in radky_ws:
             if not row:
                 continue
-            pb = POBOCKY_EXCEL_MAPPING.get(row[0])
-            if pb is None and row[0] is not None:
-                pb = _POBOCKY_EXCEL_NORM.get(' '.join(str(row[0]).split()).lower())
+            pb = POBOCKY_EXCEL_MAPPING.get(row[i_pob])
+            if pb is None and row[i_pob] is not None:
+                pb = _POBOCKY_EXCEL_NORM.get(' '.join(str(row[i_pob]).split()).lower())
             if pb is None:
                 continue
-            rok, mesic = row[1], row[4]
+            rok, mesic = row[i_rok], row[i_mes]
             if not (rok and mesic):
                 continue
             key = (pb, int(rok), int(mesic))
-            vals = [_s(row[idx]) for _, idx in _IMPORT_COLS]
+            # chybějící volitelný sloupec (starší soubor) → None = „-"
+            vals = [None if i is None else _s(row[i]) for i in sloupce]
             acc = agg.get(key)
             if acc is None:
                 agg[key] = vals
             else:
                 for i, v in enumerate(vals):
-                    acc[i] += v
+                    if v is not None:
+                        acc[i] += v
     except Exception as exc:
         return 0, [], f'Chyba čtení dat: {exc}'
     finally:
@@ -1912,7 +1847,8 @@ def _priprav_souhrn_pro_grid(raw: list[dict]) -> list[dict]:
     result = []
     for rok in sorted(roky_dict.keys()):
         mesice = sorted(roky_dict[rok], key=lambda x: int(x['mesic']))
-        totals = {c: 0.0 for c, _, _, _ in _SOUHRN_COLS}
+        # None = ve všech měsících NULL (JAMARO/MJ Foods u starších dat) → „-"
+        totals: dict = {c: None for c, _, _, _ in _SOUHRN_COLS}
         first  = True
         for m in mesice:
             mzdy  = _s(m.get('mzdy'))
@@ -1929,13 +1865,14 @@ def _priprav_souhrn_pro_grid(raw: list[dict]) -> list[dict]:
             result.append(row)
             first = False
             for c, _, _, _ in _SOUHRN_COLS:
-                totals[c] += _s(m.get(c))
+                if m.get(c) is not None:
+                    totals[c] = (totals[c] or 0.0) + _s(m.get(c))
 
         # Roční součtový řádek
-        t_mzdy = totals['mzdy']
-        t_vys  = totals['vysledek']
-        t_tot  = totals['total']
-        t_obn  = totals['obrat_nc']
+        t_mzdy = _s(totals['mzdy'])
+        t_vys  = _s(totals['vysledek'])
+        t_tot  = _s(totals['total'])
+        t_obn  = _s(totals['obrat_nc'])
         total_row: dict = dict(totals)
         total_row['_rok_disp']   = f'{rok} Celkem'
         total_row['_mesic_disp'] = ''
@@ -6863,7 +6800,7 @@ def _exp_tabulka(ws, cols: list[tuple], rows: list[dict], soucet: dict | None = 
             if typ == 'text':
                 v = '' if v is None else str(v)
             elif v in (None, ''):
-                v = None
+                v = '-' if pole in _SOUHRN_VOLITELNE else None
             else:
                 try:
                     v = float(v)
