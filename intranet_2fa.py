@@ -215,37 +215,27 @@ def ma_aktivni_2fa(user_id) -> bool:
     return bool(zaznam and zaznam['aktivni'] and zaznam['secret'])
 
 def zahaj_aktivaci(user_id, email):
-    """Vrátí (secret, otpauth_uri, qr_data_uri | None); při chybě DB nebo už
-    zapnutém 2FA (None, None, None) — zapnuté 2FA se nesmí přepsat.
-    Rozpracovaný (nepotvrzený) secret použije znovu: položka, kterou si uživatel
-    už naskenoval, platí i po znovuotevření dialogu / načtení stránky."""
-    zaznam = _nacti_totp_zaznam(user_id)
-    if not zaznam or (zaznam['aktivni'] and zaznam['secret']):
+    """Vygeneruje nový secret (přepíše případný nepotvrzený) a vrátí
+    (secret, otpauth_uri, qr_data_uri | None). Aktivace platí až po potvrzení."""
+    secret = vygeneruj_secret()
+    if not _uloz_totp(user_id, secret, False, None):
         return None, None, None
-    secret = None if zaznam['aktivni'] else zaznam['secret']
-    if not secret:
-        secret = vygeneruj_secret()
-        if not _uloz_totp(user_id, secret, False, None):
-            return None, None, None
     uri = otpauth_uri(email, secret)
     return secret, uri, qr_data_uri(uri)
 
 def potvrd_aktivaci(user_id, kod):
-    """Ověří první kód z aplikace; při úspěchu 2FA zapne. Vrací (záložní kódy,
-    None) — kódy se zobrazí JEDNOU — nebo (None, důvod): 'aktivni' = už zapnuto,
-    'kod' = kód nesedí, 'db' = chyba databáze / aktivace nezačala."""
+    """Ověří první kód z aplikace; při úspěchu 2FA zapne a vrátí seznam
+    záložních kódů (zobrazí se JEDNOU). Jinak None."""
     zaznam = _nacti_totp_zaznam(user_id)
-    if not zaznam or not zaznam['secret']:
-        return None, 'db'
-    if zaznam['aktivni']:
-        return None, 'aktivni'
+    if not zaznam or not zaznam['secret'] or zaznam['aktivni']:
+        return None
     if not overit_totp(zaznam['secret'], kod):
-        return None, 'kod'
+        return None
     kody = _vygeneruj_zalozni_kody()
     if not _uloz_totp(user_id, zaznam['secret'], True, [_hash_zalozni_kod(k) for k in kody]):
-        return None, 'db'
+        return None
     _zaznamenej_uspech(user_id)
-    return kody, None
+    return kody
 
 def overit_2fa_kod(user_id, kod):
     """Ověření při přihlášení — TOTP kód, nebo záložní kód (jednorázový).

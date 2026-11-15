@@ -14,7 +14,6 @@ import traceback
 from contextlib import closing
 import intranet_data
 import intranet_halloween
-import intranet_mikulas
 from intranet_ui_utils import refreshable_na_klienta
 from nicegui.element import Element
 
@@ -48,9 +47,6 @@ PRIKAZY = {
     '/halloween on': 'Zapne halloweenský vzhled přihlašovací stránky (i mimo říjen)',
     '/halloween off': 'Vypne halloweenský vzhled přihlašovací stránky (i v říjnu)',
     '/halloween auto': 'Halloweenský vzhled zase řídí datum — zapnutý celý říjen',
-    '/mikulas on': 'Zapne mikulášský vzhled přihlašovací stránky (i mimo 1.–6. prosince)',
-    '/mikulas off': 'Vypne mikulášský vzhled přihlašovací stránky (i v prosinci)',
-    '/mikulas auto': 'Mikulášský vzhled zase řídí datum — zapnutý 1.–6. prosince',
 }
 
 _EMAIL_RE = re.compile(r'[\w.+-]+@[\w.-]+\.\w+')
@@ -1132,21 +1128,6 @@ def vykresli_logy(user_name, vsechna_prava):
         ui.notify(f'Halloweenský vzhled přihlašovací stránky {stav}.',
                   type='info', position='top')
 
-    def _nastav_mikulase(volba):
-        # Stejně jako /halloween: globálně pro všechny, uloží se do nastavení portálu.
-        intranet_mikulas.nastav_rezim({'on': True, 'off': False, 'auto': None}[volba])
-        if volba == 'auto':
-            stav = ('řízen datem (zapnutý 1.–6. prosince) — teď '
-                    + ('zapnutý' if intranet_mikulas.je_mikulas() else 'vypnutý'))
-        else:
-            stav = 'zapnut' if volba == 'on' else 'vypnut'
-        if volba != 'off' and intranet_mikulas.je_mikulas() and intranet_halloween.je_halloween():
-            stav += ' (teď ale vládne halloween — ten má přednost)'
-        log_activity(user_name, 'Mikuláš',
-                     f'Příkaz /mikulas {volba} — mikulášský vzhled přihlašovací stránky {stav}')
-        ui.notify(f'Mikulášský vzhled přihlašovací stránky {stav}.',
-                  type='info', position='top')
-
     def _muze_menit_moduly():
         # Konzoli vidí i právo admin_logy, ale moduly patří pod „Nastavení portálu"
         # (právo mysql). Bez téhle kontroly by konzole obešla oprávnění z UI.
@@ -1210,7 +1191,6 @@ def vykresli_logy(user_name, vsechna_prava):
             return
         hledat_input.value = ''
         prikaz = re.sub(r'^/haloween\b', '/halloween', prikaz)  # i s jedním „l"
-        prikaz = re.sub(r'^/mikul[aá][sš]\b', '/mikulas', prikaz)  # i s diakritikou
         if prikaz == '/reboot':
             _potvrd_reboot()
         elif prikaz == '/dark-mode on':
@@ -1221,8 +1201,6 @@ def vykresli_logy(user_name, vsechna_prava):
             _dialog_moduly()
         elif prikaz in ('/halloween on', '/halloween off', '/halloween auto'):
             _nastav_halloween(prikaz.split()[1])
-        elif prikaz in ('/mikulas on', '/mikulas off', '/mikulas auto'):
-            _nastav_mikulase(prikaz.split()[1])
         else:
             ui.notify(f'Neznámý příkaz: {prikaz}', type='negative')
     # Příkaz smaže z pole rovnou prohlížeč: „input" s prázdnou hodnotou zruší i čekající

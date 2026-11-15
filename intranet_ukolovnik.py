@@ -3250,12 +3250,9 @@ async def _vykresli_ukoly(user_id, user_name, vsechna_prava, dialog_anchor=None,
 
         def _prepni_po_terminu(e):
             _rezim['po_terminu'] = e.value
-            # Jen do relace (ne do DB) — odhlášení app.storage.user vyprázdní → zpět vypnuto.
-            app.storage.user['ukoly_po_terminu'] = e.value
-            if e.value:
-                # Úkoly po termínu ukaž rozbalené (jinak by zůstaly ve sbalených dnech).
-                for _t in [t for t in _sbalene_dny if t and t < dnes]:
-                    _sbalene_dny.discard(_t)
+            # Osobní předvolba jako režim kanban/seznam — platí i další dny, zápis na pozadí.
+            background_tasks.create(asyncio.to_thread(
+                intranet_data.uloz_predvolbu, user_id, 'ukoly_po_terminu', e.value))
             _stranka['p'] = 1
             prekresli()
 
@@ -3715,9 +3712,7 @@ async def _vykresli_ukoly(user_id, user_name, vsechna_prava, dialog_anchor=None,
             _inicializovano['hodnota'] = True
             if not _pohled['hotove']:
                 vsechny_terminy = {u.get('termin') for u in zobrazene}
-                _po_t = _rezim.get('po_terminu')
-                _sbalene_dny.update(t for t in vsechny_terminy
-                                    if t != dnes and not (_po_t and t and t < dnes))
+                _sbalene_dny.update(t for t in vsechny_terminy if t != dnes)
 
         with seznam_box:
             if not zobrazene:
@@ -7529,7 +7524,8 @@ async def vykresli_ukolovnik(user_id, user_name, vsechna_prava):
                 # kdo sekci opravdu vidí. _vykresli_ukoly bere hodnotu přes setdefault.
                 ukoly_stav['rezim'] = {'kanban': bool(await asyncio.to_thread(
                     intranet_data.nacti_predvolbu, user_id, 'ukoly_rezim', True)),
-                    'po_terminu': bool(app.storage.user.get('ukoly_po_terminu', False))}
+                    'po_terminu': bool(await asyncio.to_thread(
+                    intranet_data.nacti_predvolbu, user_id, 'ukoly_po_terminu', False))}
                 # Kontejner pro dialogy MIMO refreshable – přežije _vykresli_ukoly.refresh()
                 _dlg_anchor = ui.element('div')
                 await _vykresli_ukoly(user_id, user_name, vsechna_prava, _dlg_anchor, ukoly_stav)

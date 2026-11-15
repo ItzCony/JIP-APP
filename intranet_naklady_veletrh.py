@@ -16,8 +16,6 @@ schvalovatel (rozpočet, kategorie, uhrazeno, komentáře), jen o nákladech ner
 a nechodí mu e-maily o nákladech ke schválení.
 Práva: naklady_veletrh_zadavatel / _schvalovatel / _spravce / _ctenar ('vse' = všechna).
 Role 'spravce' = správa modulu; schvalovatel ji má automaticky navíc k rozhodování.
-Záložka Organizátor (zadavatel + spravce): body plánu s hotovo/nehotovo a komentáře
-k nim. Bod upravuje, odškrtává a maže jen jeho autor, komentář maže jen jeho autor.
 """
 from __future__ import annotations
 
@@ -28,7 +26,6 @@ import io
 import math
 import os
 import re
-import time
 import uuid
 from collections import defaultdict
 from contextlib import contextmanager
@@ -256,24 +253,6 @@ _SCHEMA = (
     """CREATE TABLE IF NOT EXISTS naklady_veletrh_nastaveni (
         klic VARCHAR(40) PRIMARY KEY,
         hodnota VARCHAR(255) NOT NULL
-    ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci""",
-    """CREATE TABLE IF NOT EXISTS naklady_veletrh_plany (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        user_id INT NOT NULL,
-        kdo VARCHAR(255),
-        obsah TEXT NOT NULL,
-        hotovo TINYINT(1) NOT NULL DEFAULT 0,
-        vytvoreno DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        INDEX idx_user (user_id)
-    ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci""",
-    """CREATE TABLE IF NOT EXISTS naklady_veletrh_plany_komentare (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        plan_id INT NOT NULL,
-        user_id INT NOT NULL,
-        kdo VARCHAR(255),
-        obsah TEXT NOT NULL,
-        cas DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        INDEX idx_plan (plan_id)
     ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci""",
 )
 
@@ -627,67 +606,6 @@ def _uloz_rozpocet(user_id, kdo, nast, kategorie, nova) -> list[str]:
         if zmeny:
             _zapis(cur, None, user_id, kdo, 'Změna rozpočtu', '; '.join(zmeny))
     return zmeny
-
-
-# ---------- Organizátor ----------
-ORGANIZATOR_ROLE = frozenset(('zadavatel', 'spravce'))     # spravce má i schvalovatel
-ORG_TIK_S = 3.0             # jak často otevřený Organizátor kontroluje změny
-ORG_POJISTKA_S = 30.0       # jak často se i bez známé změny podívá do DB (zápisy z jiného procesu)
-_ORG_VERZE = 0              # zvedá se po každém zápisu — otevřené stránky v procesu se obnoví hned
-
-
-def _org_zmena():
-    global _ORG_VERZE
-    _ORG_VERZE += 1
-
-
-def _nacti_plany() -> dict:
-    with _transakce() as cur:
-        cur.execute('SELECT * FROM naklady_veletrh_plany ORDER BY id')
-        plany = cur.fetchall()
-        cur.execute('SELECT * FROM naklady_veletrh_plany_komentare ORDER BY id')
-        komentare = defaultdict(list)
-        for r in cur.fetchall():
-            komentare[r['plan_id']].append(r)
-    return {'plany': plany, 'komentare': komentare}
-
-
-def _plan_akce(user_id, kdo, role, akce, cil=None, hodnota=''):
-    """Zápis v Organizátoru. Bod plánu upravuje, odškrtává a maže jen autor, komentovat
-    smí každý s přístupem, komentář maže jen jeho autor."""
-    if not role & ORGANIZATOR_ROLE:
-        raise Chyba('K Organizátoru nemáte oprávnění.')
-    text = hodnota.strip()[:5000] if isinstance(hodnota, str) else ''
-    if akce in ('pridat', 'upravit', 'komentar') and not text:
-        raise Chyba('Napište text.')
-    with _transakce() as cur:
-        if akce == 'pridat':
-            cur.execute('INSERT INTO naklady_veletrh_plany (user_id, kdo, obsah) VALUES (%s, %s, %s)',
-                        (user_id, kdo, text))
-            return
-        if akce == 'smazat_komentar':
-            cur.execute('DELETE FROM naklady_veletrh_plany_komentare WHERE id = %s AND user_id = %s',
-                        (cil, user_id))
-            if not cur.rowcount:
-                raise Chyba('Komentář už neexistuje, nebo není váš.')
-            return
-        cur.execute('SELECT user_id FROM naklady_veletrh_plany WHERE id = %s FOR UPDATE', (cil,))
-        plan = cur.fetchone()
-        if not plan:
-            raise Chyba('Bod plánu mezitím autor smazal.')
-        if akce == 'komentar':
-            cur.execute('INSERT INTO naklady_veletrh_plany_komentare (plan_id, user_id, kdo, obsah) '
-                        'VALUES (%s, %s, %s, %s)', (cil, user_id, kdo, text))
-            return
-        if plan['user_id'] != user_id:
-            raise Chyba('Cizí plán můžete jen komentovat.')
-        if akce == 'upravit':
-            cur.execute('UPDATE naklady_veletrh_plany SET obsah = %s WHERE id = %s', (text, cil))
-        elif akce == 'hotovo':
-            cur.execute('UPDATE naklady_veletrh_plany SET hotovo = %s WHERE id = %s', (bool(hodnota), cil))
-        elif akce == 'smazat':
-            cur.execute('DELETE FROM naklady_veletrh_plany_komentare WHERE plan_id = %s', (cil,))
-            cur.execute('DELETE FROM naklady_veletrh_plany WHERE id = %s', (cil,))
 
 
 def pocet_akci(user_id, prava) -> int:
@@ -1225,9 +1143,7 @@ async def vykresli(user_id, user_name, vsechna_prava):
         ui.label(f'Náklady veletrh se nepodařilo načíst: {e}').classes('text-red-600')
         return
 
-    org = bool(role & ORGANIZATOR_ROLE)
-    s = {'data': data, 'vybrany': None, 'plany': None, 'rozbalene': set(),
-         'koncepty': {}, 'fokus': False, 'org_verze': -1, 'org_cas': 0.0,
+    s = {'data': data, 'vybrany': None,
          'filtr': {'q': '', 'stav': None, 'kategorie': None, 'zadal': None, 'od': '', 'do': '',
                    'min': '', 'max': '', 'moje': False}}
     otevrene = []       # překreslení otevřených detailů (dialogy) po obnově dat
@@ -1616,7 +1532,7 @@ async def vykresli(user_id, user_name, vsechna_prava):
                 ui.label(' · '.join(x for x in (nast['akce'], _do_veletrhu(nast)) if x)).classes('text-sm text-gray-500')
             with ui.row().classes('gap-2 items-center'):
                 ui.button(icon='refresh', on_click=obnov).props('flat round color=grey-7').tooltip('Načíst znovu')
-                if zadavatel and s['tab'] in ('prehled', 'naklady'):     # jinde se nákladů netýká
+                if zadavatel:
                     ui.button('Nový náklad', icon='add', on_click=lambda: formular(None)) \
                         .props('unelevated color=orange-8')
 
@@ -1951,174 +1867,12 @@ async def vykresli(user_id, user_name, vsechna_prava):
             _karta_tabulka('Podle měsíců splatnosti', ['Měsíc', 'Nákladů', 'Schváleno a uhrazeno'],
                            [(m, c, _kc(v)) for m, c, v in sou['mesice']])
 
-    # ---------- organizátor ----------
-    async def obnov_plany(vynutit=True):
-        """Načte Organizátor. Bez vynucení (automatika) překreslí jen při změně dat a chyby nehlásí."""
-        verze = _ORG_VERZE          # před čtením — zápis během čtení se chytí v dalším tiku
-        try:
-            data = await asyncio.to_thread(_nacti_plany)
-        except Exception as e:
-            if vynutit:
-                ui.notify(f'Organizátor se nepodařilo načíst: {e}', type='negative')
-            return
-        s['org_verze'], s['org_cas'] = verze, time.monotonic()
-        if vynutit or data != s['plany']:
-            s['plany'], s['fokus'] = data, False     # nová pole nemají fokus
-            organizator.refresh()
-
-    async def auto_obnova_planu():
-        if taby.value != 'organizator' or s['fokus']:      # nepřekreslovat pod rukama při psaní
-            return
-        if s['org_verze'] == _ORG_VERZE and time.monotonic() - s['org_cas'] < ORG_POJISTKA_S:
-            return
-        await obnov_plany(vynutit=False)
-
-    async def pri_prepnuti(e):
-        s['tab'] = e.value
-        hlavicka.refresh()          # tlačítko Nový náklad jen na záložkách, kterých se týká
-        if org and e.value == 'organizator':
-            await obnov_plany(vynutit=False)
-
-    async def plan_akce(akce, cil=None, hodnota='', koncept=None):
-        try:
-            await asyncio.to_thread(_plan_akce, user_id, user_name, role, akce, cil, hodnota)
-        except Chyba as e:
-            ui.notify(str(e), type='warning')       # stav se mohl změnit — níž načíst aktuální
-        except Exception as e:
-            ui.notify(f'Akci se nepodařilo provést: {e}', type='negative')
-            return
-        else:
-            _org_zmena()
-            s['koncepty'].pop(koncept, None)
-        await obnov_plany()
-
-    def pole(klic, placeholder):
-        """Textarea, jejíž rozepsaný text přežije překreslení; při fokusu automatika čeká."""
-        def fokus(stav):
-            s['fokus'] = stav
-
-        def koncept(e):
-            s['koncepty'][klic] = e.value or ''
-
-        return ui.textarea(placeholder=placeholder, value=s['koncepty'].get(klic, ''), on_change=koncept) \
-            .props('outlined dense autogrow').classes('flex-1') \
-            .on('focus', lambda: fokus(True)).on('blur', lambda: fokus(False))
-
-    async def dotaz(titulek, tlacitko, barva, text=None):
-        """Dialog: s textem vrátí upravený text, bez textu True; Zpět / zavření = None."""
-        with host, ui.dialog() as dlg, ui.card().classes('w-[520px] max-w-[95vw] gap-3'):
-            ui.label(titulek).classes('text-lg font-semibold')
-            txt = None if text is None else \
-                ui.textarea(value=text).props('outlined autogrow autofocus').classes('w-full')
-            with ui.row().classes('w-full justify-end gap-2'):
-                ui.button('Zpět', on_click=lambda: dlg.submit(None)).props('flat')
-                ui.button(tlacitko, on_click=lambda: dlg.submit(True if txt is None else txt.value)) \
-                    .props(f'unelevated color={barva}')
-        vysledek = await dlg
-        dlg.delete()
-        return vysledek
-
-    async def upravit_plan(p):
-        text = await dotaz('Upravit bod plánu', 'Uložit', 'orange-8', p['obsah'])
-        if text is not None:
-            await plan_akce('upravit', p['id'], text)
-
-    async def smazat_plan(pid):
-        if await dotaz('Smazat bod plánu i s komentáři?', 'Smazat', 'red-7'):
-            await plan_akce('smazat', pid)
-
-    async def smazat_komentar(kid):
-        if await dotaz('Smazat komentář?', 'Smazat', 'red-7'):
-            await plan_akce('smazat_komentar', kid)
-
-    def rozbal(pid, otevreno):
-        (s['rozbalene'].add if otevreno else s['rozbalene'].discard)(pid)
-
-    def plan_ui(p, komentare):
-        pid, vlastni = p['id'], p['user_id'] == user_id
-        with ui.column().classes('w-full gap-0 border-t border-gray-100 pt-2'):
-            with ui.row().classes('w-full items-start gap-2 no-wrap'):
-                ui.checkbox(value=bool(p['hotovo']), on_change=lambda e: plan_akce('hotovo', pid, e.value)) \
-                    .props('dense color=green-7' + ('' if vlastni else ' disable')).classes('mt-0.5')
-                ui.label(p['obsah']).classes('text-sm whitespace-pre-line break-words flex-1 min-w-0'
-                                             + (' line-through text-gray-400' if p['hotovo'] else ''))
-                if vlastni:
-                    ui.button(icon='edit', on_click=lambda: upravit_plan(p)) \
-                        .props('flat round dense size=sm color=grey-7').tooltip('Upravit')
-                    ui.button(icon='delete', on_click=lambda: smazat_plan(pid)) \
-                        .props('flat round dense size=sm color=grey-7').tooltip('Smazat')
-            with ui.expansion(f'Komentáře ({len(komentare)})' if komentare else 'Komentovat',
-                              icon='chat_bubble_outline', value=pid in s['rozbalene'],
-                              on_value_change=lambda e: rozbal(pid, e.value)) \
-                    .props('dense header-class="text-xs text-gray-500 px-0"').classes('w-full'):
-                for k in komentare:
-                    with ui.row().classes('w-full gap-2 items-start no-wrap'):
-                        with ui.column().classes('gap-0 flex-1 min-w-0'):
-                            ui.label(f"{k['kdo'] or ''} · {_cas(k['cas'])}").classes('text-xs text-gray-500')
-                            ui.label(k['obsah']).classes('text-sm text-gray-700 whitespace-pre-line break-words '
-                                                         'bg-gray-50 rounded px-2 py-1')
-                        if k['user_id'] == user_id:
-                            ui.button(icon='delete', on_click=lambda _=None, kid=k['id']: smazat_komentar(kid)) \
-                                .props('flat round dense size=sm color=grey-6').tooltip('Smazat komentář')
-                with ui.row().classes('w-full items-end gap-2 no-wrap'):
-                    txt = pole(pid, 'Napsat komentář…')
-
-                    async def poslat():
-                        if (txt.value or '').strip():
-                            await plan_akce('komentar', pid, txt.value, koncept=pid)
-
-                    ui.button(icon='send', on_click=poslat).props('round unelevated dense color=orange-8') \
-                        .tooltip('Přidat komentář')
-
-    @ui.refreshable
-    def organizator():
-        with ui.card().classes('w-full gap-2 shadow-sm'):
-            with ui.row().classes('w-full items-center gap-2'):
-                ui.label('Nový bod plánu').classes('font-semibold')
-                ui.label('Vlastní body odškrtnete, upravíte a smažete; komentovat můžete všechny.') \
-                    .classes('text-xs text-gray-500')
-                ui.space()
-                ui.button(icon='refresh', on_click=obnov_plany).props('flat round dense color=grey-7') \
-                    .tooltip('Načíst změny ostatních')
-            with ui.row().classes('w-full items-end gap-2 no-wrap'):
-                novy = pole('novy', 'Co mám v plánu…')
-
-                async def pridat():
-                    if (novy.value or '').strip():
-                        await plan_akce('pridat', hodnota=novy.value, koncept='novy')
-
-                ui.button('Přidat', icon='add', on_click=pridat).props('unelevated color=orange-8')
-        if s['plany'] is None:
-            ui.label('Organizátor se nepodařilo načíst.').classes('text-red-600')
-            return
-        autori = defaultdict(list)
-        for p in s['plany']['plany']:
-            autori[p['user_id']].append(p)
-        if not autori:
-            ui.label('Zatím tu nikdo nemá žádný plán.').classes('text-sm text-gray-400')
-            return
-        with ui.grid().classes('w-full gap-3 grid-cols-1 xl:grid-cols-2'):
-            for uid in sorted(autori, key=lambda u: (u != user_id, (autori[u][-1]['kdo'] or '').lower())):
-                plany = autori[uid]
-                hotovych = sum(bool(p['hotovo']) for p in plany)
-                with ui.card().classes('w-full gap-2 shadow-sm'):
-                    with ui.row().classes('w-full items-center gap-2'):
-                        ui.label('Můj plán' if uid == user_id else plany[-1]['kdo'] or '—').classes('font-semibold')
-                        ui.space()
-                        ui.label(f'hotovo {hotovych} z {len(plany)}').classes('text-xs text-gray-500')
-                    _pruh([(hotovych, '#16a34a')], len(plany), 6)
-                    for p in plany:
-                        plan_ui(p, s['plany']['komentare'].get(p['id'], []))
-
     # ---------- stránka ----------
     start = 'prehled'
     if deep is not None:
         n = s['data']['podle_id'].get(deep)
         if n and schvalovatel and n['stav'] == 'ceka' and n['zadal_id'] != user_id:
             start, s['vybrany'] = 'schvaleni', deep
-    s['tab'] = start
-    if org:
-        await obnov_plany()
     with ui.column().classes('w-full gap-3'):
         hlavicka()
         with ui.tabs().props('dense no-caps inline-label align=left active-color=orange-9 indicator-color=orange-9') \
@@ -2131,8 +1885,6 @@ async def vykresli(user_id, user_name, vsechna_prava):
             if spravce:
                 ui.tab('rozpocet', 'Rozpočet', icon='account_balance_wallet')
             ui.tab('reporty', 'Reporty a export', icon='download')
-            if org:
-                ui.tab('organizator', 'Organizátor', icon='checklist')
         with ui.tab_panels(taby, value=start).classes('w-full bg-transparent'):
             with ui.tab_panel('prehled').classes('p-0 gap-3'):
                 prehled()
@@ -2146,13 +1898,6 @@ async def vykresli(user_id, user_name, vsechna_prava):
                     rozpocet()
             with ui.tab_panel('reporty').classes('p-0 gap-3'):
                 reporty()
-            if org:
-                with ui.tab_panel('organizator').classes('p-0 gap-3'):
-                    organizator()
-    taby.on_value_change(pri_prepnuti)
-    if org:
-        with host:
-            ui.timer(ORG_TIK_S, auto_obnova_planu)
     if deep is not None and start != 'schvaleni':
         if deep in s['data']['podle_id']:
             taby.set_value('naklady')

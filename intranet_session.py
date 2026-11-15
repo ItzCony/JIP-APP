@@ -20,8 +20,6 @@ Pravidla
   připojení.** Počítáme živá WebSocket připojení na token (``ZIVE_PRIPOJENI``)
   napříč kartami i routami. Session smažeme až po ochranné lhůtě (``ODHLASENI_PO_S``),
   pokud do té doby nedojde k reconnectu/otevření jiné karty.
-* **Běžící kvíz relaci drží** (``drz_relaci``) — automatické odhlášení ji nezruší
-  ani při delším výpadku spojení; odevzdáním testu se zase uvolní.
 """
 from __future__ import annotations
 
@@ -35,6 +33,7 @@ import uuid
 from nicegui import app
 
 import intranet_data
+import intranet_monitor
 import intranet_logger
 
 # email (lower) -> aktuální (nejnovější) login_token  → single-session
@@ -46,40 +45,22 @@ PENDING_LOGOUTS: dict[str, asyncio.Task] = {}
 # e-maily, kterým admin VYNUTIL odhlášení (drženo dokud se znovu nepřihlásí) —
 # kontrola_relace je při nejbližším tiku odhlásí a přesměruje na login.
 FORCE_LOGOUT_EMAILS: set[str] = set()
-# login_token -> (email, jmeno, lhuta_s): relace, kterou automatické odhlášení
-# nesmí zrušit, i když nemá živé připojení (běžící kvíz, viz intranet_kviz).
-DRZENE_RELACE: dict[str, tuple[str, str, float | None]] = {}
 
 # Kolik sekund po ztrátě POSLEDNÍHO připojení čekáme, než relaci zrušíme.
 # Musí být VÍC než reconnect_timeout v ui.run() (web_main.py: 15 s, strop 30 s),
-# ať se stihne tichý reconnect prohlížeče. Stránka s delším reconnect_timeout
-# (kvíz) předá vlastní lhůtu přes ``lhuta_s``.
+# ať se stihne tichý reconnect prohlížeče.
 ODHLASENI_PO_S = 35
-
-# Druhá brána přes Microsoft (/auth/login?brana=…): heslo + MFA tam trvá klidně
-# déle než ODHLASENI_PO_S a odchodem ze stránky spadlo spojení. Odhlášení proto
-# počká, než se uživatel vrátí (nejvýš ODKLAD_IDP_S) — jinak by se relace
-# vyprázdnila i s oidc_state a callback by skončil „Přihlášení vypršelo".
-ODKLAD_IDP_S = 10 * 60
-# login_token -> time.time(), do kdy automatické odhlášení počká
-ODKLAD_ODHLASENI: dict[str, float] = {}
-
-# Vázané na prohlížeč, ne na přihlášení → přežijí i automatické odhlášení
-# (stejně jako tlačítko Odhlásit, viz intranet._odhlas_vycisti_relaci).
-ZACHOVAT_PO_ODHLASENI = ('totp_duvera_token', 'login_email', 'oidc_hint')
 
 
 def _vymaz_session_soubor(token: str) -> bool:
-    """Najde NiceGUI session soubor podle login_token a vyprázdní ho
-    (kromě ZACHOVAT_PO_ODHLASENI)."""
+    """Najde NiceGUI session soubor podle login_token a vyprázdní ho."""
     try:
         for cesta in glob.glob('.nicegui/storage-user-*.json'):
             try:
                 with open(cesta, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                 if data.get('login_token') == token:
-                    intranet_data.zapis_json_atomicky(
-                        cesta, {k: data[k] for k in ZACHOVAT_PO_ODHLASENI if data.get(k)})
+                    intranet_data.zapis_json_atomicky(cesta, {})
                     return True
             except Exception:
                 pass
@@ -115,12 +96,13 @@ def zahaj_relaci(id_u, email: str, jmeno: str) -> str:
 
 
 def zaznamenej_klienta(email: str, jmeno: str, ip: str, device: str) -> None:
-    """Pomalá část: audit log. Odděleno od ``zahaj_relaci``, protože
+    """Pomalá část: monitor + audit log. Odděleno od ``zahaj_relaci``, protože
     ve formuláři se IP/zařízení zjišťuje až po detekci Brave (až 2 s) — to nesmí
     zdržet samotné přihlášení."""
     # Uložíme do relace, aby je znalo i (synchronní) odhlášení
     app.storage.user['login_ip'] = ip
     app.storage.user['login_device'] = device
+    intranet_monitor.zaznamenej_prihlaseni(email, jmeno, ip=ip, device=device)
     intranet_logger.log_activity(jmeno, "Přihlášení", f"Úspěšné přihlášení (E-mail: {email})", ip=ip, device=device)
 
 
@@ -134,6 +116,7 @@ def vynut_odhlaseni(email: str) -> None:
     email = email.lower()
     FORCE_LOGOUT_EMAILS.add(email)
     token = GLOBAL_ACTIVE_SESSIONS.pop(email, None)
+    intranet_monitor.odeber_prihlaseni(email)
     if token:
         _vymaz_session_soubor(token)
         ZIVE_PRIPOJENI.pop(token, None)
@@ -156,12 +139,10 @@ def je_nahrazena(email: str, token: str) -> bool:
     return aktualni is not None and aktualni != token
 
 
-def registruj_pripojeni(client, token: str, email: str, jmeno: str,
-                        lhuta_s: float | None = None) -> None:
+def registruj_pripojeni(client, token: str, email: str, jmeno: str) -> None:
     """Zaregistruje živé připojení této stránky/karty a navěsí
     ``on_connect``/``on_disconnect``, aby počet připojení zůstal správný i při
-    reconnectu. Volat z KAŽDÉ přihlášené stránky. ``lhuta_s`` = vlastní ochranná
-    lhůta (stránka s delším reconnect_timeout, než má ui.run())."""
+    reconnectu. Volat z KAŽDÉ přihlášené stránky."""
     if not token:
         return
 
@@ -179,9 +160,7 @@ def registruj_pripojeni(client, token: str, email: str, jmeno: str,
             return
         stav['pripojeno'] = True
         ZIVE_PRIPOJENI[token] += 1
-        # Uživatel je (zase) online → zruš případné čekající odhlášení
-        # i odklad (vrátil se od Microsoftu).
-        ODKLAD_ODHLASENI.pop(token, None)
+        # Uživatel je (zase) online → zruš případné čekající odhlášení.
         t = PENDING_LOGOUTS.pop(token, None)
         if t:
             t.cancel()
@@ -192,15 +171,14 @@ def registruj_pripojeni(client, token: str, email: str, jmeno: str,
         stav['pripojeno'] = False
         if ZIVE_PRIPOJENI[token] > 0:
             ZIVE_PRIPOJENI[token] -= 1
-        _naplanuj_odhlaseni(token, email, jmeno, lhuta_s)
+        _naplanuj_odhlaseni(token, email, jmeno)
 
     _pridej()                       # počáteční připojení této karty
     client.on_connect(_pridej)      # reconnect (idempotentní díky guardu)
     client.on_disconnect(_uber)     # výpadek / zavření karty
 
 
-def _naplanuj_odhlaseni(token: str, email: str, jmeno: str,
-                        lhuta_s: float | None = None) -> None:
+def _naplanuj_odhlaseni(token: str, email: str, jmeno: str) -> None:
     """Naplánuje odhlášení po ochranné lhůtě — provede se jen, pokud do té doby
     nepřibude žádné živé připojení (tj. uživatel opravdu zavřel prohlížeč)."""
     old = PENDING_LOGOUTS.pop(token, None)
@@ -209,19 +187,16 @@ def _naplanuj_odhlaseni(token: str, email: str, jmeno: str,
 
     async def _mozna_odhlasit() -> None:
         try:
-            await asyncio.sleep(lhuta_s or ODHLASENI_PO_S)
-            # Odešel se ověřit k Microsoftu → počkej na návrat (nejvýš do konce odkladu).
-            while (zbyva := ODKLAD_ODHLASENI.get(token, 0) - time.time()) > 0:
-                await asyncio.sleep(zbyva)
-            ODKLAD_ODHLASENI.pop(token, None)
-            if ZIVE_PRIPOJENI.get(token, 0) > 0 or token in DRZENE_RELACE:
-                return                       # živé připojení / běžící kvíz → nech být
+            await asyncio.sleep(ODHLASENI_PO_S)
+            if ZIVE_PRIPOJENI.get(token, 0) > 0:
+                return                       # někde je živé připojení → nech být
             ZIVE_PRIPOJENI.pop(token, None)
             smazano = _vymaz_session_soubor(token)   # uklidí jen tenhle token
-            # Side-efekty (single-session evidence, log) jen pokud je
+            # Side-efekty (single-session evidence, monitor, log) jen pokud je
             # tahle relace pořád ta platná — ať nepřepíšeme novější login.
             if smazano and GLOBAL_ACTIVE_SESSIONS.get(email) == token:
                 GLOBAL_ACTIVE_SESSIONS.pop(email, None)
+                intranet_monitor.odeber_prihlaseni(email)
                 intranet_logger.log_activity(jmeno or 'Neznámý', "Odhlášení",
                                              "Automatické odhlášení po zavření prohlížeče")
         except asyncio.CancelledError:
@@ -232,28 +207,6 @@ def _naplanuj_odhlaseni(token: str, email: str, jmeno: str,
             PENDING_LOGOUTS.pop(token, None)
 
     PENDING_LOGOUTS[token] = asyncio.create_task(_mozna_odhlasit())
-
-
-def odloz_odhlaseni(token: str | None, sekund: float = ODKLAD_IDP_S) -> None:
-    """Uživatel odchází ověřit se k Microsoftu — automatické odhlášení tohoto
-    tokenu počká, než se vrátí (nejvýš ``sekund``). Návrat online (_pridej) odklad ruší."""
-    if token:
-        ODKLAD_ODHLASENI[token] = time.time() + sekund
-
-
-def drz_relaci(token: str, email: str, jmeno: str, lhuta_s: float | None = None) -> None:
-    """Dokud relaci někdo drží (běžící kvíz), automatické odhlášení ji přeskočí —
-    i když uživatel delší dobu nemá spojení."""
-    if token:
-        DRZENE_RELACE[token] = (email, jmeno, lhuta_s)
-
-
-def uvolni_relaci(token: str | None) -> None:
-    """Konec držení. Je-li uživatel právě offline, naplánuj odhlášení znovu —
-    jeho dřívější výpadek ho během držení přeskočil."""
-    udaje = DRZENE_RELACE.pop(token, None) if token else None
-    if udaje and ZIVE_PRIPOJENI.get(token, 0) <= 0:
-        _naplanuj_odhlaseni(token, *udaje)
 
 
 def odhlas_rucne(email: str, token: str) -> None:

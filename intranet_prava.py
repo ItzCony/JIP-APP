@@ -9,6 +9,7 @@ ZAKLADNI_PRAVA = {
     'mysql': {'kategorie': 'Administrace portálu', 'nazev': 'Nastavení portálu', 'popis': 'Může měnit globální nastavení, zapínat moduly a e-maily.', 'ikona': 'dns'},
     'dlazdice': {'kategorie': 'Administrace portálu', 'nazev': 'Úprava dlaždic', 'popis': 'Může přejmenovávat dlaždice na hlavní nástěnce.', 'ikona': 'dashboard_customize'},
     'admin_logy': {'kategorie': 'Administrace portálu', 'nazev': 'Audit Log', 'popis': 'Vidí historii aktivity a kliknutí všech uživatelů.', 'ikona': 'history'},
+    'admin_server': {'kategorie': 'Administrace portálu', 'nazev': 'Monitor serveru', 'popis': 'Vidí vytížení hardwaru serveru.', 'ikona': 'memory'},
 
     'dlazdice_dochazka_zaklad': {'kategorie': 'Docházka', 'nazev': 'Přístup do Docházky', 'popis': 'Uživatel vidí dlaždici Docházka a může modul otevřít.', 'ikona': 'event'},
     'dochazka_zadosti': {'kategorie': 'Docházka', 'nazev': 'Zadávat žádosti o volno', 'popis': 'Umožňuje uživateli vytvořit si vlastní žádost v kalendáři.', 'ikona': 'edit_calendar'},
@@ -175,7 +176,6 @@ ZAKLADNI_PRAVA = {
 
     'spolvecer_schvalovatel': {'kategorie': 'Modul Společenský večer', 'nazev': 'Schvalovatel', 'popis': 'Vidí všechny pobočky, komunikuje v chatu a schvaluje náklady (mění stav na Schváleno).', 'ikona': 'verified'},
     'spolvecer_ctenar':       {'kategorie': 'Modul Společenský večer', 'nazev': 'Čtenář', 'popis': 'Vidí všechny pobočky pouze pro čtení a může psát do chatu. Nemůže editovat tabulku ani schvalovat.', 'ikona': 'visibility'},
-    'spolvecer_ucetni':       {'kategorie': 'Modul Společenský večer', 'nazev': 'Účetní', 'popis': 'Vidí všechny pobočky pro čtení a u nákladů eviduje faktury (číslo, částka, poznámka, fajfka „náklad v účtu“). Faktury nevidí nikdo jiný než účetní a superadmin.', 'ikona': 'receipt_long'},
 
     'spolvecer_organizator_pardubice': {'kategorie': 'Modul Společenský večer', 'nazev': 'Organizátor: 010 Pardubice', 'popis': 'Vedoucí/ASM VO Pardubice – vyplňuje a edituje tabulku své pobočky a odesílá náklady ke schválení.', 'ikona': 'edit_note'},
     'spolvecer_organizator_praha':     {'kategorie': 'Modul Společenský večer', 'nazev': 'Organizátor: 011 Praha', 'popis': 'Vedoucí/ASM VO Praha – vyplňuje a edituje tabulku své pobočky a odesílá náklady ke schválení.', 'ikona': 'edit_note'},
@@ -230,14 +230,6 @@ ZAKLADNI_PRAVA = {
     'lupa_extra':     {'kategorie': 'Modul Lupopřípad', 'nazev': 'Extra čtenář',  'popis': 'Vidí data všech ASM a smí vkládat komentáře k jejich poznámkám. Nemůže nahrávat data.', 'ikona': 'visibility'},
     'lupa_vkladatel': {'kategorie': 'Modul Lupopřípad', 'nazev': 'Vkladatel dat', 'popis': 'Smí nahrávat soubory GIST prodejů (dávkově) i data GIST pro Lupou na nákup. Nevidí data ASM, ke kterým nemá přístup jinou cestou.', 'ikona': 'upload'},
     'lupa_admin':     {'kategorie': 'Modul Lupopřípad', 'nazev': 'Správce',       'popis': 'Plná práva k modulu: všechna ASM, import, komentáře, audit výjezdů.', 'ikona': 'local_police'},
-
-    # NOS — které OZ vidí ASM a vedoucí pobočky, určuje přiřazení ASM v dlaždici
-    # „Přístupy" (tabulka nos_pristup), právo samo nestačí.
-    'nos_vkladatel': {'kategorie': 'Modul NOS', 'nazev': 'Vkladatel dat (analytik)', 'popis': 'Vkládá data NOS a doklady, vidí podrobný podklad. Vidí všechny OZ, hodnoty za OZ nezadává.', 'ikona': 'upload'},
-    'nos_ctenar':    {'kategorie': 'Modul NOS', 'nazev': 'Čtenář',          'popis': 'Vidí všechny OZ, nic nezadává.', 'ikona': 'visibility'},
-    'nos_spravce':   {'kategorie': 'Modul NOS', 'nazev': 'Správce',         'popis': 'Vidí a zadává vše, přiřazuje ASM uživatelům v dlaždici „Přístupy".', 'ikona': 'local_police'},
-    'nos_asm':       {'kategorie': 'Modul NOS', 'nazev': 'ASM',             'popis': 'Vidí a zadává jen OZ svého ASM (přiřazuje správce modulu).', 'ikona': 'badge'},
-    'nos_vedouci':   {'kategorie': 'Modul NOS', 'nazev': 'Vedoucí pobočky', 'popis': 'Vidí a zadává OZ všech ASM, která mu správce modulu přiřadil.', 'ikona': 'supervisor_account'},
 
     # Rezervace ind. schůzky s vedoucími — schůzka je vždy společná, kdo má právo
     # `schuzky_vedouci`, tomu žádost přijde a odklikne si účast (nic se nehardcoduje).
@@ -364,7 +356,6 @@ _MODUL_KATEGORIE = {
     'Modul Cenopřípad':          'cenopripad_zapnuty',
     'Modul Formuláře ASM':       'asm_zapnuty',
     'Modul Lupopřípad':          'lupa_zapnuty',
-    'Modul NOS':                 'nos_zapnuty',
 }
 # Značky mají v jedné kategorii dva moduly (podskupiny).
 _MODUL_PODSKUPINA = {

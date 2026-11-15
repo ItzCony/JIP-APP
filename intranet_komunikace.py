@@ -5,10 +5,9 @@
 import asyncio
 import io
 import os
-import unicodedata
 import uuid
 import zipfile
-from datetime import date, datetime, timedelta
+from datetime import datetime
 
 import intranet_data
 import intranet_emaily
@@ -57,18 +56,6 @@ def _broadcast_feed(skupina_id, vyjimka=None):
             continue
         try:
             fn()
-        except Exception:
-            _KLIENTI.pop(cid, None)
-
-
-def _broadcast_seznam(vyjimka=None):
-    """Překreslí seznam místností klientům, kteří ho mají otevřený (žádná aktivní
-    místnost) — kvůli odznakům nepřečtených. Rozepsaný text v místnosti nezničí."""
-    for cid, info in list(_KLIENTI.items()):
-        if cid == vyjimka or info.get('skupina_id') is not None:
-            continue
-        try:
-            info['refresh']()
         except Exception:
             _KLIENTI.pop(cid, None)
 
@@ -154,15 +141,6 @@ def _init_db():
                 soubor_cesta   VARCHAR(500)  NOT NULL,
                 datum          DATETIME DEFAULT CURRENT_TIMESTAMP,
                 INDEX idx_kom (komentar_id)
-            ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci ENGINE=InnoDB
-        """)
-        # Kdy uživatel naposledy viděl nástěnku místnosti → odznak nepřečtených
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS kom_precteno (
-                user_id     INT NOT NULL,
-                skupina_id  VARCHAR(36) NOT NULL,
-                precteno    DATETIME NOT NULL,
-                PRIMARY KEY (user_id, skupina_id)
             ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci ENGINE=InnoDB
         """)
         conn.commit()
@@ -423,12 +401,6 @@ def _initials(jmeno):
     return ''.join(p[0].upper() for p in parts[:2])
 
 
-def _bez_diakritiky(text):
-    """Malá písmena bez diakritiky — pro hledání ('Školení' najde i 'skoleni')."""
-    nfkd = unicodedata.normalize('NFKD', (text or '').lower())
-    return ''.join(c for c in nfkd if not unicodedata.combining(c))
-
-
 def _ziskej_emaily_vsech():
     """Vrátí dict {email: 'Jméno Příjmení (email)'} všech aktivních uživatelů."""
     vsichni = intranet_data.ziskej_vsechny_uzivatele()
@@ -616,39 +588,20 @@ def ziskej_clenove(skupina_id):
         if conn: conn.close()
 
 
-def ziskej_prispevky(skupina_id, limit=60, archivovane=False, od='', do='', hledat=''):
-    """Příspěvky (vlákna) místnosti od nejnovějšího — z nástěnky, nebo z archivu.
-    Filtr (od/do = 'YYYY-MM-DD', hledat = autor nebo text): vlákno projde, když
-    filtru odpovídá příspěvek sám nebo některý jeho komentář."""
+def ziskej_prispevky(skupina_id, limit=60, archivovane=False):
+    """Příspěvky (vlákna) místnosti od nejnovějšího — z nástěnky, nebo z archivu."""
     _init_db()
     conn = intranet_data.get_db_connection()
     if not conn:
         return []
     cur = None
     try:
-        podm, arg = [], []
-        if od:
-            podm.append('{t}.datum >= %s')
-            arg.append(date.fromisoformat(od))
-        if do:
-            podm.append('{t}.datum < %s')
-            arg.append(date.fromisoformat(do) + timedelta(days=1))
-        if hledat:
-            # utf8mb4_unicode_ci → LIKE bez ohledu na velikost písmen i diakritiku
-            vzor = '%' + hledat.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%'
-            podm.append('({t}.autor_jmeno LIKE %s OR {t}.text LIKE %s)')
-            arg += [vzor, vzor]
-        filtr = ''
-        if podm:
-            w = ' AND '.join(podm)
-            filtr = (f" AND (({w.format(t='p')}) OR EXISTS (SELECT 1 FROM kom_komentare k"
-                     f" WHERE k.prispevek_id = p.id AND {w.format(t='k')}))")
         cur = conn.cursor(dictionary=True)
-        cur.execute(f"""
-            SELECT p.* FROM kom_prispevky p
-            WHERE p.skupina_id = %s AND COALESCE(p.archivovano, 0) = %s{filtr}
-            ORDER BY p.datum DESC LIMIT %s
-        """, (skupina_id, int(archivovane), *arg, *arg, limit))
+        cur.execute("""
+            SELECT * FROM kom_prispevky
+            WHERE skupina_id = %s AND COALESCE(archivovano, 0) = %s
+            ORDER BY datum DESC LIMIT %s
+        """, (skupina_id, int(archivovane), limit))
         return cur.fetchall()
     except Exception as e:
         print(f'[Komunikace] ziskej_prispevky: {e}')
@@ -819,62 +772,6 @@ def pocet_prispevku(skupina_id):
         return int(row[0]) if row else 0
     except Exception:
         return 0
-    finally:
-        if cur:  cur.close()
-        if conn: conn.close()
-
-
-def oznac_precteno(skupina_id, user_id):
-    """Uživatel právě vidí nástěnku místnosti → vše dosavadní má přečtené."""
-    conn = intranet_data.get_db_connection()
-    if not conn:
-        return
-    cur = None
-    try:
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO kom_precteno (user_id, skupina_id, precteno) VALUES (%s, %s, NOW())
-            ON DUPLICATE KEY UPDATE precteno = NOW()
-        """, (user_id, skupina_id))
-        conn.commit()
-    except Exception as e:
-        print(f'[Komunikace] oznac_precteno: {e}')
-    finally:
-        if cur:  cur.close()
-        if conn: conn.close()
-
-
-def pocty_neprectenych(user_id, skupina_ids):
-    """{skupina_id: počet} cizích příspěvků + komentářů (na nástěnce) novějších,
-    než uživatel místnost naposledy viděl. Bez záznamu = zatím vše nepřečtené."""
-    if not skupina_ids:
-        return {}
-    conn = intranet_data.get_db_connection()
-    if not conn:
-        return {}
-    cur = None
-    try:
-        ph = ', '.join(['%s'] * len(skupina_ids))
-        cur = conn.cursor()
-        cur.execute(f"""
-            SELECT x.skupina_id, COUNT(*) FROM (
-                SELECT p.skupina_id, p.datum FROM kom_prispevky p
-                WHERE p.skupina_id IN ({ph}) AND p.autor_id <> %s
-                  AND COALESCE(p.archivovano, 0) = 0
-                UNION ALL
-                SELECT p.skupina_id, k.datum FROM kom_komentare k
-                JOIN kom_prispevky p ON p.id = k.prispevek_id
-                WHERE p.skupina_id IN ({ph}) AND k.autor_id <> %s
-                  AND COALESCE(p.archivovano, 0) = 0
-            ) x
-            LEFT JOIN kom_precteno r ON r.skupina_id = x.skupina_id AND r.user_id = %s
-            WHERE r.precteno IS NULL OR x.datum > r.precteno
-            GROUP BY x.skupina_id
-        """, (*skupina_ids, user_id, *skupina_ids, user_id, user_id))
-        return {sid: int(n) for sid, n in cur.fetchall()}
-    except Exception as e:
-        print(f'[Komunikace] pocty_neprectenych: {e}')
-        return {}
     finally:
         if cur:  cur.close()
         if conn: conn.close()
@@ -1871,14 +1768,11 @@ async def _vykresli_telo(user_id, user_name, vsechna_prava, muj_refresh):
         def _zpet():
             st['aktivni_skupina_id'] = None
             st.pop('rozbalene_komentare', None)   # po návratu do místnosti zase sbalené
-            st.pop('filtr_vlaken', None)          # a bez filtru
             muj_refresh()   # jen lokální navigace
 
         # ── Vlákna — společné pro Nástěnku a Archiv ───────────────────────────
         # Komentáře jsou výchozí sbalené; set drží rozbalená vlákna přes překreslení
         rozbalene = st.setdefault('rozbalene_komentare', set())
-        # Filtr nástěnky (datum od/do, autor nebo text) — v `st`, ať přežije broadcast
-        filtr = st.setdefault('filtr_vlaken', {'od': '', 'do': '', 'hledat': ''})
         _panely = []   # refreshable panely místnosti (nástěnka, soubory, archiv) — viz níže
 
         def _obnov_panely():
@@ -1889,18 +1783,12 @@ async def _vykresli_telo(user_id, user_name, vsechna_prava, muj_refresh):
         def _po_zmene():
             _obnov_panely()
             _broadcast_feed(sid_aktivni, vyjimka=_cid)
-            _broadcast_seznam(vyjimka=_cid)   # odznaky nepřečtených na dlaždicích
 
-        def _nacti_vlakna(archivovane=False, filtr=None):
+        def _nacti_vlakna(archivovane=False):
             # Příspěvky + komentáře + přílohy jedním průchodem
             # ve vlákně (dřív dotaz per příspěvek/komentář na loopu)
-            if not archivovane:
-                # Kdo vidí nástěnku, má přečteno (označit PŘED načtením — co přibude
-                # mezi tím, zůstane radši nepřečtené, než aby se ztratilo)
-                oznac_precteno(sid_aktivni, user_id)
-            prispevky = ziskej_prispevky(sid_aktivni,
-                                         limit=200 if archivovane or filtr else 60,
-                                         archivovane=archivovane, **(filtr or {}))
+            prispevky = ziskej_prispevky(sid_aktivni, limit=200 if archivovane else 60,
+                                         archivovane=archivovane)
             komentare_map = {p['id']: ziskej_komentare(p['id']) for p in prispevky}
             prilohy_map = {k['id']: ziskej_prilohy_komentare(k['id'])
                            for koms in komentare_map.values() for k in koms}
@@ -2237,26 +2125,6 @@ async def _vykresli_telo(user_id, user_name, vsechna_prava, muj_refresh):
                         .classes('p-0 h-full flex flex-col gap-0') \
                         .style('min-height:0'):
 
-                    # ── Filtr nástěnky (kdy, kdo, co) ─────────────────────────
-                    if je_clen:
-                        def _nastav_filtr(klic, hodnota):
-                            filtr[klic] = (hodnota or '').strip()
-                            feed.refresh()
-
-                        with ui.row().classes('w-full items-center gap-2 px-5 py-2 bg-white '
-                                              'border-b border-gray-100 flex-shrink-0'):
-                            ui.icon('filter_alt').classes('text-gray-400')
-                            ui.input('Od', value=filtr['od'],
-                                     on_change=lambda e: _nastav_filtr('od', e.value)) \
-                                .props('outlined dense clearable stack-label type=date').classes('w-44')
-                            ui.input('Do', value=filtr['do'],
-                                     on_change=lambda e: _nastav_filtr('do', e.value)) \
-                                .props('outlined dense clearable stack-label type=date').classes('w-44')
-                            ui.input(placeholder='Hledat autora nebo text…', value=filtr['hledat'],
-                                     on_change=lambda e: _nastav_filtr('hledat', e.value)) \
-                                .props('outlined dense clearable debounce=400') \
-                                .classes('flex-1 min-w-[12rem]')
-
                     with ui.column().classes('w-full flex-1 overflow-y-auto p-5 gap-4 bg-gray-50') \
                             .style('min-height:0'):
 
@@ -2279,17 +2147,8 @@ async def _vykresli_telo(user_id, user_name, vsechna_prava, muj_refresh):
 
                             @ui.refreshable
                             async def feed():
-                                aktivni_filtr = {k: v for k, v in filtr.items() if v}
                                 prispevky, komentare_map, prilohy_map, prilohy_pr = \
-                                    await asyncio.to_thread(_nacti_vlakna, False, aktivni_filtr)
-                                if aktivni_filtr:
-                                    ui.label(f'Nalezeno vláken: {len(prispevky)}') \
-                                        .classes('text-xs text-gray-500 font-semibold')
-                                    if not prispevky:
-                                        return
-                                    # Shoda může být v komentáři — ať je hned vidět
-                                    rozbalene.update(p['id'] for p in prispevky
-                                                     if komentare_map.get(p['id']))
+                                    await asyncio.to_thread(_nacti_vlakna)
                                 if not prispevky:
                                     with ui.column().classes('w-full items-center py-16 gap-3'):
                                         ui.icon('campaign').classes('text-gray-300 text-5xl')
@@ -2607,33 +2466,8 @@ async def _vykresli_telo(user_id, user_name, vsechna_prava, muj_refresh):
             zobrazit_arch = st.get('zobrazit_archiv', False) and bool(archivovane)
             zobrazene = archivovane if zobrazit_arch else aktivni
 
-            # Hledání místnosti podle názvu — jen skrývá dlaždice, bez nového dotazu;
-            # text drží `st`, takže přežije překreslení seznamu z broadcastu
-            dlazdice = []                    # (karta, název bez diakritiky)
-            nic_nenalezeno = {'label': None}
-
-            def _filtruj_mistnosti(hodnota=None):
-                if hodnota is not None:
-                    st['hledat_mistnost'] = (hodnota or '').strip()
-                hledane = _bez_diakritiky(st.get('hledat_mistnost', ''))
-                videt = 0
-                for karta, nazev in dlazdice:
-                    shoda = hledane in nazev
-                    karta.set_visibility(shoda)
-                    videt += shoda
-                if nic_nenalezeno['label']:
-                    nic_nenalezeno['label'].set_visibility(bool(dlazdice) and not videt)
-
-            with ui.row().classes('w-full items-center justify-between gap-3 mt-1'):
-                ui.label('🕒 Archivované diskuze' if zobrazit_arch else 'Vaše místnosti') \
-                    .classes('font-bold text-xs text-gray-500 uppercase tracking-widest')
-                if zobrazene:
-                    hledat_in = ui.input(placeholder='Hledat místnost podle názvu…',
-                                         value=st.get('hledat_mistnost', ''),
-                                         on_change=lambda e: _filtruj_mistnosti(e.value)) \
-                        .props('outlined dense clearable debounce=250').classes('w-72')
-                    with hledat_in.add_slot('prepend'):
-                        ui.icon('search').classes('text-gray-400')
+            ui.label('🕒 Archivované diskuze' if zobrazit_arch else 'Vaše místnosti') \
+                .classes('font-bold text-xs text-gray-500 uppercase tracking-widest mt-1')
 
             if not zobrazene:
                 with ui.column().classes('w-full items-center py-16 gap-3 '
@@ -2659,9 +2493,6 @@ async def _vykresli_telo(user_id, user_name, vsechna_prava, muj_refresh):
                 _pocty = await asyncio.to_thread(lambda: {
                     sk['id']: (pocet_prispevku(sk['id']), len(ziskej_clenove(sk['id'])))
                     for sk in zobrazene})
-                # Archiv je jen ke čtení — nepřečtené řešíme jen u aktivních místností
-                _neprectene = {} if zobrazit_arch else await asyncio.to_thread(
-                    pocty_neprectenych, user_id, [sk['id'] for sk in zobrazene])
                 with ui.grid(columns=3).classes('w-full gap-4'):
                     for sk in zobrazene:
                         is_ver = bool(sk['je_verejna'])
@@ -2677,10 +2508,8 @@ async def _vykresli_telo(user_id, user_name, vsechna_prava, muj_refresh):
                                 .classes('w-full bg-white border border-gray-200 '
                                          'hover:border-blue-400 hover:shadow-lg '
                                          'cursor-pointer p-4 rounded-xl transition-all') \
-                                .on('click', _otevrit) as karta:
-                            dlazdice.append((karta, _bez_diakritiky(sk['nazev'])))
-                            with ui.row().classes('w-full items-start justify-between '
-                                                  'no-wrap mb-2'):
+                                .on('click', _otevrit):
+                            with ui.row().classes('items-start justify-between mb-2'):
                                 with ui.row().classes('items-center gap-2 flex-1 min-w-0'):
                                     if is_ver:
                                         ui.element('div') \
@@ -2700,15 +2529,8 @@ async def _vykresli_telo(user_id, user_name, vsechna_prava, muj_refresh):
                                     ui.label(sk['nazev']) \
                                         .classes('font-bold text-gray-800 text-base '
                                                  'truncate')
-                                nove = _neprectene.get(sk['id'], 0)
-                                if nove:
-                                    ui.badge('99+' if nove > 99 else str(nove), color='red') \
-                                        .classes('text-xs font-bold flex-shrink-0') \
-                                        .props('rounded') \
-                                        .tooltip(f'Nepřečteno: {nove} (nové příspěvky a komentáře)')
-                                else:
-                                    ui.icon('history' if bool(sk.get('archivovano')) else 'chevron_right') \
-                                        .classes('text-gray-300 flex-shrink-0')
+                                ui.icon('history' if bool(sk.get('archivovano')) else 'chevron_right') \
+                                    .classes('text-gray-300 flex-shrink-0')
 
                             if sk.get('duvod'):
                                 ui.label(sk['duvod'] or '') \
@@ -2727,7 +2549,3 @@ async def _vykresli_telo(user_id, user_name, vsechna_prava, muj_refresh):
                                 if bool(sk.get('archivovano')):
                                     ui.label('🕒 Archiv') \
                                         .classes('text-xs text-gray-500 font-bold ml-auto')
-
-                nic_nenalezeno['label'] = ui.label('Žádná místnost neodpovídá hledání.') \
-                    .classes('w-full text-center text-sm text-gray-400 py-8')
-                _filtruj_mistnosti()   # použij uložený text hned po vykreslení
