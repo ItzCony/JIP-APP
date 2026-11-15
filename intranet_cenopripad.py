@@ -1017,6 +1017,7 @@ def inicializace_cenopripad_db():
                            ("testovaci", "TINYINT DEFAULT 0"),
                            ("poznamka_zadani", "VARCHAR(1000)"),
                            ("zamitnuti_duvod", "VARCHAR(1000)"),
+                           ("zpetna_vazba", "VARCHAR(1000)"),    # Office → žadatel při uzavření
                            ("pobocka", "VARCHAR(3) DEFAULT NULL"),
                            ("prodlouzeno_z", "INT DEFAULT NULL")):   # id původního případu
             cur.execute("SELECT COUNT(*) FROM information_schema.COLUMNS WHERE "
@@ -2496,6 +2497,29 @@ def zamitni_pripad(pripad_id, duvod):
         conn.close()
 
 
+def uzavri_pripad(pripad_id, zpetna_vazba):
+    """Uzavře případ (office): stav → 'uzavreno' + uloží zpětnou vazbu pro žadatele
+    (nepovinná). Vrací (ok, chyba|None)."""
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return False, "Chyba připojení k databázi."
+    try:
+        cur = conn.cursor()
+        cur.execute("UPDATE cenopripad_pripady SET stav='uzavreno', zpetna_vazba=%s "
+                    "WHERE id=%s", (_str(zpetna_vazba, 1000) or None, pripad_id))
+        conn.commit()
+        cur.close()
+        return True, None
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False, f"Chyba uzavření: {e}"
+    finally:
+        conn.close()
+
+
 def stornuj_pripad(pripad_id, duvod):
     """Stornuje případ: stav → 'stornovano' + uloží důvod. Vrací (ok, chyba|None)."""
     conn = intranet_data.get_db_connection()
@@ -3099,6 +3123,12 @@ def _dialog_detail(pripad, user_id, user_name, prava):
                 ui.icon("block", color="red-7")
                 ui.label(f"Důvod zamítnutí: {pripad['zamitnuti_duvod']}") \
                     .classes("text-sm font-medium text-red-900")
+        if pripad.get("zpetna_vazba"):
+            with ui.row().classes("w-full items-center gap-2 bg-teal-50 rounded p-2 mb-2 "
+                                  "border border-teal-200"):
+                ui.icon("feedback", color="teal-7")
+                ui.label(f"Zpětná vazba od office: {pripad['zpetna_vazba']}") \
+                    .classes("text-sm font-medium text-teal-900")
         if pripad.get("poznamka_zadani"):
             with ui.row().classes("w-full items-center gap-2 bg-blue-50 rounded p-2 mb-2 "
                                   "border border-blue-200"):
@@ -3642,18 +3672,48 @@ def _dialog_detail(pripad, user_id, user_name, prava):
 
             if (_je_office_typu(typ, prava) and stav == "zpracovano"
                     and TYPY[typ]["oddeleni"] == "obchod"):
-                async def _uzavri():
-                    zmen_stav(pripad["id"], "uzavreno")
-                    zaznam_historie(pripad["id"], "Uzavřeno (office)", user_name,
-                                    "Případ uzavřen — finální stav (bez notifikace).")
-                    intranet_logger.log_activity(user_name, "Cenopřípad",
-                                                 f"Uzavřeno {pripad['cislo']}")
-                    await _po_akci("Případ uzavřen.", "positive")
+                def _uzavri():
+                    with ui.dialog() as udlg, ui.card().classes("p-4").style("width: 460px"):
+                        ui.label(f"Uzavřít případ {pripad['cislo']} — {pripad['nazev']}?") \
+                            .classes("font-medium")
+                        ui.label("Můžete připsat zpětnou vazbu pro žadatele (např. kratší "
+                                 "splatnost, neexistující položka) — přijde mu e-mailem "
+                                 "a uvidí ji v detailu případu.") \
+                            .classes("text-sm text-gray-500")
+                        zv_in = ui.textarea("Zpětná vazba pro žadatele (nepovinné)") \
+                            .props("outlined autogrow maxlength=1000 counter").classes("w-full")
+
+                        async def _potvrd():
+                            zv = (zv_in.value or "").strip()
+                            ok, err = await asyncio.to_thread(uzavri_pripad, pripad["id"], zv)
+                            udlg.close()
+                            if not ok:
+                                _bezpecne_notify(err or "Uzavření selhalo.", "negative")
+                                return
+                            zaznam_historie(pripad["id"], "Uzavřeno (office)", user_name,
+                                            f"Zpětná vazba: {zv}" if zv
+                                            else "Případ uzavřen — finální stav (bez notifikace).")
+                            # Bez zpětné vazby se nic neposílá (žadatel dostal mail už u „Zpracováno“).
+                            if zv and not je_test:
+                                _odesli_emaily_zadateli(
+                                    pripad, f"Cenopřípad {pripad['cislo']}: uzavřeno se zpětnou vazbou",
+                                    f"Váš případ „{pripad['nazev']}“ ({TYPY[typ]['nazev']}) byl "
+                                    f"uzavřen.\n\nZpětná vazba od office: {zv}")
+                            intranet_logger.log_activity(user_name, "Cenopřípad",
+                                                         f"Uzavřeno {pripad['cislo']}"
+                                                         + (f": {zv}" if zv else ""))
+                            await _po_akci("Případ uzavřen.", "positive")
+
+                        with ui.row().classes("w-full justify-end gap-2 mt-2"):
+                            ui.button("Zrušit", on_click=udlg.close).props("flat no-caps")
+                            ui.button("Uzavřít", icon="lock", on_click=_potvrd) \
+                                .props("unelevated no-caps").classes("bg-gray-700 text-white")
+                    udlg.open()
 
                 ui.button("Uzavřít", icon="lock", on_click=_uzavri) \
                     .props("unelevated no-caps").classes("bg-gray-700 text-white rounded-lg px-4") \
-                    .tooltip("Převede případ ze stavu „Zpracováno“ na „Uzavřeno“ "
-                             "(bez e-mailové notifikace).")
+                    .tooltip("Převede případ ze stavu „Zpracováno“ na „Uzavřeno“. Volitelně "
+                             "se zpětnou vazbou pro žadatele (pak mu přijde e-mail).")
 
             if (typ == "porovnani" and not je_test
                     and stav in ("schvaleno", "castecne_schvaleno", "zpracovano", "uzavreno")

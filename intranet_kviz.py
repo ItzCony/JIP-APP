@@ -1,11 +1,14 @@
-from nicegui import ui, app, Client
+from nicegui import ui, app, Client, run, background_tasks
 import pandas as pd
 import os
+import re
+import math
 import time
 import json
 import zipfile
 import asyncio
-from openpyxl.styles import PatternFill
+from openpyxl.styles import PatternFill, Alignment
+from openpyxl.worksheet.table import Table, TableStyleInfo
 
 from datetime import datetime, timedelta
 
@@ -14,7 +17,6 @@ import intranet_logger
 import intranet_session
 from intranet_ui_utils import refreshable_na_klienta
 
-aktivni_studenti = {}
 dokoncene_testy = []
 SOUBOR_NASTAVENI = 'nastaveni_kvizu.json'
 
@@ -30,6 +32,9 @@ _SKUPINA_DEFAULT = {
 
 config = {
     'aktivni_skupina': 'oz',   # globální nastavení — který kvíz dostanou studenti
+    # globální: celá obrazovka, ukončení testu při jejím opuštění, blokace kláves,
+    # hlídání kliknutí mimo test (rudá tečka v monitoru)
+    'kontrolni_mechanismus': True,
     'oz':  {**_SKUPINA_DEFAULT},
     'asm': {**_SKUPINA_DEFAULT},
 }
@@ -42,6 +47,7 @@ if os.path.exists(SOUBOR_NASTAVENI):
         if 'oz' in nacteno and 'asm' in nacteno:
             # nový vnořený formát
             config['aktivni_skupina'] = nacteno.get('aktivni_skupina', 'oz')
+            config['kontrolni_mechanismus'] = bool(nacteno.get('kontrolni_mechanismus', True))
             for typ in ('oz', 'asm'):
                 for k in _SKUPINA_DEFAULT:
                     config[typ][k] = nacteno[typ].get(k, _SKUPINA_DEFAULT[k])
@@ -52,6 +58,21 @@ if os.path.exists(SOUBOR_NASTAVENI):
                     config['oz'][k] = nacteno[k]
     except Exception:
         pass
+
+
+
+def _kontrola_zapnuta() -> bool:
+    """Kontrolní mechanismus (nastavení kvízu). Přepnout ho jde jen bez běžících
+    testů (viz _pisici_test), takže se běžícímu testu pravidla nikdy nezmění."""
+    return bool(config.get('kontrolni_mechanismus', True))
+
+
+def _pisici_test() -> str:
+    """Kdo má rozpracovaný test — stejný seznam jako Live Monitor, včetně těch,
+    kdo jsou dočasně bez spojení (test jim běží dál). '' = nikdo."""
+    jmena = [str(z.get('jmeno') or '?') for z in ROZPRACOVANE.values()]
+    return ', '.join(jmena[:5]) + (f' a {len(jmena) - 5} další' if len(jmena) > 5 else '')
+
 
 # ─── soubory s otázkami pro každou skupinu ───────────────────────────────────
 SOUBORY_OKRUHU = {
@@ -104,7 +125,8 @@ def uloz_nastaveni(typ):
 
 
 def nacti_otazky(typ='oz', pocet_otazek=20):
-    """Načte otázky pro danou skupinu ('oz' nebo 'asm')."""
+    """Načte otázky pro danou skupinu ('oz' nebo 'asm'). Bez UI — běží ve vlákně
+    (run.io_bound), vrací (otázky, chybová hláška nebo None)."""
     c       = config[typ]
     soubory = SOUBORY_OKRUHU[typ]
     zapnute = [c.get('okruh_1_zapnut', True), c.get('okruh_2_zapnut', False), c.get('okruh_3_zapnut', False)]
@@ -122,23 +144,227 @@ def nacti_otazky(typ='oz', pocet_otazek=20):
             if pocet <= 0:
                 continue
             if not os.path.exists(soubor):
-                ui.notify(f'Chybí soubor {soubor} pro Okruh {i}! Nahrajte jej v administraci.', type='negative', position='top')
-                return []
+                return [], f'Chybí soubor {soubor} pro Okruh {i}! Nahrajte jej v administraci.'
             df = _nacti_csv(soubor)
             if len(df) < pocet:
-                ui.notify(f'Okruh {i}: soubor má jen {len(df)} otázek, požadováno {pocet}.', type='negative', position='top')
-                return []
+                return [], f'Okruh {i}: soubor má jen {len(df)} otázek, požadováno {pocet}.'
             vsechny.extend(df.sample(n=pocet).to_dict('records'))
         import random; random.shuffle(vsechny)
-        return vsechny
+        return vsechny, None
     else:
         soubor = soubory[0]
         if not os.path.exists(soubor):
-            ui.notify(f'Chybí soubor {soubor}! Nahrajte jej v administraci.', type='negative', position='top')
-            return []
+            return [], f'Chybí soubor {soubor}! Nahrajte jej v administraci.'
         df = _nacti_csv(soubor)
         pocet_int = int(min(pocet_otazek, len(df)))
-        return df.sample(n=pocet_int).to_dict('records')
+        return df.sample(n=pocet_int).to_dict('records'), None
+
+
+# ─── rozpracované testy ─────────────────────────────────────────────────────
+# Běžící test patří uživateli, ne otevřené stránce: výpadek Wi-Fi, F5 ani restart
+# serveru ho nezruší — po otevření kvízu pokračuje, kde skončil. Čas běží i mimo
+# stránku (konec_ts je absolutní), jinak by šel test „pozastavit". Záznam vzniká
+# startem, na disk se ukládá po každé odpovědi a odevzdáním mizí. Klíče začínající
+# '_' platí jen za běhu (na disk se neukládají).
+SLOZKA_ROZPRACOVANYCH = 'Kviz_rozpracovane'
+ROZPRACOVANE: dict[str, dict] = {}
+# Výsledky odevzdané, když uživatel neměl kvíz otevřený (vypršel mu čas) —
+# ukážou se mu jednou při příštím otevření. Jen v paměti.
+NEVIDENE_VYSLEDKY: dict[str, dict] = {}
+# Jak dlouho server drží stránku kvízu po výpadku spojení (ui.run má 15 s).
+# Výpadek Wi-Fi nebo krátké uspání notebooku tak projde bez znovunačtení stránky.
+KVIZ_RECONNECT_S = 180
+# Rezerva, než test s vypršelým časem odevzdá úklid — živá stránka to stihne sama.
+_UKLID_REZERVA_S = 15
+# Zavřená stránka na celé obrazovce ukončí test až po této lhůtě. Do té doby ho
+# může převzít nová stránka (znovunačtení po výpadku spojení se tak netrestá).
+_ODCHOD_LHUTA_S = 10
+
+
+def _klic_testu(user_id, host_token) -> str:
+    """Host podle odkazu (1 odkaz = 1 člověk), ostatní podle účtu."""
+    return re.sub(r'[^0-9A-Za-z_-]', '_', f'h{host_token}' if host_token else f'u{user_id}')
+
+
+def _cesta_zaznamu(klic: str) -> str:
+    return os.path.join(SLOZKA_ROZPRACOVANYCH, f'{klic}.json')
+
+
+def _uloz_zaznam(zaznam: dict) -> None:
+    try:
+        os.makedirs(SLOZKA_ROZPRACOVANYCH, exist_ok=True)
+        intranet_data.zapis_json_atomicky(
+            _cesta_zaznamu(zaznam['klic']),
+            {k: v for k, v in zaznam.items() if not k.startswith('_')}, default=str)
+    except Exception as e:
+        print(f"[kvíz] Rozpracovaný test {zaznam.get('klic')} se nepodařilo uložit: {e}")
+
+
+def _nacti_rozpracovane() -> None:
+    """Po startu serveru vrátí rozpracované testy z disku do paměti."""
+    if not os.path.isdir(SLOZKA_ROZPRACOVANYCH):
+        return
+    for nazev in os.listdir(SLOZKA_ROZPRACOVANYCH):
+        if nazev.startswith('.') or not nazev.endswith('.json'):
+            continue  # .tmp_* = nedokončený atomický zápis
+        try:
+            with open(os.path.join(SLOZKA_ROZPRACOVANYCH, nazev), encoding='utf-8') as f:
+                zaznam = json.load(f)
+            zaznam['_odpojeno_ts'] = time.time()  # po restartu nemá nikdo spojení
+            ROZPRACOVANE.setdefault(zaznam['klic'], zaznam)
+        except Exception as e:
+            print(f'[kvíz] Rozpracovaný test {nazev} nelze načíst: {e}')
+
+
+def _zbyva_s(zaznam: dict) -> int:
+    return max(0, math.ceil(zaznam['konec_ts'] - time.time()))
+
+
+def _host_rozpracovaneho_testu(host_token: str) -> dict | None:
+    """Host smí rozpracovaný test dopsat i po skončení platnosti odkazu."""
+    z = ROZPRACOVANE.get(_klic_testu(None, host_token))
+    if not z:
+        return None
+    return {'user_id': z['user_id'], 'jmeno': z['jmeno'], 'krestni': z['host_krestni'],
+            'prijmeni': z['host_prijmeni'], 'skupina': z['typ']}
+
+
+def _mimo_s(zaznam: dict, ted: float) -> int:
+    """Celková doba mimo test včetně právě probíhajícího odchodu."""
+    od = zaznam.get('_mimo_ts')
+    return int(zaznam.get('mimo_s', 0) + (ted - od if od else 0))
+
+
+def _mimo_text(opusteni: int, mimo_s: int, ted_mimo: bool = False) -> str:
+    if ted_mimo:
+        return f'právě mimo test ({opusteni}×, {mimo_s} s)'
+    return f'{opusteni}× · {mimo_s} s' if opusteni else '—'
+
+
+# Řádek monitoru: rudá tečka + podbarvení u toho, kdo během testu klikl mimo
+# test (tečka bliká, dokud je mimo právě teď) nebo test přerušil.
+_SLOT_DOHLED = r'''
+<q-tr :props="props" :class="props.row.poruseni ? 'bg-red-1' : ''">
+  <q-td v-for="col in props.cols" :key="col.name" :props="props"
+        :class="props.row.poruseni && (col.name === 'mimo' || col.value === 'PŘERUŠENO') ? 'text-red-9 text-weight-bold' : ''">
+    <span v-if="col.name === 'jmeno' && props.row.poruseni"
+          :class="props.row.ted_mimo ? 'kviz-tecka kviz-tecka-ted' : 'kviz-tecka'"></span>{{ col.value }}
+  </q-td>
+</q-tr>
+'''
+
+
+def _vyhodnot(zaznam: dict, automaticky: bool, preruseno: bool = False) -> dict:
+    ted = time.time()
+    celkem = len(zaznam['otazky'])
+    proc = (zaznam['body'] / celkem) * 100 if celkem > 0 else 0
+    m, s = divmod(max(0, int(min(ted, zaznam['konec_ts']) - zaznam['zacatek_ts'])), 60)
+    if preruseno:
+        stav = 'PŘERUŠENO'  # opustil celou obrazovku → test končí s tím, co stihl
+    else:
+        stav = 'ČAS VYPRŠEL' if ted >= zaznam['konec_ts'] else 'DOKONČENO'
+    return {
+        'jmeno': zaznam['jmeno'], 'stav': stav,
+        'body': zaznam['body'], 'celkem': celkem, 'proc': proc, 'm': m, 's': s,
+        'min_procento': zaznam['min_procento'], 'historie': zaznam['historie_odpovedi'],
+        'automaticky': automaticky, 'cas': ted,
+        'opusteni': zaznam.get('opusteni', 0), 'mimo_s': _mimo_s(zaznam, ted),
+    }
+
+
+def _uzavri_test(klic: str, automaticky: bool = False, preruseno: bool = False,
+                 zarizeni: dict | None = None) -> tuple[dict, dict] | None:
+    """Synchronní část odevzdání — jediné místo, kde test končí (tlačítko,
+    vypršení času, úklid, opuštění celé obrazovky). Vrací (záznam, vyhodnocení),
+    nebo None, když test mezitím odevzdal někdo jiný (druhé okno / úklid)."""
+    zaznam = ROZPRACOVANE.pop(klic, None)  # pop = pojistka proti dvojímu odevzdání
+    if zaznam is None:
+        return None
+    v = _vyhodnot(zaznam, automaticky, preruseno)
+    try:
+        os.remove(_cesta_zaznamu(klic))
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f'[kvíz] Rozpracovaný test {klic} nelze smazat: {e}')
+    intranet_session.uvolni_relaci(zaznam.get('_login_token'))
+    dokoncene_testy.insert(0, {'jmeno': v['jmeno'], 'cas_odevzdani': time.strftime('%H:%M:%S'), 'vysledek': v['stav'], 'skore': f"{v['body']}/{v['celkem']}", 'uspesnost': f"{v['proc']:.2f}%",
+                               'mimo': _mimo_text(v['opusteni'], v['mimo_s']), 'poruseni': preruseno or v['opusteni'] > 0})
+    souhrn = f"{v['stav']}, {v['body']}/{v['celkem']} ({v['proc']:.2f} %), trvání {v['m']}m {v['s']}s"
+    if v['opusteni']:
+        souhrn += f", mimo test {v['opusteni']}× ({v['mimo_s']} s)"
+    if preruseno:
+        zprava = f"Varování: test ukončen – opuštění celé obrazovky: {souhrn}"
+    else:
+        kdo = ' automaticky (kvíz neměl otevřený)' if automaticky else ''
+        zprava = f"Test odevzdán{kdo}: {souhrn}"
+    intranet_logger.log_activity(v['jmeno'], 'Kvíz', zprava, **(zarizeni or {}))
+    return zaznam, v
+
+
+def _zapis_vysledek(zaznam: dict, v: dict) -> bool:
+    """Excel do Vysledky_Web + MySQL. Blokující — volat přes run.io_bound."""
+    slozka = "Vysledky_Web"
+    os.makedirs(slozka, exist_ok=True)
+    cesta = os.path.join(slozka, f"Vysledek_{v['jmeno']}_{time.strftime('%H-%M-%S')}.xlsx")
+    try:
+        souhrn = {"Jméno": v['jmeno'], "Stav": v['stav'], "Úspěšnost": f"{v['proc']:.2f}%", "Bodů": f"{v['body']}/{v['celkem']}", "Trvání": f"{v['m']}m {v['s']}s"}
+        if _kontrola_zapnuta() or v['opusteni']:
+            souhrn["Mimo test"] = f"{v['opusteni']}× ({v['mimo_s']} s)"
+        df_s = pd.DataFrame([souhrn])
+        with pd.ExcelWriter(cesta, engine='openpyxl') as w:
+            df_s.to_excel(w, sheet_name='Souhrn', index=False)
+            if v['historie']: pd.DataFrame(v['historie']).to_excel(w, sheet_name='Analýza', index=False)
+            w.sheets['Souhrn']['B2'].fill = PatternFill(start_color="FF00FF00" if v['proc'] >= v['min_procento'] else "00E02319", fill_type="solid")
+    except Exception: pass
+
+    if not intranet_data.nacti_mysql().get("enabled"):
+        return True
+    anonymni_host = zaznam['user_id'] is None
+    return intranet_data.uloz_vysledek_kvizu(
+        zaznam['user_id'],
+        v['stav'],
+        f"{v['proc']:.2f}%",
+        f"{v['body']}/{v['celkem']}",
+        f"{v['m']}m {v['s']}s",
+        v['historie'],
+        host_jmeno=zaznam['host_krestni'] if anonymni_host else None,
+        host_prijmeni=zaznam['host_prijmeni'] if anonymni_host else None,
+        # Vazba na zadavatele odkazu; u interního uživatele zůstane None.
+        pristup_token=zaznam['pristup_token'],
+    )
+
+
+async def _uloz_vysledek(zaznam: dict, v: dict) -> bool:
+    """Uloží výsledek mimo event loop — Excel + MySQL by při hromadném odevzdání
+    zdržely všechny připojené. Selhání zapíše do audit logu."""
+    try:
+        ok = bool(await run.io_bound(_zapis_vysledek, zaznam, v))
+    except Exception as e:
+        print(f"[kvíz] Výsledek {v['jmeno']} se nepodařilo uložit: {e}")
+        ok = False
+    if not ok:
+        intranet_logger.log_activity(v['jmeno'], 'Kvíz', f"Chyba: výsledek testu se nepodařilo uložit do databáze ({v['stav']}, {v['body']}/{v['celkem']}, {v['proc']:.2f} %). Záloha je ve Vysledky_Web.")
+    return ok
+
+
+async def bg_uklid_testu() -> None:
+    """Úloha na pozadí (web_main.py): po startu vrátí rozpracované testy z disku
+    a pak odevzdává ty, kterým vypršel čas a žádná stránka je neodevzdala sama
+    (uživatel kvíz zavřel nebo nemá spojení)."""
+    _nacti_rozpracovane()
+    while True:
+        try:
+            ted = time.time()
+            for klic in [k for k, z in ROZPRACOVANE.items() if ted >= z['konec_ts'] + _UKLID_REZERVA_S]:
+                if (uzavreno := _uzavri_test(klic, automaticky=True)):
+                    NEVIDENE_VYSLEDKY[klic] = uzavreno[1]
+                    await _uloz_vysledek(*uzavreno)
+            for klic in [k for k, v in NEVIDENE_VYSLEDKY.items() if ted - v['cas'] > 12 * 3600]:
+                NEVIDENE_VYSLEDKY.pop(klic, None)
+        except Exception as e:
+            print(f'[kvíz] Úklid rozpracovaných testů selhal: {e}')
+        await asyncio.sleep(15)
 
 def _nav_na_prehled():
     with ui.dialog().props('maximized persistent transition-show="fade" transition-hide="fade"') as _dlg_back:
@@ -161,6 +387,11 @@ def kviz_host_page(token: str):
     """Vstup zkoušeného bez účtu v intranetu. Token jen uloží do session a pošle na /kviz."""
     if app.storage.user.get('user_id'):
         # Přihlášený uživatel jde svou vlastní cestou, token se nespotřebuje.
+        ui.navigate.to('/kviz')
+        return
+    if _host_rozpracovaneho_testu(token):
+        # Rozpracovaný test pokračuje vždy — i když odkazu mezitím skončila platnost.
+        app.storage.user['kviz_host_token'] = token
         ui.navigate.to('/kviz')
         return
 
@@ -219,7 +450,7 @@ def kviz_host_page(token: str):
             ui.spinner(size='xl')
             ui.timer(1.0, lambda: ui.navigate.to('/kviz'), once=True)
 
-@ui.page('/kviz')
+@ui.page('/kviz', reconnect_timeout=KVIZ_RECONNECT_S)
 def index_page(client: Client):
 
     ui.add_head_html('''
@@ -243,7 +474,125 @@ def index_page(client: Client):
             /* Plynulý přechod při načtení kvízu */
             #q-app { animation: _kviz_fadein 0.3s ease-out; }
             @keyframes _kviz_fadein { from { opacity: 0; } to { opacity: 1; } }
+            /* Gesto zpět na touchpadu ani tah dolů nesmí stránku s testem opustit/obnovit */
+            html, body { overscroll-behavior: none; }
+            /* Test mimo celou obrazovku: otázky skryté, místo nich výzva k návratu */
+            .kviz-bezi .kviz-fs-vyzva { display: none !important; }
+            body.kviz-bez-fs .kviz-bezi .kviz-fs-vyzva {
+                display: flex !important; position: fixed; inset: 0; z-index: 6000;
+                flex-direction: column; align-items: center; justify-content: center; gap: 20px;
+                padding: 24px; text-align: center; background: #f8fafc;
+                animation: _kviz_fadein .25s .6s both;  /* při běžném startu nebliká */
+            }
+            body.kviz-bez-fs .kviz-obsah-testu { visibility: hidden; }
+            .kviz-kontrola { user-select: none; -webkit-user-select: none; }
+            /* Monitor: rudá tečka u studenta, který klikl mimo test (bliká = je mimo právě teď) */
+            .kviz-tecka { display: inline-block; width: 12px; height: 12px; border-radius: 50%;
+                          background: #dc2626; margin-right: 8px; vertical-align: middle; }
+            .kviz-tecka-ted { animation: _kviz_blik 1s ease-in-out infinite; }
+            @keyframes _kviz_blik { 50% { opacity: .2; } }
         </style>
+        <script>
+            // .kviz-bezi = na stránce běží test → displej zůstává zapnutý.
+            // .kviz-kontrola = navíc kontrolní mechanismus (přepínač v nastavení kvízu):
+            //  - test běží na celé obrazovce se zámkem klávesnice (Alt+Tab, Ctrl+W/T/N
+            //    nefungují, Esc se musí podržet); odchod z ní (i zavřením stránky) test ukončí,
+            //  - klik mimo stránku (jiné okno, aplikace, záložka) vidí správce v monitoru.
+            // Zámek klávesnice i displeje fungují jen přes HTTPS.
+            (() => {
+                const bezi = () => !!document.querySelector('.kviz-bezi');
+                const hlidat = () => !!document.querySelector('.kviz-kontrola');
+                const posli = (typ) => { try { emitEvent('kviz_dohled', typ); } catch (e) {} };
+                let veFs = false, odchazi = false, testBezel = false, mimo = false, mimoCasovac = null;
+
+                // Celou obrazovku prohlížeč povolí jen v reakci na klik (Spustit / Pokračovat).
+                document.addEventListener('click', (e) => {
+                    if (e.target.closest && e.target.closest('.kviz-na-celou') && !document.fullscreenElement)
+                        document.documentElement.requestFullscreen({ navigationUI: 'hide' }).catch(() => {});
+                }, true);
+
+                document.addEventListener('fullscreenchange', () => {
+                    if (document.fullscreenElement) {
+                        veFs = true;
+                        if (navigator.keyboard && navigator.keyboard.lock) navigator.keyboard.lock().catch(() => {});
+                    } else {
+                        if (navigator.keyboard && navigator.keyboard.unlock) navigator.keyboard.unlock();
+                        if (veFs && hlidat() && !odchazi) posli('fs_off');
+                        veFs = false;
+                    }
+                    obnov();
+                });
+                // Zavření stránky na celé obrazovce = odchod z testu. Server ho potvrdí až po lhůtě,
+                // protože stejně vypadá i znovunačtení, které NiceGUI dělá sám po výpadku spojení.
+                window.addEventListener('pagehide', () => {
+                    if (veFs && hlidat() && !odchazi) posli('odchod');
+                    odchazi = true;
+                });
+                window.addEventListener('pageshow', (e) => { if (e.persisted) odchazi = false; });
+
+                // Klik mimo stránku (jiné okno, aplikace, záložka). Krátké probliknutí (< 1 s)
+                // se nepočítá; při zavírání stránky časovač nedoběhne, takže ho nespustí ani reload.
+                const odesel = () => {
+                    if (!hlidat() || mimo || mimoCasovac) return;
+                    mimoCasovac = setTimeout(() => {
+                        mimoCasovac = null;
+                        if (hlidat() && !mimo && !odchazi && (document.visibilityState === 'hidden' || !document.hasFocus())) {
+                            mimo = true; posli('mimo');
+                        }
+                    }, 1000);
+                };
+                const vratil = () => {
+                    if (document.visibilityState !== 'visible' || !document.hasFocus()) return;
+                    clearTimeout(mimoCasovac); mimoCasovac = null;
+                    if (mimo) { mimo = false; posli('zpet'); }
+                };
+                window.addEventListener('blur', odesel);
+                window.addEventListener('focus', vratil);
+                document.addEventListener('visibilitychange', () => document.visibilityState === 'hidden' ? odesel() : vratil());
+
+                // Během testu: žádné obnovení, tisk, hledání, vývojářské nástroje, kopírování.
+                const ZAKAZANE = ['r', 'w', 't', 'n', 'p', 's', 'u', 'f', 'g', 'c', 'x', 'a', 'l', 'k', 'e', 'o', 'j', 'h', 'd', 'i'];
+                document.addEventListener('keydown', (e) => {
+                    if (!hlidat()) return;
+                    const k = (e.key || '').toLowerCase();
+                    if (k === 'f5' || k === 'f12' || ((e.ctrlKey || e.metaKey) && ZAKAZANE.includes(k))
+                        || (e.altKey && (k === 'arrowleft' || k === 'arrowright' || k === 'home'))) {
+                        e.preventDefault(); e.stopPropagation();
+                    }
+                }, true);
+                ['contextmenu', 'copy', 'cut', 'dragstart', 'selectstart'].forEach((t) =>
+                    document.addEventListener(t, (e) => { if (hlidat()) e.preventDefault(); }, true));
+
+                // Výzva k návratu na celou obrazovku, konec testu → ven z celé obrazovky, Wake Lock.
+                let zamek = null, zadam = false, dalsiPokus = 0;
+                async function obnov() {
+                    const b = bezi(), h = hlidat();
+                    document.body.classList.toggle('kviz-bez-fs', h && document.fullscreenEnabled && !document.fullscreenElement);
+                    if (h) testBezel = true;
+                    else if (testBezel || b) {
+                        // Konec testu, nebo test běží s vypnutou kontrolou → pryč z celé obrazovky.
+                        testBezel = false;
+                        if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+                    }
+                    const drz = b && document.visibilityState === 'visible';
+                    if (drz && !zamek && !zadam && 'wakeLock' in navigator && Date.now() >= dalsiPokus) {
+                        zadam = true;
+                        try {
+                            const z = await navigator.wakeLock.request('screen');
+                            z.addEventListener('release', () => { if (zamek === z) zamek = null; });
+                            zamek = z;
+                        } catch (e) { dalsiPokus = Date.now() + 30000; }
+                        zadam = false;
+                    } else if (!drz && zamek) {
+                        const z = zamek; zamek = null; z.release().catch(() => {});
+                    }
+                }
+                setInterval(obnov, 400);
+                document.addEventListener('visibilitychange', obnov);
+                // Server: test se nespustil → zpět z celé obrazovky.
+                window.kvizDohled = { konec() { testBezel = true; obnov(); } };
+            })();
+        </script>
     ''')
     # remove: hostovská brána nechává na body tmavý režim s overflow:hidden, v testu by ořízl obsah
     ui.query('body').classes(add='kviz-pozadi', remove='prihlaseni-pozadi')
@@ -259,6 +608,9 @@ def index_page(client: Client):
         # anonymní (user_id zůstane None) a jméno si vyplnil na vstupní stránce.
         _token = app.storage.user.get('kviz_host_token')
         _host = intranet_data.over_kviz_pristup(_token)
+        if not _host and _token:
+            # Rozpracovaný test dopíše i po skončení platnosti odkazu.
+            _host = _host_rozpracovaneho_testu(_token)
         if _host and _host['jmeno']:
             user_id, user_name, je_host = _host['user_id'], _host['jmeno'], True
             host_krestni, host_prijmeni = _host['krestni'], _host['prijmeni']
@@ -282,7 +634,9 @@ def index_page(client: Client):
     _user_email = str(app.storage.user.get('user_email', '')).lower()
     _token = app.storage.user.get('login_token')
     if _token and not je_host:
-        intranet_session.registruj_pripojeni(client, _token, _user_email, user_name)
+        # Lhůta delší než reconnect_timeout kvízu — odhlášení nesmí předběhnout návrat.
+        intranet_session.registruj_pripojeni(client, _token, _user_email, user_name,
+                                             lhuta_s=KVIZ_RECONNECT_S + 20)
 
     # Host nedědí práva uživatele, jehož jménem test píše.
     _verze_prav_stranky = None
@@ -325,15 +679,104 @@ def index_page(client: Client):
                 ui.button('Zpět na Přehled', on_click=_nav_na_prehled).classes('mt-10 bg-blue-600 text-white font-bold px-8 py-3 rounded-lg shadow-md')
         return
 
-    if 'quiz_initialized' not in app.storage.browser or app.storage.browser.get('jmeno') != user_name:
-        app.storage.browser.update({
-            'quiz_initialized': True, 'jmeno': user_name, 'zobrazit_admin_panel': False,
-            'otazky': [], 'aktualni_index': 0, 'body': 0, 'zbyva_sekund': 0,
-            'bezi_test': False, 'vybrana_odpoved': None, 'vysledek': None, 'historie_odpovedi': []
-        })
+    # Stav stránky je jen pohled — běžící test žije v ROZPRACOVANE[klic], takže ho
+    # výpadek spojení ani znovunačtení stránky nezruší.
+    host_token = app.storage.user.get('kviz_host_token') if je_host else None
+    login_token = None if je_host else _token
+    klic = _klic_testu(user_id, host_token)
+    state = {'jmeno': user_name, 'zobrazit_admin_panel': False, 'bezi_test': False,
+             'vysledek': None, 'zobrazeny_index': None, 'nacitam': False}
+    local_ui = {'cas_label': None, 'cas_vyzva': None}
+    zarizeni = {'ip': client.ip,
+                'device': intranet_logger.popis_zarizeni(client.request.headers.get('user-agent', ''))}
 
-    state = app.storage.browser
-    local_ui = {'cas_label': None}
+    def drz_relaci_testu(z: dict) -> None:
+        """Během testu nesmí relaci zrušit automatické odhlášení (ani při delším výpadku)."""
+        if not login_token:
+            return
+        if z.get('_login_token') not in (None, login_token):
+            intranet_session.uvolni_relaci(z['_login_token'])  # mezitím se přihlásil znovu
+        z['_login_token'] = login_token
+        intranet_session.drz_relaci(login_token, _user_email, user_name, lhuta_s=KVIZ_RECONNECT_S + 20)
+
+    def prevezmi_nevideny() -> dict | None:
+        """Výsledek odevzdaný mimo tuto stránku. Odpojená stránka (třeba stará po
+        znovunačtení, server ji drží až KVIZ_RECONNECT_S) si ho jen přečte; smaže ho
+        až stránka, kterou uživatel opravdu vidí (pri_pripojeni / nové otevření)."""
+        if client.has_socket_connection:
+            return NEVIDENE_VYSLEDKY.pop(klic, None)
+        return NEVIDENE_VYSLEDKY.get(klic)
+
+    zaznam = ROZPRACOVANE.get(klic)
+    if zaznam and _zbyva_s(zaznam) <= 0:
+        # Čas vypršel, zatímco tu nebyl → odevzdej hned a ukaž výsledek.
+        if (uzavreno := _uzavri_test(klic, automaticky=True)):
+            state['vysledek'] = uzavreno[1]
+            background_tasks.create(_uloz_vysledek(*uzavreno), name=f'kviz-ulozeni-{klic}')
+    elif zaznam:
+        # Rozpracovaný test → pokračuj tam, kde skončil (čas mezitím běžel).
+        state['bezi_test'] = True
+        drz_relaci_testu(zaznam)
+        zaznam['_stranka'] = client.id  # test převzala tato stránka, signály té staré už neplatí
+        if (mimo_od := zaznam.pop('_mimo_ts', None)):
+            zaznam['mimo_s'] = zaznam.get('mimo_s', 0) + (time.time() - mimo_od)  # je zpátky
+        odpojeno = zaznam.pop('_odpojeno_ts', None)
+        vypadek = f' (výpadek spojení {int(time.time() - odpojeno)} s)' if odpojeno else ''
+        s = _zbyva_s(zaznam)
+        intranet_logger.log_activity(user_name, 'Kvíz', f"Varování: test obnoven po znovunačtení stránky{vypadek}, otázka {zaznam['aktualni_index'] + 1}/{len(zaznam['otazky'])}, zbývá {s // 60:02d}:{s % 60:02d}", **zarizeni)
+    elif klic in NEVIDENE_VYSLEDKY:
+        state['vysledek'] = NEVIDENE_VYSLEDKY.pop(klic)  # odevzdáno, když tu nebyl
+
+    # Diagnostika výpadků: kdy spojení spadlo a jak dlouho trvalo, než se vrátilo.
+    def pri_odpojeni() -> None:
+        if state['bezi_test'] and (z := ROZPRACOVANE.get(klic)):
+            z['_odpojeno_ts'] = time.time()
+
+    def pri_pripojeni() -> None:
+        if state['vysledek'] is not None and NEVIDENE_VYSLEDKY.get(klic) is state['vysledek']:
+            NEVIDENE_VYSLEDKY.pop(klic, None)  # odevzdáno bez spojení, výsledek už vidí tady
+        z = ROZPRACOVANE.get(klic)
+        odpojeno = z.pop('_odpojeno_ts', None) if z else None
+        if odpojeno and time.time() - odpojeno >= 3:
+            intranet_logger.log_activity(user_name, 'Kvíz', f'Varování: výpadek spojení {int(time.time() - odpojeno)} s, test běží dál bez přerušení', **zarizeni)
+
+    client.on_disconnect(pri_odpojeni)
+    client.on_connect(pri_pripojeni)
+
+    # Dohled nad testem — události posílá skript v hlavičce stránky:
+    # 'fs_off' = opustil celou obrazovku → test končí hned,
+    # 'odchod' = stránka se zavírá na celé obrazovce → test končí po lhůtě (viz níže),
+    # 'mimo' / 'zpet' = klik mimo stránku a návrat → jen evidence pro monitor.
+    def je_aktivni_stranka() -> bool:
+        z = ROZPRACOVANE.get(klic)
+        return state['bezi_test'] and z is not None and z.get('_stranka', client.id) == client.id
+
+    async def pri_dohledu(e) -> None:
+        typ = e.args[0] if isinstance(e.args, list) and e.args else e.args
+        if not je_aktivni_stranka():
+            return  # test skončil, nebo ho mezitím převzala novější stránka (znovunačtení)
+        if not _kontrola_zapnuta():
+            return  # kontrolní mechanismus je vypnutý
+        z = ROZPRACOVANE[klic]
+        ted = time.time()
+        if typ == 'fs_off':
+            await ukoncit_test(preruseno=True)
+        elif typ == 'odchod':
+            # Stejně vypadá i znovunačtení, které NiceGUI dělá sám po výpadku spojení.
+            # Test proto skončí, jen když ho do lhůty nepřevezme nová stránka.
+            await asyncio.sleep(_ODCHOD_LHUTA_S)
+            if je_aktivni_stranka():
+                await ukoncit_test(preruseno=True)
+        elif typ == 'mimo' and not z.get('_mimo_ts'):
+            z['_mimo_ts'] = ted
+            z['opusteni'] = z.get('opusteni', 0) + 1
+            _uloz_zaznam(z)
+            intranet_logger.log_activity(user_name, 'Kvíz', f"Varování: klik mimo test (jiné okno / aplikace), {z['opusteni']}. opuštění, otázka {min(z['aktualni_index'] + 1, len(z['otazky']))}/{len(z['otazky'])}", **zarizeni)
+        elif typ == 'zpet' and (od := z.pop('_mimo_ts', None)):
+            z['mimo_s'] = z.get('mimo_s', 0) + (ted - od)
+            _uloz_zaznam(z)
+
+    ui.on('kviz_dohled', pri_dohledu)
 
     def prepni_admin_panel(zobrazit):
         state['zobrazit_admin_panel'] = zobrazit
@@ -576,6 +1019,7 @@ def index_page(client: Client):
 
     @ui.refreshable
     def hlavni_rozhrani():
+        state['zobrazeny_index'] = local_ui['cas_label'] = local_ui['cas_vyzva'] = None  # nastaví je jen obrazovka testu
         zarovnani = 'justify-start pt-12' if state.get('zobrazit_admin_panel') else 'justify-center'
 
         with ui.column().classes(f'w-full max-w-6xl mx-auto items-center {zarovnani} h-screen p-4 overflow-y-auto'):
@@ -612,20 +1056,27 @@ def index_page(client: Client):
                                         monitor_kontejner.clear()
 
                                         aktualni_cas = time.time()
-                                        mrtve_duse = [k for k, v in aktivni_studenti.items() if aktualni_cas - v.get('last_seen', aktualni_cas) > 5]
-                                        for md in mrtve_duse:
-                                            del aktivni_studenti[md]
+                                        # Rozpracované testy zůstávají i bez spojení (dopíší se po návratu).
+                                        rozpracovane = list(ROZPRACOVANE.values())
 
                                         with monitor_kontejner:
-                                            if not aktivni_studenti:
+                                            if not rozpracovane:
                                                 ui.label('Zatím nikdo nedělá test.').classes('text-gray-500 italic')
                                             else:
-                                                sloupce = [{'name': 'jmeno', 'label': 'Jméno studenta', 'field': 'jmeno', 'align': 'left'}, {'name': 'otazka', 'label': 'Aktuální otázka', 'field': 'otazka', 'align': 'center'}, {'name': 'cas', 'label': 'Zbývající čas', 'field': 'cas', 'align': 'center'}]
+                                                sloupce = [{'name': 'jmeno', 'label': 'Jméno studenta', 'field': 'jmeno', 'align': 'left'}, {'name': 'otazka', 'label': 'Aktuální otázka', 'field': 'otazka', 'align': 'center'}, {'name': 'cas', 'label': 'Zbývající čas', 'field': 'cas', 'align': 'center'}, {'name': 'spojeni', 'label': 'Spojení', 'field': 'spojeni', 'align': 'center'}]
+                                                if (kontrola := _kontrola_zapnuta()):
+                                                    sloupce.append({'name': 'mimo', 'label': 'Mimo test', 'field': 'mimo', 'align': 'center'})
                                                 data = []
-                                                for st in aktivni_studenti.values():
-                                                    m, s = divmod(int(st['zbyva_sekund']), 60)
-                                                    data.append({'jmeno': st['jmeno'], 'otazka': f"{st['aktualni_index'] + 1} / {st['celkem_otazek']}", 'cas': f"{m:02d}:{s:02d}"})
-                                                ui.table(columns=sloupce, rows=data).classes('w-full')
+                                                for i, st in enumerate(rozpracovane):
+                                                    m, s = divmod(_zbyva_s(st), 60)
+                                                    odpojeno = st.get('_odpojeno_ts')
+                                                    spojeni = f'⚠️ bez spojení {int(aktualni_cas - odpojeno)} s' if odpojeno else 'v pořádku'
+                                                    ted_mimo, opusteni = bool(st.get('_mimo_ts')), st.get('opusteni', 0)
+                                                    data.append({'id': i, 'jmeno': st['jmeno'], 'otazka': f"{min(st['aktualni_index'] + 1, len(st['otazky']))} / {len(st['otazky'])}", 'cas': f"{m:02d}:{s:02d}", 'spojeni': spojeni,
+                                                                 'mimo': _mimo_text(opusteni, _mimo_s(st, aktualni_cas), ted_mimo), 'poruseni': opusteni > 0, 'ted_mimo': ted_mimo})
+                                                tabulka = ui.table(columns=sloupce, rows=data).classes('w-full')
+                                                if kontrola:
+                                                    tabulka.add_slot('body', _SLOT_DOHLED)
                                     ui.timer(3.0, obnov_monitor)
 
                                 with ui.card().classes('w-full p-6 shadow-xl rounded-2xl border border-gray-100 bg-white/95 backdrop-blur-sm'):
@@ -637,7 +1088,12 @@ def index_page(client: Client):
                                             if not dokoncene_testy: ui.label('Zatím nikdo nedokončil test.').classes('text-gray-500 italic')
                                             else:
                                                 cols_dokonceno = [{'name': 'jmeno', 'label': 'Jméno', 'field': 'jmeno', 'align': 'left'}, {'name': 'cas', 'label': 'Odevzdáno', 'field': 'cas_odevzdani', 'align': 'center'}, {'name': 'uspesnost', 'label': 'Úspěšnost', 'field': 'uspesnost', 'align': 'center'}, {'name': 'skore', 'label': 'Skóre', 'field': 'skore', 'align': 'center'}, {'name': 'stav', 'label': 'Stav testu', 'field': 'vysledek', 'align': 'center'}]
-                                                ui.table(columns=cols_dokonceno, rows=dokoncene_testy).classes('w-full')
+                                                if (kontrola := _kontrola_zapnuta()):
+                                                    cols_dokonceno.append({'name': 'mimo', 'label': 'Mimo test', 'field': 'mimo', 'align': 'center'})
+                                                radky = [dict(r, id=i) for i, r in enumerate(dokoncene_testy)]
+                                                tabulka = ui.table(columns=cols_dokonceno, rows=radky).classes('w-full')
+                                                if kontrola:
+                                                    tabulka.add_slot('body', _SLOT_DOHLED)
                                     ui.timer(5.0, obnov_dokoncene)
 
                             with ui.tab_panel(tab_parametry):
@@ -663,6 +1119,47 @@ def index_page(client: Client):
                                                 value=config.get('aktivni_skupina', 'oz'),
                                                 on_change=lambda e: _zmen_aktivni_skupinu(e.value)
                                             ).classes('font-extrabold text-lg')
+
+                                    # ── KONTROLNÍ MECHANISMUS (globální přepínač) ─
+                                    with ui.card().classes('w-full p-5 mb-6 border-2 border-red-200 rounded-2xl bg-red-50'):
+                                        with ui.row().classes('w-full items-center justify-between gap-4 no-wrap'):
+                                            with ui.column().classes('gap-1'):
+                                                ui.label('Kontrolní mechanismus').classes('text-lg font-extrabold text-red-800')
+                                                ui.label('Test přes celou obrazovku, jejím opuštěním test končí. Blokace kláves a kopírování, '
+                                                         'kliknutí mimo test uvidíte v Live Monitoru (rudá tečka). Přepnout lze, jen když nikdo nepíše test.') \
+                                                    .classes('text-sm text-red-900')
+                                                blokace_kontroly = ui.label().classes('text-sm font-bold text-red-700')
+
+                                            def _zmen_kontrolu(hodnota):
+                                                if bool(hodnota) == _kontrola_zapnuta():
+                                                    return  # přepínač se jen srovnal s uloženým stavem
+                                                if (pisici := _pisici_test()):
+                                                    # Pojistka: test mohl začít těsně před kliknutím (zámek se obnovuje po 2 s).
+                                                    prepinac_kontroly.value = _kontrola_zapnuta()
+                                                    ui.notify(f'Nelze přepnout – test právě píše: {pisici}', type='warning', position='top')
+                                                    return
+                                                config['kontrolni_mechanismus'] = bool(hodnota)
+                                                stav = 'zapnut' if hodnota else 'vypnut'
+                                                try:
+                                                    intranet_data.zapis_json_atomicky(SOUBOR_NASTAVENI, config, indent=4)
+                                                    ui.notify(f'Kontrolní mechanismus {stav}', type='positive', position='top')
+                                                except Exception as _e:
+                                                    ui.notify(f'Chyba při ukládání: {_e}', type='negative', position='top')
+                                                intranet_logger.log_activity(user_name, 'Kvíz', f'Kontrolní mechanismus {stav}', **zarizeni)
+
+                                            prepinac_kontroly = ui.switch(value=_kontrola_zapnuta(), on_change=lambda e: _zmen_kontrolu(e.value)) \
+                                                .props('color=red size=xl').classes('shrink-0')
+
+                                            def _hlidej_prepinac():
+                                                pisici = _pisici_test()
+                                                prepinac_kontroly.set_enabled(not pisici)
+                                                blokace_kontroly.set_text(f'🔒 Nelze přepnout – test právě píše: {pisici}')
+                                                blokace_kontroly.set_visibility(bool(pisici))
+                                                if prepinac_kontroly.value != _kontrola_zapnuta():
+                                                    prepinac_kontroly.value = _kontrola_zapnuta()  # přepnul jiný správce
+
+                                            _hlidej_prepinac()
+                                            ui.timer(2.0, _hlidej_prepinac)
 
                                     # ── toggle pro editaci nastavení (ASM / OZ)
                                     if 'admin_kviz_typ' not in state:
@@ -886,65 +1383,65 @@ def index_page(client: Client):
                     vykresli_spravu_pristupu()
 
             # --- B) BĚŽÍCÍ TEST ---
-            elif state['bezi_test']:
-                with ui.column().classes('w-full max-w-4xl mt-12 skryt-pri-tisku'):
-                    with ui.row().classes('w-full justify-between items-center mb-8 border-b-2 pb-4 border-gray-200'):
-                        ui.label(f'Otázka {state["aktualni_index"] + 1} z {len(state["otazky"])}').classes('text-2xl text-gray-600 font-bold')
-                        local_ui['cas_label'] = ui.label().classes('text-3xl font-bold tracking-widest')
-                        def aktualizuj_zobrazeni_casu():
-                            if local_ui['cas_label']:
-                                s = int(state['zbyva_sekund'])
-                                local_ui['cas_label'].set_text(f'⏱ {s // 60:02d}:{s % 60:02d}')
-                                local_ui['cas_label'].classes(replace='text-3xl font-bold tracking-widest text-red-600' if s <= 600 else 'text-3xl font-bold tracking-widest text-blue-600')
-                        aktualizuj_zobrazeni_casu()
+            elif state['bezi_test'] and (zaznam := ROZPRACOVANE.get(klic)) and zaznam['aktualni_index'] < len(zaznam['otazky']):
+                idx, otazky = zaznam['aktualni_index'], zaznam['otazky']
+                state['zobrazeny_index'] = idx
+                # Znamení pro skript v hlavičce: .kviz-bezi = běží test (displej zapnutý),
+                # .kviz-kontrola = kontrolní mechanismus (celá obrazovka, dohled, blokace).
+                kontrola = _kontrola_zapnuta()
+                with ui.column().classes('w-full max-w-4xl mt-12 skryt-pri-tisku kviz-bezi' + (' kviz-kontrola' if kontrola else '')):
+                    if kontrola:
+                        # Mimo celou obrazovku jsou otázky skryté a místo nich je tahle výzva (viz CSS).
+                        with ui.element('div').classes('kviz-fs-vyzva'):
+                            ui.label('Test běží na celé obrazovce').classes('text-4xl font-extrabold text-gray-800')
+                            ui.label('Čas testu běží dál. Pro pokračování se vraťte na celou obrazovku.').classes('text-xl text-gray-600')
+                            local_ui['cas_vyzva'] = ui.label().classes('text-3xl font-bold tracking-widest text-blue-600')
+                            ui.button('POKRAČOVAT V TESTU').classes('kviz-na-celou h-16 px-10 text-2xl font-bold bg-blue-500 hover:bg-blue-600 text-white rounded-2xl shadow-lg')
+                            ui.label('Opuštění celé obrazovky během testu test ukončí.').classes('text-base font-semibold text-red-600')
+                    with ui.column().classes('w-full kviz-obsah-testu'):
+                        with ui.row().classes('w-full justify-between items-center mb-8 border-b-2 pb-4 border-gray-200'):
+                            ui.label(f'Otázka {idx + 1} z {len(otazky)}').classes('text-2xl text-gray-600 font-bold')
+                            local_ui['cas_label'] = ui.label().classes('text-3xl font-bold tracking-widest')
+                            aktualizuj_zobrazeni_casu(zaznam)
 
-                    aktualni_q = state['otazky'][state['aktualni_index']]
-                    ui.label(aktualni_q['OTÁZKA']).classes('text-4xl font-extrabold mb-10 text-center text-gray-800 w-full skryt-pri-tisku')
-                    moznosti = {'A': f"A)  {aktualni_q['A']}", 'B': f"B)  {aktualni_q['B']}", 'C': f"C)  {aktualni_q['C']}", 'D': f"D)  {aktualni_q['D']}"}
-                    radio = ui.radio(moznosti, value=state['vybrana_odpoved']).classes('text-2xl mb-12 space-y-6 w-full ml-12 text-gray-800 font-medium skryt-pri-tisku').on_value_change(lambda e: state.update(vybrana_odpoved=e.value))
+                        aktualni_q = otazky[idx]
+                        ui.label(aktualni_q['OTÁZKA']).classes('text-4xl font-extrabold mb-10 text-center text-gray-800 w-full skryt-pri-tisku')
+                        moznosti = {'A': f"A)  {aktualni_q['A']}", 'B': f"B)  {aktualni_q['B']}", 'C': f"C)  {aktualni_q['C']}", 'D': f"D)  {aktualni_q['D']}"}
+                        # Rozkliknutá odpověď patří k testu, ne ke stránce → přežije i znovunačtení.
+                        ui.radio(moznosti, value=zaznam.get('vybrana_odpoved')).classes('text-2xl mb-12 space-y-6 w-full ml-12 text-gray-800 font-medium skryt-pri-tisku').on_value_change(lambda e: zaznam.update(vybrana_odpoved=e.value))
 
-                    def dalsi_otazka():
-                        if not state['vybrana_odpoved']: return ui.notify('Vyberte odpověď!', type='warning', position='top')
-                        spravna, v = str(aktualni_q['správná odpověď']).strip().upper(), state['vybrana_odpoved']
-                        if v == spravna: state['body'] += 1; hodnoceni = "Správně"
-                        else: hodnoceni = "Špatně"
-
-                        state['historie_odpovedi'] = state['historie_odpovedi'] + [{"Pořadí v testu": state['aktualni_index'] + 1, "Otázka": aktualni_q['OTÁZKA'], "Tvoje volba": f"{v}: {aktualni_q.get(v, '')}", "Hodnocení": hodnoceni, "Správná odpověď": "-" if v == spravna else f"{spravna}: {aktualni_q.get(spravna, '')}"}]
-                        state['vybrana_odpoved'], state['aktualni_index'] = None, state['aktualni_index'] + 1
-                        if state['jmeno'] in aktivni_studenti: aktivni_studenti[state['jmeno']]['aktualni_index'] = state['aktualni_index']
-
-                        if state['aktualni_index'] < len(state['otazky']): hlavni_rozhrani.refresh()
-                        else: ukoncit_test()
-
-                    text_tlacitka = 'Odevzdat test' if state['aktualni_index'] == len(state['otazky']) - 1 else 'Další otázka'
-                    ui.button(text_tlacitka, on_click=dalsi_otazka).classes('w-[25rem] h-20 text-3xl font-bold bg-blue-500 hover:bg-blue-600 text-white rounded-xl shadow-lg mx-auto block skryt-pri-tisku')
+                        text_tlacitka = 'Odevzdat test' if idx == len(otazky) - 1 else 'Další otázka'
+                        ui.button(text_tlacitka, on_click=lambda: dalsi_otazka(idx)).classes('w-[25rem] h-20 text-3xl font-bold bg-blue-500 hover:bg-blue-600 text-white rounded-xl shadow-lg mx-auto block skryt-pri-tisku')
 
             # --- C) VÝSLEDKY PO TESTU ---
             elif state['vysledek'] is not None:
                 with ui.column().classes('w-full max-w-4xl items-center mt-12 skryt-pri-tisku'):
                     ui.label('ZPRACOVÁNÍ TESTU DOKONČENO').classes('text-4xl font-extrabold mb-8 text-gray-800 skryt-pri-tisku')
-                    celkem = len(state['otazky'])
-                    uspesnost = (state['body'] / celkem * 100) if celkem > 0 else 0
-                    min_usp = int(config[kviz_typ]['min_procento_uspesnosti'])
+                    v = state['vysledek']
+                    if v['stav'] == 'ČAS VYPRŠEL':
+                        ui.label('Čas vypršel – test byl odevzdán automaticky.').classes('text-xl text-gray-500 mb-4 skryt-pri-tisku')
+                    elif v['stav'] == 'PŘERUŠENO':
+                        ui.label('Test byl ukončen – opustil(a) jste celou obrazovku.').classes('text-xl font-bold text-red-600 mb-4 skryt-pri-tisku')
+                    celkem, uspesnost, min_usp = v['celkem'], v['proc'], v['min_procento']
                     barva = 'text-green-500' if uspesnost >= min_usp else 'text-red-600'
                     stav_text = "ÚSPĚŠNĚ SPLNĚNO" if uspesnost >= min_usp else "NESPLNĚNO"
 
                     ui.label(stav_text).classes(f'text-5xl font-black mb-4 {barva} skryt-pri-tisku')
                     ui.label(f'Úspěšnost: {uspesnost:.2f} % (Požadováno {min_usp} %)').classes(f'text-4xl font-bold mb-4 {barva} skryt-pri-tisku')
-                    ui.label(f'Získané body: {state["body"]} z {celkem}').classes('text-3xl mb-12 text-gray-600 font-bold skryt-pri-tisku')
+                    ui.label(f'Získané body: {v["body"]} z {celkem}').classes('text-3xl mb-12 text-gray-600 font-bold skryt-pri-tisku')
 
                     with ui.dialog().props('maximized transition-show="slide-up" transition-hide="slide-down"') as vysledky_dlg:
                         with ui.card().classes('w-full h-full max-w-full m-0 p-8 bg-white overflow-y-auto'):
                             ui.label('Zkušební protokol - Výsledek testu').classes('text-4xl font-bold mb-6 text-center text-gray-800')
 
-                            df_s = [{"Jméno": state['jmeno'], "Stav": state.get('konec_stav', ''), "Úspěšnost": f"{state.get('konec_proc', 0):.2f}%", "Bodů": f"{state['body']}/{celkem}", "Trvání": f"{state.get('konec_m', 0)}m {state.get('konec_s', 0)}s"}]
+                            df_s = [{"Jméno": v['jmeno'], "Stav": v['stav'], "Úspěšnost": f"{v['proc']:.2f}%", "Bodů": f"{v['body']}/{celkem}", "Trvání": f"{v['m']}m {v['s']}s"}]
                             cols_s = [{'name': c, 'label': c, 'field': c, 'align': 'left'} for c in df_s[0].keys()]
                             ui.table(columns=cols_s, rows=df_s).classes('w-full mb-8 shadow-sm text-lg')
 
                             ui.label('Analýza odpovědí').classes('text-3xl font-bold mb-4 text-gray-800')
-                            if state['historie_odpovedi']:
-                                cols_a = [{'name': c, 'label': c, 'field': c, 'align': 'left'} for c in state['historie_odpovedi'][0].keys()]
-                                ui.table(columns=cols_a, rows=state['historie_odpovedi']).classes('w-full mb-8 shadow-sm text-base')
+                            if v['historie']:
+                                cols_a = [{'name': c, 'label': c, 'field': c, 'align': 'left'} for c in v['historie'][0].keys()]
+                                ui.table(columns=cols_a, rows=v['historie']).classes('w-full mb-8 shadow-sm text-base')
 
                             with ui.row().classes('w-full justify-center mt-8 skryt-pri-tisku gap-4'):
                                 ui.button('Zavřít výsledky', on_click=vysledky_dlg.close).classes('bg-gray-500 hover:bg-gray-600 text-white px-8 h-14 text-lg font-bold shadow-md')
@@ -972,38 +1469,49 @@ def index_page(client: Client):
                     with ui.row().classes('gap-4 items-center'):
                         if not je_host:
                             ui.button('Zpět na Přehled', on_click=_nav_na_prehled).classes('h-20 text-xl font-bold bg-gray-500 hover:bg-gray-600 text-white shadow-md rounded-2xl skryt-pri-tisku')
-                        ui.button('SPUSTIT TEST', on_click=spustit_test).classes('w-[25rem] h-20 text-3xl font-bold bg-blue-500 hover:bg-blue-600 text-white shadow-xl rounded-2xl skryt-pri-tisku')
+                        ui.button('SPUSTIT TEST', on_click=spustit_test).classes(('kviz-na-celou ' if _kontrola_zapnuta() else '') + 'w-[25rem] h-20 text-3xl font-bold bg-blue-500 hover:bg-blue-600 text-white shadow-xl rounded-2xl skryt-pri-tisku')
 
                     if is_admin:
                         ui.button('⚙️ Správa Kvízu', on_click=lambda: prepni_admin_panel(True)).classes('mt-12 w-64 h-12 text-lg bg-gray-800 hover:bg-gray-700 text-white shadow-md rounded-2xl skryt-pri-tisku')
                     elif muze_generovat_hosty:
                         ui.button('🎟️ Přístupy do Kvízu', on_click=lambda: prepni_admin_panel(True)).classes('mt-12 w-64 h-12 text-lg bg-gray-800 hover:bg-gray-700 text-white shadow-md rounded-2xl skryt-pri-tisku')
 
-    def tik_casovace():
-        if state.get('bezi_test') and state.get('zbyva_sekund', 0) > 0:
-            state['zbyva_sekund'] -= 1
-            if local_ui['cas_label']:
-                s = int(state['zbyva_sekund'])
-                local_ui['cas_label'].set_text(f'⏱ {s // 60:02d}:{s % 60:02d}')
-                local_ui['cas_label'].classes(replace='text-3xl font-bold tracking-widest text-red-600' if s <= 600 else 'text-3xl font-bold tracking-widest text-blue-600')
+    def aktualizuj_zobrazeni_casu(zaznam: dict) -> None:
+        s = _zbyva_s(zaznam)
+        if local_ui['cas_vyzva']:
+            local_ui['cas_vyzva'].set_text(f'Zbývá ⏱ {s // 60:02d}:{s % 60:02d}')
+        if local_ui['cas_label']:
+            local_ui['cas_label'].set_text(f'⏱ {s // 60:02d}:{s % 60:02d}')
+            local_ui['cas_label'].classes(replace='text-3xl font-bold tracking-widest text-red-600' if s <= 600 else 'text-3xl font-bold tracking-widest text-blue-600')
 
-            # Přidáno zaznamenání aktuálního času (last_seen), kdy se student naposledy ozval
-            if state['jmeno'] not in aktivni_studenti:
-                aktivni_studenti[state['jmeno']] = {'jmeno': state['jmeno'], 'aktualni_index': state['aktualni_index'], 'celkem_otazek': len(state['otazky']), 'zbyva_sekund': state['zbyva_sekund'], 'last_seen': time.time()}
-            else:
-                aktivni_studenti[state['jmeno']]['zbyva_sekund'] = state['zbyva_sekund']
-                aktivni_studenti[state['jmeno']]['last_seen'] = time.time()
-
-            if state['zbyva_sekund'] <= 0:
+    async def tik_casovace():
+        """Zbývající čas se počítá z konec_ts — po výpadku spojení nebo uspání
+        notebooku tak sedí hned po návratu."""
+        if not state['bezi_test']:
+            return
+        zaznam = ROZPRACOVANE.get(klic)
+        if zaznam is None:
+            # Test mezitím odevzdalo jiné okno nebo úklid po vypršení času.
+            state['bezi_test'] = False
+            state['vysledek'] = prevezmi_nevideny()
+            if state['vysledek'] is None:
+                ui.notify('Test už byl odevzdán v jiném okně.', type='info', position='top')
+            hlavni_rozhrani.refresh()
+        elif _zbyva_s(zaznam) <= 0 or zaznam['aktualni_index'] >= len(zaznam['otazky']):
+            if _zbyva_s(zaznam) <= 0:
                 ui.notify('Čas vypršel! Odevzdáno.', type='negative')
-                ukoncit_test()
+            await ukoncit_test()
+        elif state['zobrazeny_index'] != zaznam['aktualni_index']:
+            hlavni_rozhrani.refresh()  # odpověď z jiného okna / obnovený test
+        else:
+            aktualizuj_zobrazeni_casu(zaznam)
 
     ui.timer(1.0, tik_casovace)
 
-    # --- Hlídání změn práv (obdoba kontrola_prav v intranet.py). Stav testu i obrazovka
-    # s výsledkem žijí jen v této stránce (cookie se po sestavení už nezapisuje), takže
-    # reload by je zahodil: probíhající test se nepřeruší nikdy, výsledek jen při ztrátě
-    # přístupu. Odložená změna se projeví při dalším otevření stránky.
+    # --- Hlídání změn práv (obdoba kontrola_prav v intranet.py). Obrazovka s výsledkem
+    # žije jen v této stránce, takže reload by ji zahodil: probíhající test se nepřeruší
+    # nikdy, výsledek jen při ztrátě přístupu. Odložená změna se projeví při dalším
+    # otevření stránky.
     if not je_host and user_id:
         _KVIZ_PRAVA = {'vse', 'kviz', 'kviz_hoste', 'vystup_osobni', 'vystup_vse'}
         _prava_kvizu = {p.lower() for p in vsechna_prava} & _KVIZ_PRAVA
@@ -1035,57 +1543,86 @@ def index_page(client: Client):
 
         ui.timer(5.0, kontrola_prav_kvizu)
 
-    def spustit_test():
-        otazky = nacti_otazky(typ=kviz_typ, pocet_otazek=int(config[kviz_typ]['pocet_otazek']))
-        if not otazky: return
-        state['otazky'], state['aktualni_index'], state['body'], state['zbyva_sekund'] = otazky, 0, 0, int(config[kviz_typ]['casovy_limit_minuty']) * 60
-        state['vybrana_odpoved'], state['vysledek'], state['historie_odpovedi'], state['bezi_test'] = None, None, [], True
-
-        aktivni_studenti[state['jmeno']] = {'jmeno': state['jmeno'], 'aktualni_index': 0, 'celkem_otazek': len(otazky), 'zbyva_sekund': state['zbyva_sekund'], 'last_seen': time.time()}
-
+    async def spustit_test():
+        if state['nacitam'] or state['bezi_test']:
+            return  # dvojklik
+        if klic not in ROZPRACOVANE:
+            cfg = config[kviz_typ]
+            state['nacitam'] = True
+            try:
+                # Čtení CSV mimo event loop — 20 lidí naráz by jinak zdrželo všechny.
+                otazky, chyba = await run.io_bound(nacti_otazky, kviz_typ, int(cfg['pocet_otazek']))
+            except Exception as e:
+                otazky, chyba = [], f'Otázky se nepodařilo načíst: {e}'
+            finally:
+                state['nacitam'] = False
+            if not otazky and klic not in ROZPRACOVANE:
+                ui.notify(chyba or 'Pro test nejsou k dispozici žádné otázky.', type='negative', position='top')
+                ui.run_javascript('window.kvizDohled && window.kvizDohled.konec()')
+                return
+            if klic not in ROZPRACOVANE:  # během načítání ho nespustilo jiné okno
+                ted = time.time()
+                ROZPRACOVANE[klic] = {
+                    'klic': klic, 'jmeno': state['jmeno'], 'user_id': user_id, 'typ': kviz_typ,
+                    'host_krestni': host_krestni, 'host_prijmeni': host_prijmeni,
+                    # Vazba na zadavatele odkazu; u interního uživatele zůstane None.
+                    'pristup_token': host_token,
+                    'otazky': otazky, 'aktualni_index': 0, 'body': 0,
+                    'historie_odpovedi': [], 'vybrana_odpoved': None,
+                    'zacatek_ts': ted, 'konec_ts': ted + int(cfg['casovy_limit_minuty']) * 60,
+                    'min_procento': int(cfg['min_procento_uspesnosti']),
+                }
+                _uloz_zaznam(ROZPRACOVANE[klic])
+                intranet_logger.log_activity(state['jmeno'], 'Kvíz', f"Test spuštěn ({kviz_typ.upper()}): {len(otazky)} otázek, limit {cfg['casovy_limit_minuty']} min", **zarizeni)
+        # Nový test, nebo pokračování testu spuštěného v jiném okně.
+        drz_relaci_testu(ROZPRACOVANE[klic])
+        ROZPRACOVANE[klic]['_stranka'] = client.id  # dohled poslouchá jen tuto stránku
+        state.update(bezi_test=True, vysledek=None)
         hlavni_rozhrani.refresh()
 
-    def ukoncit_test():
-        state['bezi_test'] = False; state['vysledek'] = True
-        if state['jmeno'] in aktivni_studenti: del aktivni_studenti[state['jmeno']]
-        trvani = (int(config[kviz_typ]['casovy_limit_minuty']) * 60) - int(state['zbyva_sekund'])
-        m, s = divmod(trvani, 60)
-        celkem = len(state['otazky'])
-        proc = (state['body'] / celkem) * 100 if celkem > 0 else 0
-        stav_testu = "DOKONČENO" if int(state['zbyva_sekund']) > 0 else "ČAS VYPRŠEL"
+    async def dalsi_otazka(idx: int):
+        zaznam = ROZPRACOVANE.get(klic)
+        if zaznam is None or zaznam['aktualni_index'] != idx or _zbyva_s(zaznam) <= 0:
+            # Dvojklik, odpověď z jiného okna, test už odevzdaný nebo po limitu
+            # (odpověď po limitu se nepočítá) — srovná to časovač.
+            return await tik_casovace()
+        v = zaznam.get('vybrana_odpoved')
+        if not v: return ui.notify('Vyberte odpověď!', type='warning', position='top')
+        aktualni_q = zaznam['otazky'][idx]
+        spravna = str(aktualni_q['správná odpověď']).strip().upper()
+        if v == spravna: zaznam['body'] += 1; hodnoceni = "Správně"
+        else: hodnoceni = "Špatně"
 
-        state['konec_m'] = m
-        state['konec_s'] = s
-        state['konec_proc'] = proc
-        state['konec_stav'] = stav_testu
+        zaznam['historie_odpovedi'].append({"Pořadí v testu": idx + 1, "Otázka": aktualni_q['OTÁZKA'], "Tvoje volba": f"{v}: {aktualni_q.get(v, '')}", "Hodnocení": hodnoceni, "Správná odpověď": "-" if v == spravna else f"{spravna}: {aktualni_q.get(spravna, '')}"})
+        zaznam['vybrana_odpoved'], zaznam['aktualni_index'] = None, idx + 1
 
-        dokoncene_testy.insert(0, {'jmeno': state['jmeno'], 'cas_odevzdani': time.strftime('%H:%M:%S'), 'vysledek': stav_testu, 'skore': f"{state['body']}/{celkem}", 'uspesnost': f"{proc:.2f}%"})
-        slozka = "Vysledky_Web"
-        os.makedirs(slozka, exist_ok=True)
-        cesta = os.path.join(slozka, f"Vysledek_{state['jmeno']}_{time.strftime('%H-%M-%S')}.xlsx")
-        try:
-            df_s = pd.DataFrame([{"Jméno": state['jmeno'], "Stav": stav_testu, "Úspěšnost": f"{proc:.2f}%", "Bodů": f"{state['body']}/{celkem}", "Trvání": f"{m}m {s}s"}])
-            with pd.ExcelWriter(cesta, engine='openpyxl') as w:
-                df_s.to_excel(w, sheet_name='Souhrn', index=False)
-                if state['historie_odpovedi']: pd.DataFrame(state['historie_odpovedi']).to_excel(w, sheet_name='Analýza', index=False)
-                w.sheets['Souhrn']['B2'].fill = PatternFill(start_color="FF00FF00" if proc >= int(config[kviz_typ]['min_procento_uspesnosti']) else "00E02319", fill_type="solid")
-        except Exception: pass
+        if zaznam['aktualni_index'] < len(zaznam['otazky']):
+            _uloz_zaznam(zaznam)  # každá odpověď hned na disk — přežije i restart serveru
+            hlavni_rozhrani.refresh()
+        else:
+            await ukoncit_test()
 
-        if intranet_data.nacti_mysql().get("enabled"):
-            intranet_data.uloz_vysledek_kvizu(
-                user_id,
-                stav_testu,
-                f"{proc:.2f}%",
-                f"{state['body']}/{celkem}",
-                f"{m}m {s}s",
-                state['historie_odpovedi'],
-                host_jmeno=host_krestni if user_id is None else None,
-                host_prijmeni=host_prijmeni if user_id is None else None,
-                # Vazba na zadavatele odkazu; u interního uživatele zůstane None.
-                pristup_token=app.storage.user.get('kviz_host_token') if je_host else None
-            )
-
+    async def ukoncit_test(preruseno: bool = False):
+        if not state['bezi_test']:
+            return  # už se odevzdává (souběh tlačítka, časovače a dohledu)
+        state['bezi_test'] = False
+        uzavreno = _uzavri_test(klic, preruseno=preruseno, zarizeni=zarizeni)
+        if uzavreno is None:
+            # Mezitím odevzdalo jiné okno nebo úklid.
+            state['vysledek'] = prevezmi_nevideny()
+            hlavni_rozhrani.refresh()
+            return
+        zaznam, state['vysledek'] = uzavreno
+        if not client.has_socket_connection:
+            # Odevzdáno bez spojení — kdyby se stránka musela znovu načíst, ukáže se výsledek tam.
+            NEVIDENE_VYSLEDKY[klic] = state['vysledek']
         hlavni_rozhrani.refresh()
+        if not await _uloz_vysledek(zaznam, state['vysledek']):
+            try:
+                ui.notify('Výsledek se nepodařilo uložit do databáze. Nahlaste to prosím zadavateli testu.',
+                          type='negative', position='top', timeout=0, close_button='OK')
+            except Exception:
+                pass  # stránka mezitím zanikla; chyba je v audit logu
 
     hlavni_rozhrani()
 
@@ -1215,7 +1752,7 @@ def vykresli_vystup_kviz(user_name, vsechna_prava):
                         def _zpracuj_excel():
                             conn = intranet_data.get_db_connection()
                             cursor = conn.cursor(dictionary=True)
-                            cursor.execute("SELECT poradi AS `Pořadí v testu`, otazka AS `Otázka`, tvoje_volba AS `Tvoje volba`, spravna_odpoved AS `Správná odpověď`, hodnoceni AS `Hodnocení` FROM zaznamy_odpovedi WHERE vysledek_id = %s ORDER BY poradi", (vid,))
+                            cursor.execute("SELECT otazka AS `Otázka`, tvoje_volba AS `Tvoje volba`, spravna_odpoved AS `Správná odpověď` FROM zaznamy_odpovedi WHERE vysledek_id = %s ORDER BY poradi", (vid,))
                             odpovedi = cursor.fetchall()
                             cursor.close(); conn.close()
                             os.makedirs("Exporty_Kviz", exist_ok=True)
@@ -1225,7 +1762,30 @@ def vykresli_vystup_kviz(user_name, vsechna_prava):
                             df_s = pd.DataFrame([{"Jméno": f"{v_data['name']} {v_data['surname']}", "Stav": v_data['stav_testu'], "Úspěšnost": v_data['uspesnost'], "Bodů": v_data['body'], "Trvání": v_data['doba_trvani']}])
                             with pd.ExcelWriter(cesta, engine='openpyxl') as w:
                                 df_s.to_excel(w, sheet_name='Souhrn', index=False)
-                                if odpovedi: pd.DataFrame(odpovedi).to_excel(w, sheet_name='Analýza', index=False)
+                                # Souhrn: šířka sloupců podle nejdelšího textu (celé jméno), tisk A4 na šířku jako Analýza
+                                ws_s = w.sheets['Souhrn']
+                                for sloupec in ws_s.columns:
+                                    ws_s.column_dimensions[sloupec[0].column_letter].width = max(len(str(c.value or '')) for c in sloupec) * 1.2 + 2
+                                ws_s.page_setup.orientation = ws_s.ORIENTATION_LANDSCAPE
+                                ws_s.page_setup.paperSize = ws_s.PAPERSIZE_A4
+                                if odpovedi:
+                                    pd.DataFrame(odpovedi).to_excel(w, sheet_name='Analýza', index=False)
+                                    # Tisk: A4 na šířku, všechny sloupce na 1 stránku šířky, dlouhé texty se zalamují
+                                    ws = w.sheets['Analýza']
+                                    for sloupec, sirka in zip('ABC', (60, 35, 35)):
+                                        ws.column_dimensions[sloupec].width = sirka
+                                    zalom = Alignment(wrap_text=True, vertical='top')
+                                    for radek in ws.iter_rows():
+                                        for bunka in radek: bunka.alignment = zalom
+                                    # Formát tabulky vč. hlavičky: pruhované sudé/liché řádky (drží i po řazení/filtru)
+                                    tabulka = Table(displayName="Analyza", ref=ws.dimensions)
+                                    tabulka.tableStyleInfo = TableStyleInfo(name="TableStyleMedium2", showRowStripes=True)
+                                    ws.add_table(tabulka)
+                                    ws.page_setup.orientation = ws.ORIENTATION_LANDSCAPE
+                                    ws.page_setup.paperSize = ws.PAPERSIZE_A4
+                                    ws.sheet_properties.pageSetUpPr.fitToPage = True
+                                    ws.page_setup.fitToWidth, ws.page_setup.fitToHeight = 1, 0
+                                    ws.print_title_rows = '1:1'
                                 barva_fill = "FF00FF00" if v_data['stav_testu'] == 'Úspěšný' else "00E02319"
                                 w.sheets['Souhrn']['B2'].fill = PatternFill(start_color=barva_fill, fill_type="solid")
                             return cesta

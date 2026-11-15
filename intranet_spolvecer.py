@@ -229,6 +229,21 @@ def inicializace_db():
             INDEX idx_pob (pobocka_klic),
             FOREIGN KEY (user_id) REFERENCES user(iduser) ON DELETE CASCADE
         ) ENGINE=InnoDB CHARACTER SET utf8mb4""")
+        # Faktury k nákladovým položkám – eviduje účetní; na jednu položku může být víc faktur.
+        cur.execute("""CREATE TABLE IF NOT EXISTS spolvecer_faktura (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            pobocka_klic VARCHAR(50) NOT NULL,
+            poradi INT NOT NULL,
+            cislo_faktury VARCHAR(100) NULL,
+            castka DECIMAL(15,2) NULL,
+            poznamka TEXT NULL,
+            v_uctu TINYINT(1) NOT NULL DEFAULT 0,
+            v_uctu_kym INT NULL,
+            v_uctu_kdy DATETIME NULL,
+            created_by INT NULL,
+            created_at DATETIME DEFAULT NOW(),
+            INDEX idx_pol (pobocka_klic, poradi)
+        ) ENGINE=InnoDB CHARACTER SET utf8mb4""")
         conn.commit()
         _db_init = True
     except Exception as e:
@@ -472,6 +487,93 @@ def _uloz_polozka_pole(klic, poradi, sloupec, hodnota, user_id):
         if conn: conn.close()
 
 
+# ==========================================
+# FAKTURY (vidí a edituje jen účetní / superadmin)
+# ==========================================
+_FAKTURA_POLE = {'cislo_faktury': 'číslo faktury', 'castka': 'částka', 'poznamka': 'poznámka'}
+
+
+def _nacti_faktury(klic, poradi=None):
+    """Faktury pobočky (volitelně jen jedné položky), nejstarší první.
+    v_uctu_jmeno = kdo dal fajfku „náklad v účtu“."""
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return []
+    cur = None
+    try:
+        cur = conn.cursor(dictionary=True, buffered=True)
+        sql = ("SELECT f.*, CONCAT(COALESCE(u.name,''),' ',COALESCE(u.surname,'')) AS v_uctu_jmeno "
+               "FROM spolvecer_faktura f LEFT JOIN user u ON u.iduser = f.v_uctu_kym "
+               "WHERE f.pobocka_klic=%s")
+        args = [klic]
+        if poradi is not None:
+            sql += " AND f.poradi=%s"
+            args.append(poradi)
+        cur.execute(sql + " ORDER BY f.id", args)
+        return cur.fetchall()
+    except Exception as e:
+        print(f"[spolvecer] nacti_faktury: {e}"); return []
+    finally:
+        if cur:  cur.close()
+        if conn: conn.close()
+
+
+def _faktury_v_uctu(faktury):
+    """Součet částek faktur s fajfkou „v účtu“."""
+    return sum(float(f['castka']) for f in faktury if f.get('v_uctu') and f.get('castka') is not None)
+
+
+def _faktura_sql(sql, args, popis):
+    """Jeden zápis do spolvecer_faktura. Vrací True, None při chybě."""
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return None
+    cur = None
+    try:
+        cur = conn.cursor()
+        cur.execute(sql, args)
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"[spolvecer] {popis}: {e}"); return None
+    finally:
+        if cur:  cur.close()
+        if conn: conn.close()
+
+
+def _pridej_fakturu(klic, poradi, user_id):
+    return _faktura_sql(
+        "INSERT INTO spolvecer_faktura (pobocka_klic, poradi, created_by) VALUES (%s,%s,%s)",
+        (klic, poradi, user_id), 'pridej_fakturu')
+
+
+def _uloz_faktura_pole(fid, klic, sloupec, hodnota):
+    if sloupec not in _FAKTURA_POLE:
+        return None
+    return _faktura_sql(
+        f"UPDATE spolvecer_faktura SET {sloupec}=%s WHERE id=%s AND pobocka_klic=%s",
+        (hodnota, fid, klic), 'uloz_faktura_pole')
+
+
+def _nastav_v_uctu(fid, klic, v_uctu, user_id):
+    """Fajfka „náklad v účtu“. Při zaškrtnutí zapíše kdo/kdy (už zaškrtnutou nepřepíše),
+    při odškrtnutí kdo/kdy smaže."""
+    if v_uctu:
+        return _faktura_sql(
+            "UPDATE spolvecer_faktura SET v_uctu=1, v_uctu_kym=%s, v_uctu_kdy=NOW() "
+            "WHERE id=%s AND pobocka_klic=%s AND v_uctu=0",
+            (user_id, fid, klic), 'nastav_v_uctu')
+    return _faktura_sql(
+        "UPDATE spolvecer_faktura SET v_uctu=0, v_uctu_kym=NULL, v_uctu_kdy=NULL "
+        "WHERE id=%s AND pobocka_klic=%s",
+        (fid, klic), 'nastav_v_uctu')
+
+
+def _smaz_fakturu(fid, klic):
+    return _faktura_sql("DELETE FROM spolvecer_faktura WHERE id=%s AND pobocka_klic=%s",
+                        (fid, klic), 'smaz_fakturu')
+
+
 def _po_editaci(klic, user_id):
     """Pokud byla pobočka schválená, vrátí ji editace zpět do stavu 'ke_schvaleni'.
     Vrací True, pokud došlo k resetu (UI pak obnoví stavový panel)."""
@@ -618,6 +720,7 @@ _PRAVO_ROLE_LABEL = {
     'vse': 'Superadmin (vše)',
     'spolvecer_schvalovatel': 'Schvalovatel',
     'spolvecer_ctenar': 'Čtenář',
+    'spolvecer_ucetni': 'Účetní',
 }
 
 
@@ -771,7 +874,8 @@ def vykresli(user_id, user_name, vsechna_prava):
 
     ma_vse          = 'vse' in vsechna_prava
     je_schvalovatel = ma_vse or 'spolvecer_schvalovatel' in vsechna_prava
-    je_ctenar       = je_schvalovatel or 'spolvecer_ctenar' in vsechna_prava
+    je_ucetni       = ma_vse or 'spolvecer_ucetni' in vsechna_prava     # jediný, kdo vidí faktury
+    je_ctenar       = je_schvalovatel or je_ucetni or 'spolvecer_ctenar' in vsechna_prava
     organizuje      = set(_KLICE_PORADI) if ma_vse else {
         klic for klic in _KLICE_PORADI if f'spolvecer_organizator_{klic}' in vsechna_prava
     }
@@ -969,10 +1073,161 @@ def vykresli(user_id, user_name, vsechna_prava):
             _badge_hlavni()
 
         if not muze_editovat:
-            ui.label('Máte přístup pouze pro čtení – můžete sledovat data a psát do chatu.').classes(
+            ui.label('Tabulku nákladů máte pouze pro čtení; faktury evidujete ve sloupci Faktury.'
+                     if je_ucetni else
+                     'Máte přístup pouze pro čtení – můžete sledovat data a psát do chatu.').classes(
                 'text-xs text-gray-400 italic mb-4')
 
         total_lbl = {'el': None}
+
+        # ---- FAKTURY: 4. sloupec tabulky – jen účetní / superadmin ----
+        cols = '1fr 160px 1fr 240px' if je_ucetni else '1fr 160px 1fr'
+        rozpocty = {p['poradi']: p['naklad'] for p in polozky}
+        _vse_fakt = _nacti_faktury(klic) if je_ucetni else []
+        fakt_cache = {p['poradi']: [f for f in _vse_fakt if f['poradi'] == p['poradi']] for p in polozky}
+        fakt_souhrn = {}   # poradi → refreshable souhrn (při změně rozpočtu adminem)
+
+        def _zbyva_label(zbyva):
+            if zbyva < -0.005:
+                ui.label(f'překročeno o {_fmt(-zbyva)} Kč').classes('text-xs font-bold text-red-600')
+            else:
+                ui.label(f'zbývá {_fmt(zbyva)} Kč').classes('text-xs text-gray-500')
+
+        @ui.refreshable
+        def _faktury_celkem():
+            v_uctu = sum(_faktury_v_uctu(f) for f in fakt_cache.values())
+            rozpocet = sum(float(v) for v in rozpocty.values() if v is not None)
+            with ui.column().classes('gap-0 items-end'):
+                ui.label(f'v účtu {_fmt(v_uctu)} Kč').classes('text-sm font-black text-green-800')
+                _zbyva_label(rozpocet - v_uctu)
+
+        def _log_fakt(por, text):
+            intranet_logger.log_activity(user_name, LOG_KATEGORIE,
+                                         f'{nazev} – faktury – {POLOZKY[por]}: {text}')
+
+        def _faktury_polozky(por):
+            """Vrátí (souhrn, seznam): buňku 4. sloupce a rozbalovací seznam faktur pod řádkem."""
+            otevreno = {'v': False}
+
+            async def obnov():
+                fakt_cache[por] = await asyncio.to_thread(_nacti_faktury, klic, por)
+                souhrn.refresh(); seznam.refresh(); _faktury_celkem.refresh()
+
+            def prepni():
+                otevreno['v'] = not otevreno['v']
+                souhrn.refresh(); seznam.refresh()
+
+            async def pridej():
+                if not await asyncio.to_thread(_pridej_fakturu, klic, por, user_id):
+                    ui.notify('Fakturu se nepodařilo přidat.', type='negative'); return
+                _log_fakt(por, 'přidána faktura')
+                otevreno['v'] = True
+                await obnov()
+
+            def _oznac(f):
+                return f.get('cislo_faktury') or f'#{f["id"]}'
+
+            def _mk_uloz(f, sloupec, el):
+                async def _h(_=None):
+                    if sloupec == 'castka':
+                        hodnota = _parse_cislo(el.value)
+                        el.set_value(_fmt(hodnota) if hodnota is not None else '')
+                    else:
+                        hodnota = (el.value or '').strip() or None
+                    stara = f.get(sloupec)
+                    if _norm(stara) == _norm(hodnota):
+                        return
+                    if not await asyncio.to_thread(_uloz_faktura_pole, f['id'], klic, sloupec, hodnota):
+                        ui.notify('Uložení faktury se nezdařilo.', type='negative'); return
+                    f[sloupec] = hodnota    # jen cache – bez překreslení, ať se neztratí fokus
+                    if sloupec == 'castka':
+                        stara = _fmt(stara) if stara is not None else None
+                        hodnota = _fmt(hodnota) if hodnota is not None else None
+                        souhrn.refresh(); _faktury_celkem.refresh()
+                    _log_fakt(por, f'faktura {_oznac(f)} – {_FAKTURA_POLE[sloupec]}: '
+                                   f'{stara or "—"} → {hodnota or "—"}')
+                return _h
+
+            def _mk_v_uctu(f):
+                async def _h(e):
+                    if not await asyncio.to_thread(_nastav_v_uctu, f['id'], klic, bool(e.value), user_id):
+                        ui.notify('Uložení fajfky se nezdařilo.', type='negative')
+                    else:
+                        _log_fakt(por, f'faktura {_oznac(f)} – ' +
+                                       ('náklad v účtu' if e.value else 'fajfka „v účtu“ odebrána'))
+                    await obnov()
+                return _h
+
+            def _mk_smaz(f):
+                async def _h():
+                    with ui.dialog() as dlg, ui.card().classes('p-5 gap-3'):
+                        ui.label(f'Smazat fakturu {_oznac(f)}?').classes('font-bold text-gray-800')
+                        with ui.row().classes('w-full justify-end gap-2'):
+                            ui.button('Zrušit', on_click=lambda: dlg.submit(False)).props('flat no-caps')
+                            ui.button('Smazat', on_click=lambda: dlg.submit(True)).props('color=negative no-caps')
+                    if not await dlg:
+                        return
+                    if not await asyncio.to_thread(_smaz_fakturu, f['id'], klic):
+                        ui.notify('Smazání se nezdařilo.', type='negative'); return
+                    _log_fakt(por, f'smazána faktura {_oznac(f)} '
+                                   f'({_fmt(f["castka"]) + " Kč" if f.get("castka") is not None else "bez částky"})')
+                    await obnov()
+                return _h
+
+            @ui.refreshable
+            def souhrn():
+                fakt = fakt_cache[por]
+                v_uctu = _faktury_v_uctu(fakt)
+                with ui.row().classes('w-full items-center justify-end gap-2 no-wrap cursor-pointer') \
+                        .on('click', prepni):
+                    with ui.column().classes('gap-0 items-end'):
+                        if fakt:
+                            ui.label(f'v účtu {_fmt(v_uctu)} Kč').classes('text-xs font-bold text-green-800')
+                        else:
+                            ui.label('bez faktur').classes('text-xs text-gray-400 italic')
+                        if rozpocty.get(por) is not None:
+                            _zbyva_label(float(rozpocty[por]) - v_uctu)
+                    if fakt:
+                        ui.label(str(len(fakt))).classes(
+                            'text-[10px] font-black bg-gray-200 text-gray-700 rounded-full px-1.5'
+                        ).tooltip('Počet faktur')
+                    ui.icon('expand_less' if otevreno['v'] else 'expand_more').classes('text-gray-400')
+
+            @ui.refreshable
+            def seznam():
+                if not otevreno['v']:
+                    return
+                with ui.column().classes('w-full gap-2 px-4 py-3 bg-slate-50 border-t border-gray-100'):
+                    for f in fakt_cache[por]:
+                        with ui.row().classes('w-full items-center gap-2 flex-wrap'):
+                            ui.checkbox('V účtu', value=bool(f.get('v_uctu')),
+                                        on_change=_mk_v_uctu(f)).classes('text-sm font-bold')
+                            c_inp = ui.input('Č. faktury', value=f.get('cislo_faktury') or '') \
+                                .props('outlined dense').classes('w-40')
+                            c_inp.on('blur', _mk_uloz(f, 'cislo_faktury', c_inp))
+                            k_inp = ui.input('Částka', value=_fmt(f['castka']) if f.get('castka') is not None else '') \
+                                .props('outlined dense suffix="Kč" inputmode=decimal input-class=text-right') \
+                                .classes('w-44')
+                            h_k = _mk_uloz(f, 'castka', k_inp)
+                            k_inp.on('blur', h_k)
+                            k_inp.on('keydown.enter', h_k)
+                            p_inp = ui.input('Poznámka', value=f.get('poznamka') or '') \
+                                .props('outlined dense').classes('flex-1 min-w-[160px]')
+                            p_inp.on('blur', _mk_uloz(f, 'poznamka', p_inp))
+                            if f.get('v_uctu'):
+                                kdy = f.get('v_uctu_kdy')
+                                kdy = kdy.strftime('%d.%m.%Y %H:%M') if isinstance(kdy, datetime.datetime) else ''
+                                with ui.row().classes('items-center gap-1 no-wrap'):
+                                    ui.icon('check_circle', color='green').classes('text-base')
+                                    ui.label(f'{(f.get("v_uctu_jmeno") or "").strip()} · {kdy}').classes(
+                                        'text-xs text-green-800 font-bold whitespace-nowrap')
+                            ui.button(icon='delete', on_click=_mk_smaz(f)).props(
+                                'flat round dense color=grey-6').tooltip('Smazat fakturu')
+                    ui.button('Přidat fakturu', icon='add', on_click=pridej).props(
+                        'flat dense no-caps color=primary').classes('self-start text-xs')
+
+            fakt_souhrn[por] = souhrn
+            return souhrn, seznam
 
         # ---- referencovatelné panely (definovány předem) ----
         @ui.refreshable
@@ -1220,16 +1475,20 @@ def vykresli(user_id, user_name, vsechna_prava):
                     with ui.element('div').classes(
                         'w-full grid px-4 py-2.5 text-[11px] font-black uppercase '
                         'tracking-wide text-gray-700').style(
-                        f'grid-template-columns: 1fr 160px 1fr; background-color:{BARVA_HLAVICKA}'):
+                        f'grid-template-columns: {cols}; background-color:{BARVA_HLAVICKA}'):
                         ui.label('Služba / zboží')
                         ui.label('Náklad bez DPH (Kč)')
                         ui.label('Poznámky pobočky')
+                        if je_ucetni:
+                            ui.label('Faktury').classes('text-right')
 
                     for p in polozky:
                         poradi = p['poradi']
+                        if je_ucetni:
+                            f_souhrn, f_seznam = _faktury_polozky(poradi)
                         with ui.element('div').classes(
                             'w-full grid items-center px-4 py-2 border-t border-gray-100'
-                        ).style('grid-template-columns: 1fr 160px 1fr'):
+                        ).style(f'grid-template-columns: {cols}'):
                             ui.label(p['nazev']).classes('text-sm text-gray-700 pr-2')
 
                             # náklad – textové pole: tisíce oddělené mezerou + přípona „Kč"
@@ -1243,6 +1502,9 @@ def vykresli(user_id, user_name, vsechna_prava):
                                         z = await asyncio.to_thread(_uloz_polozka_pole, klic, por, 'naklad',
                                                                     cislo, user_id)
                                         el.set_value(_fmt(cislo) if cislo is not None else '')
+                                        if z and por in fakt_souhrn:     # admin změnil rozpočet → „zbývá“
+                                            rozpocty[por] = cislo
+                                            fakt_souhrn[por].refresh(); _faktury_celkem.refresh()
                                         await _po_zmene(z)
                                     return _h
                                 h_n = _mk_save_naklad(n_inp, poradi)
@@ -1265,14 +1527,21 @@ def vykresli(user_id, user_name, vsechna_prava):
                             else:
                                 ui.label(p.get('poznamka') or '—').classes('text-sm text-gray-500')
 
+                            if je_ucetni:
+                                f_souhrn()
+                        if je_ucetni:
+                            f_seznam()
+
                     # součet
                     with ui.element('div').classes(
                         'w-full grid items-center px-4 py-3 border-t-2 border-gray-300'
-                    ).style(f'grid-template-columns: 1fr 160px 1fr; background-color:{BARVA_MODRA}'):
+                    ).style(f'grid-template-columns: {cols}; background-color:{BARVA_MODRA}'):
                         ui.label('Náklad celkem v Kč bez DPH').classes('text-sm font-black text-slate-800')
                         total_lbl['el'] = ui.label(_fmt(_soucet(klic)) + ' Kč').classes(
                             'text-sm font-black text-blue-900 text-right pr-2')
                         ui.label('')  # 3. sloupec (zarovnání s tabulkou)
+                        if je_ucetni:
+                            _faktury_celkem()
 
                 # Počty účastníků (v Excelu levandulové buňky)
                 with ui.card().classes('w-full p-5 rounded-2xl border shadow-sm').style(

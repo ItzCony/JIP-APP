@@ -44,3 +44,14 @@ htmlcov/
 Logy a aplikační log soubory
 .log
 activity.log
+nastaveni_intranetu.json
+
+audit_log.db
+
+audit_log.db-shm
+
+audit_log.db-wal
+
+ikos_export/.posledni_tyden
+
+ikos_export/IKOS_Export_20261102-20261108.csv

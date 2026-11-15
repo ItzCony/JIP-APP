@@ -6,7 +6,6 @@ import intranet_static
 import intranet_obsah
 import intranet_veletrh
 import intranet_logger
-import intranet_monitor
 import intranet_helpdesk
 import intranet_kviz
 import intranet_nastaveni
@@ -27,6 +26,7 @@ import intranet_asm
 import intranet_vizitky
 import intranet_spolvecer
 import intranet_lupa
+import intranet_nos
 import intranet_gastrokurzy
 import intranet_monitory
 import intranet_zalistovaci
@@ -34,6 +34,7 @@ import intranet_manualy
 import intranet_datuloziste
 import intranet_naklady_veletrh
 import intranet_halloween
+import intranet_mikulas
 
 import time
 import asyncio
@@ -81,7 +82,7 @@ def cil_po_prihlaseni(client, aktivni_tab='prehled'):
 import os as _os
 from intranet_ui_utils import prepni_tab, zaregistruj_prepinac_tabu
 _STATIC_WHITELIST = [
-    'auto.svg', 'auto.png', 'auto_halloween.svg',
+    'auto.svg', 'auto.png', 'auto_halloween.svg', 'auto_mikulas.svg',
     'prizemi.svg', 'druhe_patro.svg', 'suteren.svg',
     'prizemi_podklad.png',
     'pozadi.jpg',
@@ -561,14 +562,17 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
         ''')
 
     # Jednou za načtení — CSS v hlavičce a dekorace přihlašovací stránky se musí shodnout,
-    # i když mezitím někdo přepne /halloween v audit konzoli.
+    # i když mezitím někdo přepne /halloween nebo /mikulas v audit konzoli.
+    # Kdyby byly zapnuté oba (ruční přepínače), vyhrává halloween.
     halloween_vzhled = intranet_halloween.je_halloween()
+    mikulas_vzhled = not halloween_vzhled and intranet_mikulas.je_mikulas()
     ui.add_head_html('''
         <style>
             /* Okamžité nastavení pozadí přes CSS ještě před spuštěním JS – eliminuje bílý záblesk */
             html, body { background-color: #f3f4f6; }
 
-''' + _POZADI_CSS + _LOGIN_CSS + (intranet_halloween.CSS if halloween_vzhled else '') + '''
+''' + _POZADI_CSS + _LOGIN_CSS + (intranet_halloween.CSS if halloween_vzhled else '') \
+    + (intranet_mikulas.CSS if mikulas_vzhled else '') + '''
             body.intranet-pozadi {
                 margin: 0 !important;
                 padding: 0 !important;
@@ -711,6 +715,7 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
         'cenopripad':    'cenopripad_zapnuty',
         'asm':           'asm_zapnuty',
         'lupa':          'lupa_zapnuty',
+        'nos':           'nos_zapnuty',
         'gastrokurzy':   'gastrokurzy_zapnuty',
         'uloziste':      'datuloziste_zapnuty',
         'naklady_veletrh': 'naklady_veletrh_zapnuty',
@@ -812,8 +817,6 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
         dostupne_taby.append('narozeniny')
     if ma_vse or "admin_logy" in vsechna_prava:
         dostupne_taby.append('logy')
-    if ma_vse or "admin_server" in vsechna_prava:
-        dostupne_taby.append('server')
 
     # Plánování směn: admin nebo uživatel s přímým pravem nebo vedoucí oddělení, které má skupinu
     _ma_smeny_pravo = (ma_vse or 'smeny_admin' in vsechna_prava
@@ -896,6 +899,7 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
         ma_vse or
         'spolvecer_ctenar' in vsechna_prava or
         'spolvecer_schvalovatel' in vsechna_prava or
+        'spolvecer_ucetni' in vsechna_prava or
         any(p.startswith('spolvecer_organizator_') for p in vsechna_prava)
     )
     if _ma_spolvecer and nastaveni.get('spolvecer_zapnuty', True):
@@ -951,6 +955,9 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
     if nastaveni.get('lupa_zapnuty', True) and intranet_lupa.ma_pristup(user_id, vsechna_prava):
         dostupne_taby.append('lupa')
 
+    if nastaveni.get('nos_zapnuty', True) and intranet_nos.ma_pristup(vsechna_prava):
+        dostupne_taby.append('nos')
+
     _ma_gastrokurzy = (
         ma_vse
         or 'gastrokurzy_spravce' in vsechna_prava
@@ -979,6 +986,8 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
         ui.query('body').classes(add='prihlaseni-pozadi', remove='intranet-pozadi')
         if halloween_vzhled:
             intranet_halloween.vykresli_dekorace()
+        elif mikulas_vzhled:
+            intranet_mikulas.vykresli_dekorace()
         with ui.column().classes('w-full h-screen items-center justify-center m-0 py-8 px-4 overflow-y-auto'):
             try:
                 if app.storage.user.get('vykopnut_duplicita'):
@@ -1001,7 +1010,8 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
             except AssertionError:
                 pass
 
-            car_img = ui.image('/static/auto_halloween.svg' if halloween_vzhled else '/static/auto.svg') \
+            car_img = ui.image('/static/auto_halloween.svg' if halloween_vzhled
+                               else '/static/auto_mikulas.svg' if mikulas_vzhled else '/static/auto.svg') \
                 .classes('car-container w-64')
 
             # Předvyplnění e-mailu z „Zapamatovat si mě" (ukládá se JEN e-mail, nikdy heslo)
@@ -1540,7 +1550,6 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
 
                 def odhlasit():
                     intranet_session.odhlas_rucne(user_email, muj_token)
-                    intranet_monitor.odeber_prihlaseni(user_email)
                     _ip_out = app.storage.user.get('login_ip') or intranet_logger.ziskej_klienta_info(client)[0]
                     _zar_out = app.storage.user.get('login_device') or ''
                     intranet_logger.log_activity(user_name, "Odhlášení", "Uživatel se odhlásil ze systému", ip=_ip_out, device=_zar_out)
@@ -1555,7 +1564,7 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
                     ui.tab('prehled', label='📊  Přehled').classes('justify-start text-lg text-gray-800')
                     ui.tab('helpdesk', label='🎧  Helpdesk').classes('hidden')
 
-                    tab_dochazka = tab_vystup = tab_uzivatele = tab_mysql = tab_veletrh = tab_logy = tab_server = tab_znacky = tab_znacky_provoz = tab_narozeniny = tab_smeny = tab_komunikace = tab_planogram = tab_ochutnavky = tab_prod_akt = tab_ukolovnik = tab_vysledky = tab_sankce = tab_spolvecer = tab_vizitky = None
+                    tab_dochazka = tab_vystup = tab_uzivatele = tab_mysql = tab_veletrh = tab_logy = tab_znacky = tab_znacky_provoz = tab_narozeniny = tab_smeny = tab_komunikace = tab_planogram = tab_ochutnavky = tab_prod_akt = tab_ukolovnik = tab_vysledky = tab_sankce = tab_spolvecer = tab_vizitky = None
 
                     if ma_vse or "dochazka_admin" in vsechna_prava or "dochazka_export" in vsechna_prava or "dochazka_zadosti" in vsechna_prava or any(p.startswith('schvalovat_') for p in vsechna_prava) or any(p.startswith('hlavni_vedouci_') for p in vsechna_prava) or any(p.startswith('slozka_') for p in vsechna_prava):
                         tab_dochazka = ui.tab('dochazka', label='📅  Evidence absencí').classes('justify-start text-lg text-gray-800')
@@ -1609,14 +1618,14 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
                         ui.tab('naklady_veletrh', label='🧾  Náklady veletrh').classes('justify-start text-lg text-gray-800')
                     if 'lupa' in dostupne_taby:
                         tab_lupa = ui.tab('lupa', label='🔍  Lupopřípad').classes('justify-start text-lg text-gray-800')
+                    if 'nos' in dostupne_taby:
+                        ui.tab('nos', label='💼  NOS').classes('justify-start text-lg text-gray-800')
 
                     if ma_vse or "uzivatele" in vsechna_prava:
                         tab_uzivatele = ui.tab('uzivatele', label='👥  Správa uživatelů').classes('justify-start text-lg text-gray-800')
 
                     if ma_vse or "admin_logy" in vsechna_prava:
                         tab_logy = ui.tab('logy', label='📜  Audit Log').classes('justify-start text-lg text-gray-800')
-                    if ma_vse or "admin_server" in vsechna_prava:
-                        tab_server = ui.tab('server', label='🖥️  Monitor serveru').classes('justify-start text-lg text-gray-800')
 
                     if ma_vse or "mysql" in vsechna_prava:
                         tab_mysql = ui.tab('mysql', label='🗄️  Nastavení portálu').classes('justify-start text-lg text-gray-800')
@@ -1687,12 +1696,12 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
                 if 'cenopripad' in dostupne_taby: _RENDER_FNS['cenopripad'] = lambda: intranet_cenopripad.vykresli_cenopripad(user_id, user_name, vsechna_prava)
                 if 'asm'        in dostupne_taby: _RENDER_FNS['asm']        = lambda: intranet_asm.vykresli_asm(user_id, user_name, vsechna_prava)
                 if 'lupa'       in dostupne_taby: _RENDER_FNS['lupa']       = lambda: intranet_lupa.vykresli_lupa(user_id, user_name, vsechna_prava)
+                if 'nos'        in dostupne_taby: _RENDER_FNS['nos']        = lambda: intranet_nos.vykresli_nos(user_id, user_name, vsechna_prava)
                 if 'gastrokurzy' in dostupne_taby: _RENDER_FNS['gastrokurzy'] = lambda: intranet_gastrokurzy.vykresli(user_id, user_name, vsechna_prava)
                 if 'uloziste'   in dostupne_taby: _RENDER_FNS['uloziste']   = lambda: intranet_datuloziste.vykresli(user_id, user_name, vsechna_prava)
                 if 'naklady_veletrh' in dostupne_taby: _RENDER_FNS['naklady_veletrh'] = lambda: intranet_naklady_veletrh.vykresli(user_id, user_name, vsechna_prava)
 
                 if tab_logy:        _RENDER_FNS['logy']          = lambda: intranet_logger.vykresli_logy(user_name, vsechna_prava)
-                if tab_server:      _RENDER_FNS['server']        = lambda: intranet_monitor.vykresli_monitor(vsechna_prava)
 
                 def _vykresli_tab(tab_name: str):
                     """Zavolá render funkci pro daný tab a označí ho jako vykreslený.
@@ -1790,10 +1799,6 @@ async def route_dochazka(client: Client):
 async def route_logy(client: Client):
     await vykresli_kompletni_intranet(client, 'logy')
 
-@ui.page('/server')
-async def route_server(client: Client):
-    await vykresli_kompletni_intranet(client, 'server')
-
 @ui.page('/helpdesk')
 async def route_helpdesk(client: Client):
     await vykresli_kompletni_intranet(client, 'helpdesk')
@@ -1846,6 +1851,10 @@ async def route_cenopripad(client: Client):
 async def route_lupa(client: Client):
     await vykresli_kompletni_intranet(client, 'lupa')
 
+@ui.page('/nos')
+async def route_nos(client: Client):
+    await vykresli_kompletni_intranet(client, 'nos')
+
 @ui.page('/asm')
 async def route_asm(client: Client, pripad: str = '', vstupenka: str = ''):
     # Deep-link z e-mailu (/asm?pripad=<id>) → po vykreslení se otevře rovnou detail případu.
@@ -1892,7 +1901,6 @@ def route_logout(client: Client):
         muj_token = app.storage.user.get('login_token')
         intranet_session.odhlas_rucne(user_email, muj_token)
         if user_name and app.storage.user.get('user_id'):
-            intranet_monitor.odeber_prihlaseni(user_email)
             _ip_to = app.storage.user.get('login_ip') or intranet_logger.ziskej_klienta_info(client)[0]
             _zar_to = app.storage.user.get('login_device') or ''
             intranet_logger.log_activity(user_name, "Odhlášení", "Automatické odhlášení z důvodu nečinnosti", ip=_ip_to, device=_zar_to)

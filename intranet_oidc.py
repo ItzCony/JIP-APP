@@ -221,6 +221,9 @@ async def oidc_login(request: Request):
     if brana:
         # Brána musí ověřit člověka u počítače, ne jen platnou SSO cookie u Microsoftu.
         parametry['prompt'] = 'login'
+        # Heslo + MFA trvá i minutu → ať mezitím automatické odhlášení
+        # nevyprázdní relaci (i s oidc_state). Viz intranet_session.ODKLAD_IDP_S.
+        intranet_session.odloz_odhlaseni(app.storage.user.get('login_token'))
 
     dotaz = urllib.parse.urlencode(parametry)
     return RedirectResponse(disc['authorization_endpoint'] + '?' + dotaz)

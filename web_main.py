@@ -175,6 +175,8 @@ if __name__ == "__main__":
     # Lupou na nákup — k 10. dni v měsíci Excel s prodeji každému nákupčímu.
     import intranet_lupa
     app.on_startup(lambda: asyncio.create_task(intranet_lupa.bg_nakup_report()))
+    # Kvíz — po startu vrátí rozpracované testy z disku, odevzdá ty s vypršelým časem.
+    app.on_startup(lambda: asyncio.create_task(intranet_kviz.bg_uklid_testu()))
     # Nahrané soubory jen pro přihlášené (viz intranet_static)
     intranet_static.chranene_soubory('/znacky_foto', 'znacky_foto')
     intranet_static.chranene_soubory(znacky_provoz.foto_route, znacky_provoz.foto_dir)
