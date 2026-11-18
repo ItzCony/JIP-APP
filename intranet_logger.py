@@ -11,7 +11,7 @@ import asyncio
 import threading
 import sys
 import traceback
-from contextlib import closing
+from contextlib import closing, suppress
 import intranet_data
 import intranet_halloween
 import intranet_mikulas
@@ -300,10 +300,31 @@ def dokonci_zapis(timeout: float = 3.0):
     if _zapisovac is None or not _zapisovac.is_alive():
         return
     _fronta.put(_KONEC)
-    _zapisovac.join(timeout)
+    try:
+        _zapisovac.join(timeout)
+    finally:
+        # Zapisovač nestihl (lhůta / další Ctrl+C): co zbylo ve frontě, uložíme do
+        # activity.log — příští start ho naimportuje. Rozpracovanou dávku nezachráníme.
+        # Bez podmínky is_alive(): join přerušený KeyboardInterruptem v Pythonu 3.12
+        # označí živé vlákno jako ukončené (bpo-45274). Po řádném dopsání je fronta prázdná.
+        zbytek = []
+        while True:
+            try:
+                p = _fronta.get_nowait()
+            except queue.Empty:
+                break
+            if p is not _KONEC:
+                zbytek.append(p)
+        if zbytek:
+            _nouzovy_zapis(zbytek)
 
 
-atexit.register(dokonci_zapis)
+@atexit.register
+def _dokonci_pri_ukonceni():
+    # Další Ctrl+C při čekání = „skonči hned". Bez tracebacku, fronta je zachráněná výš.
+    # (Ruční volání před os.execv KeyboardInterrupt propouští — restart se má zrušit.)
+    with suppress(KeyboardInterrupt):
+        dokonci_zapis()
 
 
 def _nouzovy_zapis(zaznamy):

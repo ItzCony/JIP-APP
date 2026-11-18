@@ -8,7 +8,9 @@ Zadání: „Podklad účtárna OZ_2026" (list „odměna"). Hotová kostra:
   • Přístupy         – správce přiřazuje uživatelům jejich ASM
   • Data             – import dat a podmínek od účtárny, výpočet provize po řádcích
   • Podrobný podklad – výpočet odměny po OZ podle vzorců ze zadání      [sl. E–P]
-Zbývá: Podklady NOS (PDF), Přehled dokladů NOS.
+  • Přehled dokladů  – import čísel dokladů (doklady import.xlsx) po OZ, export
+  • Podklady NOS     – PDF za každého OZ (sloupce dle ř. 10 zadání), souhrnný
+                       podklad k vyplacení (PDF, XLSX)
 
 Číslo, jméno, ASM a status OZ se nikam nekopírují — čtou se z asm_oz (Formuláře ASM).
 
@@ -22,9 +24,11 @@ Každá změna hodnoty jde do nos_log (ikona oka u řádku).
 import asyncio
 import bisect
 import datetime
+import html
 import io
 import json
 import re
+import zipfile
 from decimal import Decimal, InvalidOperation
 
 from nicegui import ui, app
@@ -123,6 +127,16 @@ _TABULKY = (
         soubor VARCHAR(255),
         nahral VARCHAR(255),
         kdy DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci""",
+    # Čísla dokladů k vyplacené provizi (soubor „doklady import.xlsx", list data).
+    # Číslo dokladu není unikátní napříč OZ — jedinečná je až dvojice OZ + doklad.
+    """CREATE TABLE IF NOT EXISTS nos_doklady (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        obdobi CHAR(7) NOT NULL,
+        cislo_oz VARCHAR(20) NOT NULL,
+        asm VARCHAR(255),
+        doklad VARCHAR(40) NOT NULL,
+        INDEX idx_nos_doklady (obdobi, cislo_oz)
     ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci""",
 )
 
@@ -396,6 +410,24 @@ _DATA_CISLA = ('obrat', 'nzisk', 'obrat_site', 'obrat_cp2', 'zisk_cp2', 'kg')
 _DATA_DB = ('obdobi', 'kategorie', 'cislo_oz', 'site', 'skupina', 'skupina_nazev',
             *_DATA_CISLA, 'asm', 'jmeno')
 _SKUPINA_V_KOMENTARI = re.compile(r'(\d{1,2})-\s*[^\W\d]')
+# hlavička v doklady import.xlsx → sloupec v nos_doklady
+_DOKLADY_SLOUPCE = {'Měsíc': 'obdobi', 'ASM': 'asm', 'Dealer 3': 'cislo_oz',
+                    'Číslo dokladu': 'doklad'}
+_DOKLADY_DB = ('obdobi', 'cislo_oz', 'asm', 'doklad')
+
+
+def _mesic(hodnota) -> str:
+    """„2026M07" → „2026-07"; jiný tvar → ''."""
+    m = re.fullmatch(r'(\d{4})M(\d{1,2})', str(hodnota or '').strip())
+    obdobi = f'{m.group(1)}-{int(m.group(2)):02d}' if m else ''
+    return obdobi if _je_obdobi(obdobi) else ''
+
+
+def _text(hodnota) -> str:
+    """Číslo OZ / dokladu jako text — Excel z nich občas udělá 401.0."""
+    if isinstance(hodnota, float) and hodnota.is_integer():
+        hodnota = int(hodnota)
+    return '' if hodnota is None else str(hodnota).strip()
 
 
 def _je_cislo(v) -> bool:
@@ -489,20 +521,40 @@ def parsuj_data(ws) -> list:
         if not any(v is not None for v in radek):
             continue
         r = {db: radek[i] if i < len(radek) else None for db, i in idx.items()}
-        m = re.fullmatch(r'(\d{4})M(\d{1,2})', str(r['obdobi'] or '').strip())
-        obdobi = f'{m.group(1)}-{int(m.group(2)):02d}' if m else ''
         g = re.match(r'\s*(\d+)', str(r['skupina_nazev'] or ''))
-        if not _je_obdobi(obdobi) or not r['cislo_oz'] or not r['kategorie']:
+        r['obdobi'] = _mesic(r['obdobi'])
+        r['cislo_oz'] = _text(r['cislo_oz'])
+        if not r['obdobi'] or not r['cislo_oz'] or not r['kategorie']:
             raise ValueError(f'řádek {n}: chybí kategorie, dealer nebo měsíc ve tvaru 2026M06')
-        r['obdobi'] = obdobi
         r['skupina'] = int(g.group(1)) if g else 0     # bez skupiny = skupina 0 (dle podmínek)
-        r['cislo_oz'] = str(r['cislo_oz']).strip()
         r['kategorie'] = str(r['kategorie']).strip()
         for k in _DATA_CISLA:
             r[k] = float(r[k]) if _je_cislo(r[k]) else 0.0
         radky.append(r)
     if not radky:
         raise ValueError('list DATA je prázdný')
+    return radky
+
+
+def parsuj_doklady(ws) -> list:
+    """List data z doklady import.xlsx → řádky pro nos_doklady."""
+    it = ws.iter_rows(values_only=True)
+    hlavicka = [str(h or '').strip() for h in next(it, ())]
+    chybi = [h for h in _DOKLADY_SLOUPCE if h not in hlavicka]
+    if chybi:
+        raise ValueError('v souboru dokladů chybí sloupce: ' + ', '.join(chybi))
+    idx = {db: hlavicka.index(h) for h, db in _DOKLADY_SLOUPCE.items()}
+    radky = []
+    for n, radek in enumerate(it, start=2):
+        if not any(v is not None for v in radek):
+            continue
+        r = {db: _text(radek[i] if i < len(radek) else None) for db, i in idx.items()}
+        r['obdobi'] = _mesic(r['obdobi'])
+        if not r['obdobi'] or not r['cislo_oz'] or not r['doklad']:
+            raise ValueError(f'řádek {n}: chybí dealer, číslo dokladu nebo měsíc ve tvaru 2026M07')
+        radky.append(r)
+    if not radky:
+        raise ValueError('soubor dokladů je prázdný')
     return radky
 
 
@@ -530,22 +582,46 @@ def importuj_soubor(raw, nazev, user_name) -> str:
                 return f'podmínky – {klic}: {len(data)} položek'
         if 'data' not in listy:
             raise ValueError('neznámý soubor – čekám list DATA, Kategorie nebo Skupiny')
-        radky = parsuj_data(listy['data'])
+        # data.xlsx i doklady import.xlsx mají list „data" — rozliší je hlavička
+        ws = listy['data']
+        hlavicka = {str(h or '').strip() for h in next(ws.iter_rows(max_row=1, values_only=True), ())}
+        if 'Číslo dokladu' in hlavicka:
+            tabulka, sloupce, radky, druh = 'nos_doklady', _DOKLADY_DB, parsuj_doklady(ws), 'doklady'
+        else:
+            tabulka, sloupce, radky, druh = 'nos_data', _DATA_DB, parsuj_data(ws), 'data'
         obdobi = sorted({r['obdobi'] for r in radky})
         # Soubor je pro své měsíce úplný — nahrazuje je celé, ostatní měsíce nechává.
-        cur.execute(f"DELETE FROM nos_data WHERE obdobi IN ({','.join(['%s'] * len(obdobi))})",
+        cur.execute(f"DELETE FROM {tabulka} WHERE obdobi IN ({','.join(['%s'] * len(obdobi))})",
                     obdobi)
-        sql = (f"INSERT INTO nos_data ({', '.join(_DATA_DB)}) "
-               f"VALUES ({','.join(['%s'] * len(_DATA_DB))})")
+        sql = (f"INSERT INTO {tabulka} ({', '.join(sloupce)}) "
+               f"VALUES ({','.join(['%s'] * len(sloupce))})")
         for i in range(0, len(radky), 2000):
-            cur.executemany(sql, [tuple(r[k] for k in _DATA_DB) for r in radky[i:i + 2000]])
+            cur.executemany(sql, [tuple(r[k] for k in sloupce) for r in radky[i:i + 2000]])
         conn.commit()
-        return f'data: {len(radky)} řádků, období {obdobi[0]} až {obdobi[-1]}'
+        return f'{druh}: {len(radky)} řádků, období {obdobi[0]} až {obdobi[-1]}'
     except Exception:
         conn.rollback()
         raise
     finally:
         conn.close()
+
+
+def nacti_doklady(obdobi, cislo_oz=None) -> list:
+    sql = "SELECT obdobi, asm, cislo_oz, doklad FROM nos_doklady WHERE obdobi=%s"
+    parametry = [obdobi]
+    if cislo_oz is not None:
+        sql += " AND cislo_oz=%s"
+        parametry.append(cislo_oz)
+    return _dotaz(sql + " ORDER BY asm, cislo_oz, id", tuple(parametry))
+
+
+def prehled_dokladu(obdobi) -> list:
+    """Počet dokladů po OZ za období; jméno OZ z Formulářů ASM (aktivní záznam má přednost)."""
+    jmena = {r['cislo_oz']: r['jmeno_oz'] for r in _dotaz(
+        "SELECT cislo_oz, jmeno_oz FROM asm_oz WHERE cislo_oz<>'' ORDER BY aktivni")}
+    radky = _dotaz("SELECT cislo_oz, MAX(asm) AS asm, COUNT(*) AS pocet FROM nos_doklady "
+                   "WHERE obdobi=%s GROUP BY cislo_oz ORDER BY asm, cislo_oz", (obdobi,))
+    return [{**r, 'jmeno_oz': jmena.get(r['cislo_oz'], '')} for r in radky]
 
 
 def nacti_podminky() -> dict:
@@ -599,15 +675,19 @@ _NULA = Decimal('0.00')
 
 
 def vypocet_oz(status, provize, smluvni, smluvni_do, obdobi, srazka, odmena, akce, n1, n2) -> dict:
-    """Vzorce ze zadání (ř. 6): H=max(F−E,0), L=E+H+I+J+K, M=−25 % L mimo OSVČ, P=L+M+N+O.
-    Smluvní odměna platí jen do svého termínu (včetně); bez termínu platí stále."""
+    """Vzorce ze zadání (ř. 6): H=max(F−E,0), M=−25 % L mimo OSVČ, P=L+M+N+O.
+    Mezisoučet (ř. 16): platí-li smluvní odměna, L = smluvní odměna a srážka i odměny
+    se přeskočí; jinak L = E+I+J+K. Smluvní odměna platí jen do svého termínu
+    (včetně); bez termínu platí stále."""
     d = lambda v: _NULA if v is None else Decimal(str(v)).quantize(Decimal('0.01'))
     provize = d(provize)
     smluvni = d(smluvni) if not smluvni_do or obdobi <= smluvni_do else _NULA
+    plati = smluvni != _NULA
     dorovnani = max(smluvni - provize, _NULA)
-    mezisoucet = provize + dorovnani + d(srazka) + d(odmena) + d(akce)
+    mezisoucet = smluvni if plati else provize + d(srazka) + d(odmena) + d(akce)
     odvod = _NULA if status == 'OSVČ' else -(mezisoucet * Decimal('0.25')).quantize(Decimal('0.01'))
     return {'provize': provize, 'smluvni': smluvni, 'smluvni_do': smluvni_do or '',
+            'smluvni_plati': plati,
             'dorovnani': dorovnani, 'srazka_asm': d(srazka), 'odmena_asm': d(odmena),
             'odmena_akce': d(akce), 'mezisoucet': mezisoucet, 'odvod': odvod,
             'naklady1': d(n1), 'naklady2': d(n2),
@@ -642,6 +722,99 @@ def _export_xlsx(jmeno, hlavicka, radky):
     cesta = intranet_lupa._tmp_cesta(jmeno)
     wb.save(cesta)
     intranet_lupa._stahni_soubor(cesta, jmeno)
+
+
+# ── PDF ──────────────────────────────────────────────────────────────────────
+
+# Řádek 10 zadání: co jde do PDF (status, termín a dorovnání ne). Třetí prvek:
+# None = vždy, True = jen když platí smluvní odměna (ř. 16 „ANO/NE"), False = jen
+# když neplatí — platná smluvní odměna srážku a odměny přeskočí.
+_PDF_POLE = [
+    ('provize', 'Odměna (provize)', None),
+    ('smluvni', 'Smluvní odměna', True),
+    ('srazka_asm', 'Srážka ASM', False),
+    ('odmena_asm', 'Odměna ASM', False),
+    ('odmena_akce', 'Odměna akce (tabák)', False),
+    ('mezisoucet', 'Mezisoučet', None),
+    ('odvod', 'Odvod 25 %', None),
+    ('naklady1', 'Náklady 1 (auto)', None),
+    ('naklady2', 'Náklady 2 (cestovné)', None),
+    ('final', 'Final FA, HM', None),
+]
+_PDF_TUCNE = {'mezisoucet', 'final'}
+_PDF_CSS = """<style>
+body{font-family:Arial,Helvetica,sans-serif;font-size:11pt;color:#222}
+h1{font-size:16pt;margin:0 0 4mm}
+.meta{margin-bottom:6mm;line-height:1.6}
+table{border-collapse:collapse;width:100%}
+td,th{border:1px solid #bbb;padding:2mm 3mm}
+th{background:#eee;text-align:left}
+td.kc{text-align:right;white-space:nowrap}
+tr.b td{font-weight:bold;background:#f5f5f5}
+.pata{margin-top:8mm;font-size:8pt;color:#888}
+</style>"""
+
+
+def _mesic_txt(obdobi) -> str:
+    return f'{obdobi[5:]}/{obdobi[:4]}'
+
+
+def _forma(status) -> str:
+    return 'FA' if status == 'OSVČ' else 'HM'
+
+
+def _html_dokument(titulek, telo) -> str:
+    cas = datetime.datetime.now().strftime('%d.%m.%Y %H:%M')
+    return (f'<!DOCTYPE html><html><head><meta charset="utf-8">{_PDF_CSS}</head><body>'
+            f'<h1>{html.escape(titulek)}</h1>{telo}'
+            f'<div class="pata">Vygenerováno {cas}</div></body></html>')
+
+
+def pdf_html_oz(r, obdobi) -> str:
+    """Podklad NOS jednoho OZ (řádek z podrobny_podklad)."""
+    e = html.escape
+    meta = (f'<div class="meta">Obchodní zástupce: <b>{e(str(r["cislo_oz"]))} – '
+            f'{e(r.get("jmeno_oz") or "")}</b><br>ASM: {e(r.get("asm") or "")}</div>')
+    radky = ''.join(
+        f'<tr{" class=b" if k in _PDF_TUCNE else ""}><td>{e(popis)}</td>'
+        f'<td class="kc">{_kc_text(r[k])} Kč</td></tr>'
+        for k, popis, kdy in _PDF_POLE if kdy is None or kdy == r['smluvni_plati'])
+    return _html_dokument(f'Podklad NOS – {_mesic_txt(obdobi)}',
+                          f'{meta}<table>{radky}</table>')
+
+
+def pdf_html_souhrn(radky, obdobi) -> str:
+    """Souhrnný podklad k vyplacení: final po OZ, FA (OSVČ) / HM (ostatní)."""
+    e = html.escape
+    telo = ''.join(
+        f'<tr><td>{e(str(r["cislo_oz"]))}</td><td>{e(r.get("jmeno_oz") or "")}</td>'
+        f'<td>{e(r.get("asm") or "")}</td><td>{_forma(r.get("status"))}</td>'
+        f'<td class="kc">{_kc_text(r["final"])} Kč</td></tr>' for r in radky)
+    celkem = sum((r['final'] for r in radky), _NULA)
+    return _html_dokument(
+        f'Podklad k vyplacení NOS – {_mesic_txt(obdobi)}',
+        '<table><tr><th>Číslo OZ</th><th>Jméno OZ</th><th>ASM</th><th>FA/HM</th>'
+        f'<th>Final</th></tr>{telo}<tr class=b><td colspan=4>Celkem</td>'
+        f'<td class="kc">{_kc_text(celkem)} Kč</td></tr></table>')
+
+
+def _nazev_pdf(r, obdobi) -> str:
+    jmeno = re.sub(r'[^\w-]+', '_', (r.get('jmeno_oz') or '').split('(')[0]).strip('_')
+    return f'NOS_{obdobi}_{r["cislo_oz"]}_{jmeno}.pdf'
+
+
+async def _render_pdfy(dokumenty, notifikace=None) -> list:
+    """[(název, html)] → [(název, bajty)]. Render deleguje na modul Sankce
+    (jedno sdílené Chromium za semaforem), stejně jako Lupopřípad."""
+    import intranet_sankce
+
+    def _zprava(text):
+        if notifikace is not None:
+            notifikace.message = text
+    return await intranet_sankce._render_pdf_bytes_batch(
+        dokumenty,
+        status_cb=lambda i, n, _: _zprava(f'Renderuji PDF {i}/{n}…'),
+        on_wait=lambda: _zprava('Čekám ve frontě na tiskárnu…'))
 
 
 # ── UI ───────────────────────────────────────────────────────────────────────
@@ -926,10 +1099,35 @@ def _podil(a, b):
     return a / b if b else None
 
 
-def _posledni_obdobi() -> str:
+def _posledni_obdobi(tabulka='nos_data') -> str:
     """Poslední měsíc, za který jsou nahraná data; bez dat aktuální měsíc."""
-    r = _dotaz("SELECT MAX(obdobi) AS o FROM nos_data")
+    r = _dotaz(f"SELECT MAX(obdobi) AS o FROM {tabulka}")
     return (r and r[0]['o']) or datetime.date.today().strftime('%Y-%m')
+
+
+def _nahravani(user_name, popis, po_importu):
+    """Upload XLSX pro import (data, podmínky i doklady — druh se pozná ze souboru)."""
+    async def zpracuj(e):
+        raw, nazev = await intranet_asm._precti_upload(e, up, reset=False)
+        if raw is None:
+            return
+        try:
+            vysledek = await asyncio.to_thread(importuj_soubor, raw, nazev, user_name)
+        except ValueError as exc:
+            ui.notify(f'{nazev}: {exc}', type='negative', multi_line=True)
+            return
+        except Exception as exc:
+            print(f'[nos] import {nazev}: {exc!r}')
+            ui.notify(f'{nazev}: import selhal, nic se neuložilo.', type='negative')
+            return
+        intranet_logger.log_activity(user_name, 'NOS', f'Import {nazev} → {vysledek}')
+        ui.notify(f'{nazev} → {vysledek}', type='positive', multi_line=True)
+        po_importu()
+
+    ui.label(popis).classes('text-sm text-gray-500')
+    up = ui.upload(on_upload=zpracuj, auto_upload=True, multiple=True, max_file_size=120_000_000,
+                   label='Vybrat .xlsx (lze více najednou)') \
+        .props('accept=.xlsx multiple').classes('w-full max-w-2xl')
 
 
 def _sekce_data(user_name):
@@ -972,30 +1170,9 @@ def _sekce_data(user_name):
                          _podil(r['provize'], r['obrat'] + r['obrat_site']), round(r['provize'], 2), r['jmeno']]
                       for r in data))
 
-    async def zpracuj(e):
-        raw, nazev = await intranet_asm._precti_upload(e, up, reset=False)
-        if raw is None:
-            return
-        try:
-            vysledek = await asyncio.to_thread(importuj_soubor, raw, nazev, user_name)
-        except ValueError as exc:
-            ui.notify(f'{nazev}: {exc}', type='negative', multi_line=True)
-            return
-        except Exception as exc:
-            print(f'[nos] import {nazev}: {exc!r}')
-            ui.notify(f'{nazev}: import selhal, nic se neuložilo.', type='negative')
-            return
-        intranet_logger.log_activity(user_name, 'NOS', f'Import {nazev} → {vysledek}')
-        ui.notify(f'{nazev} → {vysledek}', type='positive', multi_line=True)
-        stav_importu.refresh()
-        obsah.refresh()
-
-    ui.label('Nahrajte data.xlsx (list DATA) a obě tabulky podmínek (listy Kategorie, Skupiny). '
-             'Soubor se pozná podle listu. Data nahradí měsíce, které soubor obsahuje.') \
-        .classes('text-sm text-gray-500')
-    up = ui.upload(on_upload=zpracuj, auto_upload=True, multiple=True, max_file_size=120_000_000,
-                   label='Vybrat .xlsx (lze více najednou)') \
-        .props('accept=.xlsx multiple').classes('w-full max-w-2xl')
+    _nahravani(user_name, 'Nahrajte data.xlsx (list DATA) a obě tabulky podmínek (listy Kategorie, '
+                          'Skupiny). Soubor se pozná podle listu. Data nahradí měsíce, které '
+                          'soubor obsahuje.', lambda: (stav_importu.refresh(), obsah.refresh()))
     with ui.column().classes('gap-0 my-3'):
         stav_importu()
     with ui.row().classes('items-center gap-3'):
@@ -1026,6 +1203,138 @@ def _sekce_podrobny(user_id, prava):
     obsah()
 
 
+def _sekce_podklady(user_id, user_name, prava):
+    """PDF za každého OZ (ZIP) nebo jednotlivě, souhrnný podklad k vyplacení."""
+    stav = {'obdobi': _posledni_obdobi()}
+
+    def radky():
+        r = podrobny_podklad(stav['obdobi'], user_id, prava)
+        if not r:
+            ui.notify('Nemáte přiřazené žádné OZ.', type='warning')
+        return r
+
+    async def stahni(dokumenty, jmeno):
+        """Jeden dokument → PDF, víc → ZIP."""
+        pozn = ui.notification('Připravuji PDF…', spinner=True, timeout=None)
+        try:
+            pdfy = await _render_pdfy(dokumenty, pozn)
+        except Exception as e:
+            ui.notify(f'PDF se nepodařilo vytvořit: {e}', type='negative', multi_line=True)
+            return
+        finally:
+            pozn.dismiss()
+        cesta = intranet_lupa._tmp_cesta(jmeno)
+        if len(pdfy) == 1:
+            with open(cesta, 'wb') as f:
+                f.write(pdfy[0][1])
+        else:
+            with zipfile.ZipFile(cesta, 'w', zipfile.ZIP_DEFLATED) as z:
+                for nazev, data in pdfy:
+                    z.writestr(nazev, data)
+        intranet_lupa._stahni_soubor(cesta, jmeno)
+        intranet_logger.log_activity(user_name, 'NOS', f'Podklady NOS: {jmeno}')
+
+    def nazev_souhrnu(pripona):
+        return f"NOS_{stav['obdobi']}_k_vyplaceni.{pripona}"
+
+    async def vse():
+        if r := radky():
+            o = stav['obdobi']
+            await stahni([(_nazev_pdf(x, o), pdf_html_oz(x, o)) for x in r]
+                         + [(nazev_souhrnu('pdf'), pdf_html_souhrn(r, o))],
+                         f'NOS_podklady_{o}.zip')
+
+    async def souhrn_pdf():
+        if r := radky():
+            await stahni([(nazev_souhrnu('pdf'), pdf_html_souhrn(r, stav['obdobi']))],
+                         nazev_souhrnu('pdf'))
+
+    def souhrn_xlsx():
+        if r := radky():
+            _export_xlsx(nazev_souhrnu('xlsx'),
+                         ['Číslo OZ', 'Jméno OZ', 'ASM', 'Status', 'FA/HM', 'Final FA, HM'],
+                         ([x['cislo_oz'], x['jmeno_oz'], x['asm'], x['status'],
+                           _forma(x['status']), x['final']] for x in r))
+
+    async def jeden(radek):
+        o = stav['obdobi']
+        r = next((x for x in podrobny_podklad(o, user_id, prava)
+                  if str(x['cislo_oz']) == str(radek['cislo_oz'])), None)
+        if r:
+            await stahni([(_nazev_pdf(r, o), pdf_html_oz(r, o))], _nazev_pdf(r, o))
+
+    @ui.refreshable
+    def obsah():
+        _tabulka([('mezisoucet', 'Mezisoučet', 'kc'), ('final', 'Final FA, HM', 'kc')],
+                 [{k: (float(v) if isinstance(v, Decimal) else v) for k, v in r.items()}
+                  for r in podrobny_podklad(stav['obdobi'], user_id, prava)],
+                 jeden, ikona='picture_as_pdf', akce_vzdy=True)
+
+    with ui.row().classes('items-center gap-3 mb-2'):
+        _vyber_obdobi(stav, obsah.refresh)
+        ui.button('PDF všech OZ (ZIP)', icon='folder_zip', on_click=vse).props('flat')
+        ui.button('Podklad k vyplacení PDF', icon='picture_as_pdf',
+                  on_click=souhrn_pdf).props('flat')
+        ui.button('Podklad k vyplacení XLSX', icon='download',
+                  on_click=souhrn_xlsx).props('flat')
+    obsah()
+
+
+def _dialog_doklady(obdobi, radek):
+    doklady = [r['doklad'] for r in nacti_doklady(obdobi, radek['cislo_oz'])]
+    with ui.dialog() as d, ui.card().classes('w-[40rem] max-w-full'):
+        ui.label(f'Doklady {obdobi}').classes('text-lg font-bold')
+        ui.label(f"{radek['cislo_oz']} · {radek['jmeno_oz']} · {len(doklady)} dokladů") \
+            .classes('text-gray-500 -mt-2')
+        ui.label(', '.join(doklady)).classes('text-sm font-mono break-words max-h-96 overflow-auto')
+        with ui.row().classes('w-full justify-end'):
+            ui.button('Zavřít', on_click=d.close).props('flat')
+    d.open()
+
+
+def _sekce_doklady(user_name):
+    stav = {'obdobi': _posledni_obdobi('nos_doklady')}
+
+    @ui.refreshable
+    def obsah():
+        radky = prehled_dokladu(stav['obdobi'])
+        ui.label(f"{sum(r['pocet'] for r in radky)} dokladů · {len(radky)} OZ") \
+            .classes('font-bold text-gray-700 mb-2')
+        hledat = ui.input(placeholder='Hledat OZ, ASM…').props('dense outlined clearable') \
+            .classes('w-72 mb-2')
+        t = ui.table(columns=[
+            {'name': k, 'label': p, 'field': k, 'sortable': True,
+             'align': 'right' if k == 'pocet' else 'left'}
+            for k, p in (('asm', 'ASM'), ('cislo_oz', 'Číslo OZ'), ('jmeno_oz', 'Jméno OZ'),
+                         ('pocet', 'Dokladů'))] + [{'name': 'akce', 'label': '', 'field': 'akce'}],
+            rows=radky, row_key='cislo_oz', pagination=50).classes('w-full').props('flat bordered dense')
+        hledat.bind_value_to(t, 'filter')
+        t.add_slot('body-cell-akce', '''
+            <q-td :props="props" auto-width>
+                <q-btn flat round dense size="sm" icon="list"
+                       @click="$parent.$emit('doklady', props.row)"><q-tooltip>Čísla dokladů</q-tooltip></q-btn>
+            </q-td>''')
+        t.on('doklady', lambda e: _dialog_doklady(stav['obdobi'], e.args))
+
+    def export():
+        doklady = nacti_doklady(stav['obdobi'])
+        if not doklady:
+            ui.notify('Za zvolené období nejsou doklady.', type='warning')
+            return
+        jmena = {r['cislo_oz']: r['jmeno_oz'] for r in prehled_dokladu(stav['obdobi'])}
+        _export_xlsx(f"NOS_doklady_{stav['obdobi']}.xlsx",
+                     ['Měsíc', 'ASM', 'Dealer 3', 'Jméno OZ', 'Číslo dokladu'],
+                     ([r['obdobi'], r['asm'], r['cislo_oz'], jmena.get(r['cislo_oz'], ''), r['doklad']]
+                      for r in doklady))
+
+    _nahravani(user_name, 'Nahrajte doklady import.xlsx (list data: Měsíc, ASM, Dealer 3, Číslo '
+                          'dokladu). Nahradí měsíce, které soubor obsahuje.', lambda: obsah.refresh())
+    with ui.row().classes('items-center gap-3 mt-3'):
+        _vyber_obdobi(stav, obsah.refresh)
+        ui.button('Export XLSX', icon='download', on_click=export).props('flat').classes('mb-2')
+    obsah()
+
+
 # (klíč, ikona, název, popis, kdo vidí: None = každý s přístupem do modulu)
 _DLAZDICE = [
     ('data', '📥', 'Data', 'Import dat NOS a výpočet provizí', je_analytik),
@@ -1051,6 +1360,8 @@ def vykresli_nos(user_id: int, user_name: str, vsechna_prava: list):
     sekce = {   # dlaždice bez záznamu zde ještě nejsou hotové
         'data': lambda: _sekce_data(user_name),
         'podrobny': lambda: _sekce_podrobny(user_id, vsechna_prava),
+        'podklady': lambda: _sekce_podklady(user_id, user_name, vsechna_prava),
+        'doklady': lambda: _sekce_doklady(user_name),
         'info': lambda: _sekce_info(user_id, user_name, vsechna_prava),
         'odmeny': lambda: _sekce_odmeny(user_id, user_name, vsechna_prava),
         'naklady2': lambda: _sekce_naklady2(user_id, user_name, vsechna_prava),
@@ -1125,4 +1436,21 @@ if __name__ == '__main__':      # rychlá kontrola vstupů (bez DB)
     _v = vypocet_oz('ZAM', 55555, 60000, '2026-06', '2026-07', -2000, 500, 1500, -10500, None)
     assert _v['dorovnani'] == 0 and _v['mezisoucet'] == 55555
     assert _v['odvod'] == Decimal('-13888.75') and _v['final'] == Decimal('31166.25')
+    # ř. 16: platná smluvní odměna přeskočí srážku i odměny, mezisoučet = smluvní
+    _v = vypocet_oz('ZAM', 50000, 60000, None, '2026-06', -2000, 500, 300, -1000, -500)
+    assert _v['smluvni_plati'] and _v['mezisoucet'] == 60000 and _v['dorovnani'] == 10000
+    assert _v['odvod'] == -15000 and _v['final'] == 43500
+    _v = vypocet_oz('OSVČ', 50000, None, None, '2026-06', -2000, 500, 300, 0, 0)
+    assert not _v['smluvni_plati'] and _v['mezisoucet'] == 48800 and _v['final'] == 48800
+    # PDF: smluvní řádek jen když platí, srážka/odměny jen když neplatí; status ne
+    _r = {'cislo_oz': '7', 'jmeno_oz': 'A <b>', 'asm': 'X', 'status': 'ZAM',
+          **vypocet_oz('ZAM', 50000, 60000, None, '2026-06', -2000, 500, 300, 0, 0)}
+    _h = pdf_html_oz(_r, '2026-06')
+    assert 'Smluvní odměna' in _h and 'Srážka ASM' not in _h and 'A &lt;b&gt;' in _h
+    assert '06/2026' in _h and 'ZAM' not in _h and '60 000,00 Kč' in _h
+    _h = pdf_html_oz({**_r, **_v}, '2026-06')
+    assert 'Smluvní odměna' not in _h and 'Srážka ASM' in _h and 'Odměna akce' in _h
+    _h = pdf_html_souhrn([_r, {**_r, **_v, 'status': 'OSVČ'}], '2026-06')
+    assert '>HM<' in _h and '>FA<' in _h and '93 800,00 Kč' in _h
+    assert _nazev_pdf(_r, '2026-06') == 'NOS_2026-06_7_A_b.pdf'
     print('OK: intranet_nos')
