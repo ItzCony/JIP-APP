@@ -822,10 +822,6 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
         except Exception:
             _pocet_ukolu = 0
 
-    # Čeká na mé rozhodnutí (schvalovatel) + moje vrácené k doplnění (zadavatel).
-    _pocet_naklady_veletrh = (intranet_naklady_veletrh.pocet_akci(user_id, vsechna_prava)
-                              if ma_pristup_naklady_veletrh else 0)
-
     # klíč = název tabu, tedy to, co zapisuje prepni_tab do historie
     dlazdice = [d for d in (
         _d('kviz', ma_pristup_kviz, '👨‍🎓', nazev_kviz, '#22c55e', _otevri_kviz),
@@ -863,7 +859,7 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
         _d('uloziste', ma_pristup_uloziste, '🗄️', 'Datové úložiště', '#64748b',
            _akce('uloziste')),
         _d('naklady_veletrh', ma_pristup_naklady_veletrh, '🧾', 'Náklady veletrh', '#0d9488',
-           _akce('naklady_veletrh'), _pocet_naklady_veletrh),
+           _akce('naklady_veletrh')),
     ) if d]
 
     podle_klice = {d['klic']: d for d in dlazdice}

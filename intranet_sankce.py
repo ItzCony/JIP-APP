@@ -6462,11 +6462,12 @@ def _s_kotvou(defs: list, kotva) -> list:
             for c in defs]
 
 
-def _kotva_tlacitko(klic: str, defs_fn, grid_fn, vychozi=()):
+def _kotva_tlacitko(klic: str, defs_fn, grid_fn, vychozi=(), po_zmene=None):
     """Tlačítko „Ukotvit sloupce" s nabídkou zaškrtávátek pro jeden grid.
     `defs_fn(kotva)` vrátí columnDefs s ukotvením, `grid_fn()` grid (ten může
     vzniknout až po tlačítku). Volba se uživateli uloží; běžící grid se
-    nepřestavuje — filtry, řazení i posun zůstanou.
+    nepřestavuje — filtry, řazení i posun zůstanou. `po_zmene(grid)` se zavolá
+    po každé změně ukotvení (Monitory přes něj dorovnají šířky sloupců).
     Vrací (tlačítko, počáteční seznam ukotvených colId)."""
     volitelne = [(_col_id(c), c.get('headerName') or _col_id(c))
                  for c in defs_fn(()) if not c.get('pinned')]
@@ -6484,6 +6485,8 @@ def _kotva_tlacitko(klic: str, defs_fn, grid_fn, vychozi=()):
         g.run_grid_method('applyColumnState', {'state': [
             {'colId': k, 'pinned': 'left' if k in stav['v'] else None}
             for k, _ in volitelne]})
+        if po_zmene:
+            po_zmene(g)
 
     def _chk(k, zapnuto):
         if not stav['ticho']:
@@ -7629,8 +7632,17 @@ async def _vykresli_nedodavky(user_id, user_name, vsechna_prava):
 # =========================================================
 # VSTUPNÍ OBRAZOVKA — DLAŽDICE SESTAV
 # =========================================================
-def _dlazdice(emoji, nadpis, barva_border, barva_btn, on_click):
-    """Klasická čtvercová dlaždice (stejný styl jako na hlavní nástěnce)."""
+def _dlazdice(emoji, nadpis, barva_border, barva_btn, on_click=None):
+    """Klasická čtvercová dlaždice (stejný styl jako na hlavní nástěnce).
+    Bez on_click = neaktivní: šedá, bez hover efektu, nekliká se."""
+    if on_click is None:
+        with ui.card().classes('w-80 h-72 items-center justify-center shadow-xl '
+                               'bg-gray-100 rounded-2xl border border-gray-300'):
+            ui.label(emoji).classes('text-7xl mb-6').style('filter: grayscale(1); opacity: .5')
+            ui.label(nadpis).classes('text-2xl font-bold text-gray-400 mb-4 text-center')
+            ui.button('Otevřít').props('disable').classes(
+                'bg-gray-400 text-white font-bold py-3 px-8 rounded-lg')
+        return
     with ui.card().classes(
         'w-80 h-72 items-center justify-center shadow-xl hover:scale-105 '
         'transition-transform duration-300 cursor-pointer bg-white rounded-2xl '
@@ -7666,7 +7678,7 @@ async def vykresli_sankce(user_id, user_name, vsechna_prava):
     pohled = app.storage.user.get('sankce_pohled')
     if pohled == 'vystaveni' and not vidi_vystaveni:
         pohled = None
-    if pohled == 'zamitnute' and not vidi_zamitnute:
+    if pohled == 'zamitnute':   # sekce zatím neaktivní (i uložený pohled z dřívějška)
         pohled = None
     if pohled == 'tikety' and not vidi_tikety:
         pohled = None
@@ -7728,12 +7740,8 @@ async def vykresli_sankce(user_id, user_name, vsechna_prava):
         return
 
     with ui.row().classes('w-full gap-8 flex-wrap pt-4'):
-        if vidi_zamitnute:
-            def _otevri_z():
-                app.storage.user['sankce_pohled'] = 'zamitnute'
-                vykresli_sankce.refresh()
-            _dlazdice('🚫', 'Zamítnuté dodávky dodavatelem',
-                      'border-orange-200', 'bg-orange-600 hover:bg-orange-700', _otevri_z)
+        if vidi_zamitnute:   # sekce zatím neaktivní
+            _dlazdice('🚫', 'Zamítnuté dodávky dodavatelem', None, None)
         if vidi_vystaveni:
             def _otevri_v():
                 app.storage.user['sankce_pohled'] = 'vystaveni'

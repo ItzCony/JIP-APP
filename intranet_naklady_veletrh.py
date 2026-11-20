@@ -1,21 +1,16 @@
-"""Náklady veletrh — evidence a schvalování nákladů firemního veletrhu JIP 2027.
+"""Náklady veletrh — evidence nákladů a rozpočtu firemního veletrhu JIP 2027.
 
 Samostatná dlaždice na přehledu; s Plánem Veletrh 2027 (intranet_veletrh) nesouvisí.
 
-Zadavatel zadá náklad (kategorie, dodavatel, částka bez DPH + sazba → s DPH,
-splatnost, zdůvodnění, přílohy) a uloží ho jako koncept, nebo odešle ke schválení
-— schvalovatelům přijde e-mail s odkazem. Schvalovatel náklad schválí, zamítne,
-nebo vrátí k doplnění (zamítnutí a vrácení s povinným komentářem), zadavateli
-přijde e-mail s výsledkem; zaplacený náklad označí jako uhrazený. Do čerpání se
-počítá jen schválené a uhrazené, čekající se ukazuje zvlášť jako rezervace.
-Náklad, se kterým by čerpání přesáhlo celkový rozpočet, schválit nejde. Každá
-akce i změna rozpočtu jde do historie. Na náklady čekající déle než 3 pracovní
-dny upozorní schvalovatele souhrnný e-mail. Koncept vidí jen jeho autor,
-o vlastním nákladu schvalovatel nerozhoduje. Částečný správce smí totéž co
-schvalovatel (rozpočet, kategorie, uhrazeno, komentáře), jen o nákladech nerozhoduje
-a nechodí mu e-maily o nákladech ke schválení.
+Bez schvalování. Náklad má očekávanou částku a po příchodu faktury i oficiální částku
+z faktury. Všechny částky i rozpočty jsou bez DPH, DPH modul neřeší (sloupce sazba_dph,
+castka_s_dph a faktura_s_dph zůstaly ve staré DB jen jako archiv). Rozdíl = očekáváno − faktura
+(kladný = ušetřeno). Stav se odvozuje: bez faktury „Čeká na fakturu“, s ní „Fakturováno“.
+Rozpočet: čerpáno = faktury, čeká = očekávané náklady bez faktury; jejich součet je
+odhad konečných nákladů a volné = rozpočet − odhad. Každá změna jde do historie.
+Náklad upravuje a maže jeho autor (zadavatel), cizí jen správce.
 Práva: naklady_veletrh_zadavatel / _schvalovatel / _spravce / _ctenar ('vse' = všechna).
-Role 'spravce' = správa modulu; schvalovatel ji má automaticky navíc k rozhodování.
+Schvalovatel (z doby schvalování) = správce: navíc nastavuje rozpočet a kategorie.
 Záložka Organizátor (zadavatel + spravce): body plánu s hotovo/nehotovo a komentáře
 k nim. Bod upravuje, odškrtává a maže jen jeho autor, komentář maže jen jeho autor.
 """
@@ -35,22 +30,17 @@ from contextlib import contextmanager
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 from fastapi.responses import FileResponse, PlainTextResponse
-from nicegui import app, background_tasks, ui
+from nicegui import app, ui
 
 import intranet_data
-import intranet_emaily
 import intranet_logger
 
 PRAVO_ZADAVATEL = 'naklady_veletrh_zadavatel'
 PRAVO_SCHVALOVATEL = 'naklady_veletrh_schvalovatel'
-PRAVO_SPRAVCE = 'naklady_veletrh_spravce'      # Částečný správce — jako schvalovatel, ale nerozhoduje
+PRAVO_SPRAVCE = 'naklady_veletrh_spravce'      # Částečný správce — od zrušení schvalování totéž co schvalovatel
 PRAVO_CTENAR = 'naklady_veletrh_ctenar'
-POVINNA_PRILOHA_OD = 10_000     # Kč s DPH — od této částky je povinná příloha (nabídka/faktura)
-VAROVANI_KATEGORIE = 0.85       # čerpání kategorie včetně čekajících
-VAROVANI_CELKEM = 0.90          # čerpání celého rozpočtu včetně čekajících
-PRIPOMINKA_PO = 3               # pracovních dní čekání → souhrnná připomínka schvalovatelům
-PRIPOMINKA_HODINA = 8           # nejdřív v kolik (jednou za pracovní den)
-DPH_SAZBY = (21, 12, 0)
+VAROVANI_KATEGORIE = 0.85       # odhad nákladů kategorie (faktury + očekávané) vůči jejímu rozpočtu
+VAROVANI_CELKEM = 0.90          # odhad nákladů celé akce vůči celkovému rozpočtu
 MAX_PRILOHA = 20 * 1024 * 1024
 PRILOHY = ('.pdf', '.png', '.jpg', '.jpeg', '.xlsx', '.xls', '.docx', '.doc', '.csv', '.txt')
 _V_PROHLIZECI = ('.pdf', '.png', '.jpg', '.jpeg')       # ostatní přílohy se stáhnou
@@ -58,27 +48,15 @@ ADRESAR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'naklady_vele
 _LOG = 'Náklady veletrh'
 _DEEP = 'naklady_veletrh_naklad'     # app.storage.user: deep-link z e-mailu (/naklady_veletrh?naklad=<id>)
 
-_STAVY = {
-    'koncept':   ('Koncept', 'grey-6'),
-    'ceka':      ('Čeká na schválení', 'amber-8'),
-    'vraceno':   ('Vráceno k doplnění', 'orange-9'),
-    'schvaleno': ('Schváleno', 'green-7'),
-    'zamitnuto': ('Zamítnuto', 'red-7'),
-    'uhrazeno':  ('Uhrazeno', 'teal-7'),
+_STAVY = {      # odvozený z faktury, uživatel ho nenastavuje
+    'ocekavano':   ('Čeká na fakturu', 'amber-8'),
+    'fakturovano': ('Fakturováno', 'green-7'),
 }
-CERPANO = ('schvaleno', 'uhrazeno')
-OTEVRENE = ('koncept', 'vraceno', 'ceka')       # autor ještě smí upravovat
-_ROZHODNUTI = {'schvalit': ('schvaleno', 'Schválil(a) náklad'),
-               'zamitnout': ('zamitnuto', 'Zamítl(a) náklad'),
-               'vratit': ('vraceno', 'Vrátil(a) náklad k doplnění')}
-_HLASKY = {'komentar': 'Komentář přidán.', 'odeslat': 'Náklad odeslán ke schválení.',
-           'stahnout': 'Náklad stažen zpět do konceptu.', 'schvalit': 'Náklad schválen.',
-           'zamitnout': 'Náklad zamítnut.', 'vratit': 'Náklad vrácen k doplnění.',
-           'uhrazeno': 'Náklad označen jako uhrazený.'}
+_HLASKY = {'komentar': 'Komentář přidán.', 'smazat': 'Náklad smazán.'}
 _CERPANO_BARVA, _CEKA_BARVA, _TENTO_BARVA, _VOLNE_BARVA = '#1B2430', '#f59e0b', '#ea580c', '#e5e7eb'
 _MESICE = ('led', 'úno', 'bře', 'dub', 'kvě', 'čvn', 'čvc', 'srp', 'zář', 'říj', 'lis', 'pro')
 
-_VYCHOZI_KATEGORIE = (      # doporučení ze zadání; rozpočty jsou ilustrativní, upraví je schvalovatel
+_VYCHOZI_KATEGORIE = (      # doporučení ze zadání; rozpočty jsou ilustrativní, upraví je správce
     ('Pronájem výstavní plochy', 600_000, '#1B2430'),
     ('Stánek a expozice', 700_000, '#E4572E'),
     ('Doprava a logistika', 250_000, '#3D7EA6'),
@@ -143,10 +121,6 @@ def _castka(text) -> Decimal | None:
     except (InvalidOperation, ValueError):
         return None
     return d.quantize(Decimal('0.01'), ROUND_HALF_UP) if d.is_finite() and abs(d) < 10 ** 12 else None
-
-
-def _s_dph(bez, sazba) -> Decimal:
-    return (bez * (100 + sazba) / 100).quantize(Decimal('0.01'), ROUND_HALF_UP)
 
 
 def _kod(nid) -> str:
@@ -215,11 +189,11 @@ _SCHEMA = (
         dodavatel VARCHAR(255) NOT NULL,
         dodavatel_ico VARCHAR(20) NULL,
         castka_bez_dph DECIMAL(15,2) NOT NULL,
-        sazba_dph INT NOT NULL,
-        castka_s_dph DECIMAL(15,2) NOT NULL,
+        faktura_bez_dph DECIMAL(15,2) NULL,
+        fakturovano DATETIME NULL,
         splatnost DATE NULL,
         zduvodneni TEXT NOT NULL,
-        stav VARCHAR(20) NOT NULL DEFAULT 'koncept',
+        stav VARCHAR(20) NOT NULL DEFAULT 'ocekavano',
         zadal_id INT NOT NULL,
         zadal_jmeno VARCHAR(255),
         vytvoreno DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -292,6 +266,17 @@ def inicializace_db():
         cur = conn.cursor(buffered=True)
         for prikaz in _SCHEMA:
             cur.execute(prikaz)
+        cur.execute("SELECT COLUMN_NAME, IS_NULLABLE FROM information_schema.COLUMNS "
+                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'naklady_veletrh'")
+        sloupce = dict(cur.fetchall())
+        if 'faktura_bez_dph' not in sloupce:     # přechod ze schvalování
+            cur.execute('ALTER TABLE naklady_veletrh ADD COLUMN faktura_bez_dph DECIMAL(15,2) NULL, '
+                        'ADD COLUMN fakturovano DATETIME NULL, '
+                        "ALTER COLUMN stav SET DEFAULT 'ocekavano'")
+            cur.execute("UPDATE naklady_veletrh SET stav = 'ocekavano'")
+        if sloupce.get('sazba_dph') == 'NO':     # zrušení DPH: staré sloupce s DPH zůstávají jen jako archiv
+            cur.execute('ALTER TABLE naklady_veletrh MODIFY sazba_dph INT NULL, '
+                        'MODIFY castka_s_dph DECIMAL(15,2) NULL')
         cur.executemany('INSERT IGNORE INTO naklady_veletrh_nastaveni (klic, hodnota) VALUES (%s, %s)',
                         list(_VYCHOZI_NASTAVENI.items()))
         cur.execute('SELECT COUNT(*) FROM naklady_veletrh_kategorie')
@@ -353,11 +338,14 @@ def _nastaveni(cur) -> dict:
 
 
 def _prehled(cur) -> dict:
-    """Rozpočet a čerpání celku i kategorií. Čerpáno = schváleno + uhrazeno, čeká = rezervace."""
+    """Rozpočet celku i kategorií. Čerpáno = faktury, čeká = očekávané náklady bez faktury,
+    čerpáno + čeká = odhad konečných nákladů. Rozdíl = očekáváno − faktura u fakturovaných."""
     nast = _nastaveni(cur)
     cur.execute("SELECT k.id, k.nazev, k.rozpocet, k.barva, "
-                "COALESCE(SUM(CASE WHEN n.stav IN ('schvaleno','uhrazeno') THEN n.castka_s_dph END), 0) AS cerpano, "
-                "COALESCE(SUM(CASE WHEN n.stav = 'ceka' THEN n.castka_s_dph END), 0) AS ceka "
+                "COALESCE(SUM(n.faktura_bez_dph), 0) AS cerpano, "
+                "COALESCE(SUM(CASE WHEN n.faktura_bez_dph IS NULL THEN n.castka_bez_dph END), 0) AS ceka, "
+                "COALESCE(SUM(n.castka_bez_dph), 0) AS ocekavano, "
+                "COALESCE(SUM(n.castka_bez_dph - n.faktura_bez_dph), 0) AS rozdil "
                 "FROM naklady_veletrh_kategorie k LEFT JOIN naklady_veletrh n ON n.kategorie_id = k.id "
                 "GROUP BY k.id ORDER BY k.poradi, k.id")
     kategorie = cur.fetchall()
@@ -367,11 +355,15 @@ def _prehled(cur) -> dict:
         k['prekroceno'] = k['volne'] < 0
         k['varovani'] = k['podil'] > VAROVANI_KATEGORIE
     celkem = _castka(nast['rozpocet']) or Decimal(0)
-    cerpano = sum((k['cerpano'] for k in kategorie), Decimal(0))
-    ceka = sum((k['ceka'] for k in kategorie), Decimal(0))
+
+    def soucet(klic):
+        return sum((k[klic] for k in kategorie), Decimal(0))
+
+    cerpano, ceka = soucet('cerpano'), soucet('ceka')
     return {'nastaveni': nast, 'kategorie': kategorie, 'celkem': celkem, 'cerpano': cerpano, 'ceka': ceka,
+            'ocekavano': soucet('ocekavano'), 'rozdil': soucet('rozdil'),
             'volne': celkem - cerpano - ceka, 'podil': _podil(cerpano + ceka, celkem),
-            'rozdeleno': sum((k['rozpocet'] for k in kategorie), Decimal(0))}
+            'rozdeleno': soucet('rozpocet')}
 
 
 def _mesice(od, do) -> list[str]:
@@ -389,9 +381,9 @@ def _mesice(od, do) -> list[str]:
 
 
 def _graf(cur, p) -> dict:
-    """Kumulativní čerpání podle měsíce schválení vs. rovnoměrný plán do měsíce veletrhu."""
-    cur.execute("SELECT LEFT(rozhodnuto, 7) AS m, SUM(castka_s_dph) AS s FROM naklady_veletrh "
-                "WHERE stav IN ('schvaleno','uhrazeno') GROUP BY LEFT(rozhodnuto, 7)")
+    """Kumulativní fakturace podle měsíce zadání faktury vs. rovnoměrný plán do měsíce veletrhu."""
+    cur.execute("SELECT LEFT(fakturovano, 7) AS m, SUM(faktura_bez_dph) AS s FROM naklady_veletrh "
+                "WHERE faktura_bez_dph IS NOT NULL GROUP BY LEFT(fakturovano, 7)")
     po_mesicich = {r['m']: r['s'] for r in cur.fetchall()}
     dnes = datetime.date.today().strftime('%Y-%m')
     mesice = _mesice(p['nastaveni']['plan_od'], p['nastaveni']['datum_akce']) or [dnes]
@@ -404,71 +396,39 @@ def _graf(cur, p) -> dict:
             'plan': [round(float(p['celkem']) * (i + 1) / len(mesice)) for i in range(len(mesice))]}
 
 
-def _nacti(user_id) -> dict:
-    """Vše, co modul zobrazuje: rozpočet, náklady, které uživatel vidí (cizí koncepty ne),
-    jejich přílohy a historie, historie rozpočtu a řada pro graf čerpání."""
+def _nacti() -> dict:
+    """Vše, co modul zobrazuje: rozpočet, náklady, jejich přílohy a historie, historie
+    rozpočtu a řada pro graf fakturace."""
     with _transakce() as cur:
         p = _prehled(cur)
-        cur.execute(_SELECT + " WHERE n.stav <> 'koncept' OR n.zadal_id = %s ORDER BY n.id DESC", (user_id,))
+        cur.execute(_SELECT + ' ORDER BY n.id DESC')
         naklady = cur.fetchall()
-        viditelne = {n['id'] for n in naklady}
         prilohy, historie = defaultdict(list), defaultdict(list)
         cur.execute('SELECT id, naklad_id, nazev, velikost FROM naklady_veletrh_prilohy ORDER BY id')
         for r in cur.fetchall():
-            if r['naklad_id'] in viditelne:
-                prilohy[r['naklad_id']].append(r)
+            prilohy[r['naklad_id']].append(r)
         cur.execute('SELECT naklad_id, kdo, akce, komentar, cas FROM naklady_veletrh_historie ORDER BY cas, id')
         for r in cur.fetchall():
-            if r['naklad_id'] is None or r['naklad_id'] in viditelne:
-                historie[r['naklad_id']].append(r)
+            historie[r['naklad_id']].append(r)
         graf = _graf(cur, p)
     return {'prehled': p, 'naklady': naklady, 'podle_id': {n['id']: n for n in naklady},
             'prilohy': prilohy, 'historie': historie, 'graf': graf}
 
 
-def _dopad(n, p) -> dict | None:
-    """Co udělá schválení nákladu s rozpočtem kategorie a celé akce."""
-    kat = next((k for k in p['kategorie'] if k['id'] == n['kategorie_id']), None)
-    if not kat:
-        return None
-    castka = n['castka_s_dph']
-    otevreny = n['stav'] in OTEVRENE
-    po = kat['rozpocet'] - kat['cerpano'] - (castka if otevreny else 0)
-    return {'kat': kat, 'castka': castka, 'otevreny': otevreny, 'po': po,
-            'po_podil': _podil(po, kat['rozpocet']),
-            'ostatni_ceka': kat['ceka'] - (castka if n['stav'] == 'ceka' else 0),
-            'celkem_po': p['celkem'] - p['cerpano'] - (castka if otevreny else 0),
-            'blokovano': n['stav'] == 'ceka' and p['cerpano'] + castka > p['celkem']}
-
-
-def _chyby_odeslani(cur, nid) -> list[str]:
-    cur.execute('SELECT n.castka_s_dph, (SELECT COUNT(*) FROM naklady_veletrh_prilohy p '
-                'WHERE p.naklad_id = n.id) AS prilohy FROM naklady_veletrh n WHERE n.id = %s', (nid,))
-    r = cur.fetchone()
-    if r and r['castka_s_dph'] >= POVINNA_PRILOHA_OD and not r['prilohy']:
-        return [f'U nákladu od {_kc(POVINNA_PRILOHA_OD)} s DPH je povinná příloha (nabídka nebo faktura).']
-    return []
-
-
-def _odeslat(cur, nid, user_id, kdo):
-    """Ke schválení; rozhodnutí z minulého kola (vrácení) se maže — zůstane v historii."""
-    cur.execute("UPDATE naklady_veletrh SET stav = 'ceka', odeslano = NOW(), upraveno = NOW(), "
-                "rozhodl_id = NULL, rozhodl_jmeno = NULL, rozhodnuto = NULL WHERE id = %s", (nid,))
-    _zapis(cur, nid, user_id, kdo, 'Odeslal(a) ke schválení')
-
-
 _POLE_ZMENY = (('nazev', 'název'), ('kategorie_id', 'kategorie'), ('dodavatel', 'dodavatel'),
-               ('dodavatel_ico', 'IČO'), ('castka_s_dph', 'částka s DPH'), ('sazba_dph', 'sazba DPH'),
-               ('splatnost', 'splatnost'), ('zduvodneni', 'zdůvodnění'))
+               ('dodavatel_ico', 'IČO'), ('castka_bez_dph', 'očekáváno'), ('faktura_bez_dph', 'faktura'),
+               ('splatnost', 'splatnost'), ('zduvodneni', 'poznámka'))
 
 
 def _zmeny(stary, novy, kategorie) -> str:
-    """Čitelný souhrn úprav do historie — schvalovatel vidí, co se změnilo."""
+    """Čitelný souhrn úprav do historie."""
     def txt(klic, v):
         if v is None or v == '':
             return '—'
-        return {'kategorie_id': lambda: kategorie.get(v, '?'), 'castka_s_dph': lambda: _kc(v, True),
-                'sazba_dph': lambda: f'{v} %', 'splatnost': lambda: _datum(v)}.get(klic, lambda: str(v))()
+        if klic in ('castka_bez_dph', 'faktura_bez_dph'):
+            return _kc(v, True)
+        return {'kategorie_id': lambda: kategorie.get(v, '?'),
+                'splatnost': lambda: _datum(v)}.get(klic, lambda: str(v))()
     out = []
     for klic, popis in _POLE_ZMENY:
         if stary[klic] != novy[klic]:
@@ -477,12 +437,14 @@ def _zmeny(stary, novy, kategorie) -> str:
     return '; '.join(out)
 
 
-def _uloz(user_id, kdo, nid, d, nove_prilohy, odeslat) -> tuple[int, list[str]]:
-    """Založí (nid None) nebo upraví vlastní náklad, připojí nahrané přílohy
-    [(název, disk, velikost)] a případně ho odešle. Vrací (nid, chyby odeslání) — s chybami
-    zůstane uložený (nový jako koncept). Čekající náklad musí pravidla splňovat i po úpravě."""
+def _uloz(user_id, kdo, role, nid, d, nove_prilohy) -> int:
+    """Založí (nid None) nebo upraví náklad a připojí nahrané přílohy [(název, disk, velikost)].
+    Cizí náklad upraví jen správce. Vyplněná faktura přepne stav na Fakturováno."""
+    if not role & {'zadavatel', 'spravce'}:
+        raise Chyba('Náklady zadává jen zadavatel nebo správce.')
     hodnoty = (d['nazev'], d['kategorie_id'], d['dodavatel'], d['dodavatel_ico'], d['castka_bez_dph'],
-               d['sazba_dph'], d['castka_s_dph'], d['splatnost'], d['zduvodneni'])
+               d['faktura_bez_dph'], d['splatnost'], d['zduvodneni'],
+               'ocekavano' if d['faktura_bez_dph'] is None else 'fakturovano')
     with _transakce() as cur:
         cur.execute('SELECT id, nazev FROM naklady_veletrh_kategorie')
         kategorie = {r['id']: r['nazev'] for r in cur.fetchall()}
@@ -490,19 +452,24 @@ def _uloz(user_id, kdo, nid, d, nove_prilohy, odeslat) -> tuple[int, list[str]]:
             raise Chyba('Vybraná kategorie už neexistuje.')
         if nid is None:
             cur.execute('INSERT INTO naklady_veletrh (nazev, kategorie_id, dodavatel, dodavatel_ico, castka_bez_dph, '
-                        'sazba_dph, castka_s_dph, splatnost, zduvodneni, zadal_id, zadal_jmeno) '
-                        'VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)', hodnoty + (user_id, kdo))
-            nid, stav = cur.lastrowid, 'koncept'
+                        'faktura_bez_dph, splatnost, zduvodneni, stav, fakturovano, zadal_id, zadal_jmeno) '
+                        'VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, IF(%s IS NULL, NULL, NOW()), %s, %s)',
+                        hodnoty + (d['faktura_bez_dph'], user_id, kdo))
+            nid = cur.lastrowid
             _zapis(cur, nid, user_id, kdo, 'Vytvořil(a) náklad')
         else:
             cur.execute('SELECT * FROM naklady_veletrh WHERE id = %s FOR UPDATE', (nid,))
             n = cur.fetchone()
-            if not n or n['zadal_id'] != user_id or n['stav'] not in OTEVRENE:
-                raise Chyba('Náklad už upravit nelze — mezitím o něm někdo rozhodl.')
-            stav = n['stav']
+            if not n:
+                raise Chyba('Náklad mezitím někdo smazal.')
+            if n['zadal_id'] != user_id and 'spravce' not in role:
+                raise Chyba('Cizí náklad upravuje jen správce.')
+            # fakturovano až za faktura_bez_dph — MySQL přiřazuje zleva, takže vidí novou hodnotu
             cur.execute('UPDATE naklady_veletrh SET nazev = %s, kategorie_id = %s, dodavatel = %s, '
-                        'dodavatel_ico = %s, castka_bez_dph = %s, sazba_dph = %s, castka_s_dph = %s, '
-                        'splatnost = %s, zduvodneni = %s, upraveno = NOW() WHERE id = %s', hodnoty + (nid,))
+                        'dodavatel_ico = %s, castka_bez_dph = %s, faktura_bez_dph = %s, splatnost = %s, '
+                        'zduvodneni = %s, stav = %s, '
+                        'fakturovano = IF(faktura_bez_dph IS NULL, NULL, COALESCE(fakturovano, NOW())), '
+                        'upraveno = NOW() WHERE id = %s', hodnoty + (nid,))
             zmeny = _zmeny(n, d, kategorie)
             if zmeny:
                 _zapis(cur, nid, user_id, kdo, 'Upravil(a) náklad', zmeny)
@@ -510,82 +477,43 @@ def _uloz(user_id, kdo, nid, d, nove_prilohy, odeslat) -> tuple[int, list[str]]:
             cur.execute('INSERT INTO naklady_veletrh_prilohy (naklad_id, nazev, disk, velikost, nahral_jmeno) '
                         'VALUES (%s, %s, %s, %s, %s)', (nid, nazev, disk, velikost, kdo))
             _zapis(cur, nid, user_id, kdo, f'Přidal(a) přílohu „{nazev}“')
-        if stav == 'ceka' or odeslat:
-            chyby = _chyby_odeslani(cur, nid)
-            if chyby and stav == 'ceka':
-                raise Chyba(' '.join(chyby))
-            if not chyby and stav != 'ceka':
-                _odeslat(cur, nid, user_id, kdo)
-            return nid, chyby
-    return nid, []
+    return nid
 
 
 def _proved(user_id, kdo, role, nid, akce, komentar='') -> dict:
-    """Akce nad nákladem v jedné transakci se zamčeným řádkem — dva schvalovatelé
-    nerozhodnou totéž dvakrát. Schválení zamyká i celkový rozpočet (stejně jako jeho
-    změna), takže ho souběžná schválení nepřečerpají. Vrací náklad před akcí."""
+    """Komentář, nebo smazání nákladu (vlastní, cizí jen správce) v transakci se zamčeným
+    řádkem. Vrací náklad před akcí."""
     komentar = (komentar or '').strip()[:4000]
+    disky = []
     with _transakce() as cur:
-        if akce == 'schvalit':
-            cur.execute("SELECT hodnota FROM naklady_veletrh_nastaveni WHERE klic = 'rozpocet' FOR UPDATE")
-            celkem = _castka(cur.fetchone()['hodnota']) or Decimal(0)
         cur.execute('SELECT * FROM naklady_veletrh WHERE id = %s FOR UPDATE', (nid,))
         n = cur.fetchone()
-        if not n or (n['stav'] == 'koncept' and n['zadal_id'] != user_id):
-            raise Chyba('Náklad nenalezen.')
-        vlastni = n['zadal_id'] == user_id
+        if not n:
+            raise Chyba('Náklad nenalezen — mezitím ho někdo smazal.')
         if akce == 'komentar':
             if not role & {'zadavatel', 'spravce'}:
-                raise Chyba('Komentáře píše jen zadavatel, správce nebo schvalovatel.')
+                raise Chyba('Komentáře píše jen zadavatel nebo správce.')
             if not komentar:
                 raise Chyba('Napište text komentáře.')
             _zapis(cur, nid, user_id, kdo, 'Komentář', komentar)
-        elif akce == 'odeslat':
-            if not (vlastni and 'zadavatel' in role and n['stav'] in ('koncept', 'vraceno')):
-                raise Chyba('Náklad teď odeslat nejde.')
-            chyby = _chyby_odeslani(cur, nid)
-            if chyby:
-                raise Chyba(' '.join(chyby))
-            _odeslat(cur, nid, user_id, kdo)
-        elif akce == 'stahnout':
-            if not (vlastni and n['stav'] == 'ceka'):
-                raise Chyba('Stáhnout jde jen vlastní náklad, který čeká na schválení.')
-            cur.execute("UPDATE naklady_veletrh SET stav = 'koncept', upraveno = NOW() WHERE id = %s", (nid,))
-            _zapis(cur, nid, user_id, kdo, 'Stáhl(a) náklad zpět do konceptu', komentar)
-        elif akce in _ROZHODNUTI:
-            if 'schvalovatel' not in role:
-                raise Chyba('O nákladech rozhoduje jen schvalovatel.')
-            if n['stav'] != 'ceka':
-                raise Chyba('Náklad už na schválení nečeká — mezitím o něm někdo rozhodl, nebo ho autor stáhl.')
-            if vlastni:
-                raise Chyba('O vlastním nákladu rozhodnout nejde.')
-            if akce != 'schvalit' and not komentar:
-                raise Chyba('U zamítnutí a vrácení je komentář povinný.')
-            if akce == 'schvalit':
-                cur.execute("SELECT COALESCE(SUM(castka_s_dph), 0) AS s FROM naklady_veletrh "
-                            "WHERE stav IN ('schvaleno','uhrazeno')")
-                if cur.fetchone()['s'] + n['castka_s_dph'] > celkem:
-                    raise Chyba('Náklad by překročil celkový rozpočet veletrhu. '
-                                'Nejprve navyšte rozpočet (záložka Rozpočet).')
-            novy, popis = _ROZHODNUTI[akce]
-            cur.execute('UPDATE naklady_veletrh SET stav = %s, rozhodl_id = %s, rozhodl_jmeno = %s, '
-                        'rozhodnuto = NOW(), upraveno = NOW() WHERE id = %s', (novy, user_id, kdo, nid))
-            _zapis(cur, nid, user_id, kdo, popis, komentar)
-        elif akce == 'uhrazeno':
-            if 'spravce' not in role or n['stav'] != 'schvaleno':
-                raise Chyba('Jako uhrazený jde označit jen schválený náklad.')
-            cur.execute("UPDATE naklady_veletrh SET stav = 'uhrazeno', uhrazeno = NOW(), upraveno = NOW() "
-                        "WHERE id = %s", (nid,))
-            _zapis(cur, nid, user_id, kdo, 'Označil(a) náklad jako uhrazený', komentar)
+        elif akce == 'smazat':
+            if not ('spravce' in role or ('zadavatel' in role and n['zadal_id'] == user_id)):
+                raise Chyba('Smazat jde jen vlastní náklad; cizí maže správce.')
+            cur.execute('SELECT disk FROM naklady_veletrh_prilohy WHERE naklad_id = %s', (nid,))
+            disky = [r['disk'] for r in cur.fetchall()]
+            cur.execute('DELETE FROM naklady_veletrh_prilohy WHERE naklad_id = %s', (nid,))
+            cur.execute('DELETE FROM naklady_veletrh WHERE id = %s', (nid,))
+            _zapis(cur, None, user_id, kdo, 'Smazání nákladu',      # historie rozpočtu — náklad už není
+                   f"{_kod(nid)} {n['nazev']} (očekáváno {_kc(n['castka_bez_dph'], True)})")
         else:
             raise Chyba('Neznámá akce.')
+    _smaz_soubory(disky)        # až po commitu
     return n
 
 
-def _uloz_rozpocet(user_id, kdo, nast, kategorie, nova) -> list[str]:
-    """Nastavení akce, celkový rozpočet a rozpočty kategorií (+ nová kategorie) v jedné
-    transakci. Zamyká celkový rozpočet jako schválení, takže souběžné schválení počítá
-    s novou hodnotou. Vrací seznam změn (ten jde i do historie)."""
+def _uloz_rozpocet(user_id, kdo, nast, kategorie, nove) -> list[str]:
+    """Nastavení akce, celkový rozpočet a rozpočty kategorií (+ nové kategorie) v jedné
+    transakci (zamčený řádek celkového rozpočtu). Vrací seznam změn (ten jde i do historie)."""
     zmeny = []
     with _transakce() as cur:
         cur.execute("SELECT hodnota FROM naklady_veletrh_nastaveni WHERE klic = 'rozpocet' FOR UPDATE")
@@ -619,7 +547,7 @@ def _uloz_rozpocet(user_id, kdo, nast, kategorie, nova) -> list[str]:
                 zmeny.append(f'{k["nazev"]}: nová barva')
             cur.execute('UPDATE naklady_veletrh_kategorie SET nazev = %s, rozpocet = %s, barva = %s WHERE id = %s',
                         (k['nazev'], k['rozpocet'], k['barva'], k['id']))
-        if nova:
+        for nova in nove:
             cur.execute('INSERT INTO naklady_veletrh_kategorie (nazev, rozpocet, barva, poradi) '
                         'SELECT %s, %s, %s, COALESCE(MAX(poradi), 0) + 1 FROM naklady_veletrh_kategorie',
                         (nova['nazev'], nova['rozpocet'], nova['barva']))
@@ -690,22 +618,6 @@ def _plan_akce(user_id, kdo, role, akce, cil=None, hodnota=''):
             cur.execute('DELETE FROM naklady_veletrh_plany WHERE id = %s', (cil,))
 
 
-def pocet_akci(user_id, prava) -> int:
-    """Odznak dlaždice: náklady čekající na rozhodnutí (schvalovatel; vlastní ne)
-    + vlastní vrácené k doplnění (zadavatel). Chyba = 0, přehled se kvůli tomu nerozbije."""
-    role = _role(prava)
-    if not role & {'zadavatel', 'schvalovatel'}:
-        return 0
-    try:
-        inicializace_db()
-        r = _sql("SELECT COALESCE(SUM(stav = 'ceka' AND zadal_id <> %s), 0) AS ceka, "
-                 "COALESCE(SUM(stav = 'vraceno' AND zadal_id = %s), 0) AS vraceno FROM naklady_veletrh",
-                 (user_id, user_id), 'jeden')
-        return int(r['ceka']) * ('schvalovatel' in role) + int(r['vraceno']) * ('zadavatel' in role)
-    except Exception:
-        return 0
-
-
 # =========================================================
 # PŘÍLOHY — na disk pod náhodným jménem, ven jen přes kontrolu práv
 # =========================================================
@@ -736,7 +648,7 @@ def _smaz_soubory(disky):
 
 def _priloha_ke_stazeni(user_id, pid):
     """(cesta, název) přílohy, kterou uživatel smí vidět — zapnutý modul, aktivní účet,
-    některá z rolí a není to cizí koncept. Jinak None (i při chybě: fail closed)."""
+    některá z rolí. Jinak None (i při chybě: fail closed)."""
     try:
         if not _zapnuto():
             return None
@@ -745,7 +657,7 @@ def _priloha_ke_stazeni(user_id, pid):
             return None
         p = _sql('SELECT p.nazev, p.disk, n.stav, n.zadal_id FROM naklady_veletrh_prilohy p '
                  'JOIN naklady_veletrh n ON n.id = p.naklad_id WHERE p.id = %s', (pid,), 'jeden')
-        if not p or (p['stav'] == 'koncept' and p['zadal_id'] != user_id):
+        if not p:
             return None
         cesta = os.path.join(ADRESAR, os.path.basename(p['disk']))
         return (cesta, p['nazev']) if os.path.isfile(cesta) else None
@@ -769,152 +681,36 @@ async def _stazeni_prilohy(pid: int):
 
 
 # =========================================================
-# E-MAILY (blokující — volat přes _na_pozadi)
-# =========================================================
-def _url(nid=None) -> str:
-    if not intranet_data.APP_URL:
-        return ''
-    return f'{intranet_data.APP_URL}/naklady_veletrh' + (f'?naklad={int(nid)}' if nid else '')
-
-
-def _posli(prijemci, predmet, text, nid=None):
-    odkaz = _url(nid)
-    if odkaz:
-        text = f'{text}\n\nOtevřít v portálu: {odkaz}'
-    for p in dict.fromkeys(prijemci):
-        if p and '@' in p:
-            try:
-                intranet_emaily.odesli_upozorneni_email(p, predmet, text)
-            except Exception as e:
-                print(f'[naklady_veletrh] e-mail {p}: {e}')
-
-
-def _email(uid) -> str:
-    r = _sql('SELECT email FROM user WHERE iduser = %s', (uid,), 'jeden')
-    return (r or {}).get('email') or ''
-
-
-def _shrnuti(n) -> str:
-    radky = (('Náklad', f"{_kod(n['id'])} {n['nazev']}"), ('Kategorie', n['kategorie']),
-             ('Dodavatel', n['dodavatel'] + (f", IČO {n['dodavatel_ico']}" if n['dodavatel_ico'] else '')),
-             ('Částka', f"{_kc(n['castka_s_dph'], True)} s DPH ({_kc(n['castka_bez_dph'], True)} bez DPH, "
-                        f"DPH {n['sazba_dph']} %)"),
-             ('Splatnost', _datum(n['splatnost'])), ('Zdůvodnění', n['zduvodneni']),
-             ('Přílohy', str(n['pocet_priloh'])), ('Zadal(a)', n['zadal_jmeno']))
-    return '\n'.join(f'{k}: {v}' for k, v in radky if v)
-
-
-def _notifikuj_odeslani(nid):
-    n = _sql(_SELECT + ' WHERE n.id = %s', (nid,), 'jeden')
-    if not n or n['stav'] != 'ceka':
-        return
-    autor = _email(n['zadal_id']).lower()
-    # Jen držitelé práva Schvalovatel ('vse' záměrně ne); autor o svém nákladu nerozhoduje.
-    prijemci = [e for e in intranet_data.ziskej_emaily_s_pravem(PRAVO_SCHVALOVATEL) if e and e.lower() != autor]
-    _posli(prijemci, f"Náklad ke schválení — {n['nazev']} ({_kc(n['castka_s_dph'])})",
-           f"{n['zadal_jmeno']} odeslal(a) ke schválení náklad veletrhu.\n\n{_shrnuti(n)}", nid)
-
-
-def _notifikuj_rozhodnuti(nid, stav, komentar):
-    n = _sql(_SELECT + ' WHERE n.id = %s', (nid,), 'jeden')
-    vysledek = {'schvaleno': 'schválen', 'zamitnuto': 'zamítnut', 'vraceno': 'vrácen k doplnění'}.get(stav)
-    if not n or not vysledek:
-        return
-    text = (f"Váš náklad {_kod(nid)} „{n['nazev']}“ ({_kc(n['castka_s_dph'], True)} s DPH) byl {vysledek}. "
-            f"Rozhodl(a): {n['rozhodl_jmeno']}.")
-    if komentar:
-        text += f"\n{'Důvod' if stav == 'zamitnuto' else 'Komentář'}: {komentar}"
-    if stav == 'vraceno':
-        text += '\n\nDoplňte prosím náklad a odešlete ho znovu ke schválení.'
-    _posli([_email(n['zadal_id'])], f"Náklad {vysledek} — {n['nazev']}", text, nid)
-
-
-def _na_pozadi(fn, *args):
-    """E-maily neblokují UI ani event loop."""
-    background_tasks.create(asyncio.to_thread(fn, *args), name=f'naklady_veletrh.{fn.__name__}')
-
-
-def _pracovni_den(d) -> bool:
-    if d.weekday() >= 5:
-        return False
-    try:
-        from intranet_obsah import je_statni_svatek     # až tady — intranet_obsah importuje tento modul
-        return not je_statni_svatek(d)
-    except Exception:
-        return True
-
-
-def _posli_pripominku(dnes):
-    """Souhrn nákladů čekajících déle než PRIPOMINKA_PO pracovních dní, jednou za pracovní den.
-    Den si zabere atomický UPDATE — víc procesů ani restart nepošle souhrn dvakrát."""
-    if not _zapnuto() or not _pracovni_den(dnes):
-        return
-    inicializace_db()
-    if not _sql("UPDATE naklady_veletrh_nastaveni SET hodnota = %s WHERE klic = 'pripominka' AND hodnota <> %s",
-                (dnes.isoformat(), dnes.isoformat())):
-        return
-    cekajici = []
-    for n in _sql(_SELECT + " WHERE n.stav = 'ceka' ORDER BY n.odeslano", vysledek='vse'):
-        od = (n['odeslano'] or n['upraveno']).date()
-        dni = sum(_pracovni_den(od + datetime.timedelta(days=i)) for i in range(1, (dnes - od).days))
-        if dni >= PRIPOMINKA_PO:
-            cekajici.append((n, dni))
-    if not cekajici:
-        return
-    radky = '\n'.join(f"• {_kod(n['id'])} {n['nazev']} — {_kc(n['castka_s_dph'])}, zadal(a) {n['zadal_jmeno']}, "
-                      f"odesláno {_datum(n['odeslano'])} (čeká {dni} prac. dní)" for n, dni in cekajici)
-    _posli(intranet_data.ziskej_emaily_s_pravem(PRAVO_SCHVALOVATEL),
-           f'Náklady veletrh: {_pocet(len(cekajici))} čeká na schválení déle než {PRIPOMINKA_PO} pracovní dny',
-           f'Na schválení čekají déle než {PRIPOMINKA_PO} pracovní dny:\n\n{radky}')
-
-
-async def _bg_pripominky():
-    await asyncio.sleep(120)
-    while True:
-        try:
-            ted = datetime.datetime.now()
-            if ted.hour >= PRIPOMINKA_HODINA:
-                await asyncio.to_thread(_posli_pripominku, ted.date())
-        except Exception as e:
-            print(f'[naklady_veletrh] připomínka: {e}')
-        await asyncio.sleep(600)
-
-
-app.on_startup(lambda: asyncio.create_task(_bg_pripominky()))
-
-
-# =========================================================
 # REPORTY — Excel a PDF pro vedení
 # =========================================================
 def _souhrny(naklady) -> dict:
-    """Odeslané náklady (bez konceptů) podle stavu, zadavatelů a měsíců splatnosti."""
+    """Náklady podle stavu, zadavatelů a měsíců splatnosti: počet, očekáváno, fakturováno."""
     stavy, autori, mesice = {}, {}, {}
+
+    def pricti(skupiny, klic, n, *popis):
+        r = skupiny.setdefault(klic, [*popis, 0, Decimal(0), Decimal(0)])
+        r[-3] += 1
+        r[-2] += n['castka_bez_dph']
+        r[-1] += n['faktura_bez_dph'] or 0
+
     for n in naklady:
-        if n['stav'] == 'koncept':
-            continue
-        castka = n['castka_s_dph']
-        st = stavy.setdefault(n['stav'], [0, Decimal(0)])
-        st[0] += 1
-        st[1] += castka
-        a = autori.setdefault(n['zadal_id'], [n['zadal_jmeno'] or '?', 0, Decimal(0), Decimal(0)])
-        a[1] += 1
-        if n['stav'] in CERPANO:
-            a[2] += castka
-            kdy = n['splatnost'] or (n['rozhodnuto'].date() if n['rozhodnuto'] else None)
-            if kdy:
-                m = mesice.setdefault(kdy.strftime('%Y-%m'), [0, Decimal(0)])
-                m[0] += 1
-                m[1] += castka
-        elif n['stav'] == 'ceka':
-            a[3] += castka
+        pricti(stavy, n['stav'], n)
+        pricti(autori, n['zadal_id'], n, n['zadal_jmeno'] or '?')
+        if n['splatnost']:
+            pricti(mesice, n['splatnost'].strftime('%Y-%m'), n)
     return {'stavy': [(k, *stavy[k]) for k in _STAVY if k in stavy],
             'autori': sorted(autori.values(), key=lambda a: (-a[2], a[0])),
             'mesice': [(f'{_MESICE[int(m[5:]) - 1]} {m[:4]}', *v) for m, v in sorted(mesice.items())]}
 
 
-_EXPORT = (('ID', 9), ('Název', 36), ('Kategorie', 24), ('Dodavatel', 26), ('IČO', 11), ('Bez DPH', 15),
-           ('DPH %', 7), ('S DPH', 15), ('Stav', 18), ('Zadal(a)', 20), ('Vytvořeno', 16), ('Rozhodl(a)', 20),
-           ('Rozhodnuto', 16), ('Splatnost', 12), ('Uhrazeno', 16), ('Zdůvodnění', 60))
+_EXPORT = (('ID', 9), ('Název', 36), ('Kategorie', 24), ('Dodavatel', 26), ('IČO', 11), ('Očekáváno bez DPH', 17),
+           ('Faktura bez DPH', 17), ('Rozdíl', 15), ('Stav', 16), ('Zadal(a)', 20), ('Vytvořeno', 16),
+           ('Faktura zadána', 16), ('Splatnost', 12), ('Poznámka', 60))
+
+
+def _rozdil(n):
+    """Očekáváno − faktura (kladný = ušetřeno); bez faktury None."""
+    return None if n['faktura_bez_dph'] is None else n['castka_bez_dph'] - n['faktura_bez_dph']
 
 
 def _xlsx(naklady, p) -> bytes:
@@ -927,17 +723,17 @@ def _xlsx(naklady, p) -> bytes:
     ws.append([h for h, _ in _EXPORT])
     for n in naklady:
         ws.append([_kod(n['id']), n['nazev'], n['kategorie'], n['dodavatel'], n['dodavatel_ico'] or '',
-                   n['castka_bez_dph'], n['sazba_dph'], n['castka_s_dph'], _STAVY[n['stav']][0],
-                   n['zadal_jmeno'] or '', n['vytvoreno'], n['rozhodl_jmeno'] or '', n['rozhodnuto'],
-                   n['splatnost'], n['uhrazeno'], n['zduvodneni']])
+                   n['castka_bez_dph'], n['faktura_bez_dph'], _rozdil(n), _STAVY[n['stav']][0],
+                   n['zadal_jmeno'] or '', n['vytvoreno'], n['fakturovano'], n['splatnost'], n['zduvodneni']])
     s = wb.create_sheet('Rozpočet')
-    s.append(['Kategorie', 'Rozpočet', 'Čerpáno', 'Čeká na schválení', 'Volné'])
+    s.append(['Kategorie', 'Rozpočet', 'Očekáváno', 'Fakturováno', 'Rozdíl', 'Očekáváno bez faktury', 'Volné'])
     for k in p['kategorie']:
-        s.append([k['nazev'], k['rozpocet'], k['cerpano'], k['ceka'], k['volne']])
-    s.append(['Součet kategorií', p['rozdeleno'], p['cerpano'], p['ceka'], p['rozdeleno'] - p['cerpano'] - p['ceka']])
-    s.append(['Celkový rozpočet akce', p['celkem'], p['cerpano'], p['ceka'], p['volne']])
+        s.append([k['nazev'], k['rozpocet'], k['ocekavano'], k['cerpano'], k['rozdil'], k['ceka'], k['volne']])
+    for nazev, rozpocet, volne in (('Součet kategorií', p['rozdeleno'], p['rozdeleno'] - p['cerpano'] - p['ceka']),
+                                   ('Celkový rozpočet akce', p['celkem'], p['volne'])):
+        s.append([nazev, rozpocet, p['ocekavano'], p['cerpano'], p['rozdil'], p['ceka'], volne])
     kc = '#,##0.00 "Kč"'
-    for list_, sirky in ((ws, [w for _, w in _EXPORT]), (s, (30, 16, 16, 18, 16))):
+    for list_, sirky in ((ws, [w for _, w in _EXPORT]), (s, (30, 16, 16, 16, 16, 22, 16))):
         for cell in list_[1]:
             cell.font = Font(bold=True, color='FFFFFF')
             cell.fill = PatternFill('solid', fgColor='1B2430')
@@ -945,12 +741,13 @@ def _xlsx(naklady, p) -> bytes:
             list_.column_dimensions[get_column_letter(i)].width = w
         list_.freeze_panes = 'A2'
     for radek in ws.iter_rows(min_row=2):
-        radek[5].number_format = radek[7].number_format = kc
-        for i in (10, 12, 14):
+        for i in (5, 6, 7):
+            radek[i].number_format = kc
+        for i in (10, 11):
             radek[i].number_format = 'dd.mm.yyyy hh:mm'
-        radek[13].number_format = 'dd.mm.yyyy'
+        radek[12].number_format = 'dd.mm.yyyy'
     ws.auto_filter.ref = ws.dimensions
-    for radek in s.iter_rows(min_row=2, min_col=2, max_col=5):
+    for radek in s.iter_rows(min_row=2, min_col=2, max_col=7):
         for cell in radek:
             cell.number_format = kc
     for cell in s[s.max_row - 1] + s[s.max_row]:
@@ -961,19 +758,20 @@ def _xlsx(naklady, p) -> bytes:
 
 
 def _varovani(p) -> list[tuple[str, str]]:
-    """Upozornění rozpočtu: (text, 'red' | 'amber')."""
+    """Upozornění rozpočtu podle odhadu (faktury + očekávané bez faktury): (text, 'red' | 'amber')."""
     out = []
     pres = p['cerpano'] + p['ceka'] - p['celkem']
     if pres > 0:
-        out.append((f'Čerpání včetně čekajících převyšuje celkový rozpočet o {_kc(pres)}.', 'red'))
+        out.append((f'Odhad nákladů (faktury + očekávané) převyšuje celkový rozpočet o {_kc(pres)}.', 'red'))
     elif p['podil'] > VAROVANI_CELKEM:
-        out.append((f"Čerpání celého rozpočtu včetně čekajících je {_pct(p['podil'])} "
+        out.append((f"Odhad nákladů je {_pct(p['podil'])} celkového rozpočtu "
                     f'(varování nad {_pct(VAROVANI_CELKEM)}).', 'amber'))
     for k in p['kategorie']:
         if k['prekroceno']:
             out.append((f"Kategorie „{k['nazev']}“ je překročena o {_kc(-k['volne'])}.", 'red'))
         elif k['varovani']:
-            out.append((f"Kategorie „{k['nazev']}“ je vyčerpána z {_pct(k['podil'])} (včetně čekajících).", 'amber'))
+            out.append((f"Kategorie „{k['nazev']}“ je vyčerpána z {_pct(k['podil'])} (faktury + očekávané).",
+                        'amber'))
     return out
 
 
@@ -1066,43 +864,45 @@ def _report_html(d, kdo) -> str:
             divy.append(f'<i style="width:{sirka:.2f}%;background:{barva}"></i>')
         return f'<div class="bar">{"".join(divy)}</div>'
 
-    ceka_n = sum(1 for n in d['naklady'] if n['stav'] == 'ceka')
+    def kc_nebo(v):
+        return '—' if v is None else _kc(v, True)
+
     kpi = ''.join(f'<div><span>{e(t)}</span><b>{v}</b><small>{e(pod)}</small></div>' for t, v, pod in (
         ('Celkový rozpočet', _kc(p['celkem']), f"v kategoriích {_kc(p['rozdeleno'])}"),
-        ('Schváleno a čerpáno', _kc(p['cerpano']), f"{_pct(_podil(p['cerpano'], p['celkem']))} rozpočtu"),
-        ('Čeká na schválení', _kc(p['ceka']), _pocet(ceka_n)),
-        ('Zbývá k dispozici', _kc(p['volne']), 'po odečtení čekajících')))
+        ('Očekávané náklady', _kc(p['ocekavano']), _pocet(len(d['naklady']))),
+        ('Fakturováno', _kc(p['cerpano']), f"rozdíl proti očekávání {_kc(p['rozdil'])}"),
+        ('Zbývá k dispozici', _kc(p['volne']), 'rozpočet − faktury − očekávané bez faktury')))
     varovani = ''.join(f'<p class="{"err" if typ == "red" else "warn"}">⚠ {e(t)}</p>' for t, typ in _varovani(p))
     legenda = ''.join(f'<div><span class="tecka" style="background:{e(k["barva"])}"></span>{e(k["nazev"])} '
                       f'— {_kc(k["cerpano"])}</div>' for k in p['kategorie'] if k['cerpano'] > 0)
-    kategorie = tab(('Kategorie', 'Rozpočet', 'Čerpáno', 'Čeká', 'Volné', 'Čerpání', ''), [
+    kategorie = tab(('Kategorie', 'Rozpočet', 'Očekáváno', 'Fakturováno', 'Rozdíl', 'Volné', 'Odhad', ''), [
         (f'<span class="tecka" style="background:{e(k["barva"])}"></span>{e(k["nazev"])}', _kc(k['rozpocet']),
-         _kc(k['cerpano']), _kc(k['ceka']), _kc(k['volne']), _pct(k['podil']),
+         _kc(k['ocekavano']), _kc(k['cerpano']), _kc(k['rozdil']), _kc(k['volne']), _pct(k['podil']),
          pruh([(k['cerpano'], _CERPANO_BARVA), (k['ceka'], _CEKA_BARVA)], k['rozpocet']))
-        for k in p['kategorie']] + [(
-            '<b>Součet kategorií</b>', f"<b>{_kc(p['rozdeleno'])}</b>", f"<b>{_kc(p['cerpano'])}</b>",
-            f"<b>{_kc(p['ceka'])}</b>", f"<b>{_kc(p['rozdeleno'] - p['cerpano'] - p['ceka'])}</b>", '', '')],
-        vpravo=(1, 2, 3, 4, 5))
-    autori = tab(('Zadavatel', 'Nákladů', 'Schváleno a uhrazeno', 'Čeká'),
-                 [(e(j), c, _kc(s), _kc(w)) for j, c, s, w in sou['autori']], (1, 2, 3))
-    mesice = tab(('Měsíc splatnosti', 'Nákladů', 'Schváleno a uhrazeno'),
-                 [(e(m), c, _kc(s)) for m, c, s in sou['mesice']], (1, 2))
-    seznam = tab(('ID', 'Název', 'Kategorie', 'Dodavatel', 'Zadal(a)', 'S DPH', 'Splatnost', 'Stav'), [
-        (_kod(n['id']), e(n['nazev']), e(n['kategorie']), e(n['dodavatel']), e(n['zadal_jmeno'] or ''),
-         _kc(n['castka_s_dph'], True), _datum(n['splatnost']), _STAVY[n['stav']][0])
-        for n in sorted(d['naklady'], key=lambda n: n['id']) if n['stav'] != 'koncept'], (5,))
+        for k in p['kategorie']] + [tuple(f'<b>{v}</b>' if v else '' for v in (
+            'Součet kategorií', _kc(p['rozdeleno']), _kc(p['ocekavano']), _kc(p['cerpano']), _kc(p['rozdil']),
+            _kc(p['rozdeleno'] - p['cerpano'] - p['ceka']), '', ''))],
+        vpravo=(1, 2, 3, 4, 5, 6))
+    autori = tab(('Zadavatel', 'Nákladů', 'Očekáváno', 'Fakturováno'),
+                 [(e(j), c, _kc(o), _kc(f)) for j, c, o, f in sou['autori']], (1, 2, 3))
+    mesice = tab(('Měsíc splatnosti', 'Nákladů', 'Očekáváno', 'Fakturováno'),
+                 [(e(m), c, _kc(o), _kc(f)) for m, c, o, f in sou['mesice']], (1, 2, 3))
+    seznam = tab(('ID', 'Název', 'Kategorie', 'Dodavatel', 'Očekáváno', 'Faktura', 'Rozdíl', 'Splatnost', 'Stav'), [
+        (_kod(n['id']), e(n['nazev']), e(n['kategorie']), e(n['dodavatel']), _kc(n['castka_bez_dph'], True),
+         kc_nebo(n['faktura_bez_dph']), kc_nebo(_rozdil(n)), _datum(n['splatnost']), _STAVY[n['stav']][0])
+        for n in sorted(d['naklady'], key=lambda n: n['id'])], (4, 5, 6))
     hlavicka = ' · '.join(x for x in (f'Stav k {_cas(datetime.datetime.now())}', f'vytiskl(a) {kdo}',
                                        _do_veletrhu(nast)) if x)
     return f'''<!doctype html><html lang="cs"><head><meta charset="utf-8"><style>{_CSS_REPORT}</style></head><body>
 <h1>Náklady veletrhu — {e(nast['akce'])}</h1><p class="muted">{e(hlavicka)}</p>
 <div class="kpi">{kpi}</div>
 {pruh([(p['cerpano'], _CERPANO_BARVA), (p['ceka'], _CEKA_BARVA)], p['celkem'])}
-<p class="muted">Čerpáno {_kc(p['cerpano'])} · čeká {_kc(p['ceka'])} · volné {_kc(max(p['volne'], 0))}</p>
+<p class="muted">Fakturováno {_kc(p['cerpano'])} · očekáváno bez faktury {_kc(p['ceka'])} · volné {_kc(max(p['volne'], 0))}</p>
 {varovani}
-<div class="grafy"><div><h2>Struktura čerpání</h2>{_svg_kolac(p['kategorie'])}<div>{legenda}</div></div>
-<div><h2>Kumulativní čerpání vs. plán</h2>{_svg_cara(d['graf'], p['celkem'])}
-<p class="muted">Oranžová = skutečnost (podle měsíce schválení), šedá = rovnoměrný plán, červená = limit.</p></div></div>
-<h2>Rozpočet vs. čerpání podle kategorií</h2>{kategorie}
+<div class="grafy"><div><h2>Struktura fakturace</h2>{_svg_kolac(p['kategorie'])}<div>{legenda}</div></div>
+<div><h2>Kumulativní fakturace vs. plán</h2>{_svg_cara(d['graf'], p['celkem'])}
+<p class="muted">Oranžová = fakturováno (podle měsíce zadání faktury), šedá = rovnoměrný plán, červená = limit.</p></div></div>
+<h2>Rozpočet podle kategorií</h2>{kategorie}
 <div class="vedle"><div><h2>Podle zadavatelů</h2>{autori}</div><div><h2>Podle měsíců splatnosti</h2>{mesice}</div></div>
 <h2>Seznam nákladů</h2>{seznam}
 </body></html>'''
@@ -1170,35 +970,38 @@ def _karta_tabulka(titulek, hlavicka, radky):
 def _udaje(n) -> list[tuple[str, str]]:
     return [r for r in (
         ('Kategorie', n['kategorie']),
-        ('Dodavatel', n['dodavatel'] + (f", IČO {n['dodavatel_ico']}" if n['dodavatel_ico'] else '')),
-        ('Částka bez DPH', _kc(n['castka_bez_dph'], True)),
-        (f"DPH {n['sazba_dph']} %", _kc(n['castka_s_dph'] - n['castka_bez_dph'], True)),
+        ('Dodavatel', (n['dodavatel'] or '—') + (f", IČO {n['dodavatel_ico']}" if n['dodavatel_ico'] else '')),
         ('Splatnost', _datum(n['splatnost']) or '—'),
         ('Zadal(a)', f"{n['zadal_jmeno']} · {_cas(n['vytvoreno'])}"),
-        ('Odesláno', _cas(n['odeslano'])) if n['odeslano'] and n['stav'] != 'koncept' else None,
-        ('Vrátil(a)' if n['stav'] == 'vraceno' else 'Rozhodl(a)', f"{n['rozhodl_jmeno']} · {_cas(n['rozhodnuto'])}")
-        if n['rozhodl_jmeno'] else None,
-        ('Uhrazeno', _cas(n['uhrazeno'])) if n['uhrazeno'] else None,
+        ('Faktura zadána', _cas(n['fakturovano'])) if n['fakturovano'] else None,
     ) if r]
 
 
 def _radek(n) -> dict:
+    rozdil = _rozdil(n)
     return {'id': n['id'], 'kod': _kod(n['id']), 'nazev': n['nazev'], 'kategorie': n['kategorie'],
-            'dodavatel': n['dodavatel'], 'zadal': n['zadal_jmeno'] or '', 'castka': float(n['castka_s_dph']),
+            'dodavatel': n['dodavatel'], 'zadal': n['zadal_jmeno'] or '', 'castka': float(n['castka_bez_dph']),
+            'faktura': None if rozdil is None else float(n['faktura_bez_dph']),
+            'rozdil': None if rozdil is None else float(rozdil),
             'splatnost': n['splatnost'].isoformat() if n['splatnost'] else '',
             'stav': _STAVY[n['stav']][0], 'barva': _STAVY[n['stav']][1],
             'vytvoreno': n['vytvoreno'].strftime('%Y-%m-%d %H:%M'), 'prilohy': n['pocet_priloh']}
 
 
 _FMT_DATUM = 'v => v ? v.slice(8, 10) + "." + v.slice(5, 7) + "." + v.slice(0, 4) : ""'
+_FMT_KC = 'v => v == null ? "—" : Math.round(v).toLocaleString("cs-CZ") + " Kč"'
 _SLOUPCE = [
     {'name': 'kod', 'label': 'ID', 'field': 'kod', 'sortable': True, 'align': 'left'},
     {'name': 'nazev', 'label': 'Název', 'field': 'nazev', 'sortable': True, 'align': 'left'},
     {'name': 'kategorie', 'label': 'Kategorie', 'field': 'kategorie', 'sortable': True, 'align': 'left'},
     {'name': 'dodavatel', 'label': 'Dodavatel', 'field': 'dodavatel', 'sortable': True, 'align': 'left'},
     {'name': 'zadal', 'label': 'Zadal(a)', 'field': 'zadal', 'sortable': True, 'align': 'left'},
-    {'name': 'castka', 'label': 'S DPH', 'field': 'castka', 'sortable': True, 'align': 'right',
-     ':format': 'v => Math.round(v).toLocaleString("cs-CZ") + " Kč"'},
+    {'name': 'castka', 'label': 'Očekáváno', 'field': 'castka', 'sortable': True, 'align': 'right',
+     ':format': _FMT_KC},
+    {'name': 'faktura', 'label': 'Faktura', 'field': 'faktura', 'sortable': True, 'align': 'right',
+     ':format': _FMT_KC},
+    {'name': 'rozdil', 'label': 'Rozdíl', 'field': 'rozdil', 'sortable': True, 'align': 'right',
+     ':format': _FMT_KC},
     {'name': 'splatnost', 'label': 'Splatnost', 'field': 'splatnost', 'sortable': True, 'align': 'left',
      ':format': _FMT_DATUM},
     {'name': 'stav', 'label': 'Stav', 'field': 'stav', 'sortable': True, 'align': 'left'},
@@ -1213,20 +1016,20 @@ _SLOT_NAZEV = r'''<q-td :props="props">{{ props.value }}<q-icon v-if="props.row.
 
 async def vykresli(user_id, user_name, vsechna_prava):
     role = _role(vsechna_prava)
-    zadavatel, schvalovatel, spravce = 'zadavatel' in role, 'schvalovatel' in role, 'spravce' in role
+    zadavatel, spravce = 'zadavatel' in role, 'spravce' in role
     try:
         deep = app.storage.user.pop(_DEEP, None)
     except Exception:
         deep = None
     try:
         await asyncio.to_thread(inicializace_db)
-        data = await asyncio.to_thread(_nacti, user_id)
+        data = await asyncio.to_thread(_nacti)
     except Exception as e:
         ui.label(f'Náklady veletrh se nepodařilo načíst: {e}').classes('text-red-600')
         return
 
     org = bool(role & ORGANIZATOR_ROLE)
-    s = {'data': data, 'vybrany': None, 'plany': None, 'rozbalene': set(),
+    s = {'data': data, 'plany': None, 'rozbalene': set(),
          'koncepty': {}, 'fokus': False, 'org_verze': -1, 'org_cas': 0.0,
          'filtr': {'q': '', 'stav': None, 'kategorie': None, 'zadal': None, 'od': '', 'do': '',
                    'min': '', 'max': '', 'moje': False}}
@@ -1235,11 +1038,11 @@ async def vykresli(user_id, user_name, vsechna_prava):
 
     async def obnov():
         try:
-            s['data'] = await asyncio.to_thread(_nacti, user_id)
+            s['data'] = await asyncio.to_thread(_nacti)
         except Exception as e:
             ui.notify(f'Data se nepodařilo načíst: {e}', type='negative')
             return
-        for fn in (hlavicka, odznak_fronty, prehled, seznam, schvaleni, rozpocet, reporty):
+        for fn in (hlavicka, prehled, seznam, rozpocet, reporty):
             fn.refresh()
         for kresli in list(otevrene):
             kresli()
@@ -1257,38 +1060,11 @@ async def vykresli(user_id, user_name, vsechna_prava):
             return
         ui.notify(_HLASKY[akce], type='positive')
         intranet_logger.log_activity(user_name, _LOG, f'{_kod(nid)}: {_HLASKY[akce]}')
-        if akce == 'odeslat':
-            _na_pozadi(_notifikuj_odeslani, nid)
-        elif akce in _ROZHODNUTI:
-            _na_pozadi(_notifikuj_rozhodnuti, nid, _ROZHODNUTI[akce][0], (komentar or '').strip())
         await obnov()
 
-    async def rozhodnuti(n, akce):
-        titulek, popis, tlacitko, barva = {
-            'schvalit': ('Schválit náklad', 'Komentář (nepovinný)', 'Schválit', 'green-7'),
-            'vratit': ('Vrátit k doplnění', 'Co je potřeba doplnit *', 'Vrátit', 'orange-9'),
-            'zamitnout': ('Zamítnout náklad', 'Důvod zamítnutí *', 'Zamítnout', 'red-7'),
-            'uhrazeno': ('Označit jako uhrazené', 'Poznámka (nepovinná)', 'Označit', 'teal-7'),
-        }[akce]
-        povinny = akce in ('vratit', 'zamitnout')
-        with host, ui.dialog() as dlg, ui.card().classes('w-[480px] max-w-[95vw] gap-3'):
-            ui.label(titulek).classes('text-lg font-semibold')
-            ui.label(f"{_kod(n['id'])} {n['nazev']} — {_kc(n['castka_s_dph'], True)}").classes('text-sm text-gray-600')
-            txt = ui.textarea(popis).props('outlined autogrow autofocus').classes('w-full')
-
-            def potvrdit():
-                if povinny and not (txt.value or '').strip():
-                    txt.props('error error-message="Vyplňte prosím komentář."')
-                    return
-                dlg.submit((txt.value or '').strip())
-
-            with ui.row().classes('w-full justify-end gap-2'):
-                ui.button('Zpět', on_click=lambda: dlg.submit(None)).props('flat')
-                ui.button(tlacitko, on_click=potvrdit).props(f'unelevated color={barva}')
-        vysledek = await dlg
-        dlg.delete()
-        if vysledek is not None:
-            await proved(n['id'], akce, vysledek)
+    async def smazat(n):
+        if await dotaz(f"Smazat náklad {_kod(n['id'])} „{n['nazev']}“ i s přílohami?", 'Smazat', 'red-7'):
+            await proved(n['id'], 'smazat')
 
     async def export_xlsx(radky):
         try:
@@ -1316,57 +1092,23 @@ async def vykresli(user_id, user_name, vsechna_prava):
         intranet_logger.log_activity(user_name, _LOG, 'PDF report pro vedení')
 
     # ---------- detail nákladu ----------
-    def dopad_ui(n, dp):
-        kat = dp['kat']
+    def kategorie_ui(n):
+        kat = next((k for k in s['data']['prehled']['kategorie'] if k['id'] == n['kategorie_id']), None)
+        if not kat:
+            return
         with ui.card().classes('w-full p-4 gap-2 shadow-none border border-gray-200'):
-            ui.label(f"Dopad na rozpočet kategorie „{kat['nazev']}“").classes('font-semibold')
-            _pruh([(kat['cerpano'], _CERPANO_BARVA)] + ([(dp['castka'], _TENTO_BARVA)] if dp['otevreny'] else []),
-                  kat['rozpocet'], 14)
-            with ui.row().classes('w-full justify-between text-sm gap-2'):
-                ui.label(f"Čerpáno {_kc(kat['cerpano'])} z {_kc(kat['rozpocet'])}")
-                if dp['otevreny']:
-                    ui.label(f"Tento náklad {_kc(dp['castka'])}").classes('text-orange-700 font-medium')
-                    ui.label(f"Po schválení zbývá {_kc(dp['po'])} ({_pct(dp['po_podil'])})")
-            if dp['ostatni_ceka'] > 0:
-                ui.label(f"V kategorii čekají na schválení další náklady za {_kc(dp['ostatni_ceka'])}.") \
-                    .classes('text-xs text-gray-500')
-            if dp['otevreny']:
-                ui.label(f"Celý rozpočet veletrhu: po schválení zbývá {_kc(dp['celkem_po'])} "
-                         f"z {_kc(s['data']['prehled']['celkem'])}.").classes('text-sm text-gray-700')
-            if dp['blokovano']:
-                _hlaska('Schválením by byl překročen celkový rozpočet veletrhu. Nejprve je nutné navýšit rozpočet.',
-                        'red')
-            elif dp['otevreny'] and dp['po'] < 0:
-                _hlaska(f"Schválením bude překročen rozpočet kategorie o {_kc(-dp['po'])}. "
-                        'Celkový rozpočet zůstane v limitu.', 'red')
-            elif dp['otevreny'] and dp['po_podil'] < 1 - VAROVANI_KATEGORIE:
-                _hlaska(f'Po schválení klesne volný rozpočet kategorie pod {_pct(1 - VAROVANI_KATEGORIE)}.', 'amber')
+            ui.label(f"Rozpočet kategorie „{kat['nazev']}“").classes('font-semibold')
+            _pruh([(kat['cerpano'], _CERPANO_BARVA), (kat['ceka'], _CEKA_BARVA)], kat['rozpocet'], 14)
+            ui.label(f"Fakturováno {_kc(kat['cerpano'])} + očekáváno bez faktury {_kc(kat['ceka'])} "
+                     f"z {_kc(kat['rozpocet'])} · volné {_kc(kat['volne'])}") \
+                .classes('text-sm ' + ('text-red-700 font-semibold' if kat['prekroceno'] else 'text-gray-700'))
 
-    def akce_ui(n, vlastni, dp):
-        nid, stav = n['id'], n['stav']
-        with ui.row().classes('w-full gap-2 items-center'):
-            if vlastni and zadavatel and stav in OTEVRENE:
-                ui.button('Upravit', icon='edit', on_click=lambda: formular(n)).props('outline color=grey-8')
-            if vlastni and zadavatel and stav in ('koncept', 'vraceno'):
-                ui.button('Odeslat ke schválení', icon='send', on_click=lambda: proved(nid, 'odeslat')) \
-                    .props('unelevated color=orange-8')
-            if vlastni and stav == 'ceka':
-                ui.button('Stáhnout zpět', icon='undo', on_click=lambda: proved(nid, 'stahnout')) \
-                    .props('outline color=grey-8').tooltip('Vrátí náklad do konceptu a zmizí z fronty ke schválení.')
-            if schvalovatel and stav == 'ceka':
-                if vlastni:
-                    ui.label('O vlastním nákladu rozhoduje jiný schvalovatel.').classes('text-sm text-gray-500')
-                else:
-                    b = ui.button('Schválit', icon='check', on_click=lambda: rozhodnuti(n, 'schvalit')) \
-                        .props('unelevated color=green-7')
-                    b.set_enabled(not (dp and dp['blokovano']))
-                    ui.button('Vrátit k doplnění', icon='reply', on_click=lambda: rozhodnuti(n, 'vratit')) \
-                        .props('outline color=orange-9')
-                    ui.button('Zamítnout', icon='block', on_click=lambda: rozhodnuti(n, 'zamitnout')) \
-                        .props('outline color=red-7')
-            if spravce and stav == 'schvaleno':
-                ui.button('Označit jako uhrazené', icon='paid', on_click=lambda: rozhodnuti(n, 'uhrazeno')) \
-                    .props('outline color=teal-7')
+    def akce_ui(n):
+        if spravce or (zadavatel and n['zadal_id'] == user_id):
+            with ui.row().classes('w-full gap-2 items-center'):
+                ui.button('Upravit / zadat fakturu' if n['faktura_bez_dph'] is None else 'Upravit', icon='edit',
+                          on_click=lambda: formular(n)).props('outline color=grey-8')
+                ui.button('Smazat', icon='delete', on_click=lambda: smazat(n)).props('flat color=red-7')
 
     def historie_ui(nid):
         ui.label('Historie a komentáře').classes('font-semibold')
@@ -1397,34 +1139,40 @@ async def vykresli(user_id, user_name, vsechna_prava):
         d = s['data']
         n = d['podle_id'].get(nid)
         if not n:
-            ui.label('Náklad nenalezen, nebo k němu nemáte přístup.').classes('text-gray-500 py-6')
+            ui.label('Náklad nenalezen.').classes('text-gray-500 py-6')
             return
-        dp = _dopad(n, d['prehled'])
+        rozdil = _rozdil(n)
         with ui.row().classes('w-full justify-between items-start gap-4'):
             with ui.column().classes('gap-1'):
                 ui.label(_kod(nid)).classes('text-xs text-gray-500')
                 ui.label(n['nazev']).classes('text-xl font-bold text-gray-900')
                 _odznak(n['stav'])
-            with ui.column().classes('items-end gap-0'):
-                ui.label('Částka s DPH').classes('text-xs text-gray-500')
-                ui.label(_kc(n['castka_s_dph'], True)).classes('text-2xl font-bold text-gray-900')
+            with ui.row().classes('gap-6 items-start'):
+                for popis, hodnota, barva in (
+                        ('Očekáváno bez DPH', _kc(n['castka_bez_dph'], True), 'text-gray-900'),
+                        ('Faktura bez DPH', '—' if rozdil is None else _kc(n['faktura_bez_dph'], True),
+                         'text-gray-900'),
+                        ('Rozdíl', '—' if rozdil is None else _kc(rozdil, True),
+                         'text-gray-400' if rozdil is None else 'text-green-700' if rozdil >= 0 else 'text-red-700')):
+                    with ui.column().classes('items-end gap-0'):
+                        ui.label(popis).classes('text-xs text-gray-500')
+                        ui.label(hodnota).classes(f'text-2xl font-bold {barva}')
         with ui.row().classes('w-full gap-8 items-start'):
             with ui.grid(columns='auto 1fr').classes('gap-x-4 gap-y-1 text-sm flex-1 min-w-[300px]'):
                 for popis, hodnota in _udaje(n):
                     ui.label(popis).classes('text-gray-500')
                     ui.label(hodnota).classes('font-medium')
             with ui.column().classes('gap-1 flex-1 min-w-[260px]'):
-                ui.label('Zdůvodnění').classes('text-xs text-gray-500')
-                ui.label(n['zduvodneni']).classes('text-sm whitespace-pre-line')
+                ui.label('Poznámka').classes('text-xs text-gray-500')
+                ui.label(n['zduvodneni'] or '—').classes('text-sm whitespace-pre-line')
                 ui.label('Přílohy').classes('text-xs text-gray-500 mt-3')
                 for pr in d['prilohy'].get(nid, []):
                     ui.link(f"📄 {pr['nazev']}", f"/naklady_veletrh/priloha/{pr['id']}", new_tab=True) \
                         .classes('text-sm')
                 if not d['prilohy'].get(nid):
                     ui.label('Bez příloh').classes('text-sm text-gray-400')
-        if dp:
-            dopad_ui(n, dp)
-        akce_ui(n, n['zadal_id'] == user_id, dp)
+        kategorie_ui(n)
+        akce_ui(n)
         historie_ui(nid)
 
     def detail(nid):
@@ -1434,6 +1182,9 @@ async def vykresli(user_id, user_name, vsechna_prava):
             obsah = ui.column().classes('w-full px-6 pb-6 gap-4')
 
         def kresli():
+            if nid not in s['data']['podle_id']:
+                dlg.close()         # náklad mezitím smazán
+                return
             obsah.clear()
             with obsah:
                 detail_obsah(nid)
@@ -1452,33 +1203,34 @@ async def vykresli(user_id, user_name, vsechna_prava):
     def formular(n=None):
         p = s['data']['prehled']
         kategorie = {k['id']: k for k in p['kategorie']}
-        stav = n['stav'] if n else 'koncept'
         existujici = s['data']['prilohy'].get(n['id'], []) if n else []
         cekajici = []       # nahrané, zatím neuložené přílohy: (název, disk, velikost)
 
+        def hodnota(pole):
+            c = _castka(pole.value or '')
+            return c if c is not None and c >= 0 else None
+
         def prepocet():
-            bez = _castka(castka.value or '')
-            hruba = _s_dph(bez, sazba.value) if bez and bez > 0 and sazba.value in DPH_SAZBY else None
-            s_dph.text = f'S DPH: {_kc(hruba, True)}' if hruba is not None else 'S DPH: —'
+            ocek, fakt = hodnota(castka), hodnota(faktura)
+            rozdil_text.text = '' if ocek is None or fakt is None else f'Rozdíl: {_kc(ocek - fakt, True)}'
             info.clear()
             with info:
                 k = kategorie.get(kat.value)
-                if k:
-                    volne = k['rozpocet'] - k['cerpano'] - k['ceka']
-                    if n and n['stav'] == 'ceka' and n['kategorie_id'] == k['id']:
-                        volne += n['castka_s_dph']      # vlastní rezervace se nepočítá dvakrát
-                    text = f"V kategorii „{k['nazev']}“ zbývá {_kc(volne)} z {_kc(k['rozpocet'])}"
-                    po = volne - hruba if hruba is not None else None
-                    if po is not None and po < 0:
-                        _hlaska(f'{text}. Náklad by rozpočet kategorie překročil o {_kc(-po)}.', 'red')
-                    elif po is not None and _podil(po, k['rozpocet']) < 1 - VAROVANI_KATEGORIE:
-                        _hlaska(f'{text}, po tomto nákladu {_kc(po)} — pod {_pct(1 - VAROVANI_KATEGORIE)}.', 'amber')
-                    else:
-                        ui.label(f'{text}' + (f', po tomto nákladu {_kc(po)}.' if po is not None else '.')) \
-                            .classes('text-sm text-gray-600')
-                if hruba is not None and hruba >= POVINNA_PRILOHA_OD and not (existujici or cekajici):
-                    _hlaska(f'Od {_kc(POVINNA_PRILOHA_OD)} s DPH je povinná příloha (nabídka nebo faktura) '
-                            '— bez ní náklad ke schválení odeslat nepůjde.', 'amber')
+                if not k:
+                    return
+                volne = k['volne']
+                if n and n['kategorie_id'] == k['id']:      # vlastní částka se nepočítá dvakrát
+                    volne += n['castka_bez_dph'] if n['faktura_bez_dph'] is None else n['faktura_bez_dph']
+                text = f"V kategorii „{k['nazev']}“ zbývá {_kc(volne)} z {_kc(k['rozpocet'])}"
+                konecna = fakt if fakt is not None else ocek
+                po = volne - konecna if konecna is not None else None
+                if po is not None and po < 0:
+                    _hlaska(f'{text}. Náklad by rozpočet kategorie překročil o {_kc(-po)}.', 'red')
+                elif po is not None and _podil(po, k['rozpocet']) < 1 - VAROVANI_KATEGORIE:
+                    _hlaska(f'{text}, po tomto nákladu {_kc(po)} — pod {_pct(1 - VAROVANI_KATEGORIE)}.', 'amber')
+                else:
+                    ui.label(f'{text}' + (f', po tomto nákladu {_kc(po)}.' if po is not None else '.')) \
+                        .classes('text-sm text-gray-600')
 
         def kresli_cekajici():
             cekajici_box.clear()
@@ -1492,7 +1244,6 @@ async def vykresli(user_id, user_name, vsechna_prava):
                 cekajici.remove(polozka)
                 _smaz_soubory([polozka[1]])
             kresli_cekajici()
-            prepocet()
 
         async def nahrano(e):
             for f in e.files:
@@ -1504,23 +1255,23 @@ async def vykresli(user_id, user_name, vsechna_prava):
                     ui.notify(f'Přílohu se nepodařilo uložit: {ex}', type='negative')
             upl.reset()
             kresli_cekajici()
-            prepocet()
 
         def zrusit():
             _smaz_soubory([x[1] for x in cekajici])
             cekajici.clear()
             dlg.close()
 
-        async def ulozit(odeslat):
+        async def ulozit():
             data, chyby = _zpracuj({'nazev': nazev.value, 'kategorie_id': kat.value, 'dodavatel': dodavatel.value,
-                                    'ico': ico.value, 'castka': castka.value, 'sazba': sazba.value,
-                                    'splatnost': splatnost.value, 'zduvodneni': zduvodneni.value})
+                                    'ico': ico.value, 'castka': castka.value, 'faktura': faktura.value,
+                                    'splatnost': splatnost.value,
+                                    'zduvodneni': zduvodneni.value})
             if chyby:
                 ui.notify(' '.join(chyby), type='warning', multi_line=True)
                 return
             try:
-                nid, chyby = await asyncio.to_thread(_uloz, user_id, user_name, n['id'] if n else None,
-                                                     data, list(cekajici), odeslat)
+                nid = await asyncio.to_thread(_uloz, user_id, user_name, role, n['id'] if n else None,
+                                              data, list(cekajici))
             except Chyba as e:
                 ui.notify(str(e), type='warning', multi_line=True)
                 return
@@ -1529,16 +1280,9 @@ async def vykresli(user_id, user_name, vsechna_prava):
                 return
             cekajici.clear()        # soubory už patří uloženému nákladu
             dlg.close()
-            odeslano = odeslat and not chyby and stav != 'ceka'
-            if chyby and odeslat:
-                ui.notify('Náklad je uložený, ale ke schválení zatím odeslat nejde: ' + ' '.join(chyby),
-                          type='warning', multi_line=True, timeout=10000)
-            else:
-                ui.notify('Náklad odeslán ke schválení.' if odeslano else 'Náklad uložen.', type='positive')
+            ui.notify('Náklad uložen.', type='positive')
             intranet_logger.log_activity(user_name, _LOG, f"{_kod(nid)}: {'upraven' if n else 'nový'} náklad "
-                                         f"„{data['nazev']}“" + (' — odeslán ke schválení' if odeslano else ''))
-            if odeslano:
-                _na_pozadi(_notifikuj_odeslani, nid)
+                                         f"„{data['nazev']}“")
             await obnov()
             if not n:
                 detail(nid)
@@ -1547,7 +1291,7 @@ async def vykresli(user_id, user_name, vsechna_prava):
             with ui.row().classes('w-full items-center justify-between'):
                 ui.label(f"Upravit náklad {_kod(n['id'])}" if n else 'Nový náklad').classes('text-lg font-semibold')
                 if n:
-                    _odznak(stav)
+                    _odznak(n['stav'])
             nazev = ui.input('Název / popis *', value=n['nazev'] if n else '',
                              placeholder='např. Výroba LED stěny stánku') \
                 .props('outlined dense maxlength=255').classes('w-full')
@@ -1558,18 +1302,21 @@ async def vykresli(user_id, user_name, vsechna_prava):
                 with ui.element('div').classes('w-48'):
                     splatnost = _datum_input('Datum splatnosti', _datum(n['splatnost']) if n else '')
             with ui.row().classes('w-full gap-3 no-wrap'):
-                dodavatel = ui.input('Dodavatel *', value=n['dodavatel'] if n else '') \
+                dodavatel = ui.input('Dodavatel', value=n['dodavatel'] if n else '') \
                     .props('outlined dense maxlength=255').classes('flex-1')
                 ico = ui.input('IČO', value=(n['dodavatel_ico'] or '') if n else '') \
                     .props('outlined dense maxlength=12').classes('w-40')
             with ui.row().classes('w-full gap-3 items-center'):
-                castka = ui.input('Částka bez DPH (Kč) *', value=_cislo_text(n['castka_bez_dph']) if n else '') \
-                    .props('outlined dense inputmode=decimal').classes('w-56')
-                sazba = ui.toggle({x: f'{x} %' for x in DPH_SAZBY}, value=n['sazba_dph'] if n else DPH_SAZBY[0]) \
-                    .props('no-caps unelevated toggle-color=orange-8')
-                s_dph = ui.label().classes('text-sm font-medium text-gray-700')
-            zduvodneni = ui.textarea('Zdůvodnění *', value=n['zduvodneni'] if n else '',
-                                     placeholder='Proč je náklad potřeba, případně porovnání nabídek') \
+                castka = ui.input('Očekávaný náklad bez DPH (Kč) *',
+                                  value=_cislo_text(n['castka_bez_dph']) if n else '') \
+                    .props('outlined dense inputmode=decimal').classes('w-64')
+                faktura = ui.input('Faktura bez DPH (Kč)', value=_cislo_text(n['faktura_bez_dph'])
+                                   if n and n['faktura_bez_dph'] is not None else '') \
+                    .props('outlined dense clearable inputmode=decimal').classes('w-64') \
+                    .tooltip('Oficiální částka z faktury bez DPH — vyplňte, až faktura přijde')
+                rozdil_text = ui.label().classes('text-sm font-medium text-gray-700')
+            zduvodneni = ui.textarea('Poznámka', value=n['zduvodneni'] if n else '',
+                                     placeholder='Co náklad zahrnuje, případně porovnání nabídek') \
                 .props('outlined autogrow maxlength=5000').classes('w-full')
             info = ui.column().classes('w-full gap-1')
             ui.label('Přílohy — nabídka, objednávka, faktura (PDF, obrázek, Excel, Word; max 20 MB)') \
@@ -1583,12 +1330,8 @@ async def vykresli(user_id, user_name, vsechna_prava):
                 .classes('w-full')
             with ui.row().classes('w-full justify-end gap-2'):
                 ui.button('Zrušit', on_click=zrusit).props('flat')
-                ui.button('Uložit změny' if stav == 'ceka' else 'Uložit koncept', on_click=lambda: ulozit(False)) \
-                    .props('outline color=grey-8')
-                if stav != 'ceka':
-                    ui.button('Odeslat ke schválení', icon='send', on_click=lambda: ulozit(True)) \
-                        .props('unelevated color=orange-8')
-        for prvek in (castka, sazba, kat):
+                ui.button('Uložit', icon='save', on_click=ulozit).props('unelevated color=orange-8')
+        for prvek in (castka, faktura, kat):
             prvek.on_value_change(prepocet)
         prepocet()
         dlg.on('hide', dlg.delete)
@@ -1616,26 +1359,22 @@ async def vykresli(user_id, user_name, vsechna_prava):
                 ui.label(' · '.join(x for x in (nast['akce'], _do_veletrhu(nast)) if x)).classes('text-sm text-gray-500')
             with ui.row().classes('gap-2 items-center'):
                 ui.button(icon='refresh', on_click=obnov).props('flat round color=grey-7').tooltip('Načíst znovu')
-                if zadavatel and s['tab'] in ('prehled', 'naklady'):     # jinde se nákladů netýká
+                if (zadavatel or spravce) and s['tab'] in ('prehled', 'naklady'):     # jinde se nákladů netýká
                     ui.button('Nový náklad', icon='add', on_click=lambda: formular(None)) \
                         .props('unelevated color=orange-8')
-
-    @ui.refreshable
-    def odznak_fronty():
-        pocet = sum(1 for n in s['data']['naklady'] if n['stav'] == 'ceka' and n['zadal_id'] != user_id)
-        if pocet:
-            ui.badge(str(pocet), color='red').props('floating')
 
     @ui.refreshable
     def prehled():
         d = s['data']
         p = d['prehled']
-        ceka_n = sum(1 for n in d['naklady'] if n['stav'] == 'ceka')
-        with ui.grid().classes('w-full gap-3 grid-cols-1 sm:grid-cols-2 xl:grid-cols-4'):
+        bez_faktury = sum(1 for n in d['naklady'] if n['faktura_bez_dph'] is None)
+        with ui.grid().classes('w-full gap-3 grid-cols-1 sm:grid-cols-2 xl:grid-cols-5'):
             _kpi('Celkový rozpočet', _kc(p['celkem']), f"v kategoriích {_kc(p['rozdeleno'])}")
-            _kpi('Schváleno a čerpáno', _kc(p['cerpano']), f"{_pct(_podil(p['cerpano'], p['celkem']))} rozpočtu")
-            _kpi('Čeká na schválení', _kc(p['ceka']), _pocet(ceka_n), 'text-amber-700')
-            _kpi('Zbývá k dispozici', _kc(p['volne']), 'po odečtení čekajících',
+            _kpi('Očekávané náklady', _kc(p['ocekavano']), _pocet(len(d['naklady'])))
+            _kpi('Fakturováno', _kc(p['cerpano']), f"bez faktury ještě {_pocet(bez_faktury)} za {_kc(p['ceka'])}")
+            _kpi('Rozdíl', _kc(p['rozdil']), 'očekáváno − faktury (kladný = ušetřeno)',
+                 'text-red-700' if p['rozdil'] < 0 else 'text-green-700')
+            _kpi('Zbývá k dispozici', _kc(p['volne']), 'rozpočet − faktury − očekávané bez faktury',
                  'text-red-700' if p['volne'] < 0 else 'text-green-700')
         with ui.card().classes('w-full p-4 gap-2 shadow-sm'):
             with ui.row().classes('w-full justify-between items-baseline'):
@@ -1643,8 +1382,8 @@ async def vykresli(user_id, user_name, vsechna_prava):
                 ui.label(_do_veletrhu(p['nastaveni'])).classes('text-sm text-gray-600')
             _pruh([(p['cerpano'], _CERPANO_BARVA), (p['ceka'], _CEKA_BARVA)], p['celkem'], 16)
             with ui.row().classes('gap-4 text-xs text-gray-600'):
-                for barva, text in ((_CERPANO_BARVA, f"Čerpáno {_kc(p['cerpano'])}"),
-                                    (_CEKA_BARVA, f"Čeká {_kc(p['ceka'])}"),
+                for barva, text in ((_CERPANO_BARVA, f"Fakturováno {_kc(p['cerpano'])}"),
+                                    (_CEKA_BARVA, f"Očekáváno bez faktury {_kc(p['ceka'])}"),
                                     (_VOLNE_BARVA, f"Volné {_kc(max(p['volne'], 0))}")):
                     with ui.row().classes('items-center gap-1'):
                         _tecka(barva)
@@ -1653,21 +1392,24 @@ async def vykresli(user_id, user_name, vsechna_prava):
                 _hlaska(text, typ)
         with ui.grid().classes('w-full gap-3 grid-cols-1 lg:grid-cols-5'):
             with ui.card().classes('p-4 gap-1 shadow-sm lg:col-span-2'):
-                ui.label('Struktura čerpání').classes('font-semibold')
-                kolac = [{'name': k['nazev'], 'value': float(k['cerpano']), 'itemStyle': {'color': k['barva']}}
-                         for k in p['kategorie'] if k['cerpano'] > 0]
-                if kolac:
-                    ui.echart({
-                        'tooltip': {'trigger': 'item', ':formatter': 'p => p.name + "<br>" + '
-                                    'Math.round(p.value).toLocaleString("cs-CZ") + " Kč (" + p.percent + " %)"'},
-                        'legend': {'type': 'scroll', 'bottom': 0},
-                        'series': [{'type': 'pie', 'radius': ['45%', '70%'], 'center': ['50%', '45%'],
-                                    'label': {'show': False}, 'data': kolac}],
-                    }).classes('w-full h-72')
-                else:
-                    ui.label('Zatím nic schváleno.').classes('text-sm text-gray-500 py-8')
+                ui.label('Rozpočet, očekáváno a faktury podle kategorií').classes('font-semibold')
+                kat = p['kategorie']
+                ui.echart({
+                    'tooltip': {'trigger': 'axis', 'axisPointer': {'type': 'shadow'}, ':valueFormatter':
+                                'v => Math.round(v).toLocaleString("cs-CZ") + " Kč"'},
+                    'legend': {'bottom': 0},
+                    'grid': {'left': 10, 'right': 20, 'top': 10, 'bottom': 40, 'containLabel': True},
+                    'xAxis': {'type': 'value',
+                              'axisLabel': {':formatter': 'v => (v / 1000).toLocaleString("cs-CZ") + " tis."'}},
+                    'yAxis': {'type': 'category', 'inverse': True, 'data': [k['nazev'] for k in kat]},
+                    'series': [{'name': nazev, 'type': 'bar', 'data': [float(k[klic]) for k in kat],
+                                'itemStyle': {'color': barva}}
+                               for nazev, klic, barva in (('Rozpočet', 'rozpocet', '#cbd5e1'),
+                                                          ('Očekáváno', 'ocekavano', _CEKA_BARVA),
+                                                          ('Fakturováno', 'cerpano', _CERPANO_BARVA))],
+                }).classes('w-full h-80')
             with ui.card().classes('p-4 gap-1 shadow-sm lg:col-span-3'):
-                ui.label('Kumulativní čerpání vs. plán').classes('font-semibold')
+                ui.label('Kumulativní fakturace vs. plán').classes('font-semibold')
                 g = d['graf']
                 ui.echart({
                     'tooltip': {'trigger': 'axis', ':valueFormatter':
@@ -1678,7 +1420,7 @@ async def vykresli(user_id, user_name, vsechna_prava):
                     'yAxis': {'type': 'value',
                               'axisLabel': {':formatter': 'v => (v / 1000).toLocaleString("cs-CZ") + " tis."'}},
                     'series': [
-                        {'name': 'Skutečnost', 'type': 'line', 'data': g['skutecnost'], 'connectNulls': False,
+                        {'name': 'Fakturováno', 'type': 'line', 'data': g['skutecnost'], 'connectNulls': False,
                          'itemStyle': {'color': _TENTO_BARVA}, 'areaStyle': {'opacity': 0.08},
                          'markLine': {'symbol': 'none', 'silent': True,
                                       'lineStyle': {'color': '#dc2626', 'type': 'dashed'},
@@ -1687,20 +1429,34 @@ async def vykresli(user_id, user_name, vsechna_prava):
                         {'name': 'Plán', 'type': 'line', 'data': g['plan'], 'symbol': 'none',
                          'itemStyle': {'color': '#64748b'}, 'lineStyle': {'type': 'dashed'}},
                     ],
-                }).classes('w-full h-72')
-        with ui.card().classes('w-full p-4 gap-3 shadow-sm'):
-            ui.label('Rozpočet vs. čerpání podle kategorií').classes('font-semibold')
-            for k in p['kategorie']:
-                with ui.column().classes('w-full gap-1'):
-                    with ui.row().classes('w-full justify-between text-sm gap-2'):
-                        with ui.row().classes('items-center gap-2'):
-                            _tecka(k['barva'], True)
-                            ui.label(k['nazev']).classes('font-medium')
-                        barva = 'text-red-700 font-semibold' if k['prekroceno'] else \
-                            'text-amber-700' if k['varovani'] else 'text-gray-600'
-                        ui.label(f"{_kc(k['cerpano'])} + čeká {_kc(k['ceka'])} z {_kc(k['rozpocet'])} · "
-                                 f"{_pct(k['podil'])}").classes(barva)
-                    _pruh([(k['cerpano'], _CERPANO_BARVA), (k['ceka'], _CEKA_BARVA)], k['rozpocet'], 10)
+                }).classes('w-full h-80')
+        with ui.card().classes('w-full p-4 gap-2 shadow-sm'):
+            ui.label('Rozpočet podle kategorií').classes('font-semibold')
+            sloupce = (('rozpocet', 'Rozpočet'), ('ocekavano', 'Očekáváno'), ('cerpano', 'Fakturováno'),
+                       ('rozdil', 'Rozdíl'), ('volne', 'Volné'))
+            with ui.grid(columns='minmax(12rem, 1.6fr) repeat(5, minmax(6.5rem, 1fr))') \
+                    .classes('w-full gap-x-3 gap-y-1 items-center text-sm'):
+                ui.label('Kategorie').classes('text-xs text-gray-500')
+                for _, h in sloupce:
+                    ui.label(h).classes('text-xs text-gray-500 text-right')
+                for k in p['kategorie']:
+                    with ui.row().classes('items-center gap-2 no-wrap'):
+                        _tecka(k['barva'], True)
+                        ui.label(k['nazev']).classes('font-medium')
+                    for klic, _ in sloupce:
+                        cls = 'text-right'
+                        if klic == 'volne' and (k['prekroceno'] or k['varovani']):
+                            cls += ' text-red-700 font-semibold' if k['prekroceno'] else ' text-amber-700'
+                        elif klic == 'rozdil' and k['rozdil'] < 0:
+                            cls += ' text-red-700'
+                        ui.label(_kc(k[klic])).classes(cls)
+                    with ui.element('div').classes('col-span-6 pb-1'):
+                        _pruh([(k['cerpano'], _CERPANO_BARVA), (k['ceka'], _CEKA_BARVA)], k['rozpocet'], 8)
+                ui.label('Součet kategorií').classes('font-semibold')
+                soucet = {'rozpocet': p['rozdeleno'], 'ocekavano': p['ocekavano'], 'cerpano': p['cerpano'],
+                          'rozdil': p['rozdil'], 'volne': p['rozdeleno'] - p['cerpano'] - p['ceka']}
+                for klic, _ in sloupce:
+                    ui.label(_kc(soucet[klic])).classes('text-right font-semibold')
         with ui.card().classes('w-full p-4 gap-2 shadow-sm'):
             ui.label('Poslední náklady').classes('font-semibold')
             posledni = sorted(d['naklady'], key=lambda n: n['upraveno'], reverse=True)[:8]
@@ -1729,7 +1485,8 @@ async def vykresli(user_id, user_name, vsechna_prava):
                         or (f['kategorie'] and n['kategorie_id'] != f['kategorie'])
                         or (f['zadal'] and n['zadal_id'] != f['zadal'])
                         or (od and n['vytvoreno'].date() < od) or (do and n['vytvoreno'].date() > do)
-                        or (mn is not None and n['castka_s_dph'] < mn) or (mx is not None and n['castka_s_dph'] > mx)):
+                        or (mn is not None and n['castka_bez_dph'] < mn)
+                        or (mx is not None and n['castka_bez_dph'] > mx)):
                     continue
                 if q and q not in ' '.join(str(x or '') for x in (
                         _kod(n['id']), n['nazev'], n['dodavatel'], n['dodavatel_ico'], n['kategorie'],
@@ -1739,7 +1496,9 @@ async def vykresli(user_id, user_name, vsechna_prava):
             return out
 
         def souhrn(radky):
-            return f"{_pocet(len(radky))} · {_kc(sum((n['castka_s_dph'] for n in radky), Decimal(0)))} s DPH"
+            ocek = sum((n['castka_bez_dph'] for n in radky), Decimal(0))
+            fakt = sum((n['faktura_bez_dph'] or 0 for n in radky), Decimal(0))
+            return f'{_pocet(len(radky))} · očekáváno {_kc(ocek)} · fakturováno {_kc(fakt)} (bez DPH)'
 
         def zmen(klic, hodnota):
             f[klic] = hodnota
@@ -1777,48 +1536,42 @@ async def vykresli(user_id, user_name, vsechna_prava):
         t = tabulka(radky)
 
     @ui.refreshable
-    def schvaleni():
-        fronta = sorted((n for n in s['data']['naklady'] if n['stav'] == 'ceka'),
-                        key=lambda n: n['odeslano'] or n['upraveno'])
-        if not fronta:
-            ui.label('Nic nečeká na schválení.').classes('text-gray-500 py-8')
-            return
-        if s['vybrany'] not in {n['id'] for n in fronta}:
-            cizi = [n for n in fronta if n['zadal_id'] != user_id]
-            s['vybrany'] = (cizi or fronta)[0]['id']
-
-        def vyber(nid):
-            s['vybrany'] = nid
-            schvaleni.refresh()
-
-        with ui.row().classes('w-full gap-4 items-start lg:flex-nowrap'):
-            with ui.column().classes('w-full lg:w-80 shrink-0 gap-2'):
-                ui.label(f'Fronta ({len(fronta)})').classes('text-sm font-semibold text-gray-600')
-                for n in fronta:
-                    vybrany = n['id'] == s['vybrany']
-                    with ui.card().classes('w-full p-3 gap-0 cursor-pointer shadow-none border '
-                                           + ('border-orange-400 bg-orange-50' if vybrany else 'hover:bg-gray-50')) \
-                            .on('click', lambda _, i=n['id']: vyber(i)):
-                        with ui.row().classes('w-full justify-between'):
-                            ui.label(_kod(n['id'])).classes('text-xs text-gray-500')
-                            ui.label(f"odesláno {_datum(n['odeslano'])}").classes('text-xs text-gray-500')
-                        ui.label(n['nazev']).classes('font-medium')
-                        ui.label(f"{n['kategorie']} · {n['zadal_jmeno']}").classes('text-xs text-gray-500')
-                        ui.label(_kc(n['castka_s_dph'], True)).classes('text-sm font-semibold')
-            with ui.card().classes('flex-1 min-w-0 w-full p-5 gap-4 shadow-sm'):
-                detail_obsah(s['vybrany'])
-
-    @ui.refreshable
     def rozpocet():
         p = s['data']['prehled']
         nast = p['nastaveni']
         radky = []
+        nove = []       # řádky nových kategorií: {'barva', 'nazev', 'castka', 'prvky'}
+
+        def pridat():
+            pouzite = {k['barva'].lower() for k in p['kategorie']} | {(r['barva'].value or '').lower() for r in nove}
+            barva_v = next((b for b in ('#0d9488', '#7c3aed', '#db2777', '#ea580c', '#65a30d', '#0284c7',
+                                        '#ca8a04') if b not in pouzite), '#64748b')
+            with mrizka:
+                barva = ui.color_input(value=barva_v).props('outlined dense')
+                nazev = ui.input(placeholder='Název nové kategorie').props('outlined dense maxlength=120')
+                castka = ui.input(placeholder='0').props('outlined dense inputmode=decimal input-class=text-right')
+                with ui.element('div').classes('col-span-3 flex justify-end') as konec:
+                    ui.button(icon='close', on_click=lambda: odebrat(r)) \
+                        .props('flat round dense color=grey-7').tooltip('Odebrat řádek')
+            r = {'barva': barva, 'nazev': nazev, 'castka': castka, 'prvky': (barva, nazev, castka, konec)}
+            nove.append(r)
+            castka.on_value_change(prepocet)
+            return r
+
+        def odebrat(r):
+            for prvek in r['prvky']:
+                prvek.delete()
+            nove.remove(r)
+            prepocet()
+
+        def pridat_a_fokus():
+            pridat()['nazev'].run_method('focus')
+            prepocet()
 
         def prepocet():
             celkem = _castka(celkem_in.value or '') or Decimal(0)
             soucet = sum((_castka(c.value or '') or Decimal(0) for _, _, c, _ in radky), Decimal(0))
-            if (nova_nazev.value or '').strip():
-                soucet += _castka(nova_castka.value or '0') or Decimal(0)
+            soucet += sum((_castka(r['castka'].value or '0') or Decimal(0) for r in nove), Decimal(0))
             rozdil = celkem - soucet
             if rozdil >= 0:
                 souhrn.text = (f'Součet kategorií {_kc(soucet)} z celkového rozpočtu {_kc(celkem)} '
@@ -1848,10 +1601,10 @@ async def vykresli(user_id, user_name, vsechna_prava):
                         'barva': barva if re.fullmatch(r'#[0-9a-fA-F]{6}', barva or '') else None}
 
             kat = [{'id': kid, **kategorie_z(nz.value, c.value, b.value)} for kid, nz, c, b in radky]
-            nova = kategorie_z(nova_nazev.value, nova_castka.value, nova_barva.value) \
-                if (nova_nazev.value or '').strip() else None
+            nove_kat = [kategorie_z(r['nazev'].value, r['castka'].value, r['barva'].value) for r in nove
+                        if (r['nazev'].value or '').strip() or (r['castka'].value or '').strip()]
             jmena = set()
-            for k in kat + ([nova] if nova else []):
+            for k in kat + nove_kat:
                 if not k['nazev']:
                     chyby.append('Název kategorie nesmí být prázdný.')
                 elif k['nazev'].casefold() in jmena:
@@ -1861,7 +1614,7 @@ async def vykresli(user_id, user_name, vsechna_prava):
                     chyby.append(f"Neplatný rozpočet kategorie „{k['nazev']}“.")
                 if not k['barva']:
                     chyby.append(f"Neplatná barva kategorie „{k['nazev']}“ (#RRGGBB).")
-            if not chyby and sum(k['rozpocet'] for k in kat + ([nova] if nova else [])) > celkem:
+            if not chyby and sum(k['rozpocet'] for k in kat + nove_kat) > celkem:
                 chyby.append('Součet rozpočtů kategorií převyšuje celkový rozpočet — navyšte celek, '
                              'nebo snižte kategorie.')
             if chyby:
@@ -1871,7 +1624,7 @@ async def vykresli(user_id, user_name, vsechna_prava):
                 zmeny = await asyncio.to_thread(
                     _uloz_rozpocet, user_id, user_name,
                     {'akce': (akce_in.value or '').strip()[:120] or _VYCHOZI_NASTAVENI['akce'],
-                     'datum_akce': datum.isoformat(), 'plan_od': plan, 'rozpocet': celkem}, kat, nova)
+                     'datum_akce': datum.isoformat(), 'plan_od': plan, 'rozpocet': celkem}, kat, nove_kat)
             except Exception as e:
                 ui.notify('Kategorie s tímto názvem už existuje.' if 'Duplicate' in str(e)
                           else f'Rozpočet se nepodařilo uložit: {e}', type='negative')
@@ -1901,9 +1654,9 @@ async def vykresli(user_id, user_name, vsechna_prava):
         with ui.card().classes('w-full p-4 gap-3 shadow-sm'):
             ui.label('Rozpočty kategorií').classes('font-semibold')
             with ui.grid(columns='9.5rem minmax(12rem, 1fr) 10rem repeat(3, minmax(7.5rem, auto))') \
-                    .classes('w-full gap-x-3 gap-y-2 items-center text-sm'):
-                for h in ('Barva', 'Kategorie', 'Rozpočet (Kč)', 'Čerpáno', 'Čeká', 'Volné'):
-                    ui.label(h).classes('text-xs text-gray-500' + (' text-right' if h in ('Čerpáno', 'Čeká', 'Volné')
+                    .classes('w-full gap-x-3 gap-y-2 items-center text-sm') as mrizka:
+                for h in ('Barva', 'Kategorie', 'Rozpočet (Kč)', 'Fakturováno', 'Bez faktury', 'Volné'):
+                    ui.label(h).classes('text-xs text-gray-500' + (' text-right' if h in ('Fakturováno', 'Bez faktury', 'Volné')
                                                                      else ''))
                 for k in p['kategorie']:
                     barva = ui.color_input(value=k['barva']).props('outlined dense')
@@ -1914,12 +1667,12 @@ async def vykresli(user_id, user_name, vsechna_prava):
                                    (k['volne'], 'text-red-700 font-semibold' if k['volne'] < 0 else '')):
                         ui.label(_kc(v)).classes(f'text-right {cls}')
                     radky.append((k['id'], nazev, castka, barva))
-                nova_barva = ui.color_input(value='#64748b').props('outlined dense')
-                nova_nazev = ui.input(placeholder='+ nová kategorie').props('outlined dense maxlength=120')
-                nova_castka = ui.input(placeholder='0').props('outlined dense inputmode=decimal input-class=text-right')
+            pridat()
+            ui.button('Přidat kategorii', icon='add', on_click=pridat_a_fokus) \
+                .props('flat dense no-caps color=orange-8').classes('self-start')
             souhrn = ui.label()
             ui.button('Uložit rozpočet', icon='save', on_click=ulozit).props('unelevated color=orange-8')
-        for prvek in [celkem_in, nova_nazev, nova_castka] + [c for _, _, c, _ in radky]:
+        for prvek in [celkem_in] + [c for _, _, c, _ in radky]:
             prvek.on_value_change(prepocet)
         prepocet()
         with ui.card().classes('w-full p-4 gap-2 shadow-sm'):
@@ -1936,20 +1689,20 @@ async def vykresli(user_id, user_name, vsechna_prava):
     def reporty():
         d = s['data']
         sou = _souhrny(d['naklady'])
-        odeslane = [n for n in d['naklady'] if n['stav'] != 'koncept']
         with ui.row().classes('w-full gap-2 items-center'):
-            ui.button('Export do Excelu', icon='table_view', on_click=lambda: export_xlsx(odeslane)) \
+            ui.button('Export do Excelu', icon='table_view', on_click=lambda: export_xlsx(d['naklady'])) \
                 .props('unelevated color=green-8')
             ui.button('PDF report pro vedení', icon='picture_as_pdf', on_click=export_pdf).props('unelevated color=red-8')
-            ui.label('Excel obsahuje všechny odeslané náklady a list Rozpočet; export podle filtrů je v záložce Náklady.') \
+            ui.label('Excel obsahuje všechny náklady a list Rozpočet; export podle filtrů je v záložce Náklady.') \
                 .classes('text-xs text-gray-500')
+        sloupce = ['Nákladů', 'Očekáváno', 'Fakturováno']
         with ui.grid().classes('w-full gap-3 grid-cols-1 xl:grid-cols-3'):
-            _karta_tabulka('Podle stavu', ['Stav', 'Nákladů', 'Částka s DPH'],
-                           [(_STAVY[k][0], c, _kc(v)) for k, c, v in sou['stavy']])
-            _karta_tabulka('Podle zadavatelů', ['Zadavatel', 'Nákladů', 'Schváleno a uhrazeno', 'Čeká'],
-                           [(j, c, _kc(v), _kc(w)) for j, c, v, w in sou['autori']])
-            _karta_tabulka('Podle měsíců splatnosti', ['Měsíc', 'Nákladů', 'Schváleno a uhrazeno'],
-                           [(m, c, _kc(v)) for m, c, v in sou['mesice']])
+            _karta_tabulka('Podle stavu', ['Stav', *sloupce],
+                           [(_STAVY[k][0], c, _kc(o), _kc(f)) for k, c, o, f in sou['stavy']])
+            _karta_tabulka('Podle zadavatelů', ['Zadavatel', *sloupce],
+                           [(j, c, _kc(o), _kc(f)) for j, c, o, f in sou['autori']])
+            _karta_tabulka('Podle měsíců splatnosti', ['Měsíc', *sloupce],
+                           [(m, c, _kc(o), _kc(f)) for m, c, o, f in sou['mesice']])
 
     # ---------- organizátor ----------
     async def obnov_plany(vynutit=True):
@@ -2112,10 +1865,6 @@ async def vykresli(user_id, user_name, vsechna_prava):
 
     # ---------- stránka ----------
     start = 'prehled'
-    if deep is not None:
-        n = s['data']['podle_id'].get(deep)
-        if n and schvalovatel and n['stav'] == 'ceka' and n['zadal_id'] != user_id:
-            start, s['vybrany'] = 'schvaleni', deep
     s['tab'] = start
     if org:
         await obnov_plany()
@@ -2125,9 +1874,6 @@ async def vykresli(user_id, user_name, vsechna_prava):
                 .classes('w-full text-gray-700 border-b border-gray-200') as taby:
             ui.tab('prehled', 'Přehled', icon='insights')
             ui.tab('naklady', 'Náklady', icon='receipt_long')
-            if schvalovatel:
-                with ui.tab('schvaleni', 'Ke schválení', icon='fact_check'):
-                    odznak_fronty()
             if spravce:
                 ui.tab('rozpocet', 'Rozpočet', icon='account_balance_wallet')
             ui.tab('reporty', 'Reporty a export', icon='download')
@@ -2138,9 +1884,6 @@ async def vykresli(user_id, user_name, vsechna_prava):
                 prehled()
             with ui.tab_panel('naklady').classes('p-0 gap-3'):
                 seznam()
-            if schvalovatel:
-                with ui.tab_panel('schvaleni').classes('p-0'):
-                    schvaleni()
             if spravce:
                 with ui.tab_panel('rozpocet').classes('p-0 gap-3'):
                     rozpocet()
@@ -2153,7 +1896,7 @@ async def vykresli(user_id, user_name, vsechna_prava):
     if org:
         with host:
             ui.timer(ORG_TIK_S, auto_obnova_planu)
-    if deep is not None and start != 'schvaleni':
+    if deep is not None:
         if deep in s['data']['podle_id']:
             taby.set_value('naklady')
             detail(deep)
@@ -2162,32 +1905,29 @@ async def vykresli(user_id, user_name, vsechna_prava):
 
 
 def _zpracuj(h) -> tuple[dict, list[str]]:
-    """Hodnoty formuláře → data pro DB a chyby (povinná pole podle zadání)."""
+    """Hodnoty formuláře → data pro DB a chyby. Povinné: název, kategorie, očekávaná částka."""
     chyby = []
     nazev = (h['nazev'] or '').strip()[:255]
     dodavatel = (h['dodavatel'] or '').strip()[:255]
     ico = ''.join((h['ico'] or '').split())[:20]
     zduvodneni = (h['zduvodneni'] or '').strip()[:5000]
     bez = _castka(h['castka'] or '')
+    faktura_text = (h['faktura'] or '').strip()
+    faktura = _castka(faktura_text) if faktura_text else None
     splatnost = _cz_datum(h['splatnost'])
     if not nazev:
         chyby.append('Vyplňte název nákladu.')
     if not h['kategorie_id']:
         chyby.append('Vyberte kategorii.')
-    if not dodavatel:
-        chyby.append('Vyplňte dodavatele.')
     if ico and not ico.isdigit():
         chyby.append('IČO smí obsahovat jen číslice.')
     if bez is None or bez <= 0:
-        chyby.append('Zadejte platnou částku bez DPH.')
-    if h['sazba'] not in DPH_SAZBY:
-        chyby.append('Vyberte sazbu DPH.')
+        chyby.append('Zadejte platný očekávaný náklad bez DPH.')
+    if faktura_text and (faktura is None or faktura < 0):
+        chyby.append('Částku z faktury zadejte jako číslo, nebo pole nechte prázdné.')
     if (h['splatnost'] or '').strip() and not splatnost:
         chyby.append('Datum splatnosti zadejte ve tvaru DD.MM.RRRR.')
-    if not zduvodneni:
-        chyby.append('Vyplňte zdůvodnění.')
     if chyby:
         return {}, chyby
     return {'nazev': nazev, 'kategorie_id': h['kategorie_id'], 'dodavatel': dodavatel, 'dodavatel_ico': ico or None,
-            'castka_bez_dph': bez, 'sazba_dph': h['sazba'], 'castka_s_dph': _s_dph(bez, h['sazba']),
-            'splatnost': splatnost, 'zduvodneni': zduvodneni}, []
+            'castka_bez_dph': bez, 'faktura_bez_dph': faktura, 'splatnost': splatnost, 'zduvodneni': zduvodneni}, []

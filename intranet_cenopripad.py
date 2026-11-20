@@ -843,6 +843,7 @@ def inicializace_cenopripad_db():
                 duvod TEXT,                             -- důvod žádosti od žadatele
                 pocet_radku INT DEFAULT 0,
                 suma_abs DOUBLE DEFAULT 0,              -- součet absolutní odchylky (K)
+                kontrola_chyb INT,                      -- řádky s Kontrolou „Chyba" (NULL = nevyhodnoceno)
                 soubor_nazev VARCHAR(255),
                 poznamka VARCHAR(1000),                 -- co má žadatel opravit
                 spravce_pozn VARCHAR(1000),             -- Office → Správce (žadatel nevidí)
@@ -862,6 +863,7 @@ def inicializace_cenopripad_db():
                 kod VARCHAR(40), nazev VARCHAR(255),
                 ks DOUBLE, nc DOUBLE, pc_std DOUBLE, pc_pozad DOUBLE,
                 odchylka_pct DOUBLE, odchylka_abs DOUBLE,
+                kontrola VARCHAR(10), kontrola_duvod VARCHAR(255),   -- viz `_oprava_kontrola`
                 INDEX idx_pripad (pripad_id)
             ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
         """)
@@ -1045,7 +1047,11 @@ def inicializace_cenopripad_db():
                                ("cenopripad_radky", "nak", "VARCHAR(10)"),
                                ("cenopripad_radky", "wp_vyjadreni", "TEXT"),
                                ("cenopripad_radky", "wp_vyjadril", "VARCHAR(255)"),
-                               ("cenopripad_radky", "wp_vyjadreno", "DATETIME")):
+                               ("cenopripad_radky", "wp_vyjadreno", "DATETIME"),
+                               # Oprava cen: Kontrola požadované PC (jako Stav u ind. cen)
+                               ("oprava_pripady", "kontrola_chyb", "INT"),
+                               ("oprava_radky", "kontrola", "VARCHAR(10)"),
+                               ("oprava_radky", "kontrola_duvod", "VARCHAR(255)")):
             cur.execute("SELECT COUNT(*) FROM information_schema.COLUMNS WHERE "
                         "TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s AND COLUMN_NAME=%s",
                         (_t, _col))
@@ -7651,21 +7657,64 @@ def _oprava_parse(raw_bytes, filename, bez_pc_std=False):
     return radky, None
 
 
+# ── Kontrola ────────────────────────────────────────────────────────────────
+def _oprava_kontrola(radky):
+    """Kontrola „Požadované PC bez DPH" — úplně stejná jako sloupec Stav u ind. cen
+    (`cp.vyhodnot_porovnani`, požadovaná PC = „PC bez DPH", bez bonusu a kompenzace):
+    netto = nejvýh. NC × (1 − OP), % marže netto < 3 % → Chyba; kód mimo master → Chyba.
+    Doplní řádkům `kontrola` + `kontrola_duvod`, vrací počet chybných řádků."""
+    vys = vyhodnot_pripad_z_db("porovnani", [
+        {"kod_produktu": r.get("kod"), "pc_bez_dph": r.get("pc_pozad")} for r in radky])
+    for r, v in zip(radky, vys["radky"]):
+        r["kontrola"] = v.get("verdikt")
+        r["kontrola_duvod"] = v.get("duvod") or ""
+    return vys["chyby"]
+
+
+def _oprava_dopln_kontrolu(pid):
+    """Dopočítá Kontrolu žádosti podané před jejím zavedením (kontrola_chyb IS NULL).
+    Vrací počet chyb, nebo None, když se zápis nepovedl."""
+    radky = _oprava_nacti_radky(pid)
+    chyby = _oprava_kontrola(radky)
+    conn = intranet_data.get_db_connection()
+    if not conn:
+        return None
+    try:
+        cur = conn.cursor()
+        if radky:
+            cur.executemany("UPDATE oprava_radky SET kontrola=%s, kontrola_duvod=%s WHERE id=%s",
+                            [(r["kontrola"], _str(r["kontrola_duvod"], 255), r["id"])
+                             for r in radky])
+        # aktualizovano=aktualizovano → dopočet nemění čas poslední změny žádosti
+        cur.execute("UPDATE oprava_pripady SET kontrola_chyb=%s, aktualizovano=aktualizovano "
+                    "WHERE id=%s", (chyby, pid))
+        conn.commit()
+        cur.close()
+        return chyby
+    except Exception as e:
+        print(f"[oprava] _oprava_dopln_kontrolu: {e}")
+        return None
+    finally:
+        conn.close()
+
+
 # ── DB ──────────────────────────────────────────────────────────────────────
 def _oprava_zapis_radky(cur, pid, radky):
     cur.execute("DELETE FROM oprava_radky WHERE pripad_id=%s", (pid,))
     cur.executemany(
         "INSERT INTO oprava_radky (pripad_id, poradi, ico, doklad, kod, nazev, ks, nc, "
-        "pc_std, pc_pozad, odchylka_pct, odchylka_abs) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+        "pc_std, pc_pozad, odchylka_pct, odchylka_abs, kontrola, kontrola_duvod) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
         [(pid, r["poradi"], _str(r.get("ico"), 40), _str(r.get("doklad"), 60),
           _str(r.get("kod"), 40), _str(r.get("nazev"), 255), r.get("ks"), r.get("nc"),
           r.get("pc_std"), r.get("pc_pozad"), r.get("odchylka_pct"),
-          r.get("odchylka_abs")) for r in radky])
+          r.get("odchylka_abs"), r.get("kontrola"),
+          _str(r.get("kontrola_duvod"), 255)) for r in radky])
 
 
 def _oprava_uloz(nazev, duvod, radky, raw, soubor_nazev, user_id, user_name):
     """Nová žádost. Vrací (id, cislo) nebo (None, chyba)."""
+    chyby = _oprava_kontrola(radky)   # před otevřením spojení (master má vlastní)
     conn = intranet_data.get_db_connection()
     if not conn:
         return None, "Není připojení k databázi."
@@ -7673,10 +7722,10 @@ def _oprava_uloz(nazev, duvod, radky, raw, soubor_nazev, user_id, user_name):
         cur = conn.cursor()
         suma = sum(r.get("odchylka_abs") or 0 for r in radky)
         cur.execute("INSERT INTO oprava_pripady (nazev, zadavatel_id, zadavatel_jmeno, "
-                    "stav, duvod, pocet_radku, suma_abs, soubor_nazev) "
-                    "VALUES (%s,%s,%s,'odeslano',%s,%s,%s,%s)",
+                    "stav, duvod, pocet_radku, suma_abs, kontrola_chyb, soubor_nazev) "
+                    "VALUES (%s,%s,%s,'odeslano',%s,%s,%s,%s,%s)",
                     (_str(nazev, 255), user_id, _str(user_name, 255), duvod,
-                     len(radky), suma, _str(soubor_nazev, 255)))
+                     len(radky), suma, chyby, _str(soubor_nazev, 255)))
         pid = cur.lastrowid
         cislo = f"OC{pid:05d}"
         cur.execute("UPDATE oprava_pripady SET cislo=%s WHERE id=%s", (cislo, pid))
@@ -7700,6 +7749,7 @@ def _oprava_uloz(nazev, duvod, radky, raw, soubor_nazev, user_id, user_name):
 def _oprava_prepis(pid, duvod, radky, raw, soubor_nazev):
     """Oprava existující žádosti žadatelem (stav „vráceno k opravě").
     Soubor je nepovinný — beze změny se zachová ten původní."""
+    chyby = _oprava_kontrola(radky) if radky is not None else None
     conn = intranet_data.get_db_connection()
     if not conn:
         return False, "Není připojení k databázi."
@@ -7708,8 +7758,8 @@ def _oprava_prepis(pid, duvod, radky, raw, soubor_nazev):
         if radky is not None:
             suma = sum(r.get("odchylka_abs") or 0 for r in radky)
             cur.execute("UPDATE oprava_pripady SET duvod=%s, pocet_radku=%s, suma_abs=%s, "
-                        "soubor_nazev=%s WHERE id=%s",
-                        (duvod, len(radky), suma, _str(soubor_nazev, 255), pid))
+                        "kontrola_chyb=%s, soubor_nazev=%s WHERE id=%s",
+                        (duvod, len(radky), suma, chyby, _str(soubor_nazev, 255), pid))
             _oprava_zapis_radky(cur, pid, radky)
             cur.execute("DELETE FROM oprava_soubory WHERE pripad_id=%s", (pid,))
             cur.execute("INSERT INTO oprava_soubory (pripad_id, nazev, data) "
@@ -7761,7 +7811,7 @@ def _oprava_seznam(user_id, prava):
     try:
         cur = conn.cursor(dictionary=True)
         sql = ("SELECT id, cislo, nazev, zadavatel_id, zadavatel_jmeno, datum_zadani, "
-               "stav, pocet_radku, suma_abs, soubor_nazev FROM oprava_pripady ")
+               "stav, pocet_radku, suma_abs, kontrola_chyb, soubor_nazev FROM oprava_pripady ")
         if _oprava_office(prava):
             cur.execute(sql + "ORDER BY id DESC")
         else:
@@ -7995,30 +8045,65 @@ def _oprava_sekce_seznam(user_id, prava):
     if not zadosti:
         ui.label("Zatím žádné žádosti o opravu ceny.").classes("text-gray-400 italic p-4")
         return
-    with ui.column().classes("w-full gap-2"):
-        for p in zadosti:
-            stav = p.get("stav")
-            barva = ("border-gray-300" if stav in _OPRAVA_STAVY_KONCOVE
-                     else "border-orange-300" if stav == "vraceno_oprava"
-                     else "border-indigo-300" if stav == "u_spravce"
-                     else "border-green-300" if stav in ("zpracovano", "spravce_schvalil")
-                     else "border-blue-300")
-            with ui.card().classes(f"w-full p-3 rounded-xl shadow-sm hover:shadow-md "
-                                   f"transition-shadow cursor-pointer border-l-4 {barva}") \
-                    .on("click", lambda pid=p["id"]: _oprava_otevri(pid)):
-                with ui.row().classes("w-full items-center gap-3 flex-wrap"):
-                    ui.label(p.get("cislo") or "—").classes("font-bold text-gray-800")
-                    if p.get("nazev"):
-                        ui.label(p.get("nazev")).classes("font-medium text-gray-700")
-                    _oprava_badge(stav)
-                    ui.space()
-                    ui.label(f"{p.get('pocet_radku', 0)} řádků") \
-                        .classes("text-sm text-gray-500")
-                    ui.label(f"{_castka(p.get('suma_abs'))} Kč") \
-                        .classes("text-sm font-medium text-red-600")
-                    ui.label(f"{p.get('zadavatel_jmeno') or ''} · "
-                             f"{_dt_cz(p.get('datum_zadani'))}") \
-                        .classes("text-xs text-gray-400")
+    # Žádosti podané před zavedením Kontroly se dopočítají jednorázově (pak už z DB).
+    for p in zadosti:
+        if p.get("kontrola_chyb") is None:
+            p["kontrola_chyb"] = _oprava_dopln_kontrolu(p["id"])
+    strana = {"p": 1}   # stránkování stejně jako u ind. cen (max PRIPADU_NA_STRANKU karet)
+
+    @ui.refreshable
+    def _seznam():
+        pocet_stran = max(1, -(-len(zadosti) // PRIPADU_NA_STRANKU))
+        strana["p"] = min(strana["p"], pocet_stran)
+        _zac = (strana["p"] - 1) * PRIPADU_NA_STRANKU
+        strana_items = zadosti[_zac:_zac + PRIPADU_NA_STRANKU]
+        with ui.column().classes("w-full gap-2"):
+            for p in strana_items:
+                _oprava_karta(p)
+        if pocet_stran > 1:
+            def _zmen_stranku(c):
+                strana["p"] = c
+                _seznam.refresh()
+            with ui.row().classes("w-full items-center justify-center gap-2 mt-2"):
+                ui.label(f"{_zac + 1}–{_zac + len(strana_items)} z {len(zadosti)}") \
+                    .classes("text-xs text-gray-400 mr-2")
+                ui.pagination(1, pocet_stran, direction_links=True, value=strana["p"],
+                              on_change=lambda e: _zmen_stranku(int(e.value))) \
+                    .props("max-pages=7 boundary-numbers")
+
+    _seznam()
+
+
+def _oprava_karta(p):
+    stav = p.get("stav")
+    barva = ("border-gray-300" if stav in _OPRAVA_STAVY_KONCOVE
+             else "border-orange-300" if stav == "vraceno_oprava"
+             else "border-indigo-300" if stav == "u_spravce"
+             else "border-green-300" if stav in ("zpracovano", "spravce_schvalil")
+             else "border-blue-300")
+    with ui.card().classes(f"w-full p-3 rounded-xl shadow-sm hover:shadow-md "
+                           f"transition-shadow cursor-pointer border-l-4 {barva}") \
+            .on("click", lambda pid=p["id"]: _oprava_otevri(pid)):
+        with ui.row().classes("w-full items-center gap-3 flex-wrap"):
+            ui.label(p.get("cislo") or "—").classes("font-bold text-gray-800")
+            if p.get("nazev"):
+                ui.label(p.get("nazev")).classes("font-medium text-gray-700")
+            _oprava_badge(stav)
+            # Výsledek Kontroly požadované PC (stejný štítek jako u ind. cen).
+            _kch = p.get("kontrola_chyb")
+            if _kch:
+                ui.badge("Kontrola: Není v pořádku", color="red").props("outline") \
+                    .tooltip(f"{_kch} z {p.get('pocet_radku', 0)} řádků s chybou")
+            elif _kch == 0:
+                ui.badge("Kontrola: V pořádku", color="green").props("outline")
+            ui.space()
+            ui.label(f"{p.get('pocet_radku', 0)} řádků") \
+                .classes("text-sm text-gray-500")
+            ui.label(f"{_castka(p.get('suma_abs'))} Kč") \
+                .classes("text-sm font-medium text-red-600")
+            ui.label(f"{p.get('zadavatel_jmeno') or ''} · "
+                     f"{_dt_cz(p.get('datum_zadani'))}") \
+                .classes("text-xs text-gray-400")
 
 
 def _oprava_detail(pid, user_id, user_name, prava):
@@ -8033,6 +8118,8 @@ def _oprava_detail(pid, user_id, user_name, prava):
     je_spravce = _oprava_spravce(prava)
     je_vlastnik = p.get("zadavatel_id") == user_id
     stav = p.get("stav")
+    if p.get("kontrola_chyb") is None:   # starší žádost bez Kontroly → dopočet
+        p["kontrola_chyb"] = _oprava_dopln_kontrolu(pid)
     radky = _oprava_nacti_radky(pid)
 
     # ── Hlavička ────────────────────────────────────────────────────────────
@@ -8041,7 +8128,6 @@ def _oprava_detail(pid, user_id, user_name, prava):
             .props("flat round color=grey-7").tooltip("Zpět na seznam")
         ui.label(f"{p.get('cislo')}" + (f" · {p.get('nazev')}" if p.get("nazev") else "")) \
             .classes("text-xl font-bold text-gray-800")
-        _oprava_badge(stav)
         ui.space()
         ui.label(f"{p.get('pocet_radku', 0)} řádků · dopad {_castka(p.get('suma_abs'))} Kč") \
             .classes("text-sm text-gray-500")
@@ -8112,7 +8198,14 @@ def _oprava_detail(pid, user_id, user_name, prava):
                   "ks": _castka(r.get("ks")), "nc": _castka(r.get("nc")),
                   "pc_std": _castka(r.get("pc_std")), "pc_pozad": _castka(r.get("pc_pozad")),
                   "pct": _pct(r.get("odchylka_pct")),
-                  "abs": _castka(r.get("odchylka_abs"))} for r in radky]
+                  "abs": _castka(r.get("odchylka_abs")),
+                  "kontrola": _VERDIKT_TXT.get(r.get("kontrola"), "—"),
+                  "kontrola_duvod": r.get("kontrola_duvod") or ""} for r in radky]
+    # Detail kontroly prozrazuje % marže netto → jako „Detail" u ind. cen jen s právem na OP.
+    vidi_detail = _vidi_op_typu("porovnani", prava)
+    _ZAP_KONTROLA = ("(p) => p.value && p.value.startsWith('❌') "
+                     "? {color:'#b91c1c', fontWeight:600} "
+                     ": (p.value && p.value.startsWith('✅') ? {color:'#15803d'} : null)")
     ui.label(f"Řádky formuláře — {len(radky)} položek").classes(
         "text-base font-bold text-gray-800 mt-1 mb-1")
     ui.aggrid({
@@ -8135,7 +8228,11 @@ def _oprava_detail(pid, user_id, user_name, prava):
              "minWidth": 105, "type": "rightAligned", ":cellStyle": _ZAP},
             {"headerName": "Absolutní odchylka", "field": "abs", "width": 140,
              "minWidth": 105, "type": "rightAligned", ":cellStyle": _ZAP},
-        ],
+            # Kontrola požadované PC — stejná jako Stav u ind. cen (`_oprava_kontrola`).
+            {"headerName": "Kontrola", "field": "kontrola", "width": 115, "minWidth": 95,
+             ":cellStyle": _ZAP_KONTROLA},
+        ] + ([{"headerName": "Detail kontroly", "field": "kontrola_duvod", "width": 200,
+               "minWidth": 130}] if vidi_detail else []),
         "rowData": grid_rows,
         "defaultColDef": {"resizable": True, "sortable": True, "filter": True,
                           "wrapHeaderText": True, "autoHeaderHeight": True,
@@ -9330,11 +9427,9 @@ def _vykresli_cenopripad(user_id, user_name, vsechna_prava):
         pohled = None
     if pohled == "letaky" and not _letaky_pristup(vsechna_prava):
         pohled = None
-    if pohled == "ovozel" and not _ovozel_pristup(vsechna_prava):
+    if pohled in ("ovozel", "ncovozel"):   # sekce zatím neaktivní (i uložený pohled / odkaz z e-mailu)
         pohled = None
     if pohled == "oprava" and not _oprava_pristup(vsechna_prava):
-        pohled = None
-    if pohled == "ncovozel" and not _nc_pristup(vsechna_prava):
         pohled = None
 
     with ui.row().classes("w-full items-center gap-3 mb-6"):
@@ -9410,31 +9505,32 @@ def _vykresli_cenopripad(user_id, user_name, vsechna_prava):
                 app.storage.user["letaky_detail"] = None
                 _nav("letaky")
             _tile("📰", "Kontrolní data letáků", "letáková kontrola", "border-rose-200", _otevri_letaky)
-        if _ovozel_pristup(vsechna_prava):
-            def _otevri_ovozel():
-                app.storage.user["ovozel_detail"] = None
-                _nav("ovozel")
-            _tile("🥦", "Kontrola cen OVOZEL", "ovoce a zelenina", "border-lime-300",
-                  _otevri_ovozel)
+        if _ovozel_pristup(vsechna_prava):   # sekce zatím neaktivní
+            _tile("🥦", "Kontrola cen OVOZEL", "ovoce a zelenina", None)
         if _oprava_pristup(vsechna_prava):
             def _otevri_oprava():
                 app.storage.user["oprava_detail"] = None
                 _nav("oprava")
             _tile("🧾", "Oprava cen", "formulář + fronta", "border-orange-300",
                   _otevri_oprava)
-        if _nc_pristup(vsechna_prava):
-            def _otevri_nc():
-                app.storage.user["ncovozel_detail"] = None
-                _nav("ncovozel")
-            _tile("🥬", "NC OVOZEL", "import cen / delist", "border-green-400",
-                  _otevri_nc)
+        if _nc_pristup(vsechna_prava):   # sekce zatím neaktivní
+            _tile("🥬", "NC OVOZEL", "import cen / delist", None)
         for klic in typy:
             c = TYPY[klic]
             _tile(c["emoji"], c["nazev"], "nákup" if c["oddeleni"] == "nakup" else "obchod",
                   c["barva"], lambda k=klic: _nav(k))
 
 
-def _tile(emoji, nadpis, popis, barva, on_click):
+def _tile(emoji, nadpis, popis, barva, on_click=None):
+    """Bez on_click = neaktivní dlaždice: šedá, bez hover efektu, nekliká se."""
+    if on_click is None:
+        with ui.card().classes("w-72 h-60 items-center justify-center shadow-xl "
+                               "bg-gray-100 rounded-2xl border border-gray-300"):
+            ui.label(emoji).classes("text-6xl mb-3").style("filter: grayscale(1); opacity: .5")
+            ui.label(nadpis).classes("text-xl font-bold text-gray-400 text-center")
+            if popis:
+                ui.label(popis).classes("text-xs text-gray-400 text-center uppercase tracking-wide")
+        return
     with ui.card().classes(
             "w-72 h-60 items-center justify-center shadow-xl hover:scale-105 "
             "transition-transform duration-300 cursor-pointer bg-white rounded-2xl border "

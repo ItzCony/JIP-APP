@@ -62,6 +62,10 @@ _MAX_SOUBOR = 20_000_000
 _MAX_ZAPIS = 255
 _MAX_VLOZENI = 5000   # strop buněk na jedno hromadné vložení (Ctrl+V / Delete výběru)
 _DNY = ('pondělí', 'úterý', 'středa', 'čtvrtek', 'pátek', 'sobota', 'neděle')
+# Termíny dalších komisí (informační panel nahoře na přehledu) — při plánování dalšího roku stačí přepsat.
+_TERMINY_KOMISI = (('Únor', datetime.date(2027, 2, 9)), ('Březen', datetime.date(2027, 3, 23)),
+                   ('Květen', datetime.date(2027, 5, 11)), ('Červenec', datetime.date(2027, 7, 13)),
+                   ('Září', datetime.date(2027, 9, 14)), ('Listopad', datetime.date(2027, 11, 9)))
 
 
 def _norm(text) -> str:
@@ -330,6 +334,62 @@ def _uloz_zapisy(polozky, klic, user_id, user_name):
     intranet_sankce.zapis_audit_hromadne(
         T_RADEK, [(h, rid, pole, ocek, nova) for h, rid, ocek, nova in zmeny], user_id, user_name)
     return vysl
+
+
+# ============================================================== LOG K2 ==
+# Log změn K2 z provozního systému (export „Všechny karty", obvykle .slk):
+# hlavička „Kód9 : | Název | Kód 2 | Změna kód 2" — Kód 2 je AKTUÁLNÍ K2 karty.
+_LOG_LIST = 'delist'   # list, kde se navíc vyhodnocuje Kód 3 a pomlčky v K2
+# (hotovo, není) — zapisuje se ve tvaru, jaký už list používá
+_LOG_HODNOTY = {'zmena_k2': ('Hotovo', 'Není'), _LOG_LIST: ('hotovo', 'není')}
+_LOG_PRAVIDLO = {
+    'zmena_k2': 'Řádky, jejichž Kód9 je v logu, dostanou „Hotovo", ostatní „Není".',
+    _LOG_LIST: 'Řádek dostane „hotovo", když je jeho Kód9 v logu a Kód 2 v logu má tolik pomlček, '
+               'kolik žádá Kód 3 na webu: 0 → jedna (34-), 9 → dvě (34--). Ostatní dostanou „není".',
+}
+_POMLCKY = '-–−'   # i typografické varianty; dlouhá „—" se počítá jako dvě
+
+
+def _bunka(v) -> str:
+    if isinstance(v, float) and v.is_integer():
+        v = int(v)
+    return str(v if v is not None else '').strip()
+
+
+def _kod9(v) -> str:
+    s = _bunka(v)
+    return (s.lstrip('0') or s) if s.isdigit() else s   # 09915070 v listu = 9915070 v logu
+
+
+def _nacti_log_k2(raw, jmeno):
+    """Log změn K2 → ({kód9: aktuální K2}, chyba). Více záznamů karty → nejnovější."""
+    import intranet_cenopripad   # čtečka .slk / .xls / .xlsx (velký modul → líně)
+    try:
+        rows = intranet_cenopripad._nacti_rows(raw, jmeno)
+    except Exception as e:
+        return {}, f'Soubor se nepodařilo přečíst ({e}).'
+    sl, log = None, {}
+    for row in rows:
+        if sl is None:
+            hl = [_norm(c).rstrip(' :') for c in row]
+            if 'kod9' in hl and 'kod 2' in hl:
+                sl = (hl.index('kod9'), hl.index('kod 2'),
+                      hl.index('zmena kod 2') if 'zmena kod 2' in hl else None)
+            continue
+        bunka = lambda i: _bunka(row[i]) if i is not None and i < len(row) else ''
+        kod = _kod9(bunka(sl[0]))
+        if kod and (kod not in log or bunka(sl[2]) >= log[kod][1]):
+            log[kod] = (bunka(sl[1]), bunka(sl[2]))
+    if sl is None:
+        return {}, 'V souboru chybí hlavička „Kód9 :" a „Kód 2" — je to log změn K2?'
+    return {k: v[0] for k, v in log.items()}, None
+
+
+def _hotovo_dle_logu(k2, k3) -> bool:
+    """Delist: Kód 3 = 0 → K2 v logu končí jednou pomlčkou (34-), 9 → dvěma (34--)."""
+    n = {'0': 1, '9': 2}.get(k3)
+    k2 = k2.replace('—', '--')
+    return n is not None and len(k2) - len(k2.rstrip(_POMLCKY)) == n
 
 
 def _smaz_obdobi(soubor_id) -> bool:
@@ -1135,6 +1195,19 @@ def _grid_options(meta, radky, pise, prazdno_txt):
     return opts
 
 
+async def _obsah_uploadu(e):
+    """(bytes, jméno) nahraného souboru, nebo (None, '') — napříč verzemi NiceGUI
+    se obsah nahraného souboru jmenuje různě."""
+    zdroj = next((v for v in (getattr(e, a, None) for a in ('content', 'file', 'stream', 'data', 'file_obj'))
+                  if v is not None and hasattr(v, 'read')), None)
+    if zdroj is None:
+        return None, ''
+    raw = zdroj.read()
+    if inspect.isawaitable(raw):
+        raw = await raw
+    return raw, getattr(e, 'name', '') or getattr(zdroj, 'name', '') or ''
+
+
 async def _list_ui(soubor_id, klic, pr, user_id, user_name):
     kody = pr['kody'] if klic == 'sumarizace' else None
     meta, radky = await asyncio.to_thread(_nacti_list, soubor_id, klic, kody)
@@ -1164,6 +1237,11 @@ async def _list_ui(soubor_id, klic, pr, user_id, user_name):
             .props('outline dense no-caps color=secondary') \
             .tooltip('Stáhne list 1:1 jako v nahraném souboru, se zapsanými hodnotami. '
                      'Je-li v listu aktivní filtr, exportují se jen vyfiltrované řádky.')
+        btn_log = None
+        if pise and zel and klic in _LOG_PRAVIDLO:
+            btn_log = ui.button('Dotáhnout z logu K2', icon='fact_check') \
+                .props('outline dense no-caps color=primary') \
+                .tooltip(f'Nahrajte log změn K2 (.slk). {_LOG_PRAVIDLO[klic]}')
 
     grid = ui.aggrid(_grid_options(meta, radky, pise, prazdno)) \
         .classes('zk-grid w-full').style(intranet_sankce._GRID_STYLE)
@@ -1223,6 +1301,12 @@ async def _list_ui(soubor_id, klic, pr, user_id, user_name):
         if not polozky:
             return
         vysl = await asyncio.to_thread(_uloz_zapisy, polozky, klic, user_id, user_name)
+        chyby = _promitni(vysl)
+        if chyby:
+            ui.notify(f'Nezapsáno {len(chyby)} z {len(vysl)}: {chyby[0]}', type='warning')
+
+    def _promitni(vysl):
+        """Promítne výsledek _uloz_zapisy do mřížky; vrací seznam chybových hlášek."""
         upd, chyby = [], []
         for rid, ok, msg, akt, by, at in vysl:
             radek = mapa[rid]
@@ -1233,8 +1317,7 @@ async def _list_ui(soubor_id, klic, pr, user_id, user_name):
             if not ok:
                 chyby.append(msg)
         grid.run_grid_method('applyTransaction', {'update': upd})
-        if chyby:
-            ui.notify(f'Nezapsáno {len(chyby)} z {len(vysl)}: {chyby[0]}', type='warning')
+        return chyby
 
     grid.on('zkZapis', _on_zapis)
 
@@ -1259,6 +1342,72 @@ async def _list_ui(soubor_id, klic, pr, user_id, user_name):
                                      + (f' ({len(ids)} vyfiltrovaných řádků)' if ids is not None else ''))
 
     btn_export.on_click(_export)
+
+    def _dotahni_log():
+        """Změna K2 (stejně jako na produkci): Kód9 v logu → „Hotovo", jinak „Není".
+        Delist navíc žádá pomlčky v K2 z logu podle Kódu 3 na webu (_hotovo_dle_logu)."""
+        sl = {_norm(s.get('hdr')).rstrip(' :'): s['L'] for s in meta['sloupce']}
+        sl_kod, sl_k3 = sl.get('kod9'), sl.get('kod 3')
+        delist = klic == _LOG_LIST
+        if sl_kod is None or (delist and sl_k3 is None):
+            ui.notify('V listu chybí sloupec „Kód9"' + (' / „Kód 3"' if delist else '') + '.',
+                      type='negative')
+            return
+        hotovo, neni = _LOG_HODNOTY[klic]
+
+        with ui.dialog() as dlg, ui.card().classes('w-[520px] max-w-full gap-3'):
+            ui.label('Dotáhnout ID změny z logu K2').classes('text-lg font-bold')
+            ui.label(f'Nahrajte log změn K2 (.slk). {_LOG_PRAVIDLO[klic]} Přepisují se jen prázdné '
+                     f'buňky a „{neni}" — jiné ruční zápisy zůstanou.') \
+                .classes('text-sm text-gray-600')
+
+            async def _on_upload(e):
+                raw, jmeno = await _obsah_uploadu(e)
+                up.reset()
+                if raw is None:
+                    ui.notify('Soubor se nepodařilo načíst.', type='negative')
+                    return
+                kody_logu, chyba = await asyncio.to_thread(_nacti_log_k2, raw, jmeno or 'log.slk')
+                if not chyba and not kody_logu:
+                    chyba = 'Log neobsahuje žádné kódy karet.'
+                if chyba:
+                    ui.notify(chyba, type='negative')
+                    return
+                polozky = []
+                for radek in mapa.values():
+                    kod = _kod9(radek.get(sl_kod))
+                    if not kod:
+                        continue
+                    stara = str(radek.get(zel) or '')
+                    if stara.strip() and _norm(stara) != 'neni':
+                        continue   # ruční zápis (i „Hotovo") nepřepisujeme
+                    k2 = kody_logu.get(kod)
+                    ok = k2 is not None and (not delist or _hotovo_dle_logu(k2, _bunka(radek.get(sl_k3))))
+                    nova = hotovo if ok else neni
+                    if stara != nova:
+                        polozky.append((radek['id'], stara, nova))
+                dlg.close()
+                if not polozky:
+                    ui.notify('Log nic nezměnil — všechny řádky už jsou vyplněné.', type='info')
+                    return
+                vysl = await asyncio.to_thread(_uloz_zapisy, polozky, klic, user_id, user_name)
+                chyby = _promitni(vysl)
+                pocty = Counter(akt for _, ok, _, akt, _, _ in vysl if ok)
+                souhrn = f"Hotovo {pocty[hotovo]}, Není {pocty[neni]}"
+                intranet_logger.log_activity(user_name, NAZEV,
+                                             f'{_LIST[klic][1]}: dotaženo z logu {jmeno} — {souhrn}')
+                ui.notify(f'Dotaženo z logu: {souhrn}.'
+                          + (f' Nezapsáno {len(chyby)}: {chyby[0]}' if chyby else ''),
+                          type='warning' if chyby else 'positive')
+
+            up = ui.upload(on_upload=_on_upload, auto_upload=True, max_file_size=_MAX_SOUBOR,
+                           label='Vybrat log .slk').props('accept=.slk').classes('w-full')
+            with ui.row().classes('w-full justify-end'):
+                ui.button('Zrušit', on_click=dlg.close).props('flat no-caps')
+        dlg.open()
+
+    if btn_log:
+        btn_log.on_click(_dotahni_log)
 
 
 async def _detail_ui(soubor_id, pr, user_id, user_name, zpet):
@@ -1398,25 +1547,17 @@ def _otevri_import(user_name, po_importu):
         datum.on_value_change(_kontrola_obdobi)
 
         async def _on_upload(e):
-            zdroj = None   # napříč verzemi NiceGUI se obsah nahraného souboru jmenuje různě
-            for attr in ('content', 'file', 'stream', 'data', 'file_obj'):
-                val = getattr(e, attr, None)
-                if val is not None and hasattr(val, 'read'):
-                    zdroj = val
-                    break
+            raw, jmeno = await _obsah_uploadu(e)
+            jmeno = jmeno or 'zapis.xlsx'
             up.reset()
             souhrn.clear()
             stav.update(raw=None, listy=None)
             btn.disable()
             mail.set_visibility(False)
-            if zdroj is None:
+            if raw is None:
                 with souhrn:
                     ui.label('❌ Soubor se nepodařilo načíst.').classes('text-sm text-red-600')
                 return
-            raw = zdroj.read()
-            if inspect.isawaitable(raw):
-                raw = await raw
-            jmeno = getattr(e, 'name', '') or getattr(zdroj, 'name', '') or 'zapis.xlsx'
             if len(raw) > _MAX_SOUBOR:
                 with souhrn:
                     ui.label('❌ Soubor je větší než 20 MB.').classes('text-sm text-red-600')
@@ -1517,6 +1658,38 @@ async def vykresli_zalistovaci(user_id, user_name: str, vsechna_prava):
                 ui.button('Nahrát zápis', icon='upload_file',
                           on_click=lambda: _otevri_import(user_name, obsah.refresh if vidi else (lambda: None))) \
                     .props('unelevated no-caps color=primary')
+        _terminy_panel()
+
+    def _terminy_panel():
+        """Informační panel s termíny dalších komisí; nejbližší budoucí termín je zvýrazněný."""
+        dnes = datetime.date.today()
+        nejblizsi = next((d for _, d in _TERMINY_KOMISI if d >= dnes), None)
+        roky = sorted({d.year for _, d in _TERMINY_KOMISI})
+        with ui.element('div').classes('w-full mb-5 rounded-xl border border-indigo-100 bg-indigo-50 p-4'):
+            with ui.row().classes('items-center gap-2 mb-3'):
+                ui.icon('event', size='1.4rem').classes('text-indigo-600')
+                ui.label(f"Termíny {', '.join(map(str, roky))}") \
+                    .classes('text-base font-bold text-indigo-900')
+            with ui.row().classes('w-full gap-2 flex-wrap'):
+                for mesic, d in _TERMINY_KOMISI:
+                    dalsi = d == nejblizsi
+                    probehla = d < dnes
+                    barvy = ('bg-indigo-600 text-white border-indigo-600 shadow' if dalsi else
+                             'bg-white text-gray-400 border-gray-200' if probehla else
+                             'bg-white text-gray-800 border-indigo-100')
+                    with ui.column().classes(f'gap-0 rounded-lg border px-3 py-2 min-w-[130px] {barvy}'):
+                        ui.label(mesic).classes('text-xs font-semibold uppercase tracking-wide '
+                                                + ('text-indigo-100' if dalsi else 'text-indigo-500'
+                                                   if not probehla else ''))
+                        ui.label(f'{d.day}. {d.month}. {d.year}').classes(
+                            'text-lg font-extrabold leading-tight' + (' line-through' if probehla else ''))
+                        if dalsi:
+                            za = (d - dnes).days
+                            kdy = ('dnes' if za == 0 else 'zítra' if za == 1 else
+                                   f"za {za} {'dny' if za < 5 else 'dní'}")
+                            ui.label(f'{_DNY[d.weekday()]} · nejbližší, {kdy}').classes('text-xs text-indigo-100')
+                        else:
+                            ui.label(_DNY[d.weekday()]).classes('text-xs opacity-70')
 
     @ui.refreshable
     async def obsah():
