@@ -2175,6 +2175,7 @@ def nacti_graf_naklad_kg_pobocky(rok: int, pobocky: list[str]) -> dict[str, dict
 
 _PREHLED_DB_COLS = [
     'total', 'vysledek', 'naklady', 'mzdy', 'nahrady', 'likvidace', 'inventura',
+    'inventura_zaplaceno',
     'repre_spotreba', 'zasoby', 'obrat_kg_celkem', 'obrat_kg', 'obrat_kg_dcery',
     'obrat_kg_site', 'obrat_kg_staropramen', 'obrat_kg_ostatni',
     'operace', 'operace_dcery', 'operace_site',
@@ -2816,6 +2817,9 @@ def _col_defs_prehled_ao(rok_old: int, rok_new: int) -> list[dict]:
                      kc_pos='bad', pct_pos='bad'),
         _ao_grp_diff('Inventura',        'inventura',      rok_old, rok_new,
                      kc_pos='bad', pct_pos='bad'),
+        # Inventura zaplaceno = sl. „Inventura z toho zaplaceno" – bez barvení (výklad nejednoznačný)
+        _ao_grp_diff('Inventura zaplaceno', 'inventura_zaplaceno', rok_old, rok_new,
+                     kc_pos='neutral', pct_pos='neutral'),
         _ao_grp_diff('Repre + spotřeba', 'repre_spotreba', rok_old, rok_new,
                      kc_pos='bad', pct_pos='bad'),
         # Zásoby = bez jednoznačné interpretace → rozdíl bez barvení
@@ -2917,7 +2921,7 @@ def nacti_prehled_ao(roky: list[int], pobocky: list[str],
     # (operace_celkem se dopočítá v _op_celkem ještě před _diff).
     diff_metriky = (
         'total', 'vysledek', 'naklady', 'mzdy', 'nahrady', 'likvidace', 'inventura',
-        'repre_spotreba', 'zasoby', 'obrat_kg_celkem', 'obrat_kg', 'obrat_kg_dcery',
+        'inventura_zaplaceno', 'repre_spotreba', 'zasoby', 'obrat_kg_celkem', 'obrat_kg', 'obrat_kg_dcery',
         'obrat_kg_site', 'obrat_kg_staropramen', 'obrat_kg_ostatni', 'operace_celkem',
     )
 

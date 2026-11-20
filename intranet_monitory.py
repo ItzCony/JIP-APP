@@ -262,6 +262,8 @@ def _bunka_styl(bunka, paleta: list = None) -> dict:
         fg = _barva(font.color, paleta)
         if fg and fg != '#000000':
             s['color'] = fg
+        if font.sz:
+            s['fontSize'] = f'{round(font.sz * 4 / 3, 1)}px'   # body → px jako Excel při 100 %
     al = bunka.alignment.horizontal if bunka.alignment is not None else None
     if al in ('left', 'center', 'right'):
         s['textAlign'] = al
@@ -298,10 +300,12 @@ def _cf_pravidlo(r, paleta: list = None):
 def _sablona_a_styly(raw: bytes):
     """(bajty šablony | None, {norm(list): {'fmt': {písmeno: formát},
     'cf': {písmeno: [pravidla]}, 'hdr': {písmeno: css}, 'bunka': {písmeno:
-    css}}}). Jen pro .xlsx/.xlsm — .xlsb styly nenese."""
+    css}, 'sirka': {písmeno: px}, 'skryte': [písmena], 'vyska': [hlavička,
+    řádek]}}). Jen pro .xlsx/.xlsm — .xlsb styly nenese."""
     try:
         import openpyxl
-        from openpyxl.utils import get_column_letter, range_boundaries
+        from openpyxl.utils import (column_index_from_string, get_column_letter,
+                                    range_boundaries)
         wb = openpyxl.load_workbook(io.BytesIO(raw), data_only=False)
     except Exception as e:
         print(f'[monitory] Šablonu nelze načíst ({e}) — export bude bez formátů.')
@@ -336,8 +340,29 @@ def _sablona_a_styly(raw: bytes):
         # rozsahů na jednom sloupci se řadí podle ní, ne podle pořadí v XML.
         for pravidla in cf.values():
             pravidla.sort(key=lambda p: p['prio'])
+        # Rozložení listu, ať grid vypadá jako sešit: šířky (Excel je má ve
+        # znacích, znak = 7 px), skryté sloupce a výšky hlavičky a řádku
+        # (body → px). Sousedy se stejnou šířkou drží openpyxl jako skupinu
+        # min–max pod písmenem prvního z nich.
+        pocet = ws.max_column or 0
+        vychozi = round((ws.sheet_format.defaultColWidth or 9.14) * 7)
+        sirka = {get_column_letter(c): vychozi for c in range(1, pocet + 1)}
+        skryte = []
+        for d in ws.column_dimensions.values():
+            od = d.min or column_index_from_string(d.index)
+            for c in range(od, min(d.max or od, pocet) + 1):
+                if d.hidden or d.width == 0:
+                    skryte.append(get_column_letter(c))
+                elif d.width:
+                    sirka[get_column_letter(c)] = round(d.width * 7)
+        vyska = []
+        for r in (1, 2):
+            rd = ws.row_dimensions.get(r)
+            vyska.append(round(((rd.height if rd is not None else None)
+                                or ws.sheet_format.defaultRowHeight or 15) * 4 / 3))
         styly[_norm(ws.title)] = {'fmt': fmt, 'cf': cf, 'hdr': hdr,
-                                  'bunka': bunky,
+                                  'bunka': bunky, 'sirka': sirka,
+                                  'skryte': skryte, 'vyska': vyska,
                                   'hlavicka': [_s(ws.cell(1, c).value).strip()
                                                for c in range(1, (ws.max_column or 0) + 1)]}
 
@@ -1106,6 +1131,110 @@ def _cf_js(pravidla: list, zaklad: dict = None):
             + ' '.join(vetve) + " return h(); }")
 
 
+# Grid „jako přes kopírák" ze sešitu: písmo sešitů (šířky sloupců jsou laděné
+# na něj), úzké odsazení buněk, linky mezi sloupci a filtr v rohu hlavičky
+# (jen při najetí nebo zapnutý) — v úzkých sloupcích by jinak sebral místo
+# nadpisu.
+_GRID_STYLE = (intranet_sankce._GRID_STYLE
+               + '; --ag-font-family: Calibri, Carlito, Arial, sans-serif'
+               '; --ag-cell-horizontal-padding: 3px'
+               '; --ag-column-border: 1px solid #d4d4d8'
+               '; --ag-header-column-border: 1px solid #d4d4d8'
+               '; --ag-header-column-border-height: 100%')
+_GRID_CSS = (
+    '.monitor-grid .ag-header-cell-filter-button{position:absolute;right:1px;bottom:1px;'
+    'margin:0;opacity:0;background:#fff;border-radius:3px}'
+    '.monitor-grid .ag-header-cell:hover .ag-header-cell-filter-button,'
+    '.monitor-grid .ag-header-cell-filtered .ag-header-cell-filter-button{opacity:1}'
+    # Dělicí čáru má připnutá hlavička na obalu, buňky v sobě — nadpis
+    # Vyjádření by seděl o 1 px vedle sloupce.
+    '.monitor-grid .ag-pinned-right-header{border-left:0}'
+    '.monitor-grid .ag-pinned-right-header .ag-header-cell'
+    '{border-left:var(--ag-pinned-column-border)}'
+)
+# Vyjádření je připnuté vpravo. Když se sloupce vejdou celé (oddálená stránka,
+# široký monitor), zbylo by před ním prázdno — to místo si vezme Vyjádření.
+# `__navic` = kolik má právě přidáno, ať se při zúžení vrátí na svou šířku.
+# Po prudkém zúžení je střed gridu stlačený na nulu a volné místo nejde
+# změřit — přídavek se nejdřív zahodí a změří se znovu (proto smyčka).
+#
+# Při velkém přiblížení by ukotvené sloupce nenechaly na zbytek místo. Pod
+# 200 px středu se proto pouští uživatelova ukotvení zprava (`__pusteno`);
+# oko zůstává, Období jde až poslední. Po oddálení se puštěné sloupce zase
+# ukotví na svou stranu, Vyjádření první. Pouští se po jednom a střed se
+# přeměřuje — ze stlačeného středu není poznat, kolik místa chybí.
+_DOROVNEJ_JS = (
+    "function(p){var a=p.api,c=a.getColumn('vyjadreni');if(!c)return;var v=0,s=0;"
+    "for(var i=0;i<3;i++){var r=a.getHorizontalPixelRange(),e=c.__navic||0;v=r.right-r.left;"
+    "s=a.getDisplayedCenterColumns().reduce(function(x,k){return x+k.getActualWidth();},0);"
+    "var n=v>0?Math.max(0,Math.round(v-s+e)):0;"
+    "if(n===e)break;c.__navic=n;"
+    "a.setColumnWidths([{key:'vyjadreni',newWidth:c.getActualWidth()-e+n}]);}"
+    "if(v<200&&s>v){for(var q=0;q<99;q++){var L=a.getDisplayedLeftColumns(),u=null;"
+    "for(var j=L.length-1;j>=0&&!u;j--)if(L[j].getColId()!=='_eye')u=L[j];"
+    "if(!u)break;u.__pusteno='left';a.setColumnsPinned([u],null);"
+    "r=a.getHorizontalPixelRange();if(r.right-r.left>=200)break;}return;}"
+    "var zpet={left:[],right:[]},dost=0;"
+    "a.getColumns().filter(function(k){return k.__pusteno;})"
+    ".sort(function(x,y){return (y===c)-(x===c);}).forEach(function(k){"
+    "if(k.isPinned()){k.__pusteno=0;return;}var w=k.getActualWidth();"
+    "if(dost||v-w<220){dost=1;return;}zpet[k.__pusteno].push(k);k.__pusteno=0;v-=w;});"
+    "['left','right'].forEach(function(t){"
+    "if(zpet[t].length)a.setColumnsPinned(zpet[t],t);});}"
+)
+# Totéž, když grid sáhne k odepínání sám (střed pod 50 px) — začal by
+# Vyjádřením. Roztažené Vyjádření se nejdřív vrátí na svou šířku. Výběr gridu
+# (i Vyjádření a oko) se přidá až tehdy, když nestačí pustit všechno ostatní.
+_NEODEPINEJ_JS = (
+    "function(p){var a=p.api,c=a.getColumn('vyjadreni'),e=c&&c.__navic;"
+    "if(e){c.__navic=0;a.setColumnWidths([{key:'vyjadreni',newWidth:c.getActualWidth()-e}]);}"
+    "var w=function(x,k){return x+k.getActualWidth();},L=a.getDisplayedLeftColumns(),ven=[],"
+    "moc=L.reduce(w,0)+a.getDisplayedRightColumns().reduce(w,0)-(p.viewportWidth-200);"
+    "for(var j=L.length-1;j>=0&&moc>0;j--){if(L[j].getColId()==='_eye')continue;"
+    "L[j].__pusteno='left';ven.push(L[j]);moc-=L[j].getActualWidth();}"
+    "if(moc>0)p.columns.forEach(function(k){"
+    "if(ven.indexOf(k)<0){k.__pusteno=k.getPinned();ven.push(k);}});"
+    "return ven;}"
+)
+# Uživatel ukotvení změnil sám (tlačítko „Ukotvit sloupce") — platí jeho nová
+# volba: co bylo puštěné dřív, se už nevrací, a místo se přepočítá znovu.
+_PO_KOTVE_JS = (
+    "function(a){a.getColumns().forEach(function(k){k.__pusteno=0;});"
+    "setTimeout(function(){(%s)({api:a});},50);}" % _DOROVNEJ_JS
+)
+# Dorovnání podle obsahu jen pro sloupce ze sešitu — prázdné Vyjádření,
+# Zapsal a Kdy by se jinak smrskly na nic.
+_AUTOSIZE_JS = ("p.api.autoSizeColumns(p.api.getColumns().filter(function(c)"
+                "{return !c.getColDef().suppressAutoSize;}),true);")
+
+
+def _volby_rozlozeni(rozlozeni: dict) -> dict:
+    """Volby gridu, které drží rozložení jako v sešitu."""
+    vyska_hl, vyska_radku = rozlozeni.get('vyska') or (48, 32)
+    return {
+        # Nadpisy se lámou jako v sešitu; výška hlavičky ze sešitu je minimum,
+        # delší nadpis si ji natáhne.
+        'defaultColDef': {'resizable': True, 'sortable': False, 'filter': True,
+                          'wrapHeaderText': True, 'autoHeaderHeight': True},
+        'rowHeight': vyska_radku,
+        'headerHeight': vyska_hl,
+        # Výška hlavičky se měří jen z vykreslených sloupců — s virtualizací
+        # by při posunu do stran skákala.
+        'suppressColumnVirtualisation': True,
+        # Změna ukotvení bez animace — sloupce by se během ní překrývaly.
+        'suppressColumnMoveAnimation': True,
+        # Šířky jsou ze sešitu. Kde nejsou (.xlsb bez šablony, starý import),
+        # dorovnají se podle obsahu — bez nadpisu, ten se zalomí.
+        ':onFirstDataRendered': 'function(p){%s(%s)(p);}' % (
+            '' if rozlozeni.get('sirka') else _AUTOSIZE_JS, _DOROVNEJ_JS),
+        ':onGridSizeChanged': _DOROVNEJ_JS,
+        # Ruční změna šířky sloupce mění volné místo taky ('api' = vlastní
+        # dorovnání, to znovu nepouštět).
+        ':onColumnResized': "function(p){if(p.finished&&p.source!=='api')(%s)(p);}" % _DOROVNEJ_JS,
+        ':processUnpinnedColumns': _NEODEPINEJ_JS,
+    }
+
+
 def _col_defs(sloupce: list, editovatelne: bool, styly: dict = None) -> list:
     cols = [
         {'headerName': '', 'field': '_eye', 'width': 46, 'minWidth': 46, 'maxWidth': 46,
@@ -1121,12 +1250,21 @@ def _col_defs(sloupce: list, editovatelne: bool, styly: dict = None) -> list:
     cf = (styly or {}).get('cf') or {}
     hdr = (styly or {}).get('hdr') or {}
     bunky = (styly or {}).get('bunka') or {}
+    sirka = (styly or {}).get('sirka') or {}
+    skryte = set((styly or {}).get('skryte') or ())
     for idx, s in enumerate(sloupce):
-        c = {'headerName': s['h'], 'field': s['k'], 'width': 150, 'sortable': True}
-        if s.get('num'):
-            c['type'] = 'numericColumn'
         # Sloupce jdou v pořadí, v jakém byly v sešitu → n-tý = písmeno n.
         pismeno = _pismeno(idx + 1)
+        if pismeno in skryte:
+            continue   # v sešitu skrytý → není ani tady (v exportu zůstává)
+        c = {'headerName': s['h'], 'field': s['k'], 'sortable': True}
+        if pismeno in sirka:
+            c['width'] = sirka[pismeno]
+        else:
+            # Bez rozložení ze sešitu se šířka dorovná podle obsahu (viz grid).
+            c.update(width=150, minWidth=60)
+        if s.get('num'):
+            c['type'] = 'numericColumn'
         if fmt.get(pismeno):
             js = _fmt_js(fmt[pismeno])
             if js:
@@ -1141,12 +1279,15 @@ def _col_defs(sloupce: list, editovatelne: bool, styly: dict = None) -> list:
             c['cellStyle'] = zaklad
         cols.append(c)
     cols += [
-        {'headerName': 'Vyjádření', 'field': 'vyjadreni', 'width': 320,
+        # Připnuté vpravo — položka i vyjádření jsou vidět naráz, bez posunu.
+        {'headerName': 'Vyjádření', 'field': 'vyjadreni', 'width': 320, 'pinned': 'right',
          'editable': editovatelne, 'cellEditor': 'agLargeTextCellEditor',
          'cellEditorPopup': True, 'cellStyle': {'backgroundColor': '#fffbeb'},
-         'headerTooltip': 'Vyjádření k řádku monitoru'},
-        {'headerName': 'Zapsal', 'field': 'vyjadreni_by', 'width': 150, 'editable': False},
+         'headerTooltip': 'Vyjádření k řádku monitoru', 'suppressAutoSize': True},
+        {'headerName': 'Zapsal', 'field': 'vyjadreni_by', 'width': 150, 'editable': False,
+         'suppressAutoSize': True},
         {'headerName': 'Kdy', 'field': 'vyjadreni_at', 'width': 130, 'editable': False,
+         'suppressAutoSize': True,
          'cellStyle': {'fontSize': '12px', 'color': '#475569'}},
     ]
     return cols
@@ -1321,7 +1462,11 @@ async def _vykresli_typ(typ: str, user_id, user_name: str, vsechna_prava):
                 print(f'[monitory] Export ze šablony selhal ({e}) — jedu bez formátů.')
         await _export_xlsx(_export_cols(sloupce), data, None, zaklad, spec['nazev'])
 
+    grid = None   # vzniká až pod lištou; spadne-li lišta, filtry nemají co plnit
+
     def _aplikuj():
+        if grid is None:
+            return
         data = _zobrazene()
         grid.options['rowData'] = data
         grid.update()
@@ -1359,7 +1504,8 @@ async def _vykresli_typ(typ: str, user_id, user_name: str, vsechna_prava):
             return intranet_sankce._s_kotvou(
                 _col_defs(sloupce, psat_vse, vsechny_styly.get(aktualni_list)), k)
         _, kotva = intranet_sankce._kotva_tlacitko(
-            f'monitor_{typ}_kotva_{_norm(aktualni_list)}', _defs_s_kotvou, lambda: grid)
+            f'monitor_{typ}_kotva_{_norm(aktualni_list)}', _defs_s_kotvou, lambda: grid,
+            po_zmene=lambda g: ui.run_javascript(f'({_PO_KOTVE_JS})(getElement({g.id}).api)'))
 
         ui.space()
         info = ui.label(_info_text()).classes('text-sm text-gray-500')
@@ -1378,19 +1524,19 @@ async def _vykresli_typ(typ: str, user_id, user_name: str, vsechna_prava):
         ui.label('👁️ Sestavu vidíte jen pro čtení – filtrovat, řadit a exportovat '
                  'ale můžete.').classes('text-xs text-gray-500 mb-1')
 
+    ui.add_css(_GRID_CSS)
     grid = ui.aggrid({
         'columnDefs': _defs_s_kotvou(kotva),
         'rowData': _zobrazene(),
-        'defaultColDef': {'resizable': True, 'sortable': False, 'filter': True},
-        'rowHeight': 32,
+        **_volby_rozlozeni(vsechny_styly.get(aktualni_list) or {}),
         'singleClickEdit': True,
         'stopEditingWhenCellsLoseFocus': True,
         'suppressMovableColumns': True,
         'rowSelection': 'multiple',
         'suppressRowClickSelection': True,
         ':getRowId': intranet_sankce._GET_ROW_ID,
-        ':onFirstDataRendered': intranet_sankce._AUTOSIZE_FIT,
-    }).classes('w-full').style(intranet_sankce._GRID_STYLE)
+        # NiceGUI by jinak sloupce smáčkl na šířku gridu.
+    }, auto_size_columns=False).classes('w-full monitor-grid').style(_GRID_STYLE)
 
     # -- Zápis vyjádření --
     async def _on_change(e):
