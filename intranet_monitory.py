@@ -91,6 +91,8 @@ MONITORY = OrderedDict([
     ('tamda', {
         'nazev': 'TAMDA', 'emoji': '🛍️', 'tabulka': 'monitor_tamda',
         'listy': ('porovnání',), 'klic': ('id', 'kod_jip', 'k2'),
+        # Hustší grid: písmo, šířky a výšky × 0,8 (jen obrazovka, export ne).
+        'meritko': 0.8,
         'border': 'border-sky-200', 'btn': 'bg-sky-600 hover:bg-sky-700',
     }),
 ])
@@ -1265,7 +1267,7 @@ _GRID_CSS = (
 #
 # Při velkém přiblížení by ukotvené sloupce nenechaly na zbytek místo. Pod
 # 200 px středu se proto pouští uživatelova ukotvení zprava (`__pusteno`);
-# oko zůstává, Období jde až poslední. Po oddálení se puštěné sloupce zase
+# oko zůstává. Po oddálení se puštěné sloupce zase
 # ukotví na svou stranu, Vyjádření první. Pouští se po jednom a střed se
 # přeměřuje — ze stlačeného středu není poznat, kolik místa chybí.
 _DOROVNEJ_JS = (
@@ -1340,7 +1342,27 @@ def _volby_rozlozeni(rozlozeni: dict) -> dict:
     }
 
 
-def _col_defs(sloupce: list, editovatelne: bool, styly: dict = None) -> list:
+def _pismo(css: dict, k: float) -> dict:
+    """Css buňky s písmem × k (fontSize je v px, viz _bunka_styl)."""
+    fs = (css or {}).get('fontSize')
+    return dict(css, fontSize=f'{round(float(fs[:-2]) * k, 1)}px') if fs else css
+
+
+def _zmensene(styly: dict, k: float) -> dict:
+    """Styly listu pro hustší grid (MONITORY[…]['meritko']): šířky, výšky
+    a písmo ze sešitu × k. Jen pro obrazovku, export jde z původních."""
+    if k == 1:
+        return styly or {}
+    st = dict(styly or {})
+    st['sirka'] = {p: round(w * k) for p, w in (st.get('sirka') or {}).items()}
+    hl, rd = st.get('vyska') or (48, 32)
+    st['vyska'] = [max(28, round(hl * k)), max(22, round(rd * k))]
+    for co in ('hdr', 'bunka'):
+        st[co] = {p: _pismo(css, k) for p, css in (st.get(co) or {}).items()}
+    return st
+
+
+def _col_defs(sloupce: list, editovatelne: bool, styly: dict = None, k: float = 1) -> list:
     cols = [
         {'headerName': '', 'field': '_eye', 'width': 46, 'minWidth': 46, 'maxWidth': 46,
          'pinned': 'left', 'sortable': False, 'editable': False, 'resizable': False,
@@ -1348,9 +1370,7 @@ def _col_defs(sloupce: list, editovatelne: bool, styly: dict = None) -> list:
          ':cellRenderer': intranet_sankce._EYE_RENDERER,
          'cellStyle': {'textAlign': 'center', 'cursor': 'pointer', 'padding': '0'},
          'headerTooltip': 'Historie změn řádku'},
-        {'headerName': 'Období', 'field': 'obdobi', 'width': 150, 'pinned': 'left',
-         'sortable': True, 'cellStyle': {'fontSize': '12px', 'color': '#475569'}},
-    ]
+    ]   # Období se filtruje nahoře → vlastní sloupec netřeba
     fmt = (styly or {}).get('fmt') or {}
     cf = (styly or {}).get('cf') or {}
     hdr = (styly or {}).get('hdr') or {}
@@ -1368,7 +1388,7 @@ def _col_defs(sloupce: list, editovatelne: bool, styly: dict = None) -> list:
             c['width'] = sirka[pismeno]
         else:
             # Bez rozložení ze sešitu se šířka dorovná podle obsahu (viz grid).
-            c.update(width=150, minWidth=60)
+            c.update(width=round(150 * k), minWidth=60)
         if s.get('num'):
             c['type'] = 'numericColumn'
         if fmt.get(pismeno):
@@ -1387,21 +1407,22 @@ def _col_defs(sloupce: list, editovatelne: bool, styly: dict = None) -> list:
         cols.append(c)
     cols += [
         # Připnuté vpravo — položka i vyjádření jsou vidět naráz, bez posunu.
-        {'headerName': 'Vyjádření', 'field': 'vyjadreni', 'width': 320, 'pinned': 'right',
+        {'headerName': 'Vyjádření', 'field': 'vyjadreni', 'width': round(320 * k), 'pinned': 'right',
          'editable': editovatelne, 'cellEditor': 'agLargeTextCellEditor',
          'cellEditorPopup': True, 'cellStyle': {'backgroundColor': '#fffbeb'},
          'headerTooltip': 'Vyjádření k řádku monitoru', 'suppressAutoSize': True},
-        {'headerName': 'Zapsal', 'field': 'vyjadreni_by', 'width': 150, 'editable': False,
+        {'headerName': 'Zapsal', 'field': 'vyjadreni_by', 'width': round(150 * k), 'editable': False,
          'suppressAutoSize': True},
-        {'headerName': 'Kdy', 'field': 'vyjadreni_at', 'width': 130, 'editable': False,
+        {'headerName': 'Kdy', 'field': 'vyjadreni_at', 'width': round(130 * k), 'editable': False,
          'suppressAutoSize': True,
          'cellStyle': {'fontSize': '12px', 'color': '#475569'}},
     ]
     return cols
 
 
-def _export_cols(sloupce: list) -> list:
-    cols = [('Období', 'obdobi', 'text', 16)]
+def _export_cols(sloupce: list, s_obdobim: bool = False) -> list:
+    # Období jen při exportu všech období — jinak je celý soubor z jednoho.
+    cols = [('Období', 'obdobi', 'text', 16)] if s_obdobim else []
     cols += [(s['h'], s['k'], 'num' if s.get('num') else 'text', 16) for s in sloupce]
     cols += [('Vyjádření', 'vyjadreni', 'text', 40),
              ('Zapsal', 'vyjadreni_by', 'text', 18),
@@ -1511,6 +1532,8 @@ async def _vykresli_typ(typ: str, user_id, user_name: str, vsechna_prava):
     ulozeny_list = app.storage.user.get(f'monitor_{typ}_list')
     aktualni_list = ulozeny_list if ulozeny_list in listy else listy[0]
     sloupce = meta.get(aktualni_list, [])
+    meritko = spec.get('meritko', 1)
+    styly_gridu = _zmensene(vsechny_styly.get(aktualni_list), meritko)
 
     vsechny = await asyncio.to_thread(_nacti, tabulka, aktualni_list)
     # Ořez na sortimenty uživatele. Jediné místo — grid, export i počty
@@ -1568,7 +1591,8 @@ async def _vykresli_typ(typ: str, user_id, user_name: str, vsechna_prava):
                 return
             except Exception as e:
                 print(f'[monitory] Export ze šablony selhal ({e}) — jedu bez formátů.')
-        await _export_xlsx(_export_cols(sloupce), data, None, zaklad, spec['nazev'])
+        await _export_xlsx(_export_cols(sloupce, stav['obdobi'] is None), data, None,
+                           zaklad, spec['nazev'])
 
     grid = None   # vzniká až pod lištou; spadne-li lišta, filtry nemají co plnit
 
@@ -1607,10 +1631,10 @@ async def _vykresli_typ(typ: str, user_id, user_name: str, vsechna_prava):
 
         # Ukotvení sloupců — stejné tlačítko jako v Nedodávkách. Volba se pamatuje
         # zvlášť pro každý monitor i list (Makro má na listech jiné sloupce);
-        # 👁 a Období jsou připnuté vždy.
+        # 👁 je připnuté vždy.
         def _defs_s_kotvou(k):
             return intranet_sankce._s_kotvou(
-                _col_defs(sloupce, psat_vse, vsechny_styly.get(aktualni_list)), k)
+                _col_defs(sloupce, psat_vse, styly_gridu, meritko), k)
         _, kotva = intranet_sankce._kotva_tlacitko(
             f'monitor_{typ}_kotva_{_norm(aktualni_list)}', _defs_s_kotvou, lambda: grid,
             po_zmene=lambda g: ui.run_javascript(f'({_PO_KOTVE_JS})(getElement({g.id}).api)'))
@@ -1636,7 +1660,7 @@ async def _vykresli_typ(typ: str, user_id, user_name: str, vsechna_prava):
     grid = ui.aggrid({
         'columnDefs': _defs_s_kotvou(kotva),
         'rowData': _zobrazene(),
-        **_volby_rozlozeni(vsechny_styly.get(aktualni_list) or {}),
+        **_volby_rozlozeni(styly_gridu),
         'singleClickEdit': True,
         'stopEditingWhenCellsLoseFocus': True,
         'suppressMovableColumns': True,
@@ -1644,7 +1668,9 @@ async def _vykresli_typ(typ: str, user_id, user_name: str, vsechna_prava):
         'suppressRowClickSelection': True,
         ':getRowId': intranet_sankce._GET_ROW_ID,
         # NiceGUI by jinak sloupce smáčkl na šířku gridu.
-    }, auto_size_columns=False).classes('w-full monitor-grid').style(_GRID_STYLE)
+    }, auto_size_columns=False).classes('w-full monitor-grid').style(
+        _GRID_STYLE + (f'; --ag-font-size: {max(12, round(14 * meritko))}px'   # Quartz má 14
+                       if meritko != 1 else ''))
 
     # -- Zápis vyjádření --
     async def _on_change(e):
