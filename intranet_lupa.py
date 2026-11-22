@@ -4124,7 +4124,8 @@ def importuj_nakup(raw_bytes, nazev_souboru, stav=None, uzivatel=''):
         with _NAKUP_ZAMEK:
             cur = conn.cursor()
             stav['faze'] = 'načítám řádky'
-            mapa, ix, smazane, kody, davka = None, None, set(), set(), []
+            # smazane: (rok, mes) → kolik řádků měsíc měl v DB; nove: kolik jich nese soubor
+            mapa, ix, smazane, nove, kody, davka = None, None, {}, {}, set(), []
             for i, radek in enumerate(_radky_xlsx(raw_bytes, stav), 1):
                 stav['hotovo'] = i
                 if mapa is None:
@@ -4144,7 +4145,8 @@ def importuj_nakup(raw_bytes, nazev_souboru, stav=None, uzivatel=''):
                 if (rok, mes) not in smazane:
                     cur.execute('DELETE FROM lupa_nakup_obrat WHERE rok=%s AND mesic=%s',
                                 (rok, mes))
-                    smazane.add((rok, mes))
+                    smazane[(rok, mes)] = max(cur.rowcount or 0, 0)
+                nove[(rok, mes)] = nove.get((rok, mes), 0) + 1
                 davka.append((rok, mes,
                               _nakup_text(_nakup_bunka(radek, ix['divize']), 60),
                               _nakup_text(_nakup_bunka(radek, ix['pobocka']), 100),
@@ -4188,7 +4190,18 @@ def importuj_nakup(raw_bytes, nazev_souboru, stav=None, uzivatel=''):
 
             stav['faze'] = 'páruji s DATA_POROVNANI'
             par = _nakup_doparuj(conn)
-            vysledek['varovani'] = par.get('chyba') or par.get('varovani')
+            # Export z GISTu filtrovaný datem pořízení nese ke starším měsícům jen pár
+            # dodatečně zaúčtovaných dokladů — celý měsíc v DB pak nahradí zlomkem.
+            ubyle = [f'{r}M{m:02d} ({_nakup_cele_txt(smazane[(r, m)])} → '
+                     f'{_nakup_cele_txt(n)})'
+                     for (r, m), n in sorted(nove.items())
+                     if smazane[(r, m)] >= 1000 and n < smazane[(r, m)] / 2]
+            vysledek['varovani'] = ' '.join(filter(None, [
+                par.get('chyba') or par.get('varovani'),
+                ('Pozor, tyto měsíce teď mají výrazně méně řádků než předtím: '
+                 + ', '.join(ubyle) + '. Export z GISTu nejspíš není za celé měsíce '
+                 '(filtr podle data pořízení?) — nahrajte je znovu kompletní.')
+                if ubyle else None]))
     except Exception as e:
         try:
             conn.rollback()

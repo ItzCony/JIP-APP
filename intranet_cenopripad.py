@@ -8106,6 +8106,28 @@ def _oprava_karta(p):
                 .classes("text-xs text-gray-400")
 
 
+# Tabulky řádků v detailu žádosti (Oprava cen, NC OVOZEL) mají zalamovanou hlavičku
+# (`wrapHeaderText` + `autoHeaderHeight`). Při přiblížení prohlížeče naroste hlavička
+# na 3–4 řádky; dřívější pevná výška `60 + n × 28 px` pak celá připadla hlavičce
+# a řádky „zmizely“ (filtr se navíc ořízl na tu úzkou plochu).
+_RADKY_AUTOHEIGHT_MAX = 15
+
+
+def _radky_grid_layout(pocet):
+    """Rozvržení tabulky řádků žádosti → (gridOptions navíc, CSS style).
+
+    Do `_RADKY_AUTOHEIGHT_MAX` řádků `domLayout: autoHeight` — výška = skutečná
+    hlavička + řádky, takže se při žádném zoomu nic neschová. Víc řádků → vnitřní
+    scroll s pevným minimem, aby i vysoké hlavičce zbylo místo na řádky.
+    Popupy (filtr sloupce) jdou do `document.body`, ne do malé tabulky.
+    """
+    opts = {":popupParent": "document.body"}
+    if pocet <= _RADKY_AUTOHEIGHT_MAX:
+        opts["domLayout"] = "autoHeight"
+        return opts, "height: auto"
+    return opts, "height: max(320px, 55vh)"
+
+
 def _oprava_detail(pid, user_id, user_name, prava):
     p = _oprava_pripad(pid)
     je_office = _oprava_office(prava)
@@ -8208,6 +8230,7 @@ def _oprava_detail(pid, user_id, user_name, prava):
                      ": (p.value && p.value.startsWith('✅') ? {color:'#15803d'} : null)")
     ui.label(f"Řádky formuláře — {len(radky)} položek").classes(
         "text-base font-bold text-gray-800 mt-1 mb-1")
+    grid_opts, grid_style = _radky_grid_layout(len(grid_rows))
     ui.aggrid({
         "columnDefs": [
             {"headerName": "#", "field": "poradi", "width": 70, "minWidth": 55},
@@ -8239,7 +8262,8 @@ def _oprava_detail(pid, user_id, user_name, prava):
                           "cellDataType": False},
         "rowHeight": 28,
         "autoSizeStrategy": {"type": "fitGridWidth"},
-    }).classes("w-full").style(f"height: min(42vh, {60 + len(grid_rows) * 28}px)")
+        **grid_opts,
+    }).classes("w-full").style(grid_style)
 
     _oprava_workflow(p, pid, stav, je_vlastnik, je_office, je_spravce, user_name,
                      prava)
@@ -9204,6 +9228,7 @@ def _nc_detail(pid, user_id, user_name, prava):
                   "poznamka": r.get("poznamka") or ""} for r in radky]
     ui.label(f"Nahraná tabulka — {len(radky)} řádků").classes(
         "text-base font-bold text-gray-800 mt-1 mb-1")
+    grid_opts, grid_style = _radky_grid_layout(len(grid_rows))
     ui.aggrid({
         "columnDefs": [
             {"headerName": "#", "field": "poradi", "width": 70, "minWidth": 55},
@@ -9221,7 +9246,8 @@ def _nc_detail(pid, user_id, user_name, prava):
                           "cellDataType": False},
         "rowHeight": 28,
         "autoSizeStrategy": {"type": "fitGridWidth"},
-    }).classes("w-full").style(f"height: min(42vh, {60 + len(grid_rows) * 28}px)")
+        **grid_opts,
+    }).classes("w-full").style(grid_style)
 
     if not je_ctenar:
         _nc_workflow(p, pid, stav, je_vlastnik, je_office, user_name)
