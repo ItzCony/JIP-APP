@@ -874,6 +874,22 @@ _EXP_SOUHRN = [
     ('Aktivita 2',     'stav2_label',      'text',  15),
 ]
 
+_EXP_TIKETY = [
+    ('Tiket',         'cislo',            'text',  10),
+    ('Stav',          'stav_label',       'text',  20),
+    ('Směr',          'typ_label',        'text',  10),
+    ('Nákupčí',       'kod_nakupci',      'text',  10),
+    ('IČO',           'ico',              'text',  12),
+    ('Dodavatel',     'jmeno_dodavatele', 'text',  40),
+    ('Období',        'obdobi',           'text',  16),
+    ('Položek',       'pocet_radku',      'int',   10),
+    ('Zbývá',         'zbyva_radku',      'int',   10),
+    ('Sankce celkem', 'castka',           'money', 15),
+    ('Předáno dne',   'predano_at_txt',   'text',  17),
+    ('Předal',        'predal',           'text',  20),
+    ('Poznámka',      'poznamka',         'text',  40),
+]
+
 
 def _slep_dokument(rows: list, jen_podklad: bool = False) -> str:
     """Sestaví kompletní HTML jednoho dokumentu (oznámení + podklad) k renderu.
@@ -6344,6 +6360,24 @@ async def _vykresli_tikety(user_id, user_name, vsechna_prava):
             data = [t for t in data if filtr['obdobi'] in t['obdobi_radku']]
         return list(data)
 
+    async def _export():
+        """Export do .xlsx toho, co je právě vidět (přepínače nahoře + filtry
+        v hlavičkách + řazení)."""
+        data, dle_gridu = _serad_dle_ids(_zobrazene(), await _viditelne_ids(grid))
+        if not dle_gridu:
+            ui.notify('Filtry v hlavičkách sloupců se nepodařilo přečíst — '
+                      'exportuji vše podle přepínačů nahoře.',
+                      type='warning', position='top', timeout=6000, multi_line=True)
+        if not data:
+            ui.notify('Aktuální filtr nevrací žádné tikety — není co exportovat.',
+                      type='warning', position='top', timeout=6000)
+            return
+        celkem = {p: sum(_f(t.get(p)) or 0 for t in data)
+                  for p in ('pocet_radku', 'zbyva_radku', 'castka')}
+        celkem['cislo'] = 'CELKEM'
+        celkem['jmeno_dodavatele'] = f'{len(data)} tiketů'
+        await _export_xlsx(_EXP_TIKETY, data, celkem, 'sankce_tikety', 'Tikety')
+
     with ui.row().classes('w-full items-center gap-3 mb-2 flex-wrap'):
         sel_obd = ui.select([VSE_OBD] + obdobi_list, value=VSE_OBD, label='Období') \
             .props('outlined dense options-dense').classes('w-60')
@@ -6358,6 +6392,10 @@ async def _vykresli_tikety(user_id, user_name, vsechna_prava):
                          '(druhotná kontrola / provoz / kód nákupčího).')
         ui.space()
         info = ui.label('').classes('text-sm text-gray-500')
+        ui.button(icon='download', text='Export', on_click=_export) \
+            .props('color=secondary outline dense no-caps') \
+            .tooltip('Stáhne .xlsx s tím, co je právě vidět (období, přepínače, filtry '
+                     'v hlavičkách i řazení).')
 
     grid = ui.aggrid({
         'columnDefs': _col_defs_tikety(),

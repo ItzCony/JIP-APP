@@ -270,6 +270,47 @@ def _bunka_styl(bunka, paleta: list = None) -> dict:
     return s
 
 
+def _styly_radku(ws, paleta: list, bunky: dict) -> tuple:
+    """Barvy po řádcích, které vzorový řádek 2 nezachytí (Makro: název bez
+    výplně / fialový / žlutý, cena Stodůlky modrá jen u části řádků).
+    Sloupci, kde se styl mezi řádky liší, nechá v `bunky` za základ jen to,
+    co mají všechny řádky stejné; zbytek nese každý řádek sám.
+    Vrací ({číslo řádku: {písmeno: css}}, {písmeno: [vlastnosti, co se liší]})."""
+    from openpyxl.utils import get_column_letter
+    # `_cells` přímo — iter_rows by u 20 tisíc řádků zakládal prázdné buňky.
+    # Formátované prázdné řádky pod daty se nepočítají, import je stejně zahodí.
+    plne = {r for (r, _), b in ws._cells.items() if r >= 2 and b.value not in (None, '')}
+    cache, sloupce = {}, {}
+    for (r, c), bunka in ws._cells.items():
+        if r not in plne:
+            continue
+        klic = tuple(bunka._style)
+        if klic not in cache:
+            cache[klic] = _bunka_styl(bunka, paleta)
+        sloupce.setdefault(c, {})[r] = klic
+    radky, radkove = {}, {}
+    for c, po_radcich in sloupce.items():
+        # Různé XF můžou dát stejné css (liší se jen rámečkem apod.).
+        ruzne = {json.dumps(cache[k], sort_keys=True): cache[k]
+                 for k in set(po_radcich.values())}
+        if len(ruzne) < 2:
+            continue
+        styly = list(ruzne.values())
+        zaklad = {k: v for k, v in styly[0].items()
+                  if all(s.get(k) == v for s in styly[1:])}
+        pismeno = get_column_letter(c)
+        if zaklad:
+            bunky[pismeno] = zaklad
+        else:
+            bunky.pop(pismeno, None)
+        radkove[pismeno] = sorted({k for s in styly for k in s} - set(zaklad))
+        for r, klic in po_radcich.items():
+            navic = {k: v for k, v in cache[klic].items() if k not in zaklad}
+            if navic:
+                radky.setdefault(r, {})[pismeno] = navic
+    return radky, radkove
+
+
 def _cf_pravidlo(r, paleta: list = None):
     """CF pravidlo z openpyxl → jednoduchý dict pro grid, nebo None (dataBary,
     barevné škály a pravidla bez viditelného formátu grid nekreslí — v exportu
@@ -297,11 +338,13 @@ def _cf_pravidlo(r, paleta: list = None):
     return None
 
 
-def _sablona_a_styly(raw: bytes):
+def _sablona_a_styly(raw: bytes, po_radcich: bool = True):
     """(bajty šablony | None, {norm(list): {'fmt': {písmeno: formát},
     'cf': {písmeno: [pravidla]}, 'hdr': {písmeno: css}, 'bunka': {písmeno:
     css}, 'sirka': {písmeno: px}, 'skryte': [písmena], 'vyska': [hlavička,
-    řádek]}}). Jen pro .xlsx/.xlsm — .xlsb styly nenese."""
+    řádek], 'radky': {řádek: {písmeno: css}}, 'radkove': {písmeno:
+    [vlastnosti]}}}). Jen pro .xlsx/.xlsm — .xlsb styly nenese.
+    `po_radcich=False` u přibalené šablony — její řádky nejsou importovaná data."""
     try:
         import openpyxl
         from openpyxl.utils import (column_index_from_string, get_column_letter,
@@ -360,9 +403,13 @@ def _sablona_a_styly(raw: bytes):
             rd = ws.row_dimensions.get(r)
             vyska.append(round(((rd.height if rd is not None else None)
                                 or ws.sheet_format.defaultRowHeight or 15) * 4 / 3))
+        # `radky` jdou při importu do dat řádků (do meta by byly obří),
+        # `radkove` zůstává v meta pro grid a export.
+        radky, radkove = _styly_radku(ws, paleta, bunky) if po_radcich else ({}, {})
         styly[_norm(ws.title)] = {'fmt': fmt, 'cf': cf, 'hdr': hdr,
                                   'bunka': bunky, 'sirka': sirka,
                                   'skryte': skryte, 'vyska': vyska,
+                                  'radky': radky, 'radkove': radkove,
                                   'hlavicka': [_s(ws.cell(1, c).value).strip()
                                                for c in range(1, (ws.max_column or 0) + 1)]}
 
@@ -688,7 +735,7 @@ def _importuj_sync(raw: bytes, typ: str, obdobi: str, od_iso: str, do_iso: str,
     elif spec.get('sablona_xlsb'):
         try:
             with open(os.path.join(_ADRESAR, spec['sablona_xlsb']), 'rb') as f:
-                sablona_xlsb, styly_listu = _sablona_a_styly(f.read())
+                sablona_xlsb, styly_listu = _sablona_a_styly(f.read(), po_radcich=False)
         except OSError as e:
             print(f'[monitory] Přibalená šablona chybí ({e}) — import bez formátů.')
 
@@ -717,7 +764,19 @@ def _importuj_sync(raw: bytes, typ: str, obdobi: str, od_iso: str, do_iso: str,
             k_sort = next((k for k in _SORT_KLICE if k in klice), None)
             sorty = set()    # kódy sortimentů viděné v tomhle listu
 
-            for r in rows_iter:
+            # `styly_listu` je klíčované normalizovaným názvem listu v sešitu;
+            # u jednolistých monitorů („DATA") se název hledá volně, tak vezmu
+            # ten jediný, co tam je.
+            st = styly_listu.get(_norm(nazev_listu))
+            if st is None and len(styly_listu) == 1:
+                st = next(iter(styly_listu.values()))
+            # Barvy po řádcích (u přibalené šablony prázdné) — do meta nejdou,
+            # nesou je data řádků.
+            radky_st = st.pop('radky', None) if st else None
+            pole = {_pismeno(i + 1): k for i, k in enumerate(klice)}
+
+            # Read-only list vrací i prázdné řádky → pořadí = číslo řádku v sešitu.
+            for cislo, r in enumerate(rows_iter, start=2):
                 if r is None or all(c is None or c == '' for c in r):
                     continue
                 data = {}
@@ -743,6 +802,11 @@ def _importuj_sync(raw: bytes, typ: str, obdobi: str, od_iso: str, do_iso: str,
                             cisla[k][0] += 1
                 if not data:
                     continue
+                # Styl řádku pod `_styl` — {klíč sloupce: css}; hash ho nezahrnuje,
+                # takže přebarvení v sešitu vyjádření neodpojí.
+                rs = radky_st.get(cislo) if radky_st else None
+                if rs:
+                    data['_styl'] = {pole[p]: css for p, css in rs.items() if p in pole}
                 if k_sort:
                     sorty.add(_sort_kod(data.get(k_sort)))
                 casti = ([r[i] if i < len(r) else '' for i in klic_idx] if klic_idx
@@ -779,12 +843,6 @@ def _importuj_sync(raw: bytes, typ: str, obdobi: str, od_iso: str, do_iso: str,
             conn.commit()
             cur2.close()
 
-            # `styly_listu` je klíčované normalizovaným názvem listu v sešitu;
-            # u jednolistých monitorů („DATA") se název hledá volně, tak vezmu
-            # ten jediný, co tam je.
-            st = styly_listu.get(_norm(nazev_listu))
-            if st is None and len(styly_listu) == 1:
-                st = next(iter(styly_listu.values()))
             if sablona_xlsb:
                 # Přibalená šablona platí jen pro hlavičku, ze které vznikla —
                 # styly i export jdou po pozici sloupce, posunutý sloupec by
@@ -976,14 +1034,17 @@ def _uloz_sortimenty(kody):
 # ============================================================
 
 def _do_sablony(raw: bytes, pripona: str, list_nazev: str, sloupce: list,
-                rows: list, extra: list) -> bytes:
+                rows: list, extra: list, radkove: dict = None) -> bytes:
     """Naleje řádky do uložené šablony: zachová vzorce (přeložené na svůj řádek),
-    formáty a podmíněné formátování z originálu. Vrací bajty sešitu."""
+    formáty a podmíněné formátování z originálu. Vrací bajty sešitu.
+    `radkove` ({písmeno: [vlastnosti]}) jsou sloupce, kde se barva liší po
+    řádcích — ty dostanou styl z `_styl` řádku místo vzoru z řádku 2."""
     import copy
     import openpyxl
     from openpyxl.formatting.formatting import ConditionalFormattingList
     from openpyxl.formula.translate import Translator
-    from openpyxl.utils import get_column_letter
+    from openpyxl.styles import PatternFill
+    from openpyxl.utils import column_index_from_string, get_column_letter
     from openpyxl.worksheet.formula import ArrayFormula
 
     wb = openpyxl.load_workbook(io.BytesIO(raw), data_only=False,
@@ -1009,6 +1070,40 @@ def _do_sablony(raw: bytes, pripona: str, list_nazev: str, sloupce: list,
     vzor = [ws.cell(2, c) for c in range(1, n + 1)]
     sablona_vzorce = [_vzor_vzorec(v.value) for v in vzor]
     styly_bunek = [v._style for v in vzor]
+    radkove = {column_index_from_string(p): (sloupce[column_index_from_string(p) - 1]['k'], set(v))
+               for p, v in (radkove or {}).items()
+               if column_index_from_string(p) <= n}
+    hotove_styly = {}   # (sloupec, css) → StyleArray; openpyxl styly jinak skládá znovu
+
+    def _prebarvi(bunka, c, css):
+        pole, vlastnosti = radkove[c]
+        klic = (c, json.dumps(css, sort_keys=True))
+        if klic in hotove_styly:
+            bunka._style = copy.copy(hotove_styly[klic])
+            return
+        # Vlastnost, kterou řádek nenese, je ve sloupci „výchozí" (bez výplně,
+        # černé, netučné) — vzor z řádku 2 ji mít může, ale nesmí ji rozlít.
+        bunka._style = copy.copy(styly_bunek[c - 1])   # sdílený vzor nesmí zmutovat
+        if 'backgroundColor' in vlastnosti:
+            bg = css.get('backgroundColor')
+            bunka.fill = (PatternFill('solid', fgColor='FF' + bg[1:]) if bg
+                          else PatternFill(fill_type=None))
+        if vlastnosti & {'color', 'fontWeight', 'fontStyle', 'fontSize'}:
+            font = copy.copy(bunka.font)
+            if 'color' in vlastnosti:
+                font.color = 'FF' + css['color'][1:] if css.get('color') else None
+            if 'fontWeight' in vlastnosti:
+                font.b = css.get('fontWeight') == 'bold'
+            if 'fontStyle' in vlastnosti:
+                font.i = css.get('fontStyle') == 'italic'
+            if 'fontSize' in vlastnosti and css.get('fontSize'):
+                font.sz = round(float(css['fontSize'][:-2]) * 3 / 4, 1)
+            bunka.font = font
+        if 'textAlign' in vlastnosti:
+            zarovnani = copy.copy(bunka.alignment)
+            zarovnani.horizontal = css.get('textAlign')
+            bunka.alignment = zarovnani
+        hotove_styly[klic] = copy.copy(bunka._style)
 
     for i, r in enumerate(rows):
         radek = 2 + i
@@ -1023,6 +1118,8 @@ def _do_sablony(raw: bytes, pripona: str, list_nazev: str, sloupce: list,
             else:
                 bunka.value = r.get(sloupce[c - 1]['k'])
             bunka._style = styly_bunek[c - 1]
+            if c in radkove:
+                _prebarvi(bunka, c, (r.get('_styl') or {}).get(radkove[c][0]) or {})
 
     # Vyjádření a metadata za poslední sloupec originálu — v šabloně nejsou.
     for j, (nadpis, pole) in enumerate(extra):
@@ -1093,13 +1190,15 @@ def _fmt_js(fmt: str):
             f"useGrouping: {'true' if tis else 'false'}}}) + '{'%' if proc else ''}'; }}")
 
 
-def _cf_js(pravidla: list, zaklad: dict = None):
+def _cf_js(pravidla: list, zaklad: dict = None, pole: str = None):
     """CF pravidla → JS cellStyle, sémantika jako v Excelu: pravidla jdou
     podle priority a platí všechna, která sedí; o stejnou vlastnost (pozadí,
     písmo, tučné) rozhoduje to s vyšší prioritou a stopIfTrue další utne.
     Makro tak má na marži „< 0 růžová, stop" před „< 0,13 tučně" — dřív
     vyhrálo první shodné v pořadí z XML a záporné marže nezrůžověly.
-    `zaklad` je statický styl buňky: CF přepíše jen to, co dxf nese."""
+    `zaklad` je statický styl buňky: CF přepíše jen to, co dxf nese.
+    S `pole` se k základu přidá styl řádku z `data._styl[pole]` (barvy, které
+    se v sešitu liší řádek od řádku)."""
     vetve = []
     for p in pravidla:
         if p.get('op') == 'contains':
@@ -1120,14 +1219,16 @@ def _cf_js(pravidla: list, zaklad: dict = None):
             styl['fontWeight'] = 'bold'
         konec = ' return h();' if p.get('stop') else ''
         vetve.append(f"if ({podm}) {{ d({json.dumps(styl)});{konec} }}")
-    if not vetve:
+    if not vetve and not pole:
         return None
     # d() doplní jen vlastnosti, které ještě nastavilo žádné silnější pravidlo.
+    radek = (f"(p.data && p.data._styl && p.data._styl[{json.dumps(pole)}]) || {{}}"
+             if pole else '{}')
     return ("(p) => { const v = Number(p.value); const s = {}; "
             "const d = (o) => { for (const k in o) if (!(k in s)) s[k] = o[k]; }; "
-            f"const h = () => Object.keys(s).length "
-            f"? Object.assign({json.dumps(zaklad or {})}, s) "
-            f": {json.dumps(zaklad) if zaklad else 'null'}; "
+            f"const z = Object.assign({{}}, {json.dumps(zaklad or {})}, {radek}); "
+            "const h = () => { const o = Object.assign(z, s); "
+            "return Object.keys(o).length ? o : null; }; "
             + ' '.join(vetve) + " return h(); }")
 
 
@@ -1146,6 +1247,10 @@ _GRID_CSS = (
     'margin:0;opacity:0;background:#fff;border-radius:3px}'
     '.monitor-grid .ag-header-cell:hover .ag-header-cell-filter-button,'
     '.monitor-grid .ag-header-cell-filtered .ag-header-cell-filter-button{opacity:1}'
+    # Nadpisy všech sloupců na střed — jinak číselné vpravo, textové vlevo
+    # a ze sešitu napůl vycentrované, hlavička pak vypadá rozházeně.
+    '.monitor-grid .ag-header-cell-label{justify-content:center}'
+    '.monitor-grid .ag-header-cell-text{text-align:center}'
     # Dělicí čáru má připnutá hlavička na obalu, buňky v sobě — nadpis
     # Vyjádření by seděl o 1 px vedle sloupce.
     '.monitor-grid .ag-pinned-right-header{border-left:0}'
@@ -1252,6 +1357,7 @@ def _col_defs(sloupce: list, editovatelne: bool, styly: dict = None) -> list:
     bunky = (styly or {}).get('bunka') or {}
     sirka = (styly or {}).get('sirka') or {}
     skryte = set((styly or {}).get('skryte') or ())
+    radkove = (styly or {}).get('radkove') or {}
     for idx, s in enumerate(sloupce):
         # Sloupce jdou v pořadí, v jakém byly v sešitu → n-tý = písmeno n.
         pismeno = _pismeno(idx + 1)
@@ -1272,7 +1378,8 @@ def _col_defs(sloupce: list, editovatelne: bool, styly: dict = None) -> list:
         if hdr.get(pismeno):
             c['headerStyle'] = hdr[pismeno]
         zaklad = bunky.get(pismeno)
-        js = _cf_js(cf[pismeno], zaklad) if cf.get(pismeno) else None
+        js = (_cf_js(cf.get(pismeno) or [], zaklad, s['k'] if pismeno in radkove else None)
+              if cf.get(pismeno) or pismeno in radkove else None)
         if js:
             c[':cellStyle'] = js
         elif zaklad:
@@ -1454,7 +1561,8 @@ async def _vykresli_typ(typ: str, user_id, user_name: str, vsechna_prava):
                 bajty = await asyncio.to_thread(
                     _do_sablony, sablona, pripona, aktualni_list, sloupce, data,
                     [('Vyjádření', 'vyjadreni'), ('Zapsal', 'vyjadreni_by'),
-                     ('Kdy', 'vyjadreni_at')])
+                     ('Kdy', 'vyjadreni_at')],
+                    (vsechny_styly.get(aktualni_list) or {}).get('radkove'))
                 jmeno = f'{zaklad}_{datetime.datetime.now():%Y-%m-%d_%H%M}.{pripona}'
                 intranet_sankce._stahni_pres_http(bajty, jmeno)
                 return
