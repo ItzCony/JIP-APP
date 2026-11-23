@@ -17,10 +17,12 @@ intranet_sankce_rozesilka.py — e-mailové doručování sankcí („Sankce k v
    (je v „rucni" polích sestavy). Přehled IČ bez platné adresy ukazuje
    i nákupčího, aby Lenka věděla, koho požádat o opravu kontaktu.
 
-3) Pátek 3:00 — automat pro účtárnu
+3) Pátek 3:00 — automat pro účtárnu (VÝCHOZÍ VYPNUTÝ)
    „Pouze podklad" všech řádků ve stavu „Fakturovat" → e-mail na účtárnu a po
    ÚSPĚŠNÉM odeslání přepne právě tyto řádky na „Odevzdáno účtárně". Když se
    odeslat nepovede, stav se nemění a automat to zkusí znovu (á 30 min).
+   Zapíná / vypíná ho administrátor obálkou vedle tlačítka „Rozesílka"
+   (červená přeškrtnutá = vypnuto, zelená = zapnuto) — stejně jako v Lupě.
 
 SMTP schránky sankcí (EnvironmentFile služby, vedle JIPKA_SMTP_*):
     JIPKA_SANKCE_SMTP_USER=sankce.dodavatel@jip-napoje.cz
@@ -73,6 +75,12 @@ _UCTARNA_DOHNAT_H = 12      # neběžel-li server ve 3:00, dožene se nejpozděj
 _UCTARNA_POKUSU = 6         # neúspěch → nový pokus á 30 min, po 6 pokusech se slot vzdá
 _UCTARNA_PAUZA_MIN = 30
 _UCTARNA_ZASEKNUTO_H = 2    # „bezi" déle než 2 h = server spadl uprostřed → zkusit znovu
+_AUTOMAT_KLIC = 'sankce_uctarna_automat'   # nastavení intranetu: {'zapnuto': bool}
+
+# Přeškrtnutí obálky (vypnuto) — stejné jako v Lupě na nákup.
+_PRESKRTNUTI = ('position:absolute;left:50%;top:50%;width:2.5px;height:120%;'
+                'background:currentColor;border-radius:2px;box-shadow:0 0 0 1.5px #fff;'
+                'transform:translate(-50%,-50%) rotate(-45deg);pointer-events:none')
 
 _ZAMEK_DOD = 'jipka_sankce_rozesilka_dod'
 _ZAMEK_UCT = 'jipka_sankce_rozesilka_uct'
@@ -87,6 +95,7 @@ PLAN_STAV_LABEL = OrderedDict([
 _BEH_LABEL = {
     'ok': 'Odesláno', 'prazdne': 'Nic k odeslání', 'chyba': 'Chyba', 'bezi': 'Běží',
     'nasazeno': 'Automat nasazen', 'zmeskano': 'Zmeškáno (server neběžel)',
+    'vypnuto': 'Automat vypnutý',
 }
 
 
@@ -904,6 +913,19 @@ def posledni_beh():
     return r[0] if r else None
 
 
+def automat_zapnuty() -> bool:
+    """Páteční automat účtárny. Výchozí VYPNUTO — dokud ho admin nezapne obálkou."""
+    n = intranet_data.nacti_nastaveni_intranetu().get(_AUTOMAT_KLIC)
+    return isinstance(n, dict) and n.get('zapnuto') is True
+
+
+def uloz_automat(zapnuto: bool):
+    n = intranet_data.nacti_nastaveni_intranetu()
+    stare = n.get(_AUTOMAT_KLIC)
+    n[_AUTOMAT_KLIC] = dict(stare if isinstance(stare, dict) else {}, zapnuto=bool(zapnuto))
+    intranet_data.uloz_nastaveni_intranetu(n)
+
+
 async def bg_uctarna_patek():
     """Serverová smyčka (web_main → app.on_startup): každý pátek ve 3:00 pošle
     účtárně „Pouze podklad" a přepne Fakturovat → Odevzdáno účtárně.
@@ -912,7 +934,11 @@ async def bg_uctarna_patek():
     serveru neodešlou dvakrát. Úplně první start jen zapíše „nasazeno" — první
     odeslání proběhne nejbližší pátek, ne hned po nasazení. Neběžel-li server
     ve 3:00, dožene se to do 15:00; později už ne (stavy by se měnily uprostřed
-    týdne) a vše počká na další pátek."""
+    týdne) a vše počká na další pátek.
+
+    Vypnutý automat (výchozí) slot jen zapíše jako „vypnuto" — po pozdějším
+    zapnutí se tak tento pátek nedohání a první odeslání je až další pátek 3:00.
+    Vypnutí zastaví i opakované pokusy po chybě."""
     await asyncio.sleep(120)
     while True:
         try:
@@ -920,8 +946,14 @@ async def bg_uctarna_patek():
                 ted = datetime.datetime.now()
                 slot = _slot_pro(ted)
                 beh = await asyncio.to_thread(_beh_nacti, slot)
+                zapnuto = await asyncio.to_thread(automat_zapnuty)
                 spustit = False
-                if beh is None:
+                if not zapnuto:
+                    if beh is None:
+                        await asyncio.to_thread(
+                            _beh_zaloz, slot, 'vypnuto',
+                            'Automat je vypnutý — nic se neodeslalo, stavy beze změny.')
+                elif beh is None:
                     if await asyncio.to_thread(_behy_prazdne):
                         await asyncio.to_thread(
                             _beh_zaloz, slot, 'nasazeno',
@@ -1240,6 +1272,7 @@ def tlacitko_rozesilka(user_id, user_name, ma_vse: bool, refresh_fn):
         problemy = problemy_databaze(db)
         log = await asyncio.to_thread(nacti_log)
         beh = await asyncio.to_thread(posledni_beh)
+        aut_zap = await asyncio.to_thread(automat_zapnuty)
         nelze = [p for p in plan if p['stav'] != 'ok']
         obsah.clear()
         with obsah:
@@ -1251,7 +1284,8 @@ def tlacitko_rozesilka(user_id, user_name, ma_vse: bool, refresh_fn):
                 ui.label(f'Nahraný soubor: {meta["nazev"]} · {_fmt_dt(meta["kdy"])} ({meta["kdo"]}) · '
                          f'{meta["pocet"]} IČ, z toho {platnych} s platným e-mailem') \
                     .classes('text-sm text-gray-700')
-            ui.label(f'Páteční automat: každý pátek ve 3:00 „Pouze podklad" (stav Fakturovat) '
+            ui.label(f'Páteční automat ({"ZAPNUTÝ" if aut_zap else "VYPNUTÝ"}): '
+                     f'každý pátek ve 3:00 „Pouze podklad" (stav Fakturovat) '
                      f'na {UCTARNA_EMAIL}, poté Fakturovat → Odevzdáno účtárně. '
                      + (f'Poslední slot {beh["slot"]:%d.%m.%Y}: '
                         f'{_BEH_LABEL.get(beh["stav"], beh["stav"])}'
@@ -1401,3 +1435,80 @@ def tlacitko_rozesilka(user_id, user_name, ma_vse: bool, refresh_fn):
             if ma_vse:
                 ui.separator()
                 ui.menu_item('Odeslat podklad účtárně hned…', on_click=_otevri_uctarna)
+    if ma_vse:
+        _obalka_automatu(user_name)
+
+
+def _obalka_automatu(user_name: str):
+    """Obálka vedle „Rozesílka" (jen admin), vzor Lupa na nákup: červeně přeškrtnutá
+    = páteční automat účtárny vypnutý (výchozí), zelená = zapnutý. Klik → potvrzení."""
+    dlg = ui.dialog()
+
+    def _zapni_sync(zapnout: bool):
+        if zapnout and _init_db():
+            # Slot, který už začal, zapnutím nedoháníme — jinak by po zapnutí
+            # v pátek dopoledne podklad odešel hned. INSERT IGNORE: běh už zapsaný
+            # smyčkou zůstane, jak je.
+            _beh_zaloz(_slot_pro(datetime.datetime.now()), 'vypnuto',
+                       'Automat byl v době slotu vypnutý — nic se neodeslalo.')
+        uloz_automat(zapnout)
+
+    async def _prepni(zapnout: bool):
+        dlg.close()
+        try:
+            await asyncio.to_thread(_zapni_sync, zapnout)
+        except Exception as e:
+            ui.notify(f'Nastavení se nepodařilo uložit: {e}', type='negative')
+            return
+        intranet_logger.log_activity(user_name, 'Sankce',
+                                     f'Páteční automat účtárny: {"ZAPNUTO" if zapnout else "VYPNUTO"}')
+        if zapnout:
+            ui.notify('Páteční automat pro účtárnu je zapnutý.', type='positive')
+        else:
+            ui.notify('Páteční automat pro účtárnu je vypnutý.', type='warning')
+        obalka.refresh()
+
+    async def _otevri():
+        # Režim podle uloženého stavu, ne podle (možná zastaralé) obálky.
+        zap = await asyncio.to_thread(automat_zapnuty)
+        smtp = intranet_emaily.nacti_smtp_uctu(SMTP_PREFIX)
+        dlg.clear()
+        with dlg, ui.card().classes('w-[520px] max-w-[95vw] gap-3'):
+            ui.label('Páteční automat pro účtárnu').classes('text-lg font-bold text-gray-800')
+            ui.label(f'Každý pátek ve 3:00 pošle „Pouze podklad" všech řádků ve stavu Fakturovat '
+                     f'na {UCTARNA_EMAIL} a odeslané řádky přepne na Odevzdáno účtárně.') \
+                .classes('text-sm text-gray-600')
+            if zap:
+                _banner('Automat je ZAPNUTÝ.', 'emerald', 'check_circle')
+            else:
+                _banner('Automat je VYPNUTÝ. Po zapnutí proběhne první odeslání v nejbližší '
+                        'pátek ve 3:00, který teprve přijde — už začatý pátek se nedohání.')
+            if not smtp['enabled']:
+                _banner(f'Schránka {SANKCE_SCHRANKA} není na serveru nastavená '
+                        f'({smtp["duvod"]}) — automat zatím nic neodešle.', 'red', 'error')
+            with ui.row().classes('w-full justify-end gap-2'):
+                ui.button('Zrušit', on_click=dlg.close).props('flat no-caps')
+                if zap:
+                    ui.button('Vypnout', icon='unsubscribe', on_click=lambda: _prepni(False)) \
+                        .props('unelevated no-caps color=red-7')
+                else:
+                    ui.button('Zapnout', icon='forward_to_inbox', on_click=lambda: _prepni(True)) \
+                        .props('unelevated no-caps color=green-7')
+        dlg.open()
+
+    @ui.refreshable
+    def obalka():
+        zap = automat_zapnuty()
+        if zap:
+            tip = (f'Páteční automat je zapnutý: každý pátek ve 3:00 „Pouze podklad" na '
+                   f'{UCTARNA_EMAIL} → Odevzdáno účtárně — kliknutím vypnete')
+        else:
+            tip = 'Páteční automat pro účtárnu je vypnutý — kliknutím zapnete'
+        with ui.button(on_click=_otevri).props('flat round').tooltip(tip):
+            with ui.element('div').classes('relative flex ' +
+                                           ('text-green-7' if zap else 'text-red-6')):
+                ui.icon('mail', size='1.6rem')
+                if not zap:
+                    ui.element('div').style(_PRESKRTNUTI)
+
+    obalka()
