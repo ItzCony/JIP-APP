@@ -217,7 +217,9 @@ _SESTAVA_IMPORT = {
     'sankce_vystaveni': {
         'nazev': 'Sankce k vystavení',
         'hash': ('ico', 'kod_zbozi', 'cislo_objednavky', 'id_pobocky', 'hodn_sankce'),
-        'rucni': ('stav', 'stav2', 'sleva', 'poznamka'),
+        # odeslano_dod* = razítko e-mailové rozesílky dodavateli — re-import ho musí
+        # zachovat, jinak by se sankce po novém importu poslala podruhé.
+        'rucni': ('stav', 'stav2', 'sleva', 'poznamka', 'odeslano_dod', 'odeslano_dod_na'),
     },
     'sankce_nedodavky': {
         'nazev': 'Nedodávky dod. k vyjádření',
@@ -906,6 +908,42 @@ def _slep_dokument(rows: list, jen_podklad: bool = False) -> str:
         + _vystaveni_pdf_html(rows)
         + '</div></body></html>'
     )
+
+
+def _dokumenty_k_tisku(radky: list, jen_podklad: bool = False) -> list:
+    """Rozdělí řádky na tiskové dokumenty — jediný zdroj pravdy pro ruční Tisk
+    i e-mailovou rozesílku (intranet_sankce_rozesilka).
+
+    Seskupuje po dodavatelích A PODLE SLEVY (klíč = IČO + jméno + podíl slevy),
+    aby každé oznámení mělo jednotnou slevu: když dodavatel nemá slevu úplně
+    u všech řádků (nebo má různé podíly), rozdělí se do samostatných dokumentů.
+    Vrací [(filename, html, rows)] s bezpečnými a unikátními názvy souborů."""
+    by_dod = OrderedDict()
+    for r in radky:
+        sl = round(_f(r.get('sleva')) or 0.0, 6)
+        klic = ((r.get('ico') or '').strip(),
+                (r.get('jmeno_dodavatele') or '').strip(),
+                sl)
+        by_dod.setdefault(klic, []).append(r)
+
+    pouzite = set()
+    out = []
+    for (_ico, dod, sl), rows in by_dod.items():
+        nazev = dod or 'dodavatel'
+        base_txt = ('Podklad_sankce_' if jen_podklad
+                    else 'Oznameni_o_smluvni_pokute_') + nazev
+        if sl and sl > 0:
+            pct = _cz_num(sl * 100).replace(',', '_').replace(' ', '')
+            base_txt += f'_sleva_{pct}pct'
+        base = _safe_filename(base_txt)
+        fname = base + '.pdf'
+        # ošetři duplicitní názvy (stejné safe-jméno)
+        k = 2
+        while fname in pouzite:
+            fname = f'{base}_{k}.pdf'; k += 1
+        pouzite.add(fname)
+        out.append((fname, _slep_dokument(rows, jen_podklad), rows))
+    return out
 
 
 async def _render_pdf_bytes_batch(html_list: list, status_cb=None,
@@ -1618,6 +1656,15 @@ def inicializace_sankce_db():
                         "AND COLUMN_NAME='cislo_obj_ub'", (_t,))
             if cur.fetchone()[0] == 0:
                 cur.execute(f'ALTER TABLE {_t} ADD COLUMN cislo_obj_ub VARCHAR(40) AFTER cislo_obj')
+        # Migrace: e-mailová rozesílka dodavatelům — kdy a na které adresy řádek
+        # odešel (intranet_sankce_rozesilka). NULL = dodavateli ještě neodeslán.
+        for _sl, _def in (('odeslano_dod', 'DATETIME DEFAULT NULL'),
+                          ('odeslano_dod_na', 'VARCHAR(500) DEFAULT NULL')):
+            cur.execute("SELECT COUNT(*) FROM information_schema.COLUMNS "
+                        "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='sankce_vystaveni' "
+                        "AND COLUMN_NAME=%s", (_sl,))
+            if cur.fetchone()[0] == 0:
+                cur.execute(f'ALTER TABLE sankce_vystaveni ADD COLUMN {_sl} {_def}')
         # Migrace: zálohy byly původně jen pro „Sankce k vystavení" — starým
         # snímkům dopiš, ke které sestavě patří.
         cur.execute("SELECT COUNT(*) FROM information_schema.COLUMNS "
@@ -2735,7 +2782,8 @@ def _smaz_radky(tabulka: str, radek_ids: list) -> tuple:
 _POLE_LABEL = {'stav': 'Stav', 'stav2': 'Aktivita 2', 'sleva': 'Sleva na sankci',
                'poznamka': 'Poznámka', 'tiket': 'Tiket', 'rozhodnuti': 'Rozhodnutí',
                'tiket_stav': 'Stav tiketu', 'vyjadreni': 'Vyjádření nákupčího',
-               'vyjadreni_ub': 'Vyjádření Unibrands'}
+               'vyjadreni_ub': 'Vyjádření Unibrands',
+               'odeslano_dod': 'Odesláno dodavateli'}
 
 
 def _zobraz_historii(tabulka: str, row_hash: str, popis: str):
@@ -4141,6 +4189,11 @@ def _col_defs_vystaveni(je_ucetni: bool) -> list:
          ':cellStyle': _STAV2_STYLE,
          'headerTooltip': 'Druhý stav (V procesu / Uzavřeno) — mění účtárna'
                           if je_ucetni else 'Druhý stav (V procesu / Uzavřeno)'},
+        {'headerName': 'Odesláno dod.', 'field': 'odeslano_dod', 'width': 135,
+         'sortable': True, 'tooltipField': 'odeslano_dod_na',
+         'headerTooltip': 'Kdy odešla Kompletní sestava e-mailem dodavateli (Rozesílka → '
+                          'Rozeslat dodavatelům). Prázdné = zatím neodesláno. '
+                          'Po najetí na buňku se ukážou adresy.'},
     ]
     return cols
 
@@ -4495,38 +4548,14 @@ async def _vykresli_vystaveni(user_id, user_name, vsechna_prava):
                           type='negative', position='top', timeout=9000)
                 return
 
-            # Seskup po dodavatelích A PODLE SLEVY (klíč = IČO + jméno + podíl slevy),
-            # aby každé oznámení mělo jednotnou slevu: když dodavatel nemá slevu úplně
-            # u všech řádků (nebo má různé podíly), rozdělí se do samostatných dokumentů.
-            by_dod = OrderedDict()
-            for r in sel:
-                sl = round(_f(r.get('sleva')) or 0.0, 6)
-                klic = ((r.get('ico') or '').strip(),
-                        (r.get('jmeno_dodavatele') or '').strip(),
-                        sl)
-                by_dod.setdefault(klic, []).append(r)
-            n_dok = len(by_dod)                                  # počet dokumentů
-            n_dod = len({(k[0], k[1]) for k in by_dod})          # počet dodavatelů
+            # Dokument = dodavatel + podíl slevy (viz _dokumenty_k_tisku).
+            dokumenty = _dokumenty_k_tisku(sel, jen_podklad)
+            n_dok = len(dokumenty)                               # počet dokumentů
+            n_dod = len({((rows[0].get('ico') or '').strip(),    # počet dodavatelů
+                          (rows[0].get('jmeno_dodavatele') or '').strip())
+                         for _fn, _html, rows in dokumenty})
             n_pol = len(sel)
-
-            # sestav (filename, html) per dokument — bezpečné názvy souborů
-            pouzite = set()
-            html_list = []
-            for (_ico, dod, sl), rows in by_dod.items():
-                nazev = dod or 'dodavatel'
-                base_txt = ('Podklad_sankce_' if jen_podklad
-                            else 'Oznameni_o_smluvni_pokute_') + nazev
-                if sl and sl > 0:
-                    pct = _cz_num(sl * 100).replace(',', '_').replace(' ', '')
-                    base_txt += f'_sleva_{pct}pct'
-                base = _safe_filename(base_txt)
-                fname = base + '.pdf'
-                # ošetři duplicitní názvy (stejné safe-jméno)
-                k = 2
-                while fname in pouzite:
-                    fname = f'{base}_{k}.pdf'; k += 1
-                pouzite.add(fname)
-                html_list.append((fname, _slep_dokument(rows, jen_podklad)))
+            html_list = [(fn, html) for fn, html, _rows in dokumenty]
 
             # průběžná notifikace s progress-barem
             notif = ui.notification(
@@ -4711,6 +4740,11 @@ async def _vykresli_vystaveni(user_id, user_name, vsechna_prava):
                                  on_click=lambda: _tisk_podkladu(False))
                     ui.menu_item('Pouze podklad',
                                  on_click=lambda: _tisk_podkladu(True))
+            # E-mailová rozesílka dodavatelům + databáze adres (líný import —
+            # intranet_sankce_rozesilka importuje tento modul).
+            import intranet_sankce_rozesilka
+            intranet_sankce_rozesilka.tlacitko_rozesilka(
+                user_id, user_name, ma_vse, _vykresli_vystaveni.refresh)
             _obnova_button(user_name, _vykresli_vystaveni.refresh, je_hlavni_admin=ma_vse)
         ui.button(icon='download', text='Export', on_click=_export) \
             .props('color=secondary outline dense no-caps') \
