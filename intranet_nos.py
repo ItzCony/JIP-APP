@@ -44,7 +44,8 @@ PRAVA_MODULU = ('nos_vkladatel', 'nos_ctenar', 'nos_spravce') + PRAVA_ZADAVATEL
 # (sloupec v DB, popisek, typ vstupu)
 POLE_INFO = [
     ('smluvni_odmena', 'Smluvní odměna', 'kc'),
-    ('smluvni_do', 'Termín smluvní odměny (do)', 'mesic'),
+    ('smluvni_od', 'Smluvní odměna platí od', 'mesic'),
+    ('smluvni_do', 'Smluvní odměna platí do', 'mesic'),
     ('naklady_auto', 'Náklady 1 (auto)', 'kc'),
 ]
 POLE_MESIC = [
@@ -64,6 +65,7 @@ _TABULKY = (
     """CREATE TABLE IF NOT EXISTS nos_oz_info (
         cislo_oz VARCHAR(20) PRIMARY KEY,
         smluvni_odmena DECIMAL(12,2) DEFAULT NULL,
+        smluvni_od CHAR(7) DEFAULT NULL,
         smluvni_do CHAR(7) DEFAULT NULL,
         naklady_auto DECIMAL(12,2) DEFAULT NULL
     ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci""",
@@ -154,6 +156,12 @@ def inicializace_db():
         cur = conn.cursor()
         for sql in _TABULKY:
             cur.execute(sql)
+        # sloupec přidaný po prvním nasazení; už existuje → chyba 1060, přeskočit
+        try:
+            cur.execute("ALTER TABLE nos_oz_info ADD COLUMN smluvni_od CHAR(7) DEFAULT NULL "
+                        "AFTER smluvni_odmena")
+        except Exception:
+            pass
         conn.commit()
         _DB_INIT_HOTOVO = True
     finally:
@@ -261,6 +269,8 @@ def uloz(pole, cislo_oz, obdobi, hodnoty: dict, user_id, user_name, prava) -> bo
     except (InvalidOperation, ValueError):
         return False
     if (nove.get('smluvni_odmena') or 0) < 0:
+        return False
+    if nove.get('smluvni_od') and nove.get('smluvni_do') and nove['smluvni_od'] > nove['smluvni_do']:
         return False
 
     # Názvy tabulek a sloupců jsou konstanty z tohoto souboru, nikdy vstup uživatele.
@@ -660,7 +670,8 @@ def provize_oz(obdobi) -> dict:
 POLE_PODKLAD = [
     ('provize', 'Odměna (provize)', 'kc'),
     ('smluvni', 'Smluvní odměna', 'kc'),
-    ('smluvni_do', 'Termín', 'mesic'),
+    ('smluvni_od', 'Od', 'mesic'),
+    ('smluvni_do', 'Do', 'mesic'),
     ('dorovnani', 'Dorovnání', 'kc'),
     ('srazka_asm', 'Srážka ASM', 'kc'),
     ('odmena_asm', 'Odměna ASM', 'kc'),
@@ -674,19 +685,22 @@ POLE_PODKLAD = [
 _NULA = Decimal('0.00')
 
 
-def vypocet_oz(status, provize, smluvni, smluvni_do, obdobi, srazka, odmena, akce, n1, n2) -> dict:
+def vypocet_oz(status, provize, smluvni, smluvni_od, smluvni_do, obdobi,
+               srazka, odmena, akce, n1, n2) -> dict:
     """Vzorce ze zadání (ř. 6): H=max(F−E,0), M=−25 % L mimo OSVČ, P=L+M+N+O.
     Mezisoučet (ř. 16): platí-li smluvní odměna, L = smluvní odměna a srážka i odměny
-    se přeskočí; jinak L = E+I+J+K. Smluvní odměna platí jen do svého termínu
-    (včetně); bez termínu platí stále."""
+    se přeskočí; jinak L = E+I+J+K. Smluvní odměna platí jen v rozmezí od–do
+    (obě meze včetně); chybějící mez = neomezeno."""
     d = lambda v: _NULA if v is None else Decimal(str(v)).quantize(Decimal('0.01'))
     provize = d(provize)
-    smluvni = d(smluvni) if not smluvni_do or obdobi <= smluvni_do else _NULA
+    v_terminu = (not smluvni_od or obdobi >= smluvni_od) and (not smluvni_do or obdobi <= smluvni_do)
+    smluvni = d(smluvni) if v_terminu else _NULA
     plati = smluvni != _NULA
     dorovnani = max(smluvni - provize, _NULA)
     mezisoucet = smluvni if plati else provize + d(srazka) + d(odmena) + d(akce)
     odvod = _NULA if status == 'OSVČ' else -(mezisoucet * Decimal('0.25')).quantize(Decimal('0.01'))
-    return {'provize': provize, 'smluvni': smluvni, 'smluvni_do': smluvni_do or '',
+    return {'provize': provize, 'smluvni': smluvni,
+            'smluvni_od': smluvni_od or '', 'smluvni_do': smluvni_do or '',
             'smluvni_plati': plati,
             'dorovnani': dorovnani, 'srazka_asm': d(srazka), 'odmena_asm': d(odmena),
             'odmena_akce': d(akce), 'mezisoucet': mezisoucet, 'odvod': odvod,
@@ -706,7 +720,7 @@ def podrobny_podklad(obdobi, user_id, prava) -> list:
         i, m = info.get(c, {}), mesic.get(c, {})
         radky.append({**oz, **vypocet_oz(
             oz['status'], provize.get(c, {}).get('provize'), i.get('smluvni_odmena'),
-            i.get('smluvni_do'), obdobi, m.get('srazka_asm'), m.get('odmena_asm'),
+            i.get('smluvni_od'), i.get('smluvni_do'), obdobi, m.get('srazka_asm'), m.get('odmena_asm'),
             m.get('odmena_akce'), i.get('naklady_auto'), n2.get(c))})
     return radky
 
@@ -912,13 +926,32 @@ def _dialog_uprav(titulek, radek, pole, uloz_fn, po_ulozeni):
     d.open()
 
 
+_MESICE_CZ = ('leden', 'únor', 'březen', 'duben', 'květen', 'červen', 'červenec', 'srpen',
+              'září', 'říjen', 'listopad', 'prosinec')
+
+
+def _nabidka_obdobi(vybrane) -> dict:
+    """Měsíce od prvních nahraných dat po aktuální měsíc (nejnovější nahoře) → {'2026-10': 'říjen 2026'}."""
+    dnes = datetime.date.today().strftime('%Y-%m')
+    r = _dotaz("SELECT MIN(obdobi) AS od, MAX(obdobi) AS do FROM nos_data")
+    od = min(filter(None, ((r and r[0]['od']) or dnes, vybrane, dnes)))
+    do = max(filter(None, ((r and r[0]['do']) or dnes, vybrane, dnes)))
+    rok, mes = map(int, do.split('-'))
+    nabidka = {}
+    while f'{rok:04d}-{mes:02d}' >= od:
+        nabidka[f'{rok:04d}-{mes:02d}'] = f'{_MESICE_CZ[mes - 1]} {rok}'
+        rok, mes = (rok, mes - 1) if mes > 1 else (rok - 1, 12)
+    return nabidka
+
+
 def _vyber_obdobi(stav, po_zmene):
+    """Výběr měsíce, za který se sekce zobrazuje a exportuje (není to filtr tabulky)."""
     def zmena(e):
-        if _je_obdobi(e.value):
+        if _je_obdobi(e.value) and e.value != stav['obdobi']:
             stav['obdobi'] = e.value
             po_zmene()
-    ui.input('Období', value=stav['obdobi'], on_change=zmena) \
-        .props('type=month stack-label outlined dense').classes('w-48 mb-2')
+    ui.select(_nabidka_obdobi(stav['obdobi']), label='Měsíc', value=stav['obdobi'],
+              on_change=zmena).props('outlined dense options-dense').classes('w-48 mb-2')
 
 
 def _sekce_info(user_id, user_name, prava):
@@ -929,6 +962,7 @@ def _sekce_info(user_id, user_name, prava):
         for oz in nacti_oz(user_id, prava):
             i = info.get(oz['cislo_oz'], {})
             radky.append({**oz, 'smluvni_odmena': _f(i.get('smluvni_odmena')),
+                          'smluvni_od': i.get('smluvni_od') or '',
                           'smluvni_do': i.get('smluvni_do') or '',
                           'naklady_auto': _f(i.get('naklady_auto'))})
         _tabulka(POLE_INFO, radky, lambda r: _dialog_uprav(
@@ -1431,20 +1465,24 @@ if __name__ == '__main__':      # rychlá kontrola vstupů (bez DB)
     assert abs(provize_radku({**_r, 'kategorie': 'Výprodej'}, _p) - 1.5) < 1e-9
     assert provize_radku({**_r, 'kategorie': 'Neznámá'}, _p) == 0.0
     # zadání ř. 6 a 7: OSVČ, provize 55 555, smluvní 60 000 do 6/2026
-    _v = vypocet_oz('OSVČ', 55555, 60000, '2026-06', '2026-06', -2000, 500, 1500, 0, 0)
+    _v = vypocet_oz('OSVČ', 55555, 60000, None, '2026-06', '2026-06', -2000, 500, 1500, 0, 0)
     assert _v['dorovnani'] == 4445 and _v['mezisoucet'] == 60000 and _v['final'] == 60000
-    _v = vypocet_oz('ZAM', 55555, 60000, '2026-06', '2026-07', -2000, 500, 1500, -10500, None)
+    _v = vypocet_oz('ZAM', 55555, 60000, None, '2026-06', '2026-07', -2000, 500, 1500, -10500, None)
     assert _v['dorovnani'] == 0 and _v['mezisoucet'] == 55555
     assert _v['odvod'] == Decimal('-13888.75') and _v['final'] == Decimal('31166.25')
+    # rozmezí od–do: před „od" neplatí, od „od" do „do" včetně platí
+    assert not vypocet_oz('ZAM', 1, 60000, '2026-03', '2026-06', '2026-02', 0, 0, 0, 0, 0)['smluvni_plati']
+    assert vypocet_oz('ZAM', 1, 60000, '2026-03', '2026-06', '2026-03', 0, 0, 0, 0, 0)['smluvni_plati']
+    assert vypocet_oz('ZAM', 1, 60000, '2026-03', None, '2027-01', 0, 0, 0, 0, 0)['smluvni_plati']
     # ř. 16: platná smluvní odměna přeskočí srážku i odměny, mezisoučet = smluvní
-    _v = vypocet_oz('ZAM', 50000, 60000, None, '2026-06', -2000, 500, 300, -1000, -500)
+    _v = vypocet_oz('ZAM', 50000, 60000, None, None, '2026-06', -2000, 500, 300, -1000, -500)
     assert _v['smluvni_plati'] and _v['mezisoucet'] == 60000 and _v['dorovnani'] == 10000
     assert _v['odvod'] == -15000 and _v['final'] == 43500
-    _v = vypocet_oz('OSVČ', 50000, None, None, '2026-06', -2000, 500, 300, 0, 0)
+    _v = vypocet_oz('OSVČ', 50000, None, None, None, '2026-06', -2000, 500, 300, 0, 0)
     assert not _v['smluvni_plati'] and _v['mezisoucet'] == 48800 and _v['final'] == 48800
     # PDF: smluvní řádek jen když platí, srážka/odměny jen když neplatí; status ne
     _r = {'cislo_oz': '7', 'jmeno_oz': 'A <b>', 'asm': 'X', 'status': 'ZAM',
-          **vypocet_oz('ZAM', 50000, 60000, None, '2026-06', -2000, 500, 300, 0, 0)}
+          **vypocet_oz('ZAM', 50000, 60000, None, None, '2026-06', -2000, 500, 300, 0, 0)}
     _h = pdf_html_oz(_r, '2026-06')
     assert 'Smluvní odměna' in _h and 'Srážka ASM' not in _h and 'A &lt;b&gt;' in _h
     assert '06/2026' in _h and 'ZAM' not in _h and '60 000,00 Kč' in _h
