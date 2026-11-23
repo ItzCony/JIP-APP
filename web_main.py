@@ -166,6 +166,10 @@ if __name__ == "__main__":
     app.on_startup(lambda: asyncio.create_task(intranet_narozeniny.bg_narozeniny_emaily()))
     # IKOS — každé pondělí v 1:00 CSV schválených absencí za předchozí týden do ikos_export/.
     app.on_startup(lambda: asyncio.create_task(intranet_exporty.bg_ikos_tydenni_export()))
+    # Sankce — každý pátek ve 3:00 „Pouze podklad" (stav Fakturovat) účtárně
+    # a přepnutí na Odevzdáno účtárně.
+    import intranet_sankce_rozesilka
+    app.on_startup(lambda: asyncio.create_task(intranet_sankce_rozesilka.bg_uctarna_patek()))
     # Evidence OZ — ranní přepočet „Aktivní OZ" + kontrola proti kartám.
     import intranet_asm
     app.on_startup(lambda: asyncio.create_task(intranet_asm.bg_oz_denni()))
