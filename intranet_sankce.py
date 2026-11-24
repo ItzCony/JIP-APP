@@ -342,17 +342,20 @@ _POBOCKY_NAZVY = {
 }
 
 
+def _pobocka_kod(v) -> str:
+    """Hodnota `id_pobocky` → trojmístný kód střediska ('' když v ní číslo není).
+    Snese '10', '010', '010 - Pardubice' i '10.0' (číslo z Excelu)."""
+    m = re.search(r'\d+', _s(v))
+    return m.group(0).zfill(3) if m else ''
+
+
 def _pobocka_nazev(v) -> str:
     """Kód střediska → název VO pobočky pro tisk.
 
-    Snese '10', '010', '010 - Pardubice' i '10.0' (číslo z Excelu). Neznámý kód
-    vrací '' — v podkladu pak zůstane jen holá hodnota z importu.
+    Neznámý kód vrací '' — v podkladu pak zůstane jen holá hodnota z importu.
     POZOR: uložené `id_pobocky` se tímhle NIKDY nepřepisuje, vstupuje do row_hash.
     """
-    m = re.search(r'\d+', _s(v))
-    if not m:
-        return ''
-    return _POBOCKY_NAZVY.get(m.group(0).zfill(3), '')
+    return _POBOCKY_NAZVY.get(_pobocka_kod(v), '')
 
 
 def _safe_filename(s: str) -> str:
@@ -4782,10 +4785,19 @@ async def _vykresli_vystaveni(user_id, user_name, vsechna_prava):
     # Přepínač dvou pohledů na TATÁŽ data (filtry nahoře platí pro oba):
     #   • Řádky      – původní detail (kód zboží, čísla objednávek…)
     #   • Dodavatelé – souhrn po IČ/názvu, bez rozpadu na položky
-    with ui.row().classes('items-center gap-3 mb-2'):
+    with ui.row().classes('w-full items-center gap-3 mb-2'):
         prep = ui.toggle({'radky': '📋 Řádky (detail)', 'souhrn': '🏢 Dodavatelé (souhrn)'},
                          value=pohled['v']).props('no-caps dense unelevated')
         lbl_pohled = ui.label('').classes('text-xs text-gray-500')
+        if ma_vse:
+            # Příjemci pátečního podkladu účtárně podle poboček (líný import —
+            # intranet_sankce_rozesilka importuje tento modul).
+            import intranet_sankce_rozesilka
+            ui.space()
+            ui.button(icon='settings',
+                      on_click=intranet_sankce_rozesilka.nastaveni_prijemcu(user_name)) \
+                .props('flat round dense color=grey-7') \
+                .tooltip('Příjemci podkladu účtárně podle poboček')
 
     _opts_v = {
         'columnDefs': _col_defs_vystaveni(je_ucetni),

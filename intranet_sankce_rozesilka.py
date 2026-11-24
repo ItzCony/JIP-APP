@@ -76,6 +76,11 @@ _UCTARNA_POKUSU = 6         # neúspěch → nový pokus á 30 min, po 6 pokusec
 _UCTARNA_PAUZA_MIN = 30
 _UCTARNA_ZASEKNUTO_H = 2    # „bezi" déle než 2 h = server spadl uprostřed → zkusit znovu
 _AUTOMAT_KLIC = 'sankce_uctarna_automat'   # nastavení intranetu: {'zapnuto': bool}
+# Příjemci podkladu účtárně podle poboček (ozubené kolečko v Sankce k vystavení):
+# {'emaily': [e1, e2], 'pobocky': {'010': 0, '011': 1, …}} — hodnota = index příjemce.
+# Pobočka bez přiřazení a neznámý kód → příjemce 1.
+_PRIJEMCI_KLIC = 'sankce_uctarna_prijemci'
+_PRIJEMCU = 2
 
 # Přeškrtnutí obálky (vypnuto) — stejné jako v Lupě na nákup.
 _PRESKRTNUTI = ('position:absolute;left:50%;top:50%;width:2.5px;height:120%;'
@@ -759,18 +764,57 @@ def _prepni_na_uctarnu(rows: list, spustil: str, user_id) -> int:
     return len(zmenene)
 
 
+async def _odesli_cast_uctarne(smtp, email: str, rows: list, spustil: str) -> tuple:
+    """Jeden e-mail „Pouze podklad" pro jednoho příjemce účtárny. → (ok, zpráva)."""
+    n_dod = len({norm_ico(r.get('ico')) for r in rows})
+    pobocky = sorted({S._pobocka_kod(r.get('id_pobocky')) or '?' for r in rows})
+    dokumenty = S._dokumenty_k_tisku(rows, True)
+    pdfs = await S._render_pdf_bytes_batch([(fn, html) for fn, html, _r in dokumenty])
+    dnes = datetime.date.today()
+    if len(pdfs) == 1:
+        prilohy = list(pdfs)
+    else:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for fn, pdf in pdfs:
+                zf.writestr(fn, pdf)
+        prilohy = [(f'Podklad_sankce_{dnes:%Y-%m-%d}.zip', buf.getvalue())]
+
+    predmet = f'Sankce – podklad k fakturaci {dnes:%d.%m.%Y} ({n_dod} dodavatelů)'
+    text = (
+        'Dobrý den,\n\n'
+        'v příloze posíláme podklady k fakturaci sankcí (tisk „Pouze podklad") — '
+        'řádky ve stavu Fakturovat za pobočky přiřazené této adrese.\n\n'
+        f'Pobočky: {", ".join(pobocky)}\n'
+        f'Dodavatelů: {n_dod}\n'
+        f'Dokumentů: {len(pdfs)}\n'
+        f'Řádků: {len(rows)}\n'
+        f'Celkem po slevách: {S._cz_money(_castka(rows))} Kč\n\n'
+        'Po odeslání této zprávy se řádky v intranetu převedou do stavu '
+        '„Odevzdáno účtárně".\n\n'
+        f'Automatická zpráva z intranetu JIP (spustil: {spustil}).'
+    )
+    return await asyncio.to_thread(
+        intranet_emaily.odesli_email_z_uctu, smtp, [email], predmet, text,
+        prilohy, ODESILATEL_JMENO)
+
+
 async def odesli_uctarne(spustil: str, user_id=None) -> dict:
-    """Pošle účtárně „Pouze podklad" všech řádků ve stavu Fakturovat a po
-    úspěšném odeslání je přepne na Odevzdáno účtárně. Volá páteční automat
-    i ruční tlačítko hlavního admina."""
+    """Pošle účtárně „Pouze podklad" všech řádků ve stavu Fakturovat — rozdělené
+    podle poboček na příjemce z nastavení (ozubené kolečko). Po
+    úspěšném odeslání přepne řádky daného příjemce na Odevzdáno účtárně; co
+    neodešlo, zůstává ve Fakturovat a dožene ho další pokus automatu.
+    Volá páteční automat i ruční tlačítko hlavního admina."""
     out = {'ok': False, 'prazdne': False, 'pocet': 0, 'prepnuto': 0, 'zprava': ''}
     zamek = await asyncio.to_thread(_zamek_ziskej, _ZAMEK_UCT)
     if zamek is None:
         out['zprava'] = 'Odeslání účtárně právě běží, nebo není spojení s databází.'
         return out
-    rows, n_dod, castka = [], 0, 0.0
+    rows, prijemci, logy = [], [UCTARNA_EMAIL], []
     try:
         await asyncio.to_thread(_init_db)
+        cfg = await asyncio.to_thread(nacti_prijemce)
+        prijemci = [e for e in cfg['emaily'] if e]
         rows = [r for r in await asyncio.to_thread(S._nacti, 'sankce_vystaveni')
                 if r.get('stav') == STAV_FAKTUROVAT]
         out['pocet'] = len(rows)
@@ -778,8 +822,6 @@ async def odesli_uctarne(spustil: str, user_id=None) -> dict:
             out.update(ok=True, prazdne=True,
                        zprava='Ve stavu Fakturovat nic není — účtárně se nic neposílalo.')
             return out
-        n_dod = len({norm_ico(r.get('ico')) for r in rows})
-        castka = _castka(rows)
 
         smtp = intranet_emaily.nacti_smtp_uctu(SMTP_PREFIX)
         if not smtp['enabled']:
@@ -791,57 +833,45 @@ async def odesli_uctarne(spustil: str, user_id=None) -> dict:
                              'obraťte se na administrátora intranetu.')
             return out
 
-        dokumenty = S._dokumenty_k_tisku(rows, True)
-        pdfs = await S._render_pdf_bytes_batch([(fn, html) for fn, html, _r in dokumenty])
-        dnes = datetime.date.today()
-        if len(pdfs) == 1:
-            prilohy = list(pdfs)
-        else:
-            buf = io.BytesIO()
-            with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
-                for fn, pdf in pdfs:
-                    zf.writestr(fn, pdf)
-            prilohy = [(f'Podklad_sankce_{dnes:%Y-%m-%d}.zip', buf.getvalue())]
-
-        predmet = f'Sankce – podklad k fakturaci {dnes:%d.%m.%Y} ({n_dod} dodavatelů)'
-        text = (
-            'Dobrý den,\n\n'
-            'v příloze posíláme podklady k fakturaci sankcí (tisk „Pouze podklad") — '
-            'všechny řádky, které jsou v intranetu ve stavu Fakturovat.\n\n'
-            f'Dodavatelů: {n_dod}\n'
-            f'Dokumentů: {len(pdfs)}\n'
-            f'Řádků: {len(rows)}\n'
-            f'Celkem po slevách: {S._cz_money(castka)} Kč\n\n'
-            'Po odeslání této zprávy se řádky v intranetu převedou do stavu '
-            '„Odevzdáno účtárně".\n\n'
-            f'Automatická zpráva z intranetu JIP (spustil: {spustil}).'
-        )
-        ok, zprava = await asyncio.to_thread(
-            intranet_emaily.odesli_email_z_uctu, smtp, [UCTARNA_EMAIL], predmet, text,
-            prilohy, ODESILATEL_JMENO)
-        if not ok:
-            out['zprava'] = zprava
-            return out
-        # Pojistka před hromadnou změnou stavů — jde vrátit přes Obnovu ze zálohy.
-        try:
-            await asyncio.to_thread(S._vytvor_zalohu, 'sankce_vystaveni', 'auto',
-                                    f'{spustil} (před odevzdáním účtárně)', True)
-        except Exception as e:
-            print(f'[sankce-rozesilka] záloha před odevzdáním: {e}')
-        out['prepnuto'] = await asyncio.to_thread(_prepni_na_uctarnu, rows, spustil, user_id)
-        out['ok'] = True
-        out['zprava'] = (f'Odesláno na {UCTARNA_EMAIL}: {len(rows)} řádků, {n_dod} dodavatelů, '
-                         f'{S._cz_money(castka)} Kč; na Odevzdáno účtárně přepnuto '
-                         f'{out["prepnuto"]} řádků.' + (f' ({zprava})' if zprava else ''))
-    except RuntimeError as e:            # Playwright / Chromium chybí
-        out['zprava'] = str(e)
+        zalohovano = False
+        for email, cast in _rozdel_podle_prijemcu(rows, cfg):
+            n_dod = len({norm_ico(r.get('ico')) for r in cast})
+            castka = _castka(cast)
+            try:
+                ok, zprava = await _odesli_cast_uctarne(smtp, email, cast, spustil)
+            except RuntimeError as e:            # Playwright / Chromium chybí
+                ok, zprava = False, str(e)
+            except Exception as e:
+                traceback.print_exc()
+                ok, zprava = False, f'Neočekávaná chyba: {e}'
+            if ok:
+                # Pojistka před hromadnou změnou stavů — jde vrátit přes Obnovu ze zálohy.
+                if not zalohovano:
+                    try:
+                        await asyncio.to_thread(S._vytvor_zalohu, 'sankce_vystaveni', 'auto',
+                                                f'{spustil} (před odevzdáním účtárně)', True)
+                    except Exception as e:
+                        print(f'[sankce-rozesilka] záloha před odevzdáním: {e}')
+                    zalohovano = True
+                n = await asyncio.to_thread(_prepni_na_uctarnu, cast, spustil, user_id)
+                out['prepnuto'] += n
+                zprava = (f'Odesláno na {email}: {len(cast)} řádků, {n_dod} dodavatelů, '
+                          f'{S._cz_money(castka)} Kč; na Odevzdáno účtárně přepnuto {n} řádků.'
+                          + (f' ({zprava})' if zprava else ''))
+            else:
+                zprava = f'Na {email} NEODESLÁNO ({len(cast)} řádků): {zprava}'
+            logy.append((email, len(cast), castka, ok, zprava))
+        out['ok'] = all(l[3] for l in logy)
+        out['zprava'] = ' '.join(l[4] for l in logy)
     except Exception as e:
         traceback.print_exc()
         out['zprava'] = f'Neočekávaná chyba: {e}'
     finally:
         await asyncio.to_thread(_zamek_uvolni, zamek, _ZAMEK_UCT)
-        await asyncio.to_thread(_zapis_log, 'uctarna', '', 'Účtárna', [UCTARNA_EMAIL],
-                                out['pocet'], castka, out['ok'], out['zprava'], spustil)
+        for email, pocet, castka, ok, zprava in logy or [
+                (', '.join(prijemci), out['pocet'], _castka(rows), out['ok'], out['zprava'])]:
+            await asyncio.to_thread(_zapis_log, 'uctarna', '', 'Účtárna', [email],
+                                    pocet, castka, ok, zprava, spustil)
     intranet_logger.log_activity(spustil, 'Sankce', f'Podklad účtárně: {out["zprava"]}')
     return out
 
@@ -924,6 +954,49 @@ def uloz_automat(zapnuto: bool):
     stare = n.get(_AUTOMAT_KLIC)
     n[_AUTOMAT_KLIC] = dict(stare if isinstance(stare, dict) else {}, zapnuto=bool(zapnuto))
     intranet_data.uloz_nastaveni_intranetu(n)
+
+
+def nacti_prijemce() -> dict:
+    """{'emaily': [e1, e2], 'pobocky': {kód: index}}. Bez nastavení jde vše
+    na UCTARNA_EMAIL (příjemce 1)."""
+    n = intranet_data.nacti_nastaveni_intranetu().get(_PRIJEMCI_KLIC)
+    n = n if isinstance(n, dict) else {}
+    emaily = [str(e or '').strip() for e in (n.get('emaily') or [])][:_PRIJEMCU]
+    emaily += [''] * (_PRIJEMCU - len(emaily))
+    emaily[0] = emaily[0] or UCTARNA_EMAIL
+    pobocky = {str(k): v for k, v in (n.get('pobocky') or {}).items()
+               if isinstance(v, int) and 0 <= v < _PRIJEMCU}
+    return {'emaily': emaily, 'pobocky': pobocky}
+
+
+def uloz_prijemce(emaily: list, pobocky: dict):
+    n = intranet_data.nacti_nastaveni_intranetu()
+    n[_PRIJEMCI_KLIC] = {'emaily': list(emaily), 'pobocky': dict(pobocky)}
+    intranet_data.uloz_nastaveni_intranetu(n)
+
+
+def _rozdel_podle_prijemcu(rows: list, cfg: dict) -> list:
+    """Řádky → [(e-mail, řádky)] v pořadí příjemců. Příjemce bez adresy
+    a neznámá pobočka padají na příjemce 1; stejná adresa 2× = jeden e-mail."""
+    emaily = cfg['emaily']
+    skup = OrderedDict()
+    for e in emaily:
+        if e:
+            skup.setdefault(e.lower(), (e, []))
+    for r in rows:
+        i = cfg['pobocky'].get(S._pobocka_kod(r.get('id_pobocky')), 0)
+        e = emaily[i] or emaily[0]
+        skup[e.lower()][1].append(r)
+    return [v for v in skup.values() if v[1]]
+
+
+def _popis_prijemcu(cfg: dict) -> str:
+    """Do textů dialogů: „a@x (010, 011) a b@x (012)" / jen „a@x"."""
+    skup = _rozdel_podle_prijemcu(
+        [{'id_pobocky': k} for k in S._POBOCKY_NAZVY], cfg)
+    if len(skup) <= 1:
+        return skup[0][0] if skup else cfg['emaily'][0]
+    return ' a '.join(f'{e} ({", ".join(r["id_pobocky"] for r in rr)})' for e, rr in skup)
 
 
 async def bg_uctarna_patek():
@@ -1273,6 +1346,7 @@ def tlacitko_rozesilka(user_id, user_name, ma_vse: bool, refresh_fn):
         log = await asyncio.to_thread(nacti_log)
         beh = await asyncio.to_thread(posledni_beh)
         aut_zap = await asyncio.to_thread(automat_zapnuty)
+        komu = _popis_prijemcu(await asyncio.to_thread(nacti_prijemce))
         nelze = [p for p in plan if p['stav'] != 'ok']
         obsah.clear()
         with obsah:
@@ -1286,7 +1360,7 @@ def tlacitko_rozesilka(user_id, user_name, ma_vse: bool, refresh_fn):
                     .classes('text-sm text-gray-700')
             ui.label(f'Páteční automat ({"ZAPNUTÝ" if aut_zap else "VYPNUTÝ"}): '
                      f'každý pátek ve 3:00 „Pouze podklad" (stav Fakturovat) '
-                     f'na {UCTARNA_EMAIL}, poté Fakturovat → Odevzdáno účtárně. '
+                     f'na {komu}, poté Fakturovat → Odevzdáno účtárně. '
                      + (f'Poslední slot {beh["slot"]:%d.%m.%Y}: '
                         f'{_BEH_LABEL.get(beh["stav"], beh["stav"])}'
                         + (f' — {beh["info"]}' if beh.get('info') else '')
@@ -1390,11 +1464,12 @@ def tlacitko_rozesilka(user_id, user_name, ma_vse: bool, refresh_fn):
     async def _otevri_uctarna():
         rows = [r for r in await asyncio.to_thread(S._nacti, 'sankce_vystaveni')
                 if r.get('stav') == STAV_FAKTUROVAT]
+        komu = _popis_prijemcu(await asyncio.to_thread(nacti_prijemce))
         dlg.clear()
         with dlg, ui.card().classes('w-[560px] max-w-[95vw] gap-3'):
             ui.label('Odeslat podklad účtárně hned').classes('text-lg font-bold text-gray-800')
             ui.label(f'Totéž, co dělá automat každý pátek ve 3:00: „Pouze podklad" všech řádků '
-                     f've stavu Fakturovat ({len(rows)} řádků) na {UCTARNA_EMAIL} a po odeslání '
+                     f've stavu Fakturovat ({len(rows)} řádků) na {komu} a po odeslání '
                      f'přepnutí na Odevzdáno účtárně.').classes('text-sm text-gray-600')
             prubeh = ui.row().classes('items-center gap-2')
             prubeh.set_visibility(False)
@@ -1471,12 +1546,13 @@ def _obalka_automatu(user_name: str):
     async def _otevri():
         # Režim podle uloženého stavu, ne podle (možná zastaralé) obálky.
         zap = await asyncio.to_thread(automat_zapnuty)
+        komu = _popis_prijemcu(await asyncio.to_thread(nacti_prijemce))
         smtp = intranet_emaily.nacti_smtp_uctu(SMTP_PREFIX)
         dlg.clear()
         with dlg, ui.card().classes('w-[520px] max-w-[95vw] gap-3'):
             ui.label('Páteční automat pro účtárnu').classes('text-lg font-bold text-gray-800')
             ui.label(f'Každý pátek ve 3:00 pošle „Pouze podklad" všech řádků ve stavu Fakturovat '
-                     f'na {UCTARNA_EMAIL} a odeslané řádky přepne na Odevzdáno účtárně.') \
+                     f'na {komu} a odeslané řádky přepne na Odevzdáno účtárně.') \
                 .classes('text-sm text-gray-600')
             if zap:
                 _banner('Automat je ZAPNUTÝ.', 'emerald', 'check_circle')
@@ -1501,7 +1577,7 @@ def _obalka_automatu(user_name: str):
         zap = automat_zapnuty()
         if zap:
             tip = (f'Páteční automat je zapnutý: každý pátek ve 3:00 „Pouze podklad" na '
-                   f'{UCTARNA_EMAIL} → Odevzdáno účtárně — kliknutím vypnete')
+                   f'{_popis_prijemcu(nacti_prijemce())} → Odevzdáno účtárně — kliknutím vypnete')
         else:
             tip = 'Páteční automat pro účtárnu je vypnutý — kliknutím zapnete'
         with ui.button(on_click=_otevri).props('flat round').tooltip(tip):
@@ -1512,3 +1588,65 @@ def _obalka_automatu(user_name: str):
                     ui.element('div').style(_PRESKRTNUTI)
 
     obalka()
+
+
+def nastaveni_prijemcu(user_name: str):
+    """Ozubené kolečko na pravém kraji lišty pohledů v Sankce k vystavení (jen admin):
+    komu jde páteční podklad účtárně za kterou pobočku. Dialog vznikne v místě
+    volání; vrací handler, který ho otevře."""
+    dlg = ui.dialog()
+
+    async def _otevri():
+        cfg = await asyncio.to_thread(nacti_prijemce)
+        dlg.clear()
+        with dlg, ui.card().classes('w-[520px] max-w-[95vw] gap-3'):
+            ui.label('Příjemci podkladu účtárně').classes('text-lg font-bold text-gray-800')
+            ui.label('Páteční „Pouze podklad" (i ruční odeslání účtárně) se rozdělí podle '
+                     'poboček — každý příjemce dostane jen řádky svých poboček. Řádek '
+                     's neznámou pobočkou jde na příjemce 1.').classes('text-sm text-gray-600')
+            vstupy = [ui.input(f'Příjemce {i + 1}', value=e,
+                               placeholder='' if i == 0 else 'nepovinné')
+                      .props('outlined dense').classes('w-full')
+                      for i, e in enumerate(cfg['emaily'])]
+            volby = {}
+            with ui.grid(columns='1fr auto').classes('w-full items-center gap-x-4 gap-y-1'):
+                ui.label('Pobočka').classes('text-xs font-bold text-gray-500')
+                ui.label('Příjemce').classes('text-xs font-bold text-gray-500')
+                for kod, nazev in S._POBOCKY_NAZVY.items():
+                    ui.label(f'{kod} {nazev}').classes('text-sm text-gray-800')
+                    volby[kod] = ui.toggle({i: str(i + 1) for i in range(_PRIJEMCU)},
+                                           value=cfg['pobocky'].get(kod, 0)) \
+                        .props('dense unelevated toggle-color=indigo')
+
+            async def _ulozit():
+                emaily = [(v.value or '').strip() for v in vstupy]
+                pobocky = {k: int(t.value or 0) for k, t in volby.items()}
+                chyby = [f'Příjemce {i + 1}: neplatná adresa „{e}".'
+                         for i, e in enumerate(emaily)
+                         if e and not intranet_emaily.je_platny_email(e)]
+                if not emaily[0]:
+                    chyby.append('Příjemce 1 je povinný.')
+                chyby += [f'Příjemce {i + 1} nemá adresu, ale má přiřazené pobočky.'
+                          for i in range(1, _PRIJEMCU)
+                          if not emaily[i] and i in pobocky.values()]
+                if chyby:
+                    ui.notify(' '.join(chyby), type='negative')
+                    return
+                try:
+                    await asyncio.to_thread(uloz_prijemce, emaily, pobocky)
+                except Exception as e:
+                    ui.notify(f'Nastavení se nepodařilo uložit: {e}', type='negative')
+                    return
+                popis = _popis_prijemcu({'emaily': emaily, 'pobocky': pobocky})
+                intranet_logger.log_activity(user_name, 'Sankce',
+                                             f'Příjemci podkladu účtárně: {popis}')
+                dlg.close()
+                ui.notify(f'Uloženo — podklad půjde na {popis}.', type='positive')
+
+            with ui.row().classes('w-full justify-end gap-2'):
+                ui.button('Zrušit', on_click=dlg.close).props('flat no-caps')
+                ui.button('Uložit', icon='save', on_click=_ulozit) \
+                    .props('unelevated no-caps color=primary')
+        dlg.open()
+
+    return _otevri

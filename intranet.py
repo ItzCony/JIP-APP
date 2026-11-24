@@ -1883,14 +1883,7 @@ async def route_uloziste(client: Client, slozka: str = ''):
     await vykresli_kompletni_intranet(client, 'uloziste')
 
 @ui.page('/naklady_veletrh')
-async def route_naklady_veletrh(client: Client, naklad: str = ''):
-    # Deep-link z e-mailu (/naklady_veletrh?naklad=<id>). Je to jen přání — modul
-    # náklad otevře, jen když ho uživatel smí vidět; jinak ukáže hlášku.
-    if naklad:
-        try:
-            app.storage.user['naklady_veletrh_naklad'] = int(naklad)
-        except (TypeError, ValueError):
-            pass
+async def route_naklady_veletrh(client: Client):
     await vykresli_kompletni_intranet(client, 'naklady_veletrh')
 
 @ui.page('/logout')
