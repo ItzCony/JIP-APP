@@ -31,6 +31,7 @@ import intranet_data
 import intranet_emaily
 import intranet_logger
 import intranet_notifikace
+from intranet_ui_utils import KOPIE_CLASS, KOPIE_COLDEF, KOPIE_JS
 import cenopripad_vypocet as cp
 
 
@@ -8128,134 +8129,6 @@ def _radky_grid_layout(pocet):
     return opts, "height: max(320px, 55vh)"
 
 
-# Kopírování z tabulky jako v Excelu — AG Grid Community nemá výběr rozsahu ani
-# schránku (jen Enterprise). Výběr: klik/tažení myší, Shift+klik, Shift(+Ctrl)+šipky,
-# Ctrl+A; Ctrl+C → TSV (Excel vloží do buněk; po Ctrl+A i s hlavičkou), bez výběru
-# zaměřená buňka. Zápis přes textarea+execCommand — navigator.clipboard na http
-# (intranet bez TLS) nefunguje. Gridu stačí třída `_KOPIE_CLASS`, `_KOPIE_COLDEF`
-# v defaultColDef a `ui.run_javascript(_KOPIE_JS)`. Výběr žije na `api.__cpSel`
-# (řádky = zobrazený index, tj. po řazení/filtru; sloupce = colId).
-_KOPIE_CLASS = "cp-kopie"
-_KOPIE_COLDEF = {"cellClassRules": {":cp-sel": (
-    "(p) => { const s = p.api.__cpSel; return !!s && p.rowIndex >= s.r1"
-    " && p.rowIndex <= s.r2 && s.cols.includes(p.column.getColId()); }")}}
-_KOPIE_JS = r"""
-(() => {
-  if (window.__cpKopie) return;
-  window.__cpKopie = true;
-  const st = document.createElement('style');
-  st.textContent = '.cp-kopie .ag-cell.cp-sel { background-color: rgba(37,99,235,.16); }';
-  document.head.appendChild(st);
-  const apiGridu = (el) => {
-    const root = el && el.closest ? el.closest('.cp-kopie') : null;
-    const comp = root && getElement(root);
-    return (comp && comp.api) || null;
-  };
-  const sloupce = (api) => api.getAllDisplayedColumns();
-  // Buňka v DOM → {r: zobrazený index řádku, c: pořadí zobrazeného sloupce}
-  const pozice = (api, cell) => {
-    const row = cell.closest('.ag-row');
-    const r = row ? parseInt(row.getAttribute('row-index'), 10) : NaN;
-    const c = sloupce(api).findIndex((k) => k.getColId() === cell.getAttribute('col-id'));
-    return Number.isNaN(r) || c < 0 ? null : {r, c};
-  };
-  const nastav = (api, a, h, vse) => {   // a = kotva, h = druhý roh; a=null výběr zruší
-    api.__cpSel = a && {a, h, vse: !!vse, r1: Math.min(a.r, h.r), r2: Math.max(a.r, h.r),
-      cols: sloupce(api).slice(Math.min(a.c, h.c), Math.max(a.c, h.c) + 1).map((k) => k.getColId())};
-    api.refreshCells({force: true});
-  };
-  const kopiruj = (api, cell) => {
-    let s = api.__cpSel;
-    if (!s) {
-      const p = pozice(api, cell);
-      if (!p) return;
-      s = {r1: p.r, r2: p.r, cols: [sloupce(api)[p.c].getColId()]};
-    }
-    const txt = (v) => String(v == null ? '' : v).replace(/\s*[\t\r\n]+\s*/g, ' ').trim();
-    const radky = s.vse ? [s.cols.map((id) =>
-      txt(api.getDisplayNameForColumn(api.getColumn(id), 'header'))).join('\t')] : [];
-    for (let r = s.r1; r <= s.r2; r++) {
-      const node = api.getDisplayedRowAtIndex(r);
-      if (node) radky.push(s.cols.map((id) =>
-        txt(api.getCellValue({rowNode: node, colKey: id, useFormatter: true}))).join('\t'));
-    }
-    if (!radky.length) return;
-    const data = radky.join('\r\n');
-    let ok = false;
-    const onCopy = (e) => { e.clipboardData.setData('text/plain', data); e.preventDefault(); ok = true; };
-    const ta = document.createElement('textarea');
-    ta.value = data;
-    ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0;';
-    document.body.appendChild(ta);
-    ta.focus(); ta.select();
-    document.addEventListener('copy', onCopy, true);
-    try { document.execCommand('copy'); } catch (e) {}
-    document.removeEventListener('copy', onCopy, true);
-    ta.remove();
-    cell.focus({preventScroll: true});   // šipky dál chodí po gridu
-    if (!ok && navigator.clipboard) { navigator.clipboard.writeText(data); ok = true; }
-    const jedna = radky.length === 1 && s.cols.length === 1;
-    Quasar.Notify.create({position: 'bottom', timeout: 1500, message: !ok
-      ? 'Kopírování selhalo.'
-      : 'Zkopírováno: ' + (jedna ? (data.length > 40 ? data.slice(0, 40) + '…' : data)
-                                 : radky.length + ' ř. × ' + s.cols.length + ' sl.')});
-  };
-  let tah = null;   // grid, ve kterém se právě táhne myší
-  document.addEventListener('mousedown', (ev) => {
-    tah = null;
-    const cell = ev.button === 0 && ev.target.closest ? ev.target.closest('.cp-kopie .ag-cell') : null;
-    const api = cell && apiGridu(cell);
-    const p = api && pozice(api, cell);
-    if (!p) return;
-    let a = p;
-    if (ev.shiftKey) {   // Shift+klik: od kotvy výběru, jinak od dosud zaměřené buňky
-      const s = api.__cpSel, f = api.getFocusedCell();
-      const fc = f && f.column ? sloupce(api).indexOf(f.column) : -1;
-      a = s ? s.a : (fc >= 0 ? {r: f.rowIndex, c: fc} : p);
-    }
-    nastav(api, a, p);
-    tah = api;
-  }, true);
-  document.addEventListener('mouseover', (ev) => {
-    if (!tah) return;
-    if (!(ev.buttons & 1)) { tah = null; return; }
-    const cell = ev.target.closest ? ev.target.closest('.cp-kopie .ag-cell') : null;
-    const s = tah.__cpSel, p = cell && apiGridu(cell) === tah && pozice(tah, cell);
-    if (s && p && (p.r !== s.h.r || p.c !== s.h.c)) nastav(tah, s.a, p);
-  });
-  document.addEventListener('mouseup', () => { tah = null; });
-  const SIPKY = {arrowup: [-1, 0], arrowdown: [1, 0], arrowleft: [0, -1], arrowright: [0, 1]};
-  document.addEventListener('keydown', (ev) => {
-    const ae = document.activeElement;
-    const cell = ae && ae.closest ? ae.closest('.cp-kopie .ag-cell') : null;
-    const api = cell && apiGridu(cell);
-    if (!api || ev.altKey) return;
-    const ctrl = ev.ctrlKey || ev.metaKey, k = (ev.key || '').toLowerCase(), sipka = SIPKY[k];
-    const stop = () => { ev.preventDefault(); ev.stopPropagation(); };
-    if (ctrl && !ev.shiftKey && (ev.code === 'KeyC' || k === 'c')) {
-      stop(); kopiruj(api, cell);
-    } else if (ctrl && !ev.shiftKey && (ev.code === 'KeyA' || k === 'a')) {
-      stop();
-      const n = api.getDisplayedRowCount();
-      if (n) nastav(api, {r: 0, c: 0}, {r: n - 1, c: sloupce(api).length - 1}, true);
-    } else if (sipka && ev.shiftKey) {   // Shift+šipka rozšíří výběr, s Ctrl až na kraj
-      stop();
-      const s = api.__cpSel, p = s ? s.h : pozice(api, cell);
-      if (!p) return;
-      const kam = (x, d, max) => Math.min(max, Math.max(0, !d ? x : ctrl ? (d < 0 ? 0 : max) : x + d));
-      const h = {r: kam(p.r, sipka[0], api.getDisplayedRowCount() - 1),
-                 c: kam(p.c, sipka[1], sloupce(api).length - 1)};
-      nastav(api, s ? s.a : p, h);
-      api.ensureIndexVisible(h.r);
-      api.ensureColumnVisible(sloupce(api)[h.c]);
-    } else if (api.__cpSel && (sipka || ['tab', 'pageup', 'pagedown', 'home', 'end', 'escape'].includes(k))) {
-      nastav(api, null);   // běžný posun zaměřené buňky výběr zruší (jako v Excelu)
-    }
-  }, true);
-})();
-"""
-
-
 def _oprava_detail(pid, user_id, user_name, prava):
     p = _oprava_pripad(pid)
     je_office = _oprava_office(prava)
@@ -8359,7 +8232,7 @@ def _oprava_detail(pid, user_id, user_name, prava):
     ui.label(f"Řádky formuláře — {len(radky)} položek").classes(
         "text-base font-bold text-gray-800 mt-1 mb-1")
     grid_opts, grid_style = _radky_grid_layout(len(grid_rows))
-    ui.run_javascript(_KOPIE_JS)
+    ui.run_javascript(KOPIE_JS)
     ui.aggrid({
         "columnDefs": [
             {"headerName": "#", "field": "poradi", "width": 70, "minWidth": 55},
@@ -8388,11 +8261,11 @@ def _oprava_detail(pid, user_id, user_name, prava):
         "rowData": grid_rows,
         "defaultColDef": {"resizable": True, "sortable": True, "filter": True,
                           "wrapHeaderText": True, "autoHeaderHeight": True,
-                          "cellDataType": False, **_KOPIE_COLDEF},
+                          "cellDataType": False, **KOPIE_COLDEF},
         "rowHeight": 28,
         "autoSizeStrategy": {"type": "fitGridWidth"},
         **grid_opts,
-    }).classes(f"w-full {_KOPIE_CLASS}").style(grid_style)
+    }).classes(f"w-full {KOPIE_CLASS}").style(grid_style)
 
     _oprava_workflow(p, pid, stav, je_vlastnik, je_office, je_spravce, user_name,
                      prava)

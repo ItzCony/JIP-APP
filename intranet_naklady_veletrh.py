@@ -3,6 +3,7 @@
 Sloupce: název nákladu, domluvený náklad, Náklad - Final, rozdíl (domluvený − Final, kladný = ušetřeno),
 poznámka; dole součty. Nic víc.
 Tabulka jako v Excelu (AG Grid). Každý zápis do buňky jde do logu (kdy, kdo, kam, bylo → je); ukáže ho očičko u řádku.
+Výběr, Ctrl+C a Ctrl+V jako v Excelu (intranet_ui_utils.KOPIE_JS); vložený blok se zapíše celý, nebo vůbec.
 Zapisuje, přidává a maže řádky: naklady_veletrh_zadavatel / _schvalovatel / _spravce
 ('vse' = všechna práva); naklady_veletrh_ctenar jen čte.
 Staré tabulky naklady_veletrh* (kategorie, faktury, přílohy, plány) zůstaly v DB jen jako archiv.
@@ -10,6 +11,7 @@ Staré tabulky naklady_veletrh* (kategorie, faktury, přílohy, plány) zůstaly
 from __future__ import annotations
 
 import asyncio
+import csv
 import datetime
 import io
 from contextlib import contextmanager
@@ -19,6 +21,7 @@ from nicegui import ui
 
 import intranet_data
 import intranet_logger
+from intranet_ui_utils import KOPIE_CLASS, KOPIE_COLDEF, KOPIE_JS, KOPIE_VKLADANI_CLASS
 
 PRAVO_ZADAVATEL = 'naklady_veletrh_zadavatel'
 PRAVO_SCHVALOVATEL = 'naklady_veletrh_schvalovatel'
@@ -108,6 +111,11 @@ def _soucet(hodnoty) -> Decimal:
     return sum((h for h in hodnoty if h is not None), Decimal(0))
 
 
+def _tsv(text) -> list[list[str]]:
+    """Schránka (Excel i grid) → řádky buněk; Excel buňku s novým řádkem obalí uvozovkami."""
+    return [r or [''] for r in csv.reader(io.StringIO(str(text or ''), newline=''), dialect='excel-tab')]
+
+
 # =========================================================
 # DATABÁZE (blokující — volat přes asyncio.to_thread)
 # =========================================================
@@ -177,27 +185,46 @@ def _nacti() -> list[dict]:
         return cur.fetchall()
 
 
+def _novy(cur, user_id, kdo) -> int:
+    cur.execute('INSERT INTO naklady_veletrh_polozky () VALUES ()')
+    pid = cur.lastrowid
+    _loguj(cur, pid, user_id, kdo, 'Nový řádek')
+    return pid
+
+
+def _zapis(cur, pid, k, hodnota, user_id, kdo) -> bool:
+    """Zapíše buňku a změnu do logu. False = v DB už ta hodnota je. LookupError = řádek smazán."""
+    kam = _SLOUPCE[k]       # zároveň hlídá, že k je skutečný sloupec (jde do SQL)
+    cur.execute(f'SELECT {k} AS v FROM naklady_veletrh_polozky WHERE id = %s FOR UPDATE', (pid,))
+    radek = cur.fetchone()
+    if radek is None:
+        raise LookupError('Řádek mezitím někdo smazal.')
+    if radek['v'] == hodnota:
+        return False
+    cur.execute(f'UPDATE naklady_veletrh_polozky SET {k} = %s WHERE id = %s', (hodnota, pid))
+    _loguj(cur, pid, user_id, kdo, kam, _zobraz(k, radek['v']), _zobraz(k, hodnota))
+    return True
+
+
 def _pridej(user_id, kdo) -> int:
     with _transakce() as cur:
-        cur.execute('INSERT INTO naklady_veletrh_polozky () VALUES ()')
-        pid = cur.lastrowid
-        _loguj(cur, pid, user_id, kdo, 'Nový řádek')
-        return pid
+        return _novy(cur, user_id, kdo)
 
 
 def _zmen(pid, k, hodnota, user_id, kdo) -> bool:
-    """Zapíše buňku a změnu do logu. False = v DB už ta hodnota je. LookupError = řádek smazán."""
-    kam = _SLOUPCE[k]       # zároveň hlídá, že k je skutečný sloupec (jde do SQL)
     with _transakce() as cur:
-        cur.execute(f'SELECT {k} AS v FROM naklady_veletrh_polozky WHERE id = %s FOR UPDATE', (pid,))
-        radek = cur.fetchone()
-        if radek is None:
-            raise LookupError('Řádek mezitím někdo smazal.')
-        if radek['v'] == hodnota:
-            return False
-        cur.execute(f'UPDATE naklady_veletrh_polozky SET {k} = %s WHERE id = %s', (hodnota, pid))
-        _loguj(cur, pid, user_id, kdo, kam, _zobraz(k, radek['v']), _zobraz(k, hodnota))
-        return True
+        return _zapis(cur, pid, k, hodnota, user_id, kdo)
+
+
+def _vloz(zmeny, user_id, kdo) -> int:
+    """Ctrl+V v jedné transakci — celé, nebo nic.
+    zmeny = [(id | None = nový řádek, {sloupec: hodnota})] → počet změněných buněk."""
+    n = 0
+    with _transakce() as cur:
+        for pid, hodnoty in zmeny:
+            pid = pid or _novy(cur, user_id, kdo)
+            n += sum(_zapis(cur, pid, k, v, user_id, kdo) for k, v in hodnoty.items())
+    return n
 
 
 def _smaz(pid, user_id, kdo):
@@ -340,6 +367,46 @@ async def vykresli(user_id, user_name, vsechna_prava):
             tx(update=[do_gridu(r, g['k']) if r else prazdny(g['k'])])
             soucty()
 
+    async def vloz(e):
+        """Ctrl+V (intranet_ui_utils.KOPIE_JS): blok ze schránky od levého horního rohu výběru, jedna
+        buňka vyplní celý výběr; co přeteče pod poslední řádek, přidá jako nové náklady."""
+        a = e.args if isinstance(e.args, dict) else {}
+        klice, cols, blok = a.get('radky') or [], a.get('sloupce') or [], _tsv(a.get('text'))
+        if not pise or not klice or not cols or not blok:
+            return
+        if len(blok) == 1 and len(blok[0]) == 1:        # jako Excel
+            blok = [blok[0] * min(int(a.get('sirka') or 1), len(cols))] * min(int(a.get('vyska') or 1), len(klice))
+        if len(blok) > 500:
+            ui.notify('Najednou jde vložit nejvýš 500 řádků.', type='warning')
+            return
+        async with zamek:
+            zmeny = []      # [(id | None = nový náklad, {sloupec: hodnota})]; mimo zapisovatelné sloupce nic
+            for i, bunky in enumerate(blok):
+                r = radek(str(klice[i])) if i < len(klice) else None
+                try:
+                    h = {k: ' '.join(v.split())[:_TEXTY[k]] if k in _TEXTY else _castka(v)
+                         for k, v in zip(cols, bunky) if k in _SLOUPCE}
+                except ValueError as ex:
+                    ui.notify(f'„{ex}“ není částka, nic se nevložilo. Částku zadejte jako číslo, '
+                              'např. 12 500 nebo 12 500,50.', type='warning')
+                    return
+                if r or any(v not in ('', None) for v in h.values()):     # prázdné nové řádky nezakládá
+                    zmeny.append((r and r['id'], h))
+            if not any(h for _, h in zmeny):
+                return
+            try:
+                n = await asyncio.to_thread(_vloz, zmeny, user_id, user_name)
+            except LookupError as ex:
+                ui.notify(str(ex), type='warning')
+            except Exception as ex:
+                ui.notify(f'Vložení se nepodařilo: {ex}', type='negative')
+            else:
+                novych = sum(pid is None for pid, _ in zmeny)
+                zprava = f'Vloženo buněk: {n}' + (f', nových řádků: {novych}' if novych else '')
+                ui.notify(zprava, position='bottom', timeout=1500)
+                intranet_logger.log_activity(user_name, _LOG, f'Ctrl+V — {zprava}')
+            await obnov()
+
     async def klik(e):
         a = e.args
         if a.get('colId') not in ('log', 'smazat') or a.get('rowPinned'):
@@ -413,14 +480,16 @@ async def vykresli(user_id, user_name, vsechna_prava):
         {'field': 'odsouhlaseno', 'headerName': _SLOUPCE['odsouhlaseno'], **castka},
         {'field': 'rozdil', 'headerName': 'Rozdíl', 'headerTooltip': 'Domluvený náklad − Náklad - Final '
                                                                       '(kladný = ušetřeno, záporný = přes domluvu)',
-         ':cellClassRules': '{"nv-plus": p => p.value > 0, "nv-minus": p => p.value < 0}', **kc},
+         'cellClassRules': {**KOPIE_COLDEF['cellClassRules'], ':nv-plus': 'p => p.value > 0',
+                            ':nv-minus': 'p => p.value < 0'}, **kc},
         {'field': 'poznamka', 'headerName': _SLOUPCE['poznamka'], 'flex': 1, 'minWidth': 140,
          'wrapText': True, 'autoHeight': True, **ed},
-        {'field': 'log', 'headerName': '', 'width': 44, ':cellRenderer': _ikona('visibility', 'Kdo co kam zapsal')},
+        {'field': 'log', 'headerName': '', 'width': 44, ':cellRenderer': _ikona('visibility', 'Kdo co kam zapsal'),
+         ':valueFormatter': '() => ""'},       # Ctrl+C: prázdná buňka, ne „true“
     ]
     if pise:
         sloupce.append({'field': 'smazat', 'headerName': '', 'width': 44,
-                        ':cellRenderer': _ikona('delete', 'Smazat řádek')})
+                        ':cellRenderer': _ikona('delete', 'Smazat řádek'), ':valueFormatter': '() => ""'})
 
     with ui.card().classes('w-full p-4 gap-3 shadow-sm'):
         with ui.row().classes('w-full items-center justify-between'):
@@ -428,6 +497,7 @@ async def vykresli(user_id, user_name, vsechna_prava):
             ui.button('Export', icon='download', on_click=export).props('flat color=primary')
         # auto_size_columns=False: NiceGUI 3.x jinak přidá autoSizeStrategy, AG Grid 34 ji
         # s flex sloupcem odmítne a vykreslí prázdnou tabulku (bez hlaviček i řádků)
+        ui.run_javascript(KOPIE_JS)
         grid = ui.aggrid({
             'columnDefs': sloupce,
             'rowData': radky_gridu(),
@@ -439,15 +509,19 @@ async def vykresli(user_id, user_name, vsechna_prava):
             'enterNavigatesVerticallyAfterEdit': True,
             'undoRedoCellEditing': True,
             'suppressNoRowsOverlay': True,     # prázdnou tabulku řekne řádek Součet 0 Kč
-            'defaultColDef': {'sortable': False, 'resizable': True, 'suppressMovable': True},
+            'defaultColDef': {'sortable': False, 'resizable': True, 'suppressMovable': True, **KOPIE_COLDEF},
             ':onRowDataUpdated': 'p => p.api.refreshCells({columns: ["cislo"]})',   # čísla řádků po smazání
-        }, theme='balham', auto_size_columns=False).classes('w-full nv-grid').style('height: auto')
+        }, theme='balham', auto_size_columns=False).style('height: auto') \
+            .classes(f'w-full nv-grid {KOPIE_CLASS}' + (f' {KOPIE_VKLADANI_CLASS}' if pise else ''))
         grid.on('cellValueChanged', zmena)
         grid.on('cellClicked', klik)
+        grid.on('vlozeni', vloz)
 
 
 if __name__ == '__main__':      # kontrola parseru a formátu částek
     assert _castka(' 12 500,50 Kč') == Decimal('12500.50')
+    assert _tsv('Stánek\t12 500,50\r\nDoprava\t\r\n') == [['Stánek', '12 500,50'], ['Doprava', '']]
+    assert _tsv('"dva\nřádky"\t1\n\nx') == [['dva\nřádky', '1'], [''], ['x']] and _tsv(None) == []
     assert _castka('12 500') == Decimal('12500.00')
     assert _castka('') is None and _castka(None) is None
     for spatne in ('abc', '1,2,3', 'nan', 'inf', '1e13'):
