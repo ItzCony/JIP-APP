@@ -35,8 +35,6 @@ import intranet_data
 import intranet_logger
 import intranet_emaily
 import intranet_static
-import gastrokurzy_seed
-import gastrokurzy_seed_prezence
 import asyncio
 import calendar
 import datetime
@@ -245,88 +243,6 @@ def inicializace_db():
         return
     cur.close()
     conn.close()
-    _naseeduj()
-    _naseeduj_prezenci()
-
-
-def _naseeduj():
-    """Jednorázový import dat z Excelů zadání (jen když je tabulka prázdná).
-
-    Počty přihlášených z Excelu nemají jména – zakládají se jako anonymní řádky
-    prezenční listiny, které ASM/vedoucí doplní. Počet v přehledu = počet
-    aktivních řádků, takže je jen jeden zdroj pravdy.
-    """
-    conn = intranet_data.get_db_connection()
-    if not conn:
-        return
-    cur = conn.cursor()
-    try:
-        cur.execute("SELECT COUNT(*) FROM gastrokurzy_termin WHERE zdroj = 'import-zadani'")
-        if cur.fetchone()[0]:
-            return
-        vse = ([('standard', t) for t in gastrokurzy_seed.TERMINY]
-               + [('top', t) for t in gastrokurzy_seed.TOP_TERMINY])
-        for typ, t in vse:
-            # souhrn_odeslan = NOW(): import zadání se do denního souhrnu nehlásí.
-            cur.execute("""INSERT INTO gastrokurzy_termin
-                (typ, misto, datum, nazev, firma, lektor, kapacita, stav,
-                 zdroj, souhrn_verze, souhrn_odeslan)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'import-zadani', 1, NOW())""",
-                        (typ, t['misto'], t.get('datum'), t.get('nazev'), t.get('firma'),
-                         t.get('lektor'), t.get('kapacita'), t.get('stav', 'aktivni')))
-            tid = cur.lastrowid
-            for klic, pocet in t['prihlasky']:
-                for _ in range(int(pocet or 0)):
-                    cur.execute("""INSERT INTO gastrokurzy_prihlaska
-                        (termin_id, pobocka_klic, zapsal) VALUES (%s, %s, 'import')""",
-                                (tid, klic))
-        conn.commit()
-        print(f"[gastrokurzy] Import zadání: {len(vse)} termínů")
-    except Exception as e:
-        print(f"[gastrokurzy] Seed chyba: {e}")
-    finally:
-        cur.close()
-        conn.close()
-
-
-def _naseeduj_prezenci():
-    """Import prezenční listiny ASM 2026 – jarní kurzy i s konkrétními účastníky.
-
-    Jde o jiné termíny než podzimní z KURZY.xlsx, proto se zakládají samostatně
-    (historie). Vlastní krok, aby šel spustit i nad už naplněnou tabulkou:
-    poznávacím znamením je `gastrokurzy_termin.zdroj = 'import-prezence'`.
-    """
-    conn = intranet_data.get_db_connection()
-    if not conn:
-        return
-    cur = conn.cursor()
-    try:
-        cur.execute("SELECT COUNT(*) FROM gastrokurzy_termin WHERE zdroj = 'import-prezence'")
-        if cur.fetchone()[0]:
-            return
-        osob = 0
-        for t in gastrokurzy_seed_prezence.TERMINY:
-            cur.execute("""INSERT INTO gastrokurzy_termin
-                (typ, misto, datum, nazev, stav, zdroj, souhrn_verze, souhrn_odeslan)
-                VALUES ('standard', %s, %s, %s, 'aktivni', 'import-prezence', 1, NOW())""",
-                        (t['misto'], t['datum'], t['nazev']))
-            tid = cur.lastrowid
-            for o in t['ucastnici']:
-                cur.execute("""INSERT INTO gastrokurzy_prihlaska
-                    (termin_id, pobocka_klic, oz, ico, provozovna, zakaznik,
-                     funkce, telefon, podpis, zapsal)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'import-prezence')""",
-                            (tid, o['pobocka'], o['oz'], o['ico'], o['provozovna'],
-                             o['jmeno'], o['funkce'], o['telefon'], o['podpis']))
-                osob += 1
-        conn.commit()
-        print(f"[gastrokurzy] Import prezenční listiny: "
-              f"{len(gastrokurzy_seed_prezence.TERMINY)} termínů, {osob} účastníků")
-    except Exception as e:
-        print(f"[gastrokurzy] Import prezence chyba: {e}")
-    finally:
-        cur.close()
-        conn.close()
 
 
 # Pobočky v Excelu bývají zkratkou, ne plným názvem.
