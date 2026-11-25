@@ -18,7 +18,6 @@ import intranet_static
 import intranet_logger
 import intranet_obsah
 import intranet_kviz
-import odstavka
 import intranet
 import intranet_oidc  # registruje /auth/login a /auth/callback (no-op bez env)
 import intranet_exporty
