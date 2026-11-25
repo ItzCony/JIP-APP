@@ -22,6 +22,7 @@ import intranet
 import intranet_oidc  # registruje /auth/login a /auth/callback (no-op bez env)
 import intranet_exporty
 import intranet_jobs
+import intranet_kpi
 import znackyjip
 import znacky_provoz
 import prodejni_aktivity
@@ -150,6 +151,8 @@ if __name__ == "__main__":
     app.on_startup(intranet_jobs.init_pool)
     app.on_startup(lambda: asyncio.create_task(intranet_jobs.warmup()))
     app.on_shutdown(intranet_jobs.shutdown_pool)
+    # Rozběhnutý výpočet KPI (samostatný proces) skončí s aplikací.
+    app.on_shutdown(intranet_kpi.ukonci)
     # Při zastavení služby (systemctl stop → SIGTERM → graceful shutdown) zavři
     # nečinná DB spojení, ať MySQL nehlásí „Aborted connection".
     app.on_shutdown(intranet_data.zavri_db_pool)

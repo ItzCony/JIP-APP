@@ -55,3 +55,6 @@ audit_log.db-wal
 ikos_export/.posledni_tyden
 
 ikos_export/IKOS_Export_20261102-20261108.csv
+
+# KPI (Analytické oddělení) – výstupy běhů skriptu
+KPI/

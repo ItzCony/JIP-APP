@@ -12,6 +12,7 @@ qrcode
 opencv-python-headless
 openpyxl
 pyxlsb
+xlsxwriter
 xlrd
 xlwt
 docxtpl
