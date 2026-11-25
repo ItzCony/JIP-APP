@@ -239,6 +239,8 @@ ZAKLADNI_PRAVA = {
     'nos_asm':       {'kategorie': 'Modul NOS', 'nazev': 'ASM',             'popis': 'Vidí a zadává jen OZ svého ASM (přiřazuje správce modulu).', 'ikona': 'badge'},
     'nos_vedouci':   {'kategorie': 'Modul NOS', 'nazev': 'Vedoucí pobočky', 'popis': 'Vidí a zadává OZ všech ASM, která mu správce modulu přiřadil.', 'ikona': 'supervisor_account'},
 
+    'analyticke_oddeleni': {'kategorie': 'Modul Analytické oddělení', 'nazev': 'Analytické Oddělení', 'popis': 'Vidí dlaždici Analytické oddělení na přehledu a má v ní plný přístup: Pobočkové bonusy všech poboček — podkladová tabulka, import, zpracování dat, výpočet a stahování bonusů.', 'ikona': 'analytics'},
+
     # Rezervace ind. schůzky s vedoucími — schůzka je vždy společná, kdo má právo
     # `schuzky_vedouci`, tomu žádost přijde a odklikne si účast (nic se nehardcoduje).
     'schuzky_zadatel': {'kategorie': 'Modul Formuláře ASM', 'nazev': 'Žadatel o schůzku', 'popis': 'ASM. Zakládá žádosti o schůzku (jedna žádost pro všechny vedoucí), vidí jen své žádosti a jejich stav. V kalendáři vidí obsazenost anonymně (šedé bloky).', 'ikona': 'event_available'},
@@ -326,6 +328,15 @@ def ma_pristup_zalistovaci(prava) -> bool:
     return 'vse' in prava or any(p in prava for p in ZALISTOVACI_ROLE)
 
 
+ANALYTICKE_PRAVO = 'analyticke_oddeleni'
+
+
+def ma_pristup_analyticke(prava) -> bool:
+    """Analytické oddělení: superadmin nebo právo „Analytické Oddělení" (plný přístup)."""
+    prava = prava or ()
+    return 'vse' in prava or ANALYTICKE_PRAVO in prava
+
+
 # Práva kategorie „Administrace portálu" — nikdy se nepřidělují přes UI ani
 # se neukládají komukoliv jinému než skrytému hlavnímu adminovi (iduser=1).
 # Katalog si je ponechává kvůli popiskům a kontrolám v kódu; z nabídky
@@ -365,6 +376,7 @@ _MODUL_KATEGORIE = {
     'Modul Formuláře ASM':       'asm_zapnuty',
     'Modul Lupopřípad':          'lupa_zapnuty',
     'Modul NOS':                 'nos_zapnuty',
+    'Modul Analytické oddělení': 'analyticke_zapnuty',
 }
 # Značky mají v jedné kategorii dva moduly (podskupiny).
 _MODUL_PODSKUPINA = {

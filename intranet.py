@@ -27,6 +27,7 @@ import intranet_vizitky
 import intranet_spolvecer
 import intranet_lupa
 import intranet_nos
+import intranet_bonusy_ao
 import intranet_gastrokurzy
 import intranet_monitory
 import intranet_zalistovaci
@@ -716,6 +717,7 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
         'asm':           'asm_zapnuty',
         'lupa':          'lupa_zapnuty',
         'nos':           'nos_zapnuty',
+        'analyticke':    'analyticke_zapnuty',
         'gastrokurzy':   'gastrokurzy_zapnuty',
         'uloziste':      'datuloziste_zapnuty',
         'naklady_veletrh': 'naklady_veletrh_zapnuty',
@@ -957,6 +959,11 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
 
     if nastaveni.get('nos_zapnuty', True) and intranet_nos.ma_pristup(vsechna_prava):
         dostupne_taby.append('nos')
+
+    # Analytické oddělení (Pobočkové bonusy): superadmin nebo právo „Analytické Oddělení".
+    if (nastaveni.get('analyticke_zapnuty', True)
+            and intranet_prava.ma_pristup_analyticke(vsechna_prava)):
+        dostupne_taby.append('analyticke')
 
     _ma_gastrokurzy = (
         ma_vse
@@ -1620,6 +1627,8 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
                         tab_lupa = ui.tab('lupa', label='🔍  Lupopřípad').classes('justify-start text-lg text-gray-800')
                     if 'nos' in dostupne_taby:
                         ui.tab('nos', label='💼  NOS').classes('justify-start text-lg text-gray-800')
+                    if 'analyticke' in dostupne_taby:
+                        ui.tab('analyticke', label='📊  Analytické oddělení').classes('justify-start text-lg text-gray-800')
 
                     if ma_vse or "uzivatele" in vsechna_prava:
                         tab_uzivatele = ui.tab('uzivatele', label='👥  Správa uživatelů').classes('justify-start text-lg text-gray-800')
@@ -1697,6 +1706,7 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
                 if 'asm'        in dostupne_taby: _RENDER_FNS['asm']        = lambda: intranet_asm.vykresli_asm(user_id, user_name, vsechna_prava)
                 if 'lupa'       in dostupne_taby: _RENDER_FNS['lupa']       = lambda: intranet_lupa.vykresli_lupa(user_id, user_name, vsechna_prava)
                 if 'nos'        in dostupne_taby: _RENDER_FNS['nos']        = lambda: intranet_nos.vykresli_nos(user_id, user_name, vsechna_prava)
+                if 'analyticke' in dostupne_taby: _RENDER_FNS['analyticke'] = lambda: intranet_bonusy_ao.vykresli_analyticke(user_id, user_name, vsechna_prava)
                 if 'gastrokurzy' in dostupne_taby: _RENDER_FNS['gastrokurzy'] = lambda: intranet_gastrokurzy.vykresli(user_id, user_name, vsechna_prava)
                 if 'uloziste'   in dostupne_taby: _RENDER_FNS['uloziste']   = lambda: intranet_datuloziste.vykresli(user_id, user_name, vsechna_prava)
                 if 'naklady_veletrh' in dostupne_taby: _RENDER_FNS['naklady_veletrh'] = lambda: intranet_naklady_veletrh.vykresli(user_id, user_name, vsechna_prava)
