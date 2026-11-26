@@ -344,8 +344,9 @@ _LOG_LIST = 'delist'   # list, kde se navíc vyhodnocuje Kód 3 a pomlčky v K2
 _LOG_HODNOTY = {'zmena_k2': ('Hotovo', 'Není'), _LOG_LIST: ('hotovo', 'není')}
 _LOG_PRAVIDLO = {
     'zmena_k2': 'Řádky, jejichž Kód9 je v logu, dostanou „Hotovo", ostatní „Není".',
-    _LOG_LIST: 'Řádek dostane „hotovo", když je jeho Kód9 v logu a Kód 2 v logu má tolik pomlček, '
-               'kolik žádá Kód 3 na webu: 0 → jedna (34-), 9 → dvě (34--). Ostatní dostanou „není".',
+    _LOG_LIST: 'Řádek dostane „hotovo", když je jeho Kód9 v logu a Kód 2 v logu obsahuje 9, '
+               'nebo má tolik pomlček, kolik žádá Kód 3 na webu: 0 → jedna (34-), 9 → dvě (34--). '
+               'Ostatní dostanou „není".',
 }
 _POMLCKY = '-–−'   # i typografické varianty; dlouhá „—" se počítá jako dvě
 
@@ -386,7 +387,10 @@ def _nacti_log_k2(raw, jmeno):
 
 
 def _hotovo_dle_logu(k2, k3) -> bool:
-    """Delist: Kód 3 = 0 → K2 v logu končí jednou pomlčkou (34-), 9 → dvěma (34--)."""
+    """Delist: K2 v logu obsahuje 9 → hotovo vždy (bez ohledu na Kód 3).
+    Jinak Kód 3 = 0 → K2 v logu končí jednou pomlčkou (34-), 9 → dvěma (34--)."""
+    if '9' in k2:
+        return True
     n = {'0': 1, '9': 2}.get(k3)
     k2 = k2.replace('—', '--')
     return n is not None and len(k2) - len(k2.rstrip(_POMLCKY)) == n
