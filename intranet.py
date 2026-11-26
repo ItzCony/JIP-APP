@@ -34,6 +34,7 @@ import intranet_zalistovaci
 import intranet_manualy
 import intranet_datuloziste
 import intranet_naklady_veletrh
+import intranet_server_status
 import intranet_halloween
 import intranet_mikulas
 
@@ -983,6 +984,10 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
     if intranet_naklady_veletrh.ma_pristup_k_modulu(vsechna_prava):
         dostupne_taby.append('naklady_veletrh')
 
+    # Server Status — výhradně hlavní administrátor (user_id 1), žádné právo to neotevře.
+    if intranet_server_status.je_hlavni_admin(user_id):
+        dostupne_taby.append('server_status')
+
     if not user_id:
         # Deep-link z e-mailu musí přežít i přesměrování přes firemní účet (OIDC) —
         # callback je běžný HTTP redirect a původní URL už nezná.
@@ -1636,6 +1641,9 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
                     if ma_vse or "admin_logy" in vsechna_prava:
                         tab_logy = ui.tab('logy', label='📜  Audit Log').classes('justify-start text-lg text-gray-800')
 
+                    if 'server_status' in dostupne_taby:
+                        ui.tab('server_status', label='🖥️  Server Status').classes('justify-start text-lg text-gray-800')
+
                     if ma_vse or "mysql" in vsechna_prava:
                         tab_mysql = ui.tab('mysql', label='🗄️  Nastavení portálu').classes('justify-start text-lg text-gray-800')
 
@@ -1710,6 +1718,7 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
                 if 'gastrokurzy' in dostupne_taby: _RENDER_FNS['gastrokurzy'] = lambda: intranet_gastrokurzy.vykresli(user_id, user_name, vsechna_prava)
                 if 'uloziste'   in dostupne_taby: _RENDER_FNS['uloziste']   = lambda: intranet_datuloziste.vykresli(user_id, user_name, vsechna_prava)
                 if 'naklady_veletrh' in dostupne_taby: _RENDER_FNS['naklady_veletrh'] = lambda: intranet_naklady_veletrh.vykresli(user_id, user_name, vsechna_prava)
+                if 'server_status' in dostupne_taby: _RENDER_FNS['server_status'] = lambda: intranet_server_status.vykresli(user_id, user_name, vsechna_prava)
 
                 if tab_logy:        _RENDER_FNS['logy']          = lambda: intranet_logger.vykresli_logy(user_name, vsechna_prava)
 
@@ -1895,6 +1904,10 @@ async def route_uloziste(client: Client, slozka: str = ''):
 @ui.page('/naklady_veletrh')
 async def route_naklady_veletrh(client: Client):
     await vykresli_kompletni_intranet(client, 'naklady_veletrh')
+
+@ui.page('/server_status')
+async def route_server_status(client: Client):
+    await vykresli_kompletni_intranet(client, 'server_status')
 
 @ui.page('/logout')
 def route_logout(client: Client):

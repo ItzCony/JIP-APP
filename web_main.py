@@ -181,6 +181,9 @@ if __name__ == "__main__":
     # Lupou na nákup — k 10. dni v měsíci Excel s prodeji každému nákupčímu.
     import intranet_lupa
     app.on_startup(lambda: asyncio.create_task(intranet_lupa.bg_nakup_report()))
+    # Server Status — měření každých 10 s, minutová historie do MySQL, e-mailová upozornění.
+    import intranet_server_status
+    app.on_startup(lambda: asyncio.create_task(intranet_server_status.bg_mereni()))
     # Kvíz — po startu vrátí rozpracované testy z disku, odevzdá ty s vypršelým časem.
     app.on_startup(lambda: asyncio.create_task(intranet_kviz.bg_uklid_testu()))
     # Nahrané soubory jen pro přihlášené (viz intranet_static)
