@@ -5826,9 +5826,22 @@ def _letaky_radky(pid):
         cur.execute("SELECT * FROM letaky_radky WHERE pripad_id=%s ORDER BY poradi", (pid,))
         r = cur.fetchall()
         cur.close()
+        # Dod A–Z jako v Excelu (vzor „označená sestava“), v rámci dodavatele NC3-ANC vzestupně (prázdné na konec)
+        r.sort(key=lambda x: (_letaky_dodkey(x), x["nc3_anc"] is None, x["nc3_anc"] or 0.0))
         return r
     finally:
         conn.close()
+
+
+def _letaky_dodkey(r):
+    # Excel: čísla (100 … 930) číselně před textem (101A … 906-70); text bez ohledu na velikost
+    # písmen a s ignorovanou pomlčkou/apostrofem (563A-B < 563A-C < 563-D); prázdné na konec
+    s = str(r.get("dod") or "").strip()
+    if re.fullmatch(r"\d+(\.\d+)?", s):
+        return (0, float(s), "")
+    if not s:
+        return (2, 0.0, "")
+    return (1, 0.0, s.replace("-", "").replace("'", "").casefold())
 
 
 def _letaky_zpracuj(pid):
@@ -5965,7 +5978,7 @@ def _letaky_notifikuj(cislo, kanal, chyb, pocet, zadavatel_jmeno, zadavatel_id,
 def _letaky_export_xlsx(pid):
     """Export sestavy do .xlsx jako „Označená sestava": všechny sloupce + dopočítaná
     pole jako Excel vzorce, podmíněné formátování (stejná pravidla jako v aplikaci),
-    autofiltr, řazení dle Dod."""
+    autofiltr, řazení dle NC3-ANC a Dod (viz _letaky_radky)."""
     import openpyxl
     from openpyxl.styles import Font, PatternFill, Alignment
     from openpyxl.formatting.rule import FormulaRule
@@ -5973,14 +5986,6 @@ def _letaky_export_xlsx(pid):
     radky = _letaky_radky(pid)
     if not radky:
         return None, "Sestava nemá data."
-
-    # surová data + řazení dle Dod (sloupec A) vzestupně
-    def _dodkey(r):
-        try:
-            return (0, float(r.get("dod")))
-        except (TypeError, ValueError):
-            return (1, str(r.get("dod") or ""))
-    radky = sorted(radky, key=_dodkey)
 
     try:
         data_keys = list(json.loads(radky[0]["data_json"]).keys()) if radky[0].get("data_json") else []
