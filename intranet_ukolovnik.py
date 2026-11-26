@@ -3367,7 +3367,7 @@ async def _vykresli_ukoly(user_id, user_name, vsechna_prava, dialog_anchor=None,
             return not od or (t and od <= t.isoformat() <= do)
         return True
 
-    STRANKA_VEL = 30
+    STRANKA_VEL = 20
     # Perzistentní stav napříč refreshi (uložení úkolu nevrací uživatele na 1. stránku)
     _stranka = ukoly_stav.setdefault('stranka', {'p': 1})
     _razeni = ukoly_stav.setdefault('razeni', {'pole': None, 'smer': 'asc'})  # pole: None|'termin'|'prirazen'

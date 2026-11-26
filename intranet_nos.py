@@ -857,7 +857,7 @@ def _dialog_log(cislo_oz, jmeno):
                        'kdo': z['kdo'], 'obdobi': z['obdobi'] or '', 'pole': z['pole'],
                        'stara': z['stara_hodnota'] or '—', 'nova': z['nova_hodnota'] or '—'}
                       for z in zaznamy],
-                row_key='id', pagination=15).classes('w-full').props('dense flat')
+                row_key='id', pagination=20).classes('w-full').props('dense flat')
         with ui.row().classes('w-full justify-end'):
             ui.button('Zavřít', on_click=d.close).props('flat')
     d.open()
@@ -879,7 +879,7 @@ def _tabulka(pole, radky, on_akce, ikona='edit', akce_vzdy=False):
 
     hledat = ui.input(placeholder='Hledat OZ, ASM…').props('dense outlined clearable') \
         .classes('w-72 mb-2')
-    t = ui.table(columns=sloupce, rows=radky, row_key='cislo_oz', pagination=50) \
+    t = ui.table(columns=sloupce, rows=radky, row_key='cislo_oz', pagination=20) \
         .classes('w-full').props('flat bordered')
     hledat.bind_value_to(t, 'filter')
     podminka = '' if akce_vzdy else 'v-if="props.row.smi"'
@@ -1115,7 +1115,7 @@ def _prehled(sloupce, radky, row_key='cislo_oz'):
         {'name': k, 'label': p, 'field': k, 'sortable': True,
          'align': 'right' if typ == 'kc' else 'left',
          **({':format': _FORMAT_KC} if typ == 'kc' else {})}
-        for k, p, typ in sloupce], rows=radky, row_key=row_key, pagination=50) \
+        for k, p, typ in sloupce], rows=radky, row_key=row_key, pagination=20) \
         .classes('w-full').props('flat bordered dense')
     hledat.bind_value_to(t, 'filter')
 
@@ -1341,7 +1341,7 @@ def _sekce_doklady(user_name):
              'align': 'right' if k == 'pocet' else 'left'}
             for k, p in (('asm', 'ASM'), ('cislo_oz', 'Číslo OZ'), ('jmeno_oz', 'Jméno OZ'),
                          ('pocet', 'Dokladů'))] + [{'name': 'akce', 'label': '', 'field': 'akce'}],
-            rows=radky, row_key='cislo_oz', pagination=50).classes('w-full').props('flat bordered dense')
+            rows=radky, row_key='cislo_oz', pagination=20).classes('w-full').props('flat bordered dense')
         hledat.bind_value_to(t, 'filter')
         t.add_slot('body-cell-akce', '''
             <q-td :props="props" auto-width>

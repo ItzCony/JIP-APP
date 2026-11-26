@@ -5074,7 +5074,7 @@ def _sklad_soubor(radky, skupina, format="xlsx"):
     return data, pripona, mime
 
 
-PRIPADU_NA_STRANKU = 40   # max karet případů na jednu stránku seznamu
+PRIPADU_NA_STRANKU = 20   # max karet případů na jednu stránku seznamu
 
 
 def _wp_fronta_panel(user_name, prava):
@@ -5147,7 +5147,7 @@ def _wp_fronta_panel(user_name, prava):
                      "na vyjádření. Zaškrtněte položky, napište vyjádření a uložte.") \
                 .classes("text-sm text-gray-600")
             tbl = ui.table(columns=cols, rows=rows, row_key="id", selection="multiple",
-                           pagination={"rowsPerPage": 50}) \
+                           pagination={"rowsPerPage": 20}) \
                 .props("dense flat bordered wrap-cells").classes("w-full")
             vyj_in = ui.textarea("Vyjádření nákupčího") \
                 .props("outlined autogrow").classes("w-full")

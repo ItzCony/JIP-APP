@@ -969,7 +969,7 @@ def index_page(client: Client):
                        {'name': 'body', 'label': 'Body', 'field': 'body', 'align': 'center'},
                        {'name': 'trvani', 'label': 'Trvání', 'field': 'trvani', 'align': 'center'},
                        {'name': 'datum', 'label': 'Odevzdáno', 'field': 'datum', 'align': 'center', 'sortable': True}]
-            ui.table(columns=sloupce, rows=rows, pagination=15).classes('w-full')
+            ui.table(columns=sloupce, rows=rows, pagination=20).classes('w-full')
 
             async def _export():
                 def _soubor():
