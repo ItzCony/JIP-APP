@@ -529,7 +529,7 @@ MODULY = {
     'asm_zapnuty':           ('📝 Modul Formuláře ASM',          'Formuláře ASM'),
     'lupa_zapnuty':          ('🔍 Modul Lupopřípad',             'Lupopřípad'),
     'nos_zapnuty':           ('💼 Modul NOS',                    'NOS'),
-    'analyticke_zapnuty':    ('📊 Modul Analytické oddělení',    'Analytické oddělení'),
+    'analyticke_zapnuty':    ('🧮 Modul Analytické oddělení',    'Analytické oddělení'),
     'schuzky_zapnuty':       ('🗓️ Modul Schůzky s vedoucími',    'Schůzky s vedoucími'),
     'gastrokurzy_zapnuty':   ('👨‍🍳 Modul Gastrokurzy',            'Gastrokurzy'),
     'datuloziste_zapnuty':   ('🗄️ Modul Datové úložiště',        'Datové úložiště'),

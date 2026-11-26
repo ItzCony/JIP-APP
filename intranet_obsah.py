@@ -863,7 +863,7 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
         _d('lupa', ma_pristup_lupa, '🔍', 'Lupopřípad', '#a855f7',
            _akce('lupa', f'lupa_pohled_{user_id}')),
         _d('nos', ma_pristup_nos, '💼', 'NOS', '#0d9488', _akce('nos', f'nos_dlazdice_{user_id}')),
-        _d('analyticke', ma_pristup_analyticke, '📊', 'Analytické oddělení', '#eab308',
+        _d('analyticke', ma_pristup_analyticke, '🧮', 'Analytické oddělení', '#eab308',
            _akce('analyticke', f'analyticke_sekce_{user_id}')),
         _d('gastrokurzy', ma_pristup_gastrokurzy, '👨‍🍳', 'Gastrokurzy', '#f97316',
            _akce('gastrokurzy')),
