@@ -2573,7 +2573,7 @@ def vykresli_dochazku(user_id, user_name, vsechna_prava):
                                     render_historie.refresh()
                                 ui.button(icon='clear', on_click=_zrusit_filtr_historie).props('flat round').tooltip('Zrušit filtr').classes('self-center text-gray-500')
 
-                            HIST_NA_STRANU = 10
+                            HIST_NA_STRANU = 20
                             hist_page = {'p': 1}
 
                             @ui.refreshable
@@ -2634,8 +2634,8 @@ def vykresli_dochazku(user_id, user_name, vsechna_prava):
                                                     ui.label(f"Důvod: {z['rejection_reason']}").classes('text-xs text-red-500 italic mt-1')
                                                 if z.get('storno_req_at'):
                                                     ui.label(f"⏳ Žádost o storno: {z.get('storno_req_reason') or ''}").classes('text-xs text-orange-600 font-medium')
-                                    # doplň prázdné sloty, ať má každá strana výšku 10 záznamů
-                                    for _ in range(HIST_NA_STRANU - len(strana)):
+                                    # doplň prázdné sloty, ať má každá strana výšku HIST_NA_STRANU záznamů (jen při více stranách)
+                                    for _ in range(HIST_NA_STRANU - len(strana) if pocet_stran > 1 else 0):
                                         ui.element('div').classes('w-full mb-2 shrink-0').style('height: 74px')
                                     if pocet_stran > 1:
                                         def _zmen_stranu(e):
@@ -3784,7 +3784,7 @@ def vykresli_spravu_uzivatelu(user_email, user_name, vsechna_prava=None):
                                     columns=COLS_SYS,
                                     rows=_filtruj(l_rows, 'sys'),
                                     row_key='cislo',
-                                    pagination=25,
+                                    pagination=20,
                                 ).classes('w-full shadow-sm rounded-xl').props(TBL_P)
                                 tbl_l.add_slot('body-cell-stav', STAV_SLOT)
                                 tbl_l.on('rowClick', lambda e: _on_row_click(e.args))
@@ -3798,7 +3798,7 @@ def vykresli_spravu_uzivatelu(user_email, user_name, vsechna_prava=None):
                                     columns=COLS_CSV,
                                     rows=_filtruj(r_rows, 'csv'),
                                     row_key='cislo',
-                                    pagination=25,
+                                    pagination=20,
                                 ).classes('w-full shadow-sm rounded-xl').props(TBL_P)
                                 tbl_r.add_slot('body-cell-stav', STAV_SLOT)
                                 tbl_r.add_slot('body-cell-charakteristika', CHARAKT_SLOT)

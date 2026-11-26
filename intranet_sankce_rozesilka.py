@@ -1102,7 +1102,7 @@ def _fmt_dt(v) -> str:
     return S._s(v)
 
 
-def _tabulka(sloupce: list, radky: list, row_key: str, prazdno: str, strankovat: int = 12):
+def _tabulka(sloupce: list, radky: list, row_key: str, prazdno: str, strankovat: int = 20):
     """ui.table s vyhledáváním. sloupce = [(field, label, align)]."""
     if not radky:
         ui.label(prazdno).classes('text-sm text-gray-500 italic py-3')

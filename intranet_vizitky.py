@@ -63,6 +63,8 @@ SHEET_NAZEV = 'Formulář pro výrobu vizitek a p'                # název listu
 SABLONA_SOUBOR = 'vizitky_sablona.xlsx'                        # kopie zaslané šablony — plní se 1:1
 QR_CESTA = 'U:\\JIP\\vizitky\\NOVÉ_2024\\QR_code\\'            # pevná cesta v poli QR kód (needitovatelné)
 
+NA_STRANU = 20   # žádostí na stránku v seznamu (jednotně s ostatními moduly)
+
 TYP_LABEL = {'email': 'E-mailový podpis', 'vizitka': 'Vizitka'}
 TYP_IKONA = {'email': 'alternate_email', 'vizitka': 'badge'}
 
@@ -1987,6 +1989,7 @@ def vykresli_vizitky(user_id, user_name, user_email, vsechna_prava):
     # na ně sahají přes tento slovník, takže jsou definované PŘED hlavičkou a případná
     # chyba při stavbě lišty nezpůsobí pád tlačítek v hlavičce (NameError na closure).
     refs = {}
+    strana = {'p': 1}   # aktuální stránka seznamu žádostí
 
     def _projde_filtrem(z) -> bool:
         f_jmeno = refs.get('f_jmeno'); f_stav = refs.get('f_stav'); f_odd = refs.get('f_odd')
@@ -2022,6 +2025,10 @@ def vykresli_vizitky(user_id, user_name, user_email, vsechna_prava):
         seznam_box.clear()
         zadosti = nacti_zadosti(None if je_realizator else user_id)
         zadosti = [z for z in zadosti if _projde_filtrem(z)]
+        # Stránka se drží i po úpravě žádosti; jen filtr / reset vrací na 1. stránku.
+        stran = max(1, -(-len(zadosti) // NA_STRANU))
+        strana['p'] = min(max(strana['p'], 1), stran)
+        _od = (strana['p'] - 1) * NA_STRANU
         with seznam_box:
             if not zadosti:
                 with ui.card().classes('w-full p-12 items-center justify-center bg-gray-50 border border-dashed border-gray-200 rounded-xl'):
@@ -2029,7 +2036,7 @@ def vykresli_vizitky(user_id, user_name, user_email, vsechna_prava):
                     ui.label('Žádné žádosti k zobrazení.').classes('text-xl text-gray-500 font-bold')
                 return
             with ui.grid(columns=1).classes('w-full gap-4 lg:grid-cols-2'):
-                for z in zadosti:
+                for z in zadosti[_od:_od + NA_STRANU]:
                     karta_cls = STAV_KARTA.get(z.get('stav'), 'border-l-4 border-gray-300 bg-white')
                     with ui.card().classes(f'w-full p-4 rounded-xl shadow-sm hover:shadow-lg transition-shadow {karta_cls}'):
                         with ui.row().classes('w-full items-start justify-between'):
@@ -2057,6 +2064,19 @@ def vykresli_vizitky(user_id, user_name, user_email, vsechna_prava):
                             if _s(z.get('oddeleni')):
                                 ui.label(f'🏢 {z.get("oddeleni")}').classes('truncate')
                             ui.label(f'🕒 {_cas(z.get("vytvoreno"))}')
+            if stran > 1:
+                def _zmen_stranu(e):
+                    strana['p'] = int(e.value or 1)
+                    _prekresli_seznam()
+                with ui.row().classes('w-full items-center justify-center gap-3 mt-2'):
+                    ui.pagination(1, stran, direction_links=True, value=strana['p'],
+                                  on_change=_zmen_stranu).props('max-pages=7 boundary-numbers')
+                    ui.label(f'{_od + 1}–{min(_od + NA_STRANU, len(zadosti))} z {len(zadosti)} žádostí') \
+                        .classes('text-xs text-gray-400')
+
+    def _filtruj():
+        strana['p'] = 1
+        _prekresli_seznam()
 
     def _reset_filtr():
         for k in ('f_jmeno', 'f_stav', 'f_odd'):
@@ -2067,7 +2087,7 @@ def vykresli_vizitky(user_id, user_name, user_email, vsechna_prava):
             el = refs.get(k)
             if el is not None:
                 el.value = None
-        _prekresli_seznam()
+        _filtruj()
 
     # ── Hlavička ──────────────────────────────────────────────
     with ui.row().classes('w-full items-center justify-between mb-4'):
@@ -2103,7 +2123,7 @@ def vykresli_vizitky(user_id, user_name, user_email, vsechna_prava):
                            value='', label='Stav').props('outlined dense').classes('w-44')
         f_odd = ui.select(oddeleni_filtr, value='', label='Oddělení', with_input=True) \
             .props('outlined dense clearable').classes('w-56')
-        ui.button('Filtrovat', icon='filter_alt', on_click=lambda: _prekresli_seznam()) \
+        ui.button('Filtrovat', icon='filter_alt', on_click=_filtruj) \
             .props('unelevated no-caps').classes('bg-blue-600 text-white')
         ui.button(icon='restart_alt', on_click=lambda: _reset_filtr()) \
             .props('flat round dense').classes('text-gray-500').tooltip('Zrušit filtry')

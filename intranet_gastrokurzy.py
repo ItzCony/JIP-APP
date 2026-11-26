@@ -2503,7 +2503,7 @@ def vykresli(user_id, user_name, vsechna_prava):
                     ui.label('Zatím nikdo není zapsaný.').classes('text-gray-400')
                 return
             tabulka = ui.table(columns=sloupce, rows=radky, row_key='id',
-                               pagination=50).classes('w-full').props('dense flat bordered')
+                               pagination=20).classes('w-full').props('dense flat bordered')
             hledani.on_value_change(lambda e: tabulka.set_filter(e.value or ''))
 
         @ui.refreshable

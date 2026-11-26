@@ -531,7 +531,7 @@ def _podminky(filtr: dict, navic: list | None = None):
     return (' WHERE ' + ' AND '.join(podm)) if podm else '', par
 
 
-def nacti_stranku(filtr: dict, strana: int = 1, na_stranku: int = 50):
+def nacti_stranku(filtr: dict, strana: int = 1, na_stranku: int = 20):
     """→ (záznamy jako dicty, celkový počet). Nejnovější první."""
     init_db()
     where, par = _podminky(filtr)
@@ -768,7 +768,7 @@ def _severity(uroven: str, zprava: str):
 # ==========================================
 # Sloupce: Datum, Čas, Uživatel, Událost, IP adresa, Prohlížeč, Systém, Zpráva
 _GRID = 'grid-template-columns: 110px 90px 165px 140px 130px 160px 105px 1fr'
-_NA_STRANKU = (50, 100, 200)
+_NA_STRANKU = (20, 50, 100, 200)
 
 
 def _vykresli_detail(z: dict, filtruj_uzivatele, hledej):
