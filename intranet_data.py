@@ -2046,7 +2046,15 @@ def pridej_zadost_volno(user_id, od_data, do_data, hodin, minut, typ_id, cas_od=
         if cursor: cursor.close()
         if conn: conn.close()
 
-def ziskej_zadosti(user_id=None):
+def ziskej_zadosti(user_id=None, vcetne_neaktivnich=False):
+    """Žádosti o volno. Výpis všech skryje deaktivované uživatele; exporty
+    (účetní/IKOS) předávají vcetne_neaktivnich=True, ať jim nic nechybí."""
+    res = _ziskej_zadosti_vse(user_id)
+    if user_id or vcetne_neaktivnich:
+        return res
+    return [z for z in res if z['u_aktivni']]
+
+def _ziskej_zadosti_vse(user_id=None):
     # Krátkodobá cache pouze pro dotaz "všechny žádosti" (user_id=None)
     if user_id is None:
         now = time.time()
@@ -2061,7 +2069,7 @@ def ziskej_zadosti(user_id=None):
         q = """SELECT lr.idleaveRequest, lr.user_iduser, lr.`from`, lr.`to`, lr.sumaHours, lr.suma_hodin, lr.suma_minut, lr.cas_od, lr.cas_do, lr.created_at, lr.approved_at, lr.rejection_reason,
                       lr.storno_req_at, lr.storno_req_reason,
                       t.name as typ, lr.typeOfLeave_idtypeOfLeave as typ_id, s.name as stav, lr.leaveStatus_idleaveStatus as stav_id,
-                      u.name as u_jmeno, u.surname as u_prijmeni,
+                      u.name as u_jmeno, u.surname as u_prijmeni, u.is_active as u_aktivni,
                       a.name as a_jmeno, a.surname as a_prijmeni,
                       GROUP_CONCAT(d.name SEPARATOR ', ') as oddeleni
                FROM leaveRequest lr
@@ -2203,7 +2211,15 @@ def uprav_zadost_volno(zadost_id, admin_id, datum_od, datum_do, hodin, minut, ty
         if cursor: cursor.close()
         if conn: conn.close()
 
-def ziskej_vsechna_volna_kalendar(jen_budouci=False):
+def ziskej_vsechna_volna_kalendar(jen_budouci=False, vcetne_neaktivnich=False):
+    """Absence pro kalendář. Deaktivovaní uživatelé se skryjí; exporty
+    (účetní/IKOS) předávají vcetne_neaktivnich=True, ať jim nic nechybí."""
+    res = _volna_kalendar_vse(jen_budouci)
+    if vcetne_neaktivnich or not res:
+        return res
+    return [v for v in res if v['u_aktivni']]
+
+def _volna_kalendar_vse(jen_budouci=False):
     # Cachujeme pouze dotaz bez filtru (jen_budouci=False) — ten je nejnáročnější
     if not jen_budouci:
         if _CACHE_VOLNA_KALENDAR_ALL['data'] is not None and (time.time() - _CACHE_VOLNA_KALENDAR_ALL['ts']) < _CACHE_SPRAVA_TTL:
@@ -2216,7 +2232,7 @@ def ziskej_vsechna_volna_kalendar(jen_budouci=False):
         q = """SELECT lr.user_iduser, lr.`from`, lr.`to`, lr.sumaHours, lr.suma_hodin, lr.suma_minut, lr.cas_od, lr.cas_do, lr.leaveStatus_idleaveStatus as stav_id,
                       lr.created_at,
                       t.name as typ, s.name as stav_nazev,
-                      u.name as u_jmeno, u.surname as u_prijmeni,
+                      u.name as u_jmeno, u.surname as u_prijmeni, u.is_active as u_aktivni,
                       GROUP_CONCAT(d.name SEPARATOR ', ') as oddeleni
                FROM leaveRequest lr
                JOIN typeOfLeave t ON lr.typeOfLeave_idtypeOfLeave = t.idtypeOfLeave
@@ -2468,6 +2484,7 @@ def pridej_uprav_uzivatele(email, jmeno, prijmeni, heslo_raw, nazev_role, nazev_
 
         conn.commit()
         vymazat_cache_prav(user_id)
+        invaliduj_cache_dochazky()  # (de)aktivace mění, čí absence jsou vidět
         return True, "OK"
     except Exception as e:
         return False, str(e)
