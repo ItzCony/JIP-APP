@@ -352,6 +352,7 @@ def _absence_rozsah(datum_od_str, datum_do_str, user_ids=None):
             JOIN user u ON lr.user_iduser = u.iduser
             JOIN typeOfLeave t ON lr.typeOfLeave_idtypeOfLeave = t.idtypeOfLeave
             WHERE lr.leaveStatus_idleaveStatus = 2
+              AND u.is_active = 1
               AND lr.`from` <= %s AND lr.`to` >= %s
         """
         params = [datum_do_str, datum_od_str]

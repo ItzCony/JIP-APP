@@ -478,7 +478,7 @@ def vykresli_exportni_tlacitka(user_name, vsechna_prava, vsichni_uzivatele_kompl
                         sim = asyncio.create_task(_sim_b())
 
                         def _zpracuj_excel():
-                            vsechna_volna = intranet_data.ziskej_vsechna_volna_kalendar(jen_budouci=False)
+                            vsechna_volna = intranet_data.ziskej_vsechna_volna_kalendar(jen_budouci=False, vcetne_neaktivnich=True)
                             dostupna = []
                             for v in vsechna_volna:
                                 if v['stav_id'] not in (2, 4): continue
@@ -593,7 +593,7 @@ def vykresli_exportni_tlacitka(user_name, vsechna_prava, vsichni_uzivatele_kompl
 
                 @ui.refreshable
                 def obnovit_report_data_b():
-                    vsechna_volna = intranet_data.ziskej_vsechna_volna_kalendar(jen_budouci=False)
+                    vsechna_volna = intranet_data.ziskej_vsechna_volna_kalendar(jen_budouci=False, vcetne_neaktivnich=True)
 
                     dostupna = []
                     for v in vsechna_volna:
@@ -852,7 +852,7 @@ def vykresli_exportni_tlacitka(user_name, vsechna_prava, vsichni_uzivatele_kompl
                         sim = asyncio.create_task(_sim_u())
 
                         def _zpracuj_excel_u():
-                            vsechna_volna = intranet_data.ziskej_vsechna_volna_kalendar(jen_budouci=False)
+                            vsechna_volna = intranet_data.ziskej_vsechna_volna_kalendar(jen_budouci=False, vcetne_neaktivnich=True)
                             dostupna = []
                             for v in vsechna_volna:
                                 if v['stav_id'] not in (2, 4): continue
@@ -956,7 +956,7 @@ def vykresli_exportni_tlacitka(user_name, vsechna_prava, vsichni_uzivatele_kompl
 
                 @ui.refreshable
                 def obnovit_report_data_u():
-                    vsechna_volna = intranet_data.ziskej_vsechna_volna_kalendar(jen_budouci=False)
+                    vsechna_volna = intranet_data.ziskej_vsechna_volna_kalendar(jen_budouci=False, vcetne_neaktivnich=True)
 
                     dostupna = []
                     for v in vsechna_volna:
@@ -1266,7 +1266,7 @@ def vykresli_exportni_tlacitka(user_name, vsechna_prava, vsichni_uzivatele_kompl
                     popis_obdobi = f"{por_od.strftime('%d.%m.%Y')} – {por_do.strftime('%d.%m.%Y')}"
 
                     # Filtrovat schválené dovolené v zadaném období (podle data zahájení)
-                    vsechny_zadosti = intranet_data.ziskej_zadosti()
+                    vsechny_zadosti = intranet_data.ziskej_zadosti(vcetne_neaktivnich=True)
                     vybrano_obdobi = {}  # user_id → hodiny
                     for z in vsechny_zadosti:
                         if z.get('stav_id') == 2 and z.get('typ') == 'Dovolená':
@@ -1586,7 +1586,7 @@ def vykresli_exportni_tlacitka(user_name, vsechna_prava, vsichni_uzivatele_kompl
                     nast_i = intranet_data.nacti_nastaveni_intranetu()
                     oddelovac = nast_i.get('ikos_oddelovac', ';')
                     slozka = nast_i.get('ikos_slozka', 'Exporty_Dochazka')
-                    vsechna_volna = intranet_data.ziskej_vsechna_volna_kalendar(jen_budouci=False)
+                    vsechna_volna = intranet_data.ziskej_vsechna_volna_kalendar(jen_budouci=False, vcetne_neaktivnich=True)
                     return vsechna_volna, oddelovac, slozka
 
                 try:
@@ -1842,7 +1842,7 @@ def proved_automaticky_export_ikos():
         slozka = IKOS_AUTO_SLOZKA
 
         vsichni = intranet_data.ziskej_vsechny_uzivatele()
-        vsechna_volna = intranet_data.ziskej_vsechna_volna_kalendar(jen_budouci=False)
+        vsechna_volna = intranet_data.ziskej_vsechna_volna_kalendar(jen_budouci=False, vcetne_neaktivnich=True)
         if vsechna_volna is None:
             return False, 'Nepodařilo se načíst absence z DB.'
 
