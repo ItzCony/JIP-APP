@@ -739,6 +739,11 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
     # Náklady veletrh — samostatná dlaždice, s Plánem Veletrh 2027 nesouvisí.
     ma_pristup_naklady_veletrh = intranet_naklady_veletrh.ma_pristup_k_modulu(vsechna_prava)
 
+    # Server Status — jen hlavní administrátor (user_id 1); odznak = aktivní upozornění.
+    import intranet_server_status
+    ma_pristup_server_status = intranet_server_status.je_hlavni_admin(user_id)
+    _pocet_upozorneni_serveru = intranet_server_status.pocet_upozorneni() if ma_pristup_server_status else 0
+
     nazev_kviz       = "Zkouškový Kvíz"
     nazev_dochazka   = "Docházka a Volno"
     nazev_veletrh    = "Plán Veletrh 2027"
@@ -866,6 +871,8 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
            _akce('uloziste')),
         _d('naklady_veletrh', ma_pristup_naklady_veletrh, '🧾', 'Náklady veletrh', '#0d9488',
            _akce('naklady_veletrh')),
+        _d('server_status', ma_pristup_server_status, '🖥️', 'Server Status', '#22c55e',
+           _akce('server_status'), _pocet_upozorneni_serveru),
     ) if d]
 
     podle_klice = {d['klic']: d for d in dlazdice}
