@@ -1633,7 +1633,7 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
                     if 'nos' in dostupne_taby:
                         ui.tab('nos', label='💼  NOS').classes('justify-start text-lg text-gray-800')
                     if 'analyticke' in dostupne_taby:
-                        ui.tab('analyticke', label='📊  Analytické oddělení').classes('justify-start text-lg text-gray-800')
+                        ui.tab('analyticke', label='🧮  Analytické oddělení').classes('justify-start text-lg text-gray-800')
 
                     if ma_vse or "uzivatele" in vsechna_prava:
                         tab_uzivatele = ui.tab('uzivatele', label='👥  Správa uživatelů').classes('justify-start text-lg text-gray-800')

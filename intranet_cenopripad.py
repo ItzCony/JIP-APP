@@ -4407,39 +4407,50 @@ def _parse_datum(v):
         return None
 
 
-def platnosti_do_pro_pripady(case_ids):
-    """{pripad_id: nejzazší 'termín do' (date)} z řádků (vstup_json). Platnost case =
-    poslední datum, do kdy platí aspoň jeden řádek. Případy bez data → bez záznamu."""
+def platnost_a_kontrola_pro_pripady(case_ids):
+    """Jedním průchodem řádků (vstup_json + marze_json) vrátí dvojici map:
+    - {pripad_id: nejzazší 'termín do' (date)} — platnost case = poslední datum, do kdy
+      platí aspoň jeden řádek; případy bez data → bez záznamu;
+    - {pripad_id: 'ok'|'chyba'} — agregovaný sloupec „Kontrola" (viz `kontrola_stav_pro_pripady`).
+    U IND jde o desítky tisíc řádků; dva samostatné průchody (každý s vlastním dotazem
+    a parsováním JSON) trvaly zhruba dvakrát déle."""
     ids = [i for i in case_ids if i]
     if not ids:
-        return {}
+        return {}, {}
     conn = intranet_data.get_db_connection()
     if not conn:
-        return {}
-    out = {}
+        return {}, {}
+    platnost, ma_definici, ma_chybu = {}, set(), set()
     try:
-        cur = conn.cursor(dictionary=True)
+        cur = conn.cursor()
         ph = ",".join(["%s"] * len(ids))
-        cur.execute(f"SELECT pripad_id, vstup_json FROM cenopripad_radky "
+        cur.execute(f"SELECT pripad_id, vstup_json, marze_json FROM cenopripad_radky "
                     f"WHERE pripad_id IN ({ph})", ids)
-        for r in cur.fetchall():
+        for pid, vstup, marze in cur.fetchall():
             try:
-                vst = json.loads(r["vstup_json"]) if r["vstup_json"] else {}
+                vst = json.loads(vstup) if vstup else {}
             except Exception:
-                continue
+                vst = {}
+            if not isinstance(vst, dict):
+                vst = {}
             d = _parse_datum(vst.get("termin_do"))
-            if d is None:
-                continue
-            pid = r["pripad_id"]
-            if pid not in out or d > out[pid]:
-                out[pid] = d
+            if d is not None and (pid not in platnost or d > platnost[pid]):
+                platnost[pid] = d
+            if str(vst.get("definice") or "").strip():
+                ma_definici.add(pid)
+            # marze_json parsujeme jen tam, kde „Chyba" v textu vůbec je (zlomek řádků)
+            if marze and '"Chyba"' in marze and pid not in ma_chybu:
+                try:
+                    if json.loads(marze).get("kontrola") == "Chyba":
+                        ma_chybu.add(pid)
+                except Exception:
+                    pass
         cur.close()
-        return out
     except Exception as e:
-        print(f"[cenopripad] platnosti_do_pro_pripady: {e}")
-        return out
+        print(f"[cenopripad] platnost_a_kontrola_pro_pripady: {e}")
     finally:
         conn.close()
+    return platnost, {pid: ("chyba" if pid in ma_chybu else "ok") for pid in ma_definici}
 
 
 def prodlouzeni_pripadu(pripad_id):
@@ -4491,39 +4502,7 @@ def kontrola_stav_pro_pripady(case_ids):
     „definice nastavení" (vstup_json['definice']); ostatní případy nemají záznam
     (a badge se u nich nezobrazí). 'chyba' = aspoň jeden řádek má Kontrola == 'Chyba'
     (marze_json['kontrola']); jinak 'ok'."""
-    ids = [i for i in case_ids if i]
-    if not ids:
-        return {}
-    conn = intranet_data.get_db_connection()
-    if not conn:
-        return {}
-    ma_definici, ma_chybu = set(), set()
-    try:
-        cur = conn.cursor(dictionary=True)
-        ph = ",".join(["%s"] * len(ids))
-        cur.execute(f"SELECT pripad_id, vstup_json, marze_json FROM cenopripad_radky "
-                    f"WHERE pripad_id IN ({ph})", ids)
-        for r in cur.fetchall():
-            pid = r["pripad_id"]
-            try:
-                vst = json.loads(r["vstup_json"]) if r["vstup_json"] else {}
-            except Exception:
-                vst = {}
-            if str(vst.get("definice") or "").strip():
-                ma_definici.add(pid)
-            try:
-                mj = json.loads(r["marze_json"]) if r["marze_json"] else {}
-            except Exception:
-                mj = {}
-            if mj.get("kontrola") == "Chyba":
-                ma_chybu.add(pid)
-        cur.close()
-        return {pid: ("chyba" if pid in ma_chybu else "ok") for pid in ma_definici}
-    except Exception as e:
-        print(f"[cenopripad] kontrola_stav_pro_pripady: {e}")
-        return {}
-    finally:
-        conn.close()
+    return platnost_a_kontrola_pro_pripady(case_ids)[1]
 
 
 # Varovná věta do „OK" e-mailů, když je agregovaný sloupec „Kontrola" špatně.
@@ -5224,30 +5203,32 @@ def _sub_view_typ(typ, user_id, user_name, prava):
     if _muze_zadat(typ, prava):
         _formular_novy_pripad(typ, user_id, user_name, cfg["oddeleni"])
 
-    # Aktuální pobočka přihlášeného uživatele (pro volitelný filtr „Zadání z pobočky")
-    _moje_pobocka = None
-    try:
-        _pc = intranet_data.get_db_connection()
-        if _pc:
-            _pcu = _pc.cursor()
-            _pcu.execute("SELECT pobocka FROM user WHERE iduser=%s", (user_id,))
-            _pr = _pcu.fetchone()
-            _moje_pobocka = _pr[0] if _pr else None
-            _pcu.close()
-            _pc.close()
-    except Exception:
-        _moje_pobocka = None
-    _stav_pobocka = {"on": bool(app.storage.user.get("ind_filtr_pobocka", False))}
+    # "moje" = aktuální pobočka přihlášeného uživatele (pro volitelný filtr „Zadání
+    # z pobočky"); načte se na pozadí spolu se seznamem (viz _dokresli níže).
+    _stav_pobocka = {"on": bool(app.storage.user.get("ind_filtr_pobocka", False)), "moje": None}
+
+    def _nacti_pobocku():
+        try:
+            _pc = intranet_data.get_db_connection()
+            if _pc:
+                _pcu = _pc.cursor()
+                _pcu.execute("SELECT pobocka FROM user WHERE iduser=%s", (user_id,))
+                _pr = _pcu.fetchone()
+                _stav_pobocka["moje"] = _pr[0] if _pr else None
+                _pcu.close()
+                _pc.close()
+        except Exception:
+            _stav_pobocka["moje"] = None
 
     def _nacti_vsechny():
         # Filtr pobočky pouze pro IND (porovnani), jen když je zapnutý a uživatel pobočku má
-        _fp = _moje_pobocka if (typ == "porovnani" and _stav_pobocka["on"] and _moje_pobocka) else None
+        _moje = _stav_pobocka["moje"]
+        _fp = _moje if (typ == "porovnani" and _stav_pobocka["on"] and _moje) else None
         data = nacti_pripady(typ, prava, user_id, filtr_pobocka=_fp)
         if typ == "porovnani":   # IND: dopočítej platnost „do" (nejzazší termín do) + archiv
             _dnes = datetime.date.today()
-            _ids = [p["id"] for p in data]
-            _mapa_plat = platnosti_do_pro_pripady(_ids)
-            _mapa_kontrola = kontrola_stav_pro_pripady(_ids)   # agregovaný sloupec „Kontrola"
+            # + agregovaný sloupec „Kontrola" — obojí jedním průchodem řádků
+            _mapa_plat, _mapa_kontrola = platnost_a_kontrola_pro_pripady([p["id"] for p in data])
             _prodl_z, _prodl_na = vazby_prodlouzeni()
             for p in data:
                 p["_prodlouzeni_z"] = _prodl_z.get(p["id"])        # číslo původního případu
@@ -5258,15 +5239,9 @@ def _sub_view_typ(typ, user_id, user_name, prava):
                 p["_kontrola"] = _mapa_kontrola.get(p["id"])   # 'ok'|'chyba'|None (None = bez definice)
         return data
 
-    vsechny = _nacti_vsechny()
     # Deep-link z e-mailu (?pripad=<id>) — otevři rovnou detail případu, ať ho
     # příjemce nemusí dohledávat v seznamu. Zpracuje se jen jednou (pop).
     _deep = app.storage.user.pop("pripad_detail", None)
-    if _deep:
-        _dp = next((p for p in vsechny if p["id"] == _deep), None)
-        if _dp:
-            ui.timer(0.25, lambda p=_dp: _dialog_detail(p, user_id, user_name, prava),
-                     once=True)
     nadpis = ("Historie případů" if (_wp_sprava(prava) if typ == WP_TYP
                                      else _vidi_vsechny_pripady(prava))
               else "Moje případy" if typ == WP_TYP
@@ -5274,22 +5249,81 @@ def _sub_view_typ(typ, user_id, user_name, prava):
                                           or _vedouci_odd_slugs(prava))
               else "Moje případy")
     ui.label(nadpis).classes("text-lg font-bold text-gray-700 mb-1")
-    if not vsechny:
+
+    # Seznam se načítá na pozadí: u IND jde o tisíce případů a desítky tisíc řádků (~sekunda
+    # i víc). Synchronně by blokoval event loop celého serveru — klik na dlaždici by se
+    # projevil až po načtení a ostatní uživatelé by mezitím čekali.
+    misto = ui.column().classes("w-full")
+    with misto:
+        with ui.row().classes("items-center gap-3 py-4"):
+            ui.spinner(size="lg").classes("text-emerald-600")
+            ui.label("Načítám případy…").classes("text-gray-400")
+
+    async def _dokresli():
+        def _nacti():
+            _nacti_pobocku()
+            return _nacti_vsechny()
+        try:
+            vsechny = await asyncio.to_thread(_nacti)
+        except Exception as e:   # DB funkce chyby polykají; pojistka, ať nezůstane věčný spinner
+            print(f"[cenopripad] načtení seznamu {typ}: {e}")
+            vsechny = None
+        if misto.is_deleted:   # pohled se mezitím překreslil / opustil
+            return
+        misto.clear()
+        with misto:
+            if vsechny is None:
+                ui.label("Případy se nepodařilo načíst — zkuste stránku obnovit.") \
+                    .classes("text-red-500 py-4")
+                return
+            if _deep:
+                _dp = next((p for p in vsechny if p["id"] == _deep), None)
+                if _dp:
+                    ui.timer(0.25, lambda p=_dp: _dialog_detail(p, user_id, user_name, prava),
+                             once=True)
+            _seznam_pripadu(typ, user_id, user_name, prava, vsechny, _nacti_vsechny, _stav_pobocka)
+
+    # Časovač je mimo `misto`: při opuštění pohledu (překreslení modulu) zanikne
+    # a rozběhnuté načítání se zruší.
+    ui.timer(0, _dokresli, once=True)
+
+
+def _seznam_pripadu(typ, user_id, user_name, prava, vsechny, _nacti_vsechny, _stav_pobocka):
+    """Seznam případů dlaždice (filtry + stránkované karty) z už načtených `vsechny`;
+    dokresluje ho `_sub_view_typ` po načtení na pozadí."""
+    def _filtr_pobocky():   # IND filtr „Zadání z pobočky“ je zapnutý a seznam skutečně zužuje
+        return typ == "porovnani" and _stav_pobocka["on"] and bool(_stav_pobocka["moje"])
+
+    def _prazdno():
         with ui.column().classes("items-center py-10 gap-2 w-full"):
             ui.icon("inbox", size="3rem", color="grey-4")
-            ui.label("Zatím žádné případy.").classes("text-gray-400")
+            ui.label("Z vaší pobočky zatím žádné případy." if _filtr_pobocky()
+                     else "Zatím žádné případy.").classes("text-gray-400")
+
+    # Prázdný seznam se zapnutým filtrem pobočky musí dál ukázat filtry i s přepínačem —
+    # jinak by filtr (uložený v app.storage.user) nešlo vypnout.
+    if not vsechny and not _filtr_pobocky():
+        _prazdno()
         return
 
     flt = {"nazev": "", "zadavatel": "", "stav": "", "od": "", "do": "", "platnost": ""}
     strana = {"p": 1}   # stránkování seznamu (max PRIPADU_NA_STRANKU karet na stránku)
-    zadavatele = sorted({p["zadavatel_jmeno"] for p in vsechny if p["zadavatel_jmeno"]})
-    stav_opts = {"": "— stav —", **{s: _STAV_BADGE.get(s, (s,))[0]
-                                    for s in sorted({p["stav"] for p in vsechny})}}
-    if typ == "porovnani":   # pseudo-stav: původní i nové případy z prodloužení
-        stav_opts["_prodlouzene"] = "Prodloužené"
+
+    def _volby():
+        """Volby filtrů žadatel / stav z aktuálních `vsechny` (přepínač pobočky je mění)."""
+        zad = {"": "— žadatel —", **{z: z for z in sorted({p["zadavatel_jmeno"] for p in vsechny
+                                                          if p["zadavatel_jmeno"]})}}
+        stav = {"": "— stav —", **{s: _STAV_BADGE.get(s, (s,))[0]
+                                  for s in sorted({p["stav"] for p in vsechny})}}
+        if typ == "porovnani":   # pseudo-stav: původní i nové případy z prodloužení
+            stav["_prodlouzene"] = "Prodloužené"
+        return zad, stav
 
     @ui.refreshable
     def _seznam():
+        if not vsechny:   # typicky zapnutý filtr pobočky bez případů (jinak return výše)
+            _prazdno()
+            return
         items = _filtruj(vsechny, flt)
         with ui.row().classes("w-full items-center justify-between max-w-5xl mb-1"):
             ui.label(f"{len(items)} z {len(vsechny)} případů").classes("text-xs text-gray-500")
@@ -5332,12 +5366,25 @@ def _sub_view_typ(typ, user_id, user_name, prava):
         strana["p"] = 1   # změna filtru → zpět na první stránku
         _seznam.refresh()
 
-    def _prepni_pobocku(e):
+    async def _prepni_pobocku(e):
         # Zapnutí/vypnutí filtru pobočky → znovunačtení (zúží/rozšíří v rámci již viditelných)
         _stav_pobocka["on"] = bool(e.value)
         app.storage.user["ind_filtr_pobocka"] = _stav_pobocka["on"]
         nonlocal vsechny
-        vsechny = _nacti_vsechny()
+        e.sender.disable()   # načítá se na pozadí (viz _sub_view_typ); mezitím nepřepínat
+        try:
+            nove = await asyncio.to_thread(_nacti_vsechny)
+        finally:
+            if not e.sender.is_deleted:
+                e.sender.enable()
+        if e.sender.is_deleted:   # pohled se mezitím překreslil / opustil
+            return
+        vsechny = nove
+        zad, stav = _volby()   # volby filtrů podle nového seznamu; zmizelou vybranou volbu zruš
+        for sel, klic, volby in ((sel_zad, "zadavatel", zad), (sel_stav, "stav", stav)):
+            if flt[klic] not in volby:
+                flt[klic] = ""
+            sel.set_options(volby, value=flt[klic])
         strana["p"] = 1
         _seznam.refresh()
 
@@ -5346,9 +5393,10 @@ def _sub_view_typ(typ, user_id, user_name, prava):
     with ui.row().classes("w-full gap-2 flex-nowrap items-end max-w-5xl mb-2"):
         ui.input("Název / číslo", on_change=lambda e: _zmen("nazev", e)) \
             .props("outlined dense clearable").classes("w-40")
-        ui.select({"": "— žadatel —", **{z: z for z in zadavatele}}, value="",
-                  on_change=lambda e: _zmen("zadavatel", e)).props("outlined dense").classes("w-40")
-        ui.select(stav_opts, value="", on_change=lambda e: _zmen("stav", e)) \
+        zad, stav = _volby()
+        sel_zad = ui.select(zad, value="", on_change=lambda e: _zmen("zadavatel", e)) \
+            .props("outlined dense").classes("w-40")
+        sel_stav = ui.select(stav, value="", on_change=lambda e: _zmen("stav", e)) \
             .props("outlined dense").classes("w-40")
         ui.input("Od", on_change=lambda e: _zmen("od", e)) \
             .props("outlined dense type=date").classes("w-40")
@@ -5361,7 +5409,7 @@ def _sub_view_typ(typ, user_id, user_name, prava):
                       on_change=lambda e: _zmen("platnost", e)) \
                 .props("outlined dense").classes("w-44 ml-auto")
             # Volitelný filtr „Zadání z pobočky" — jen když uživatel pobočku má; zužuje seznam
-            if _moje_pobocka:
+            if _stav_pobocka["moje"]:
                 ui.switch("Zadání z pobočky", value=_stav_pobocka["on"],
                           on_change=_prepni_pobocku).props("dense").classes("ml-2")
 
@@ -8041,6 +8089,42 @@ def _oprava_sekce_nova(user_id, user_name, prava):
             _akce, klic_nazev="Název žádosti (nepovinné)")
 
 
+def _oprava_csv(items):
+    """CSV souhrnu žádostí o opravu ceny — ; oddělovač + BOM (jako `_pripady_csv`)."""
+    import csv
+    buf = io.StringIO()
+    w = csv.writer(buf, delimiter=";")
+    w.writerow(["Číslo", "Název", "Žadatel", "Datum zadání", "Stav", "Řádků",
+                "Absolutní odchylka", "Chyb", "Kontrola"])
+    for p in items:
+        kch = p.get("kontrola_chyb")
+        w.writerow([p["cislo"], p["nazev"], p["zadavatel_jmeno"], str(p["datum_zadani"]),
+                    _OPRAVA_STAV_BADGE.get(p["stav"], (p["stav"],))[0], p["pocet_radku"],
+                    _castka(p["suma_abs"]), "" if kch is None else kch,
+                    "" if kch is None else ("Chyba" if kch else "OK")])
+    return ("﻿" + buf.getvalue()).encode("utf-8")
+
+
+def _oprava_detail_xlsx(items, vidi_detail):
+    """Detailní .xlsx — řádky formulářů všech `items`. „Detail kontroly" prozrazuje
+    marži, proto jen s právem na OP (stejně jako v detailu žádosti)."""
+    hlav = ["Číslo", "Název žádosti", "Žadatel", "Stav", "#", "IČO", "Číslo dokladu",
+            "Kód karty", "Název karty", "Počet ks", "Nákupní cena", "Standardní PC bez DPH",
+            "Požadovaná PC bez DPH", "% odchylka oproti std. PC", "Absolutní odchylka",
+            "Kontrola"] + (["Detail kontroly"] if vidi_detail else [])
+    radky = []
+    for p in items:
+        stav = _OPRAVA_STAV_BADGE.get(p["stav"], (p["stav"],))[0]
+        for r in _oprava_nacti_radky(p["id"]):
+            radky.append([p["cislo"], p["nazev"], p["zadavatel_jmeno"], stav, r["poradi"],
+                          r["ico"], r["doklad"], r["kod"], r["nazev"], r["ks"], r["nc"],
+                          r["pc_std"], r["pc_pozad"],
+                          "" if r["odchylka_pct"] is None else _pct(r["odchylka_pct"]),
+                          r["odchylka_abs"], r["kontrola"]]
+                         + ([r["kontrola_duvod"]] if vidi_detail else []))
+    return _xlsx_bytes(hlav, radky, text_sloupce=(5, 6, 7))   # IČO, doklad, kód: vodicí nuly
+
+
 def _oprava_sekce_seznam(user_id, prava):
     zadosti = _oprava_seznam(user_id, prava)
     if not zadosti:
@@ -8050,14 +8134,34 @@ def _oprava_sekce_seznam(user_id, prava):
     for p in zadosti:
         if p.get("kontrola_chyb") is None:
             p["kontrola_chyb"] = _oprava_dopln_kontrolu(p["id"])
+    flt = {"nazev": "", "zadavatel": "", "stav": "", "od": "", "do": ""}   # viz `_filtruj`
     strana = {"p": 1}   # stránkování stejně jako u ind. cen (max PRIPADU_NA_STRANKU karet)
+    vidi_detail = _vidi_op_typu("porovnani", prava)
 
     @ui.refreshable
     def _seznam():
-        pocet_stran = max(1, -(-len(zadosti) // PRIPADU_NA_STRANKU))
+        items = _filtruj(zadosti, flt)
+        with ui.row().classes("w-full items-center justify-between mb-1"):
+            ui.label(f"{len(items)} z {len(zadosti)} žádostí").classes("text-xs text-gray-500")
+            with ui.row().classes("gap-1"):
+                ui.button("Export souhrnu (CSV)", icon="download",
+                          on_click=lambda: ui.download.content(
+                              _oprava_csv(items), "oprava_cen.csv", "text/csv")) \
+                    .props("flat no-caps").classes("text-blue-600")
+
+                async def _export_det():
+                    data = await asyncio.to_thread(_oprava_detail_xlsx, items, vidi_detail)
+                    ui.download.content(data, "oprava_cen_detail.xlsx", XLSX_MIME)
+
+                ui.button("Detailní export (řádky)", icon="download", on_click=_export_det) \
+                    .props("flat no-caps").classes("text-rose-600")
+        if not items:
+            ui.label("Žádné žádosti neodpovídají filtru.").classes("text-gray-400 italic")
+            return
+        pocet_stran = max(1, -(-len(items) // PRIPADU_NA_STRANKU))
         strana["p"] = min(strana["p"], pocet_stran)
         _zac = (strana["p"] - 1) * PRIPADU_NA_STRANKU
-        strana_items = zadosti[_zac:_zac + PRIPADU_NA_STRANKU]
+        strana_items = items[_zac:_zac + PRIPADU_NA_STRANKU]
         with ui.column().classes("w-full gap-2"):
             for p in strana_items:
                 _oprava_karta(p)
@@ -8066,12 +8170,34 @@ def _oprava_sekce_seznam(user_id, prava):
                 strana["p"] = c
                 _seznam.refresh()
             with ui.row().classes("w-full items-center justify-center gap-2 mt-2"):
-                ui.label(f"{_zac + 1}–{_zac + len(strana_items)} z {len(zadosti)}") \
+                ui.label(f"{_zac + 1}–{_zac + len(strana_items)} z {len(items)}") \
                     .classes("text-xs text-gray-400 mr-2")
                 ui.pagination(1, pocet_stran, direction_links=True, value=strana["p"],
                               on_change=lambda e: _zmen_stranku(int(e.value))) \
                     .props("max-pages=7 boundary-numbers")
 
+    def _zmen(klic, e):
+        flt[klic] = e.value or ""
+        strana["p"] = 1   # změna filtru → zpět na první stránku
+        _seznam.refresh()
+
+    stavy = {p["stav"] for p in zadosti}
+    with ui.row().classes("w-full gap-2 flex-nowrap items-end mb-2"):
+        ui.input("Název / číslo", on_change=lambda e: _zmen("nazev", e)) \
+            .props("outlined dense clearable").classes("w-40")
+        ui.select({"": "— žadatel —", **{z: z for z in sorted(
+                      {p["zadavatel_jmeno"] for p in zadosti if p["zadavatel_jmeno"]})}},
+                  value="", on_change=lambda e: _zmen("zadavatel", e)) \
+            .props("outlined dense").classes("w-40")
+        # Stavy v pořadí workflow (jako `_OPRAVA_STAV_BADGE`), jen ty, které v seznamu jsou.
+        ui.select({"": "— stav —", **{s: lbl for s, (lbl, _) in _OPRAVA_STAV_BADGE.items()
+                                     if s in stavy}},
+                  value="", on_change=lambda e: _zmen("stav", e)) \
+            .props("outlined dense").classes("w-44")
+        ui.input("Od", on_change=lambda e: _zmen("od", e)) \
+            .props("outlined dense type=date").classes("w-40")
+        ui.input("Do", on_change=lambda e: _zmen("do", e)) \
+            .props("outlined dense type=date").classes("w-40")
     _seznam()
 
 
