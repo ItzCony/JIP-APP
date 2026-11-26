@@ -23,7 +23,7 @@ import io
 import json
 import os
 import re
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 
 from nicegui import ui, app, context, run
 
@@ -5964,9 +5964,11 @@ def _letaky_notifikuj(cislo, kanal, chyb, pocet, zadavatel_jmeno, zadavatel_id,
 
 def _letaky_export_xlsx(pid):
     """Export sestavy do .xlsx jako „Označená sestava": všechny sloupce + dopočítaná
-    pole, barevné zvýraznění (K2 + 4 sloupce dle znaménka), autofiltr, řazení dle Dod."""
+    pole jako Excel vzorce, podmíněné formátování (stejná pravidla jako v aplikaci),
+    autofiltr, řazení dle Dod."""
     import openpyxl
     from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.formatting.rule import FormulaRule
     p = _letaky_pripad(pid)
     radky = _letaky_radky(pid)
     if not radky:
@@ -5992,11 +5994,7 @@ def _letaky_export_xlsx(pid):
     ws = wb.active
     ws.title = "sjetina"
     bold = Font(bold=True)
-    fill_k2 = PatternFill("solid", fgColor="FEE2E2")
-    font_k2 = Font(color="B91C1C", bold=True)
-    # barvy z engine (bez '#') pro openpyxl výplň + písmo
-    barva_hex = {k: v.lstrip("#").upper() for k, v in _LETAKY_BARVA.items()}
-    text_hex = {k: v.lstrip("#").upper() for k, v in _LETAKY_TEXT.items()}
+    fill_k2_hex, font_k2_hex = "FEE2E2", "B91C1C"     # chybný K2 (jako v tabulce)
 
     for j, h in enumerate(headers, 1):
         c = ws.cell(row=1, column=j, value=h)
@@ -6006,31 +6004,108 @@ def _letaky_export_xlsx(pid):
     kanal = p.get("kanal")
     druh = _letaky_druh(p.get("druh"))      # finální sestava barví jinak
 
+    # Vstupní sloupce vzorců (stejné hlavičky jako v _letaky_parse) → písmeno sloupce.
+    def _pis(*nazvy):
+        for n in nazvy:
+            if n in data_keys:
+                return openpyxl.utils.get_column_letter(data_keys.index(n) + 1)
+        return None
+    vstupy = {"nc": _pis("Aktuální NC"), "nc3": _pis("Aktuální NC3"),
+              "anc": _pis("Akční NC"), "anck": _pis("Akční NCK"),
+              "apc": _pis("Akční PC"), "kal": _pis("Kalkulace")}
+    vstup_sl = {data_keys.index(h) + 1 for h in
+                ("Aktuální NC", "Aktuální NC3", "Akční NC", "Akční NCK", "Akční PC", "Kalkulace")
+                + _letaky_hlidane_sloupce(kanal, druh)
+                if h in data_keys}
+    comp_pis = {key: openpyxl.utils.get_column_letter(len(data_keys) + 1 + off)
+                for off, (key, _l, _t) in enumerate(comp)}
+
+    def _vzorec(key, i):
+        """Excel vzorec dopočítaného sloupce (stejná logika jako _letaky_parse:
+        dělení nulou → 0, chybějící/nečíselný vstup → prázdno). None = nelze sestavit."""
+        v = vstupy
+        if key == "nc3_anc" and v["nc3"] and v["anc"]:
+            a, b = f"{v['nc3']}{i}", f"{v['anc']}{i}"
+            return f'=IF(OR(NOT(ISNUMBER({a})),NOT(ISNUMBER({b}))),"",IF({a}=0,0,({a}-{b})/{a}))'
+        if key == "nc_anc" and v["nc"] and v["anc"]:
+            a, b = f"{v['nc']}{i}", f"{v['anc']}{i}"
+            return f'=IF(OR(NOT(ISNUMBER({a})),NOT(ISNUMBER({b}))),"",IF({a}=0,0,{b}/{a}-1))'
+        if key == "akcni_prirazka" and v["apc"] and v["anck"]:
+            a, b = f"{v['apc']}{i}", f"{v['anck']}{i}"
+            return f'=IF(OR(NOT(ISNUMBER({a})),NOT(ISNUMBER({b}))),"",IF({b}=0,0,{a}/{b}-1))'
+        if key == "rozdil_korekce" and v["kal"] and v["apc"] and v["anck"]:
+            a, k = f"{comp_pis['akcni_prirazka']}{i}", f"{v['kal']}{i}"
+            return f'=IF(OR(NOT(ISNUMBER({a})),NOT(ISNUMBER({k}))),"",{a}-{k}/100)'
+        return None
+
     for i, r in enumerate(radky, start=2):
         try:
             dd = json.loads(r["data_json"]) if r.get("data_json") else {}
         except Exception:
             dd = {}
         for j, h in enumerate(data_keys, 1):
-            bunka = ws.cell(row=i, column=j, value=dd.get(h))
-            # Nula v hlídaném sloupci (+ u finální záporná cena) → barevná buňka.
-            styl = _letaky_bunka_styl(kanal, h, dd.get(h), druh)
-            if styl:
-                bunka.fill = PatternFill("solid", fgColor=styl[0].lstrip("#").upper())
-                bunka.font = Font(color=styl[1].lstrip("#").upper(), bold=True)
-        if k2_col and r.get("k2_chyba"):
-            cc = ws.cell(row=i, column=k2_col)
-            cc.fill = fill_k2
-            cc.font = font_k2
+            hodnota = dd.get(h)
+            # Vstupy vzorců musí být v Excelu čísla (text „12,50" by vzorec rozbil);
+            # převod stejný jako v _letaky_parse (cp.parse_cislo).
+            if j in vstup_sl and isinstance(hodnota, str):
+                num = cp.parse_cislo(hodnota)
+                if num is not None:
+                    hodnota = num
+            ws.cell(row=i, column=j, value=hodnota)
         for off, (key, _lbl, typ) in enumerate(comp):
             j = len(data_keys) + 1 + off
-            val = r.get(key)
-            cell = ws.cell(row=i, column=j, value=val)
+            # Do buňky jde vzorec (živý výpočet v Excelu); hodnota z DB jen jako
+            # záloha, když chybí vstupní sloupec.
+            cell = ws.cell(row=i, column=j, value=_vzorec(key, i) or r.get(key))
             cell.number_format = "0.00%" if typ == "pct" else "0.00"
-            barva = _letaky_klasifikuj(key, val, druh)
-            if barva:
-                cell.fill = PatternFill("solid", fgColor=barva_hex[barva])
-                cell.font = Font(color=text_hex[barva], bold=True)
+
+    # Podmíněné formátování (místo pevných barev) — barvy se v Excelu přepočítají
+    # při změně hodnot. Pravidla = stejná jako v aplikaci; první platné pravidlo
+    # vyhrává (stopIfTrue), stejně jako _letaky_klasifikuj / _letaky_bunka_styl.
+    # ISNUMBER hlídá prázdné/textové buňky (text je v Excelu „větší" než číslo).
+    posl = len(radky) + 1
+
+    def _cf(col_letter, podminka, fill_hex, text_hex_):
+        """Přidá pravidlo na sloupec; `podminka` = výraz s „{c}" za buňku 1. řádku dat."""
+        c = f"{col_letter}2"
+        ws.conditional_formatting.add(
+            f"{col_letter}2:{col_letter}{posl}",
+            FormulaRule(formula=[podminka.format(c=c)], stopIfTrue=True,
+                        fill=PatternFill(start_color=fill_hex.lstrip("#").upper(),
+                                         end_color=fill_hex.lstrip("#").upper(),
+                                         fill_type="solid"),
+                        font=Font(color=text_hex_.lstrip("#").upper(), bold=True)))
+
+    # 1) Nula v hlídaném sloupci (oba druhy) → světle červená.
+    for h in _LETAKY_NULA_SLOUPCE.get(kanal, ()):
+        if h in data_keys:
+            _cf(openpyxl.utils.get_column_letter(data_keys.index(h) + 1),
+                "AND(ISNUMBER({c}),ABS({c})<1E-9)", _LETAKY_NULA_FILL, _LETAKY_NULA_TEXT)
+    # 2) Záporná cena (jen finální sestava).
+    if druh == "finalni":
+        for h in _LETAKY_ZAPOR_SLOUPCE:
+            if h in data_keys:
+                _cf(openpyxl.utils.get_column_letter(data_keys.index(h) + 1),
+                    f"AND(ISNUMBER({{c}}),{{c}}<{_LETAKY_ZAPOR_PRAH!r})",
+                    _LETAKY_ZAPOR_FILL, _LETAKY_ZAPOR_TEXT)
+    # 3) K2 (stejně jako _k2_chyba): prázdné, chybí znak kanálu, nebo zakázaný znak.
+    if k2_col:
+        k2_l = openpyxl.utils.get_column_letter(k2_col)
+        casti = ['LEN(TRIM({c}&""))=0']
+        znak = _LETAKY_K2_ZNAK.get(kanal, "")
+        if znak:
+            casti.append(f'ISERROR(SEARCH("{znak}",{{c}}&""))')
+        casti += [f'ISNUMBER(FIND("{z}",{{c}}&""))' for z in _LETAKY_K2_ZAKAZ]
+        _cf(k2_l, "OR(" + ",".join(casti) + ")", fill_k2_hex, font_k2_hex)
+    # 4) Dopočítané sloupce dle _letaky_pravidla(col, druh).
+    excel_op = {">": ">", "<": "<", ">=": ">=", "<=": "<="}
+    for key, _lbl, _t in comp:
+        for op, prah, barva in _letaky_pravidla(key, druh):
+            if op == "=":
+                podm = f"AND(ISNUMBER({{c}}),ABS({{c}}-({prah!r}))<1E-9)"
+            else:
+                podm = f"AND(ISNUMBER({{c}}),{{c}}{excel_op[op]}{prah!r})"
+            _cf(comp_pis[key], podm, _LETAKY_BARVA[barva], _LETAKY_TEXT[barva])
 
     ws.freeze_panes = "A2"
     last_col = openpyxl.utils.get_column_letter(len(headers))
@@ -6333,6 +6408,8 @@ def _letaky_detail(pid, user_id, user_name, prava):
 
     # Číselné sloupce (ceny/množství) → zarovnat vpravo pro čitelnost.
     _NUM_KEYS  = {"Aktuální NC", "Aktuální NC3", "Akční NC", "Akční NCK", "Akční PC", "Balení"}
+    # Sloupce zobrazené zaokrouhleně na 2 desetinná místa (zdroj je vzorec → 8.1818…).
+    _DVE_MISTA_KEYS = {"Akční PC"}
     # Dlouhé textové sloupce → omezit šířku, plný text v tooltipu.
     _WIDE_KEYS = {"Název", "Dodavatel popis", "Dodavatel"}
 
@@ -6352,6 +6429,11 @@ def _letaky_detail(pid, user_id, user_name, prava):
             cd["headerTooltip"] = f"{k} — sloupec {pism} v původním souboru"
         if k in _NUM_KEYS:
             cd["type"] = "rightAligned"
+        if k in _DVE_MISTA_KEYS:
+            # vždy 2 desetinná místa + číslice stejné šířky → desetinné čárky pod sebou
+            cd[":valueFormatter"] = ("(p) => typeof p.value === 'number' "
+                                     "? p.value.toFixed(2) : p.value")
+            cd["cellClass"] = "tabular-nums"
         if k in _WIDE_KEYS:
             cd["maxWidth"] = 320
             cd["tooltipField"] = f"d_{i}"
@@ -6380,9 +6462,22 @@ def _letaky_detail(pid, user_id, user_name, prava):
                 if v.is_integer():
                     return str(int(v))
             return v
+        def _cell2(v):
+            # Zaokrouhlení na 2 místa jako Excel: nejdřív setřást float šum
+            # (3.1249999999999996 → 3.125), pak half-up (→ 3.13). Zůstává číslem → řazení funguje.
+            if isinstance(v, str):
+                try:
+                    v = float(v.strip().replace(",", "."))
+                except ValueError:
+                    return v
+            if isinstance(v, (int, float)) and not isinstance(v, bool) \
+                    and v == v and abs(v) != float("inf"):
+                return float(Decimal(repr(round(float(v), 9)))
+                             .quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+            return _cell(v)
         row = {"poradi": r["poradi"]}
         for i, k in enumerate(poradi_klicu):
-            row[f"d_{i}"] = _cell(dd.get(k))
+            row[f"d_{i}"] = (_cell2 if k in _DVE_MISTA_KEYS else _cell)(dd.get(k))
         row["nc3_anc"] = _pct(r.get("nc3_anc"))
         row["nc_anc"] = _pct(r.get("nc_anc"))
         row["rozdil_korekce"] = _pct(r.get("rozdil_korekce")) if r.get("rozdil_korekce") is not None else "—"
