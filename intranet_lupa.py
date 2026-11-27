@@ -631,7 +631,6 @@ def importuj_soubor(raw_bytes, nazev_souboru, stav=None):
     zakaznici, produkty, dealeri = {}, {}, {}
     smazane_partice = set()
     davka = []
-    od_commitu = 0
     cur = None
     try:
         cur = conn.cursor()
@@ -666,9 +665,9 @@ def importuj_soubor(raw_bytes, nazev_souboru, stav=None):
 
             partice = (asm, rok, mesic)
             if partice not in smazane_partice:
+                # DELETE i INSERTy jedna transakce: rozbitý soubor nesmí nechat měsíc prázdný/napůl
                 cur.execute('DELETE FROM lupa_obrat WHERE asm=%s AND rok=%s AND mesic=%s',
                             partice)
-                conn.commit()
                 smazane_partice.add(partice)
 
             zakaznici.setdefault(ico, (
@@ -686,11 +685,7 @@ def importuj_soubor(raw_bytes, nazev_souboru, stav=None):
             if len(davka) >= _DAVKA:
                 _uloz_davku(cur, davka)
                 vysledek['radku'] += len(davka)
-                od_commitu += len(davka)
                 davka = []
-                if od_commitu >= _COMMIT_PO:
-                    conn.commit()
-                    od_commitu = 0
 
         if mapa is None:
             vysledek['chyba'] = ('Nenalezena hlavička. Očekávám sloupce ASM, Měsíc, '
