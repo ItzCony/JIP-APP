@@ -6216,9 +6216,15 @@ def _otevri_tiket(t: dict, user_id, user_name, vsechna_prava, refresh):
                 r['rozhodnuti_label'] = ROZ_LABEL.get(kod, '')
             g.run_grid_method('setGridOption', 'rowData', radky)
 
-        async def _odeslat():
-            novy, hlaska = await asyncio.to_thread(
-                _odesli_rozhodnuti, t, radky, user_id, user_name, tvrde_storno)
+        async def _odeslat(e):
+            # vypnuté tlačítko NiceGUI ignoruje i na serveru → dvojklik nezaloží tikety 2×
+            e.sender.disable()
+            try:
+                novy, hlaska = await asyncio.to_thread(
+                    _odesli_rozhodnuti, t, radky, user_id, user_name, tvrde_storno)
+            finally:
+                if not e.sender.is_deleted:
+                    e.sender.enable()
             if not novy:
                 ui.notify(hlaska, type='warning', position='top', timeout=6000)
                 return
