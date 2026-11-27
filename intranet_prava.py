@@ -239,6 +239,11 @@ ZAKLADNI_PRAVA = {
     'nos_asm':       {'kategorie': 'Modul NOS', 'nazev': 'ASM',             'popis': 'Vidí a zadává jen OZ svého ASM (přiřazuje správce modulu).', 'ikona': 'badge'},
     'nos_vedouci':   {'kategorie': 'Modul NOS', 'nazev': 'Vedoucí pobočky', 'popis': 'Vidí a zadává OZ všech ASM, která mu správce modulu přiřadil.', 'ikona': 'supervisor_account'},
 
+    # ASM Plantour — ASM žádné právo nepotřebuje, svá data vidí díky párování ASM
+    # s uživatelem podle příjmení. Vedoucí pobočky: práva plantour_pobocka_<kód> níže.
+    'plantour_analytik': {'kategorie': 'Modul ASM Plantour', 'nazev': 'Analytik', 'popis': 'Vidí data všech ASM a každý měsíc nahrává export z Plantouru.', 'ikona': 'upload'},
+    'plantour_ctenar':   {'kategorie': 'Modul ASM Plantour', 'nazev': 'Čtenář',   'popis': 'Vidí data všech ASM, nic nenahrává.', 'ikona': 'visibility'},
+
     'analyticke_oddeleni': {'kategorie': 'Modul Analytické oddělení', 'nazev': 'Analytické Oddělení', 'popis': 'Vidí dlaždici Analytické oddělení na přehledu a má v ní plný přístup: Pobočkové bonusy všech poboček — podkladová tabulka, import, zpracování dat, výpočet a stahování bonusů.', 'ikona': 'analytics'},
 
     # Rezervace ind. schůzky s vedoucími — schůzka je vždy společná, kdo má právo
@@ -263,6 +268,16 @@ for _k in ('CK', 'DR', 'HV', 'KO', 'LT', 'ML', 'MR', 'NP', 'OZ', 'RD', 'SK', 'UP
         'popis': f'Vidí sekci „Fronta“ — jen nesouhlasící položky s kódem nákupčího {_k} '
                  f'(sloupec S v DATA_POROVNANI) — a vyjadřuje se k nim. NEVIDÍ OP a marže %.',
         'ikona': 'assignment_ind'}
+
+# ASM Plantour — vedoucí pobočky. Kód = asm_oz.pobocka (jako _POBOCKY_NAZVY_OZ ve Formulářích ASM).
+for _kod, _pob in (('010', 'Pardubice'), ('011', 'Praha'), ('012', 'Jilemnice'), ('013', 'Most'),
+                   ('014', 'Liberec'), ('017', 'Horšovský Týn'), ('019', 'Hodonín'), ('020', 'Zlín'),
+                   ('026', 'Ostrava'), ('028', 'Brno – Wine Life'), ('032', 'Olomouc'),
+                   ('033', 'České Budějovice'), ('034', 'Plzeň'), ('037', 'Nová Role')):
+    ZAKLADNI_PRAVA[f'plantour_pobocka_{_kod}'] = {
+        'kategorie': 'Modul ASM Plantour', 'nazev': f'Vedoucí: {_pob}',
+        'popis': f'Vidí data všech ASM pobočky {_pob} (pobočka ASM podle Formulářů ASM).',
+        'ikona': 'store'}
 
 # Zalistovací komise: zkratky nákupčích (sloupec A „Nákupčí“ listu Sumarizace).
 # Nejsou to role — jen zúží Čtenáři list Sumarizace na řádky jeho zkratek.
@@ -376,6 +391,7 @@ _MODUL_KATEGORIE = {
     'Modul Formuláře ASM':       'asm_zapnuty',
     'Modul Lupopřípad':          'lupa_zapnuty',
     'Modul NOS':                 'nos_zapnuty',
+    'Modul ASM Plantour':        'plantour_zapnuty',
     'Modul Analytické oddělení': 'analyticke_zapnuty',
 }
 # Značky mají v jedné kategorii dva moduly (podskupiny).

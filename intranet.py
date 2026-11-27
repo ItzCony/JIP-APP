@@ -27,6 +27,7 @@ import intranet_vizitky
 import intranet_spolvecer
 import intranet_lupa
 import intranet_nos
+import intranet_plantour
 import intranet_bonusy_ao
 import intranet_gastrokurzy
 import intranet_monitory
@@ -718,6 +719,7 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
         'asm':           'asm_zapnuty',
         'lupa':          'lupa_zapnuty',
         'nos':           'nos_zapnuty',
+        'plantour':      'plantour_zapnuty',
         'analyticke':    'analyticke_zapnuty',
         'gastrokurzy':   'gastrokurzy_zapnuty',
         'uloziste':      'datuloziste_zapnuty',
@@ -960,6 +962,9 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
 
     if nastaveni.get('nos_zapnuty', True) and intranet_nos.ma_pristup(vsechna_prava):
         dostupne_taby.append('nos')
+
+    if nastaveni.get('plantour_zapnuty', True) and intranet_plantour.ma_pristup(user_id, vsechna_prava):
+        dostupne_taby.append('plantour')
 
     # Analytické oddělení (Pobočkové bonusy): superadmin nebo právo „Analytické Oddělení".
     if (nastaveni.get('analyticke_zapnuty', True)
@@ -1632,6 +1637,8 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
                         tab_lupa = ui.tab('lupa', label='🔍  Lupopřípad').classes('justify-start text-lg text-gray-800')
                     if 'nos' in dostupne_taby:
                         ui.tab('nos', label='💼  NOS').classes('justify-start text-lg text-gray-800')
+                    if 'plantour' in dostupne_taby:
+                        ui.tab('plantour', label='🧭  ASM Plantour').classes('justify-start text-lg text-gray-800')
                     if 'analyticke' in dostupne_taby:
                         ui.tab('analyticke', label='🧮  Analytické oddělení').classes('justify-start text-lg text-gray-800')
 
@@ -1714,6 +1721,7 @@ async def vykresli_kompletni_intranet(client: Client, aktivni_tab='prehled'):
                 if 'asm'        in dostupne_taby: _RENDER_FNS['asm']        = lambda: intranet_asm.vykresli_asm(user_id, user_name, vsechna_prava)
                 if 'lupa'       in dostupne_taby: _RENDER_FNS['lupa']       = lambda: intranet_lupa.vykresli_lupa(user_id, user_name, vsechna_prava)
                 if 'nos'        in dostupne_taby: _RENDER_FNS['nos']        = lambda: intranet_nos.vykresli_nos(user_id, user_name, vsechna_prava)
+                if 'plantour'   in dostupne_taby: _RENDER_FNS['plantour']   = lambda: intranet_plantour.vykresli_plantour(user_id, user_name, vsechna_prava)
                 if 'analyticke' in dostupne_taby: _RENDER_FNS['analyticke'] = lambda: intranet_bonusy_ao.vykresli_analyticke(user_id, user_name, vsechna_prava)
                 if 'gastrokurzy' in dostupne_taby: _RENDER_FNS['gastrokurzy'] = lambda: intranet_gastrokurzy.vykresli(user_id, user_name, vsechna_prava)
                 if 'uloziste'   in dostupne_taby: _RENDER_FNS['uloziste']   = lambda: intranet_datuloziste.vykresli(user_id, user_name, vsechna_prava)
@@ -1873,6 +1881,11 @@ async def route_lupa(client: Client):
 @ui.page('/nos')
 async def route_nos(client: Client):
     await vykresli_kompletni_intranet(client, 'nos')
+
+
+@ui.page('/plantour')
+async def route_plantour(client: Client):
+    await vykresli_kompletni_intranet(client, 'plantour')
 
 @ui.page('/asm')
 async def route_asm(client: Client, pripad: str = '', vstupenka: str = ''):
