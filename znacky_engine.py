@@ -564,12 +564,15 @@ class ZnackyEngine:
             try:
                 conn = intranet_data.get_db_connection()
                 if conn:
-                    cursor = conn.cursor(dictionary=True, buffered=True)
-                    cursor.execute(f"""SELECT p.*, CONCAT(u.name,' ',u.surname) AS zadavatel_jmeno
-                        FROM `{self.t_pripad}` p JOIN user u ON p.zadavatel_id=u.iduser
-                        WHERE p.stav='aktivni' AND p.datum_do < CURDATE()""")
-                    expired = cursor.fetchall()
-                    cursor.close(); conn.close()
+                    try:
+                        cursor = conn.cursor(dictionary=True, buffered=True)
+                        cursor.execute(f"""SELECT p.*, CONCAT(u.name,' ',u.surname) AS zadavatel_jmeno
+                            FROM `{self.t_pripad}` p JOIN user u ON p.zadavatel_id=u.iduser
+                            WHERE p.stav='aktivni' AND p.datum_do < CURDATE()""")
+                        expired = cursor.fetchall()
+                        cursor.close()
+                    finally:
+                        conn.close()
                     for pripad in expired:
                         if self._uzavri_pripad_db(pripad['id']):
                             await asyncio.to_thread(self._odesli_email_uzavreni, pripad)

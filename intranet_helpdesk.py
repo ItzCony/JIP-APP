@@ -89,10 +89,13 @@ def vykresli_helpdesk(user_id, user_name, vsechna_prava):
 
                     conn = intranet_data.get_db_connection()
                     if conn:
-                        cur = conn.cursor()
-                        cur.execute("INSERT INTO helpdesk_tikety (user_id, jmeno_zadavatele, predmet, popis, prirazeno_jmeno) VALUES (%s, %s, %s, %s, %s)",
-                                    (user_id, user_name, predmet.value.strip(), popis.value.strip(), priradit_komu.value))
-                        conn.commit(); cur.close(); conn.close()
+                        try:
+                            cur = conn.cursor()
+                            cur.execute("INSERT INTO helpdesk_tikety (user_id, jmeno_zadavatele, predmet, popis, prirazeno_jmeno) VALUES (%s, %s, %s, %s, %s)",
+                                        (user_id, user_name, predmet.value.strip(), popis.value.strip(), priradit_komu.value))
+                            conn.commit(); cur.close()
+                        finally:
+                            conn.close()
 
                         intranet_logger.log_activity(user_name, "Helpdesk", f"Vytvořen nový tiket (Pro: {priradit_komu.value}): {predmet.value[:30]}...")
                         ui.notify('Požadavek byl úspěšně odeslán.', type='positive', position='top')
@@ -112,13 +115,16 @@ def vykresli_helpdesk(user_id, user_name, vsechna_prava):
     conn = intranet_data.get_db_connection()
     tikety = []
     if conn:
-        cur = conn.cursor(dictionary=True)
-        if is_admin:
-            cur.execute("SELECT * FROM helpdesk_tikety ORDER BY CASE WHEN stav='Nové' THEN 1 WHEN stav='Řeší se' THEN 2 WHEN stav='Vyřešeno' THEN 3 ELSE 4 END, vytvoreno DESC")
-        else:
-            cur.execute("SELECT * FROM helpdesk_tikety WHERE user_id = %s ORDER BY vytvoreno DESC", (user_id,))
-        tikety = cur.fetchall()
-        cur.close(); conn.close()
+        try:
+            cur = conn.cursor(dictionary=True)
+            if is_admin:
+                cur.execute("SELECT * FROM helpdesk_tikety ORDER BY CASE WHEN stav='Nové' THEN 1 WHEN stav='Řeší se' THEN 2 WHEN stav='Vyřešeno' THEN 3 ELSE 4 END, vytvoreno DESC")
+            else:
+                cur.execute("SELECT * FROM helpdesk_tikety WHERE user_id = %s ORDER BY vytvoreno DESC", (user_id,))
+            tikety = cur.fetchall()
+            cur.close()
+        finally:
+            conn.close()
 
     if not tikety:
         with ui.card().classes('w-full p-12 items-center justify-center bg-gray-50 border border-gray-200 border-dashed rounded-xl'):
@@ -149,9 +155,12 @@ def vykresli_helpdesk(user_id, user_name, vsechna_prava):
                             if is_admin:
                                 def zmenit_resitele(e):
                                     c = intranet_data.get_db_connection()
-                                    cur = c.cursor()
-                                    cur.execute("UPDATE helpdesk_tikety SET prirazeno_jmeno = %s WHERE id = %s", (e.value, t['id']))
-                                    c.commit(); cur.close(); c.close()
+                                    try:
+                                        cur = c.cursor()
+                                        cur.execute("UPDATE helpdesk_tikety SET prirazeno_jmeno = %s WHERE id = %s", (e.value, t['id']))
+                                        c.commit(); cur.close()
+                                    finally:
+                                        if c: c.close()
                                     intranet_logger.log_activity(user_name, "Helpdesk", f"Tiket #{t['id']} přeřazen na: {e.value}")
                                     ui.notify(f'Přeřazeno na: {e.value}', type='info')
                                     vykresli_helpdesk.refresh()
@@ -178,9 +187,12 @@ def vykresli_helpdesk(user_id, user_name, vsechna_prava):
                             ui.label('Změnit stav:').classes('font-bold text-gray-600 text-sm mr-2')
                             def zmenit_stav(novy_stav):
                                 c = intranet_data.get_db_connection()
-                                cur = c.cursor()
-                                cur.execute("UPDATE helpdesk_tikety SET stav = %s WHERE id = %s", (novy_stav, t['id']))
-                                c.commit(); cur.close(); c.close()
+                                try:
+                                    cur = c.cursor()
+                                    cur.execute("UPDATE helpdesk_tikety SET stav = %s WHERE id = %s", (novy_stav, t['id']))
+                                    c.commit(); cur.close()
+                                finally:
+                                    if c: c.close()
                                 intranet_logger.log_activity(user_name, "Helpdesk", f"Změněn stav tiketu #{t['id']} na: {novy_stav}")
                                 ui.notify(f'Stav změněn na {novy_stav}', type='info')
                                 dlg.close(); vykresli_helpdesk.refresh()
@@ -197,10 +209,13 @@ def vykresli_helpdesk(user_id, user_name, vsechna_prava):
                                     ui.label('Tato akce trvale smaže tiket i celou jeho historii konverzace.').classes('mb-4 text-gray-700')
                                     def on_yes():
                                         c = intranet_data.get_db_connection()
-                                        cur = c.cursor()
-                                        cur.execute("DELETE FROM helpdesk_komentare WHERE tiket_id = %s", (t['id'],))
-                                        cur.execute("DELETE FROM helpdesk_tikety WHERE id = %s", (t['id'],))
-                                        c.commit(); cur.close(); c.close()
+                                        try:
+                                            cur = c.cursor()
+                                            cur.execute("DELETE FROM helpdesk_komentare WHERE tiket_id = %s", (t['id'],))
+                                            cur.execute("DELETE FROM helpdesk_tikety WHERE id = %s", (t['id'],))
+                                            c.commit(); cur.close()
+                                        finally:
+                                            if c: c.close()
                                         intranet_logger.log_activity(user_name, "Helpdesk", f"Trvale smazán tiket #{t['id']}")
                                         ui.notify('Tiket byl úspěšně smazán.', type='positive')
                                         d_del.close(); dlg.close(); vykresli_helpdesk.refresh()
@@ -219,10 +234,13 @@ def vykresli_helpdesk(user_id, user_name, vsechna_prava):
                 c = intranet_data.get_db_connection()
                 komentare = []
                 if c:
-                    cur = c.cursor(dictionary=True)
-                    cur.execute("SELECT * FROM helpdesk_komentare WHERE tiket_id = %s ORDER BY vytvoreno ASC", (t['id'],))
-                    komentare = cur.fetchall()
-                    cur.close(); c.close()
+                    try:
+                        cur = c.cursor(dictionary=True)
+                        cur.execute("SELECT * FROM helpdesk_komentare WHERE tiket_id = %s ORDER BY vytvoreno ASC", (t['id'],))
+                        komentare = cur.fetchall()
+                        cur.close()
+                    finally:
+                        c.close()
 
                 with komentare_container:
                     if not komentare:
@@ -258,13 +276,16 @@ def vykresli_helpdesk(user_id, user_name, vsechna_prava):
                         txt = novy_komentar.value.strip() if novy_komentar.value else ""
                         if not txt: return
                         c = intranet_data.get_db_connection()
-                        cur = c.cursor()
-                        cur.execute("INSERT INTO helpdesk_komentare (tiket_id, user_id, jmeno_autora, text) VALUES (%s, %s, %s, %s)",
-                                    (t['id'], user_id, user_name, txt))
+                        try:
+                            cur = c.cursor()
+                            cur.execute("INSERT INTO helpdesk_komentare (tiket_id, user_id, jmeno_autora, text) VALUES (%s, %s, %s, %s)",
+                                        (t['id'], user_id, user_name, txt))
 
-                        if is_admin and t['user_id'] != user_id and t['stav'] == 'Nové':
-                            cur.execute("UPDATE helpdesk_tikety SET stav = 'Řeší se' WHERE id = %s", (t['id'],))
-                        c.commit(); cur.close(); c.close()
+                            if is_admin and t['user_id'] != user_id and t['stav'] == 'Nové':
+                                cur.execute("UPDATE helpdesk_tikety SET stav = 'Řeší se' WHERE id = %s", (t['id'],))
+                            c.commit(); cur.close()
+                        finally:
+                            if c: c.close()
 
                         novy_komentar.value = ''
                         nacti_a_vykresli_komentare()

@@ -981,18 +981,21 @@ def index_page(client: Client):
                     kdo = {z['id']: (z['name'] or '', z['surname'] or '', z['datum']) for z in data}
                     odpovedi = []
                     conn = intranet_data.get_db_connection()
-                    if conn and kdo:
-                        cur = conn.cursor(dictionary=True)
-                        cur.execute(f"SELECT vysledek_id, poradi, otazka, tvoje_volba, spravna_odpoved, hodnoceni "
-                                    f"FROM zaznamy_odpovedi WHERE vysledek_id IN ({','.join(['%s'] * len(kdo))}) "
-                                    f"ORDER BY vysledek_id, poradi", tuple(kdo))
-                        for o in cur.fetchall():
-                            j, p, d = kdo[o['vysledek_id']]
-                            odpovedi.append({'Jméno': j, 'Příjmení': p, 'Odevzdáno': d,
-                                             'Pořadí v testu': o['poradi'], 'Otázka': o['otazka'],
-                                             'Tvoje volba': o['tvoje_volba'], 'Správná odpověď': o['spravna_odpoved'],
-                                             'Hodnocení': o['hodnoceni']})
-                        cur.close(); conn.close()
+                    try:
+                        if conn and kdo:
+                            cur = conn.cursor(dictionary=True)
+                            cur.execute(f"SELECT vysledek_id, poradi, otazka, tvoje_volba, spravna_odpoved, hodnoceni "
+                                        f"FROM zaznamy_odpovedi WHERE vysledek_id IN ({','.join(['%s'] * len(kdo))}) "
+                                        f"ORDER BY vysledek_id, poradi", tuple(kdo))
+                            for o in cur.fetchall():
+                                j, p, d = kdo[o['vysledek_id']]
+                                odpovedi.append({'Jméno': j, 'Příjmení': p, 'Odevzdáno': d,
+                                                 'Pořadí v testu': o['poradi'], 'Otázka': o['otazka'],
+                                                 'Tvoje volba': o['tvoje_volba'], 'Správná odpověď': o['spravna_odpoved'],
+                                                 'Hodnocení': o['hodnoceni']})
+                            cur.close()
+                    finally:
+                        if conn: conn.close()
                     os.makedirs('Exporty_Kviz', exist_ok=True)
                     cesta = os.path.join('Exporty_Kviz', f"Hoste_Kviz_{time.strftime('%Y%m%d_%H%M%S')}.xlsx")
                     with pd.ExcelWriter(cesta, engine='openpyxl') as w:
@@ -1643,15 +1646,17 @@ def vykresli_vystup_kviz(user_name, vsechna_prava):
             def _export():
                 conn = intranet_data.get_db_connection()
                 if not conn: raise ValueError('Nelze se připojit k databázi.')
-                cursor = conn.cursor(dictionary=True)
-                if "vse" in vsechna_prava or "vystup_vse" in vsechna_prava:
-                    cursor.execute("SELECT COALESCE(u.name, v.host_jmeno) AS Jméno, COALESCE(u.surname, v.host_prijmeni) AS Příjmení, v.stav_testu AS Stav, v.uspesnost AS Úspěšnost, v.body AS Body, v.doba_trvani AS Trvání, v.datum AS Odevzdáno FROM vysledky_kvizu v LEFT JOIN user u ON v.user_iduser = u.iduser ORDER BY v.datum DESC")
-                else:
-                    u_id = next((u['id'] for u in intranet_data.ziskej_vsechny_uzivatele().values() if f"{u['jmeno']} {u['prijmeni']}" == user_name), None)
-                    cursor.execute("SELECT u.name AS Jméno, u.surname AS Příjmení, v.stav_testu AS Stav, v.uspesnost AS Úspěšnost, v.body AS Body, v.doba_trvani AS Trvání, v.datum AS Odevzdáno FROM vysledky_kvizu v JOIN user u ON v.user_iduser = u.iduser WHERE v.user_iduser = %s ORDER BY v.datum DESC", (u_id,))
-                data = cursor.fetchall()
-                cursor.close()
-                conn.close()
+                try:
+                    cursor = conn.cursor(dictionary=True)
+                    if "vse" in vsechna_prava or "vystup_vse" in vsechna_prava:
+                        cursor.execute("SELECT COALESCE(u.name, v.host_jmeno) AS Jméno, COALESCE(u.surname, v.host_prijmeni) AS Příjmení, v.stav_testu AS Stav, v.uspesnost AS Úspěšnost, v.body AS Body, v.doba_trvani AS Trvání, v.datum AS Odevzdáno FROM vysledky_kvizu v LEFT JOIN user u ON v.user_iduser = u.iduser ORDER BY v.datum DESC")
+                    else:
+                        u_id = next((u['id'] for u in intranet_data.ziskej_vsechny_uzivatele().values() if f"{u['jmeno']} {u['prijmeni']}" == user_name), None)
+                        cursor.execute("SELECT u.name AS Jméno, u.surname AS Příjmení, v.stav_testu AS Stav, v.uspesnost AS Úspěšnost, v.body AS Body, v.doba_trvani AS Trvání, v.datum AS Odevzdáno FROM vysledky_kvizu v JOIN user u ON v.user_iduser = u.iduser WHERE v.user_iduser = %s ORDER BY v.datum DESC", (u_id,))
+                    data = cursor.fetchall()
+                    cursor.close()
+                finally:
+                    conn.close()
 
                 if not data: raise ValueError('Žádná data k exportu.')
                 df = pd.DataFrame(data)
@@ -1677,15 +1682,18 @@ def vykresli_vystup_kviz(user_name, vsechna_prava):
         ui.label('Chyba databáze').classes('text-red-500 text-xl')
         return
 
-    cursor = conn.cursor(dictionary=True)
-    if "vse" in vsechna_prava or "vystup_vse" in vsechna_prava:
-        cursor.execute("SELECT v.id, COALESCE(u.name, v.host_jmeno) AS name, COALESCE(u.surname, v.host_prijmeni) AS surname, v.stav_testu, v.uspesnost, v.body, v.doba_trvani, v.datum FROM vysledky_kvizu v LEFT JOIN user u ON v.user_iduser = u.iduser ORDER BY v.datum DESC")
-    else:
-        u_id = next((u['id'] for u in intranet_data.ziskej_vsechny_uzivatele().values() if f"{u['jmeno']} {u['prijmeni']}" == user_name), None)
-        cursor.execute("SELECT v.id, u.name, u.surname, v.stav_testu, v.uspesnost, v.body, v.doba_trvani, v.datum FROM vysledky_kvizu v JOIN user u ON v.user_iduser = u.iduser WHERE v.user_iduser = %s ORDER BY v.datum DESC", (u_id,))
+    try:
+        cursor = conn.cursor(dictionary=True)
+        if "vse" in vsechna_prava or "vystup_vse" in vsechna_prava:
+            cursor.execute("SELECT v.id, COALESCE(u.name, v.host_jmeno) AS name, COALESCE(u.surname, v.host_prijmeni) AS surname, v.stav_testu, v.uspesnost, v.body, v.doba_trvani, v.datum FROM vysledky_kvizu v LEFT JOIN user u ON v.user_iduser = u.iduser ORDER BY v.datum DESC")
+        else:
+            u_id = next((u['id'] for u in intranet_data.ziskej_vsechny_uzivatele().values() if f"{u['jmeno']} {u['prijmeni']}" == user_name), None)
+            cursor.execute("SELECT v.id, u.name, u.surname, v.stav_testu, v.uspesnost, v.body, v.doba_trvani, v.datum FROM vysledky_kvizu v JOIN user u ON v.user_iduser = u.iduser WHERE v.user_iduser = %s ORDER BY v.datum DESC", (u_id,))
 
-    vysledky = cursor.fetchall()
-    cursor.close(); conn.close()
+        vysledky = cursor.fetchall()
+        cursor.close()
+    finally:
+        conn.close()
 
     if not vysledky:
         ui.label('Zatím nejsou k dispozici žádné výsledky.').classes('text-gray-500 italic text-xl')
@@ -1695,10 +1703,13 @@ def vykresli_vystup_kviz(user_name, vsechna_prava):
         def ukaz_detail(vid):
             conn = intranet_data.get_db_connection()
             if not conn: return
-            cursor = conn.cursor(dictionary=True)
-            cursor.execute("SELECT * FROM zaznamy_odpovedi WHERE vysledek_id = %s ORDER BY poradi", (vid,))
-            odpovedi = cursor.fetchall()
-            cursor.close(); conn.close()
+            try:
+                cursor = conn.cursor(dictionary=True)
+                cursor.execute("SELECT * FROM zaznamy_odpovedi WHERE vysledek_id = %s ORDER BY poradi", (vid,))
+                odpovedi = cursor.fetchall()
+                cursor.close()
+            finally:
+                conn.close()
 
             with ui.dialog() as dlg, ui.card().classes('w-full max-w-4xl p-6 rounded-xl max-h-[80vh] overflow-y-auto'):
                 ui.label('Detail odpovědí').classes('text-2xl font-bold mb-4')
@@ -1722,10 +1733,13 @@ def vykresli_vystup_kviz(user_name, vsechna_prava):
                     conn = intranet_data.get_db_connection()
                     if conn:
                         try:
-                            cursor = conn.cursor()
-                            cursor.execute("DELETE FROM zaznamy_odpovedi WHERE vysledek_id = %s", (vid,))
-                            cursor.execute("DELETE FROM vysledky_kvizu WHERE id = %s", (vid,))
-                            conn.commit(); cursor.close(); conn.close()
+                            try:
+                                cursor = conn.cursor()
+                                cursor.execute("DELETE FROM zaznamy_odpovedi WHERE vysledek_id = %s", (vid,))
+                                cursor.execute("DELETE FROM vysledky_kvizu WHERE id = %s", (vid,))
+                                conn.commit(); cursor.close()
+                            finally:
+                                conn.close()
                             intranet_logger.log_activity(user_name, "Kvíz", f"Smazán výsledek testu (ID: {vid})")
                             ui.notify('Výsledek smazán.', type='positive', position='top')
                             dlg.close(); vykresli_vystup_kviz.refresh()
@@ -1751,10 +1765,13 @@ def vykresli_vystup_kviz(user_name, vsechna_prava):
                         ui.notify('Generuji Excel export...', type='info')
                         def _zpracuj_excel():
                             conn = intranet_data.get_db_connection()
-                            cursor = conn.cursor(dictionary=True)
-                            cursor.execute("SELECT otazka AS `Otázka`, tvoje_volba AS `Tvoje volba`, spravna_odpoved AS `Správná odpověď` FROM zaznamy_odpovedi WHERE vysledek_id = %s ORDER BY poradi", (vid,))
-                            odpovedi = cursor.fetchall()
-                            cursor.close(); conn.close()
+                            try:
+                                cursor = conn.cursor(dictionary=True)
+                                cursor.execute("SELECT otazka AS `Otázka`, tvoje_volba AS `Tvoje volba`, spravna_odpoved AS `Správná odpověď` FROM zaznamy_odpovedi WHERE vysledek_id = %s ORDER BY poradi", (vid,))
+                                odpovedi = cursor.fetchall()
+                                cursor.close()
+                            finally:
+                                if conn: conn.close()
                             os.makedirs("Exporty_Kviz", exist_ok=True)
                             bezpecne_jmeno = f"{v_data['name']}_{v_data['surname']}".replace(" ", "_")
                             format_data = v_data['datum'].strftime('%Y%m%d_%H%M%S')

@@ -1338,25 +1338,31 @@ def _smazat_poradu_db(porada_id):
     if not conn:
         return False
     try:
-        cur = conn.cursor()
-        cur.execute("SELECT soubor_cesta FROM ukolovnik_porada_prilohy WHERE porada_id=%s", (porada_id,))
-        prilohy_cesty = [r[0] for r in cur.fetchall()]
-        cur.execute("SELECT id FROM ukolovnik_ukoly WHERE porada_id=%s", (porada_id,))
-        ukol_ids = [r[0] for r in cur.fetchall()]
-        cur.close(); conn.close()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT soubor_cesta FROM ukolovnik_porada_prilohy WHERE porada_id=%s", (porada_id,))
+            prilohy_cesty = [r[0] for r in cur.fetchall()]
+            cur.execute("SELECT id FROM ukolovnik_ukoly WHERE porada_id=%s", (porada_id,))
+            ukol_ids = [r[0] for r in cur.fetchall()]
+            cur.close()
+        finally:
+            conn.close()
         for uid in ukol_ids:
             _smazat_ukol_db(uid)
         conn2 = intranet_data.get_db_connection()
         if not conn2:
             return False
-        cur2 = conn2.cursor()
-        cur2.execute("DELETE FROM ukolovnik_porada_poznamky WHERE porada_id=%s", (porada_id,))
-        cur2.execute("DELETE FROM ukolovnik_porada_prilohy WHERE porada_id=%s", (porada_id,))
-        cur2.execute("DELETE FROM ukolovnik_porada_ucastnici WHERE porada_id=%s", (porada_id,))
-        cur2.execute("DELETE FROM ukolovnik_sledovaci WHERE typ='porada' AND ref_id=%s", (porada_id,))
-        cur2.execute("DELETE FROM ukolovnik_log WHERE typ='porada' AND ref_id=%s", (porada_id,))
-        cur2.execute("DELETE FROM ukolovnik_porady WHERE id=%s", (porada_id,))
-        conn2.commit()
+        try:
+            cur2 = conn2.cursor()
+            cur2.execute("DELETE FROM ukolovnik_porada_poznamky WHERE porada_id=%s", (porada_id,))
+            cur2.execute("DELETE FROM ukolovnik_porada_prilohy WHERE porada_id=%s", (porada_id,))
+            cur2.execute("DELETE FROM ukolovnik_porada_ucastnici WHERE porada_id=%s", (porada_id,))
+            cur2.execute("DELETE FROM ukolovnik_sledovaci WHERE typ='porada' AND ref_id=%s", (porada_id,))
+            cur2.execute("DELETE FROM ukolovnik_log WHERE typ='porada' AND ref_id=%s", (porada_id,))
+            cur2.execute("DELETE FROM ukolovnik_porady WHERE id=%s", (porada_id,))
+            conn2.commit(); cur2.close()
+        finally:
+            conn2.close()
         for cesta in prilohy_cesty:      # soubory až po commitu — jinak zmizí i při selhání DELETE
             try:
                 if cesta and os.path.isfile(cesta):
@@ -1368,9 +1374,6 @@ def _smazat_poradu_db(porada_id):
     except Exception as e:
         print(f"[_smazat_poradu_db] {e}")
         return False
-    finally:
-        try: cur2.close(); conn2.close()
-        except Exception: pass
 
 
 def _smazat_projekt_db(projekt_id):
@@ -1506,20 +1509,23 @@ def _dialog_detail_ukolu(ukol_id, user_id, user_name, vsechna_prava=None, on_ref
                                 except Exception:
                                     ui.notify('Neplatný formát data.', type='warning'); return
                                 c = intranet_data.get_db_connection()
-                                cu = c.cursor()
-                                cu.execute("""
-                                    INSERT INTO ukolovnik_ukoly
-                                        (nazev, popis, porada_id, porada_nazev, porada_datum, prirazen_id, prirazen_jmeno,
-                                         zadal_id, zadal_jmeno, termin, odhad_hodin, priorita, oddeleni, typ_ukolu)
-                                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                                """, (uk['nazev'], uk.get('popis', ''),
-                                      uk.get('porada_id'), uk.get('porada_nazev'), uk.get('porada_datum'),
-                                      uk.get('prirazen_id'), uk.get('prirazen_jmeno'),
-                                      user_id, user_name, novy_termin,
-                                      uk.get('odhad_hodin'), uk.get('priorita', 'Normální'),
-                                      uk.get('oddeleni'), uk.get('typ_ukolu', 'Pravidelný')))
-                                nova_id = cu.lastrowid
-                                c.commit(); cu.close(); c.close()
+                                try:
+                                    cu = c.cursor()
+                                    cu.execute("""
+                                        INSERT INTO ukolovnik_ukoly
+                                            (nazev, popis, porada_id, porada_nazev, porada_datum, prirazen_id, prirazen_jmeno,
+                                             zadal_id, zadal_jmeno, termin, odhad_hodin, priorita, oddeleni, typ_ukolu)
+                                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                                    """, (uk['nazev'], uk.get('popis', ''),
+                                          uk.get('porada_id'), uk.get('porada_nazev'), uk.get('porada_datum'),
+                                          uk.get('prirazen_id'), uk.get('prirazen_jmeno'),
+                                          user_id, user_name, novy_termin,
+                                          uk.get('odhad_hodin'), uk.get('priorita', 'Normální'),
+                                          uk.get('oddeleni'), uk.get('typ_ukolu', 'Pravidelný')))
+                                    nova_id = cu.lastrowid
+                                    c.commit(); cu.close()
+                                finally:
+                                    if c: c.close()
                                 intranet_logger.log_activity(user_name, "Úkolovník", f"Duplikace úkolu #{uk['id']} → #{nova_id}")
                                 _log('ukol', nova_id, user_id, user_name, f'Duplikováno z úkolu #{uk["id"]}: {uk["nazev"][:60]}')
                                 if uk.get('prirazen_id') and uk['prirazen_id'] != user_id:
@@ -1660,31 +1666,34 @@ def _dialog_detail_ukolu(ukol_id, user_id, user_name, vsechna_prava=None, on_ref
                                     zmena_vlastnika = bool(novy_prirazen_id) and novy_prirazen_id != stary_prirazen_id
                                     novy_prirazen_jmeno = uziv_opts_d.get(novy_prirazen_id, uk.get('prirazen_jmeno'))
                                     c = intranet_data.get_db_connection()
-                                    cu = c.cursor()
-                                    cu.execute(
-                                        "UPDATE ukolovnik_ukoly SET termin=%s, typ_ukolu=%s, oddeleni=%s, odhad_hodin=%s, "
-                                        "prirazen_id=%s, prirazen_jmeno=%s WHERE id=%s",
-                                        (new_termin, edit_typ.value, new_odd, new_odhad,
-                                         novy_prirazen_id, novy_prirazen_jmeno, ukol_id)
-                                    )
-                                    # Předelegování → ukonči případný běžící časovač původního zpracovatele.
-                                    # Jinak by mu úkol zůstal viset v reálném kalendáři s neukončeným záznamem
-                                    # (cas_konec IS NULL) a časovač by běžel donekonečna.
-                                    if zmena_vlastnika and stary_prirazen_id:
-                                        _now = datetime.datetime.now()
+                                    try:
+                                        cu = c.cursor()
                                         cu.execute(
-                                            "SELECT id, cas_start FROM ukolovnik_cas_zaznamy "
-                                            "WHERE ukol_id=%s AND user_id=%s AND cas_konec IS NULL "
-                                            "ORDER BY cas_start DESC LIMIT 1",
-                                            (ukol_id, stary_prirazen_id))
-                                        _bezici = cu.fetchone()
-                                        if _bezici:
-                                            _zid, _zstart = _bezici[0], _bezici[1]
-                                            _delta_min = max(1, int((_now - _zstart).total_seconds() / 60))
+                                            "UPDATE ukolovnik_ukoly SET termin=%s, typ_ukolu=%s, oddeleni=%s, odhad_hodin=%s, "
+                                            "prirazen_id=%s, prirazen_jmeno=%s WHERE id=%s",
+                                            (new_termin, edit_typ.value, new_odd, new_odhad,
+                                             novy_prirazen_id, novy_prirazen_jmeno, ukol_id)
+                                        )
+                                        # Předelegování → ukonči případný běžící časovač původního zpracovatele.
+                                        # Jinak by mu úkol zůstal viset v reálném kalendáři s neukončeným záznamem
+                                        # (cas_konec IS NULL) a časovač by běžel donekonečna.
+                                        if zmena_vlastnika and stary_prirazen_id:
+                                            _now = datetime.datetime.now()
                                             cu.execute(
-                                                "UPDATE ukolovnik_cas_zaznamy SET cas_konec=%s, trvani_minut=%s WHERE id=%s",
-                                                (_now, _delta_min, _zid))
-                                    c.commit(); cu.close(); c.close()
+                                                "SELECT id, cas_start FROM ukolovnik_cas_zaznamy "
+                                                "WHERE ukol_id=%s AND user_id=%s AND cas_konec IS NULL "
+                                                "ORDER BY cas_start DESC LIMIT 1",
+                                                (ukol_id, stary_prirazen_id))
+                                            _bezici = cu.fetchone()
+                                            if _bezici:
+                                                _zid, _zstart = _bezici[0], _bezici[1]
+                                                _delta_min = max(1, int((_now - _zstart).total_seconds() / 60))
+                                                cu.execute(
+                                                    "UPDATE ukolovnik_cas_zaznamy SET cas_konec=%s, trvani_minut=%s WHERE id=%s",
+                                                    (_now, _delta_min, _zid))
+                                        c.commit(); cu.close()
+                                    finally:
+                                        if c: c.close()
                                     _log('ukol', ukol_id, user_id, user_name,
                                          f'Upravil/a metadata: termín={new_termin}, typ={edit_typ.value}')
                                     # Změna termínu → notifikace „z X na Y", jinak obecná úprava
@@ -1814,12 +1823,15 @@ def _dialog_detail_ukolu(ukol_id, user_id, user_name, vsechna_prava=None, on_ref
                             txt = nova_poz.value.strip() if nova_poz.value else ''
                             if not txt: return
                             c = intranet_data.get_db_connection()
-                            cu = c.cursor()
-                            cu.execute(
-                                "INSERT INTO ukolovnik_ukol_poznamky (ukol_id, user_id, jmeno_autora, text) VALUES (%s,%s,%s,%s)",
-                                (ukol_id, user_id, user_name, txt)
-                            )
-                            c.commit(); cu.close(); c.close()
+                            try:
+                                cu = c.cursor()
+                                cu.execute(
+                                    "INSERT INTO ukolovnik_ukol_poznamky (ukol_id, user_id, jmeno_autora, text) VALUES (%s,%s,%s,%s)",
+                                    (ukol_id, user_id, user_name, txt)
+                                )
+                                c.commit(); cu.close()
+                            finally:
+                                if c: c.close()
                             intranet_logger.log_activity(user_name, "Úkolovník", f"Poznámka k úkolu #{ukol_id}")
                             _log('ukol', ukol_id, user_id, user_name, 'Přidal/a poznámku')
                             _notifikuj_ucastniky_ukolu(ukol_id, user_id, f"💬 {user_name} přidal/a poznámku k úkolu '{uk['nazev'][:40]}'.")
@@ -1869,12 +1881,15 @@ def _dialog_detail_ukolu(ukol_id, user_id, user_name, vsechna_prava=None, on_ref
                             with open(cesta, 'wb') as f:
                                 f.write(obsah)
                             c = intranet_data.get_db_connection()
-                            cu = c.cursor()
-                            cu.execute(
-                                "INSERT INTO ukolovnik_ukol_prilohy (id, ukol_id, user_id, jmeno_autora, soubor_nazev, soubor_cesta) VALUES (%s,%s,%s,%s,%s,%s)",
-                                (soubor_id, ukol_id, user_id, user_name, nazev, cesta)
-                            )
-                            c.commit(); cu.close(); c.close()
+                            try:
+                                cu = c.cursor()
+                                cu.execute(
+                                    "INSERT INTO ukolovnik_ukol_prilohy (id, ukol_id, user_id, jmeno_autora, soubor_nazev, soubor_cesta) VALUES (%s,%s,%s,%s,%s,%s)",
+                                    (soubor_id, ukol_id, user_id, user_name, nazev, cesta)
+                                )
+                                c.commit(); cu.close()
+                            finally:
+                                if c: c.close()
                             intranet_logger.log_activity(user_name, "Úkolovník", f"Příloha k úkolu #{ukol_id}: {nazev}")
                             _log('ukol', ukol_id, user_id, user_name, f'Nahrál/a přílohu: {nazev}')
                             _notifikuj_ucastniky_ukolu(ukol_id, user_id, f"📎 {user_name} přidal/a přílohu '{nazev}' k úkolu '{uk['nazev'][:40]}'.")
@@ -1922,18 +1937,24 @@ def _dialog_detail_ukolu(ukol_id, user_id, user_name, vsechna_prava=None, on_ref
 
                                 def _toggle_plan(pid=pl['id'], curr=hotovo_val, popis=pl['popis']):
                                     c2 = intranet_data.get_db_connection()
-                                    cu2 = c2.cursor()
-                                    cu2.execute("UPDATE ukolovnik_ukol_plany SET hotovo=%s WHERE id=%s", (0 if curr else 1, pid))
-                                    c2.commit(); cu2.close(); c2.close()
+                                    try:
+                                        cu2 = c2.cursor()
+                                        cu2.execute("UPDATE ukolovnik_ukol_plany SET hotovo=%s WHERE id=%s", (0 if curr else 1, pid))
+                                        c2.commit(); cu2.close()
+                                    finally:
+                                        if c2: c2.close()
                                     akce_pl = f'Splnil/a krok: {popis[:80]}' if not curr else f'Odznačil/a krok: {popis[:80]}'
                                     _log('ukol', ukol_id, user_id, user_name, akce_pl)
                                     nacti_plany()
 
                                 def _smazat_plan(pid=pl['id']):
                                     c2 = intranet_data.get_db_connection()
-                                    cu2 = c2.cursor()
-                                    cu2.execute("DELETE FROM ukolovnik_ukol_plany WHERE id=%s", (pid,))
-                                    c2.commit(); cu2.close(); c2.close()
+                                    try:
+                                        cu2 = c2.cursor()
+                                        cu2.execute("DELETE FROM ukolovnik_ukol_plany WHERE id=%s", (pid,))
+                                        c2.commit(); cu2.close()
+                                    finally:
+                                        if c2: c2.close()
                                     nacti_plany()
 
                                 with ui.row().classes('w-full items-center gap-2 p-2 bg-white border border-gray-200 rounded-lg'):
@@ -1967,9 +1988,12 @@ def _dialog_detail_ukolu(ukol_id, user_id, user_name, vsechna_prava=None, on_ref
                                 except Exception:
                                     pass
                             c = intranet_data.get_db_connection()
-                            cu = c.cursor()
-                            cu.execute("INSERT INTO ukolovnik_ukol_plany (ukol_id, popis, termin) VALUES (%s,%s,%s)", (ukol_id, txt, termin_p))
-                            c.commit(); cu.close(); c.close()
+                            try:
+                                cu = c.cursor()
+                                cu.execute("INSERT INTO ukolovnik_ukol_plany (ukol_id, popis, termin) VALUES (%s,%s,%s)", (ukol_id, txt, termin_p))
+                                c.commit(); cu.close()
+                            finally:
+                                if c: c.close()
                             _log('ukol', ukol_id, user_id, user_name, f'Přidal/a krok plánu: {txt[:80]}')
                             novy_plan_text.value = ''
                             novy_plan_termin.value = ''
@@ -2094,7 +2118,7 @@ def _dialog_novy_ukol(user_id, user_name, vsechna_prava=None, porada_id=None, po
         else:
             ui.label('Nový úkol').classes('text-2xl font-bold text-blue-800 mb-4')
 
-        nazev = ui.input('Název úkolu').classes('w-full mb-3 bg-white').props('outlined')
+        nazev = ui.input('Název úkolu').classes('w-full mb-3 bg-white').props('outlined maxlength=255')
         popis = ui.textarea('Popis (volitelně)').classes('w-full mb-3 bg-white').props('outlined rows=2')
 
         _default_uziv = user_name if user_name in uziv_select else next(iter(uziv_select), None)
@@ -2225,18 +2249,21 @@ def _dialog_novy_ukol(user_id, user_name, vsechna_prava=None, porada_id=None, po
                     ui.notify(f'Příliš mnoho výskytů ({len(vyskyty)}). Zkraťte období opakování.', type='warning'); return
                 opak_uid = str(uuid.uuid4())
                 c = intranet_data.get_db_connection()
-                cu = c.cursor()
-                for d in vyskyty:
-                    cu.execute("""
-                        INSERT INTO ukolovnik_ukoly
-                            (nazev, popis, porada_id, porada_nazev, porada_datum, prirazen_id, prirazen_jmeno,
-                             zadal_id, zadal_jmeno, termin, odhad_hodin, priorita, oddeleni, typ_ukolu,
-                             zobrazit_od, opakovani_id)
-                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    """, (nazev_val, popis_val, porada_id, porada_nazev, porada_datum,
-                          prirazen_id, prirazen_jmeno, user_id, user_name,
-                          d, odhad, priorita.value, odd_val, typ_val, d, opak_uid))
-                c.commit(); cu.close(); c.close()
+                try:
+                    cu = c.cursor()
+                    for d in vyskyty:
+                        cu.execute("""
+                            INSERT INTO ukolovnik_ukoly
+                                (nazev, popis, porada_id, porada_nazev, porada_datum, prirazen_id, prirazen_jmeno,
+                                 zadal_id, zadal_jmeno, termin, odhad_hodin, priorita, oddeleni, typ_ukolu,
+                                 zobrazit_od, opakovani_id)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        """, (nazev_val, popis_val, porada_id, porada_nazev, porada_datum,
+                              prirazen_id, prirazen_jmeno, user_id, user_name,
+                              d, odhad, priorita.value, odd_val, typ_val, d, opak_uid))
+                    c.commit(); cu.close()
+                finally:
+                    if c: c.close()
                 _bump_data_verze()  # živě promítnout nové úkoly ostatním klientům
                 intranet_logger.log_activity(user_name, "Úkolovník", f"Vytvořen opakovaný úkol ({len(vyskyty)}×): {nazev_val[:40]}")
                 if prirazen_id and prirazen_id != user_id:
@@ -2247,18 +2274,21 @@ def _dialog_novy_ukol(user_id, user_name, vsechna_prava=None, porada_id=None, po
                 return
 
             c = intranet_data.get_db_connection()
-            cu = c.cursor()
-            cu.execute("""
-                INSERT INTO ukolovnik_ukoly
-                    (nazev, popis, porada_id, porada_nazev, porada_datum, prirazen_id, prirazen_jmeno,
-                     zadal_id, zadal_jmeno, termin, odhad_hodin, priorita, oddeleni, typ_ukolu)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            """, (nazev_val, popis_val,
-                  porada_id, porada_nazev, porada_datum,
-                  prirazen_id, prirazen_jmeno, user_id, user_name,
-                  termin_date, odhad, priorita.value, odd_val, typ_val))
-            nova_id = cu.lastrowid
-            c.commit(); cu.close(); c.close()
+            try:
+                cu = c.cursor()
+                cu.execute("""
+                    INSERT INTO ukolovnik_ukoly
+                        (nazev, popis, porada_id, porada_nazev, porada_datum, prirazen_id, prirazen_jmeno,
+                         zadal_id, zadal_jmeno, termin, odhad_hodin, priorita, oddeleni, typ_ukolu)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """, (nazev_val, popis_val,
+                      porada_id, porada_nazev, porada_datum,
+                      prirazen_id, prirazen_jmeno, user_id, user_name,
+                      termin_date, odhad, priorita.value, odd_val, typ_val))
+                nova_id = cu.lastrowid
+                c.commit(); cu.close()
+            finally:
+                if c: c.close()
 
             intranet_logger.log_activity(user_name, "Úkolovník", f"Vytvořen úkol: {nazev_val[:40]}")
             _log('ukol', nova_id, user_id, user_name, f'Vytvořil/a úkol: {nazev_val[:80]}')
@@ -4580,10 +4610,13 @@ def _dialog_detail_porady(porada_id, user_id, user_name, vsechna_prava, on_refre
                 if _zamek_brani(): return
                 def _provest():
                     c = intranet_data.get_db_connection()
-                    cu = c.cursor()
-                    cu.execute("DELETE FROM ukolovnik_porada_ucastnici WHERE porada_id=%s AND user_id=%s",
-                               (porada_id, uc['user_id']))
-                    c.commit(); cu.close(); c.close()
+                    try:
+                        cu = c.cursor()
+                        cu.execute("DELETE FROM ukolovnik_porada_ucastnici WHERE porada_id=%s AND user_id=%s",
+                                   (porada_id, uc['user_id']))
+                        c.commit(); cu.close()
+                    finally:
+                        if c: c.close()
                     _log('porada', porada_id, user_id, user_name, f"Odebral/a účastníka: {uc['jmeno']}")
                     try:
                         intranet_notifikace.pridej(uc['user_id'],
@@ -4611,11 +4644,14 @@ def _dialog_detail_porady(porada_id, user_id, user_name, vsechna_prava, on_refre
                         if not novi:
                             ui.notify('Nikdo nevybrán.', type='warning'); return
                         c = intranet_data.get_db_connection()
-                        cu = c.cursor()
-                        for uid, jm in novi.items():
-                            cu.execute("INSERT IGNORE INTO ukolovnik_porada_ucastnici (porada_id, user_id, jmeno) VALUES (%s,%s,%s)",
-                                       (porada_id, uid, jm))
-                        c.commit(); cu.close(); c.close()
+                        try:
+                            cu = c.cursor()
+                            for uid, jm in novi.items():
+                                cu.execute("INSERT IGNORE INTO ukolovnik_porada_ucastnici (porada_id, user_id, jmeno) VALUES (%s,%s,%s)",
+                                           (porada_id, uid, jm))
+                            c.commit(); cu.close()
+                        finally:
+                            if c: c.close()
                         jmena_vsech = ', '.join(sorted(u['jmeno'] for u in _ziskej_ucastniky_porady(porada_id)))
                         for uid in novi:
                             try:
@@ -4691,14 +4727,17 @@ def _dialog_detail_porady(porada_id, user_id, user_name, vsechna_prava, on_refre
                             zmeny.append(('Místo', porada.get('misto') or '', nove['misto']))
 
                         c = intranet_data.get_db_connection()
-                        cu = c.cursor()
-                        cu.execute("""UPDATE ukolovnik_porady SET nazev=%s, popis=%s, datum=%s, cas_od=%s, cas_do=%s,
-                                      misto=%s, moderator_id=%s, moderator_jmeno=%s, zapisovatel_id=%s, zapisovatel_jmeno=%s
-                                      WHERE id=%s""",
-                                   (nove['nazev'], nove['popis'], nove['datum'], nove['cas_od'], nove['cas_do'],
-                                    nove['misto'], nove['moderator_id'], nove['moderator_jmeno'],
-                                    nove['zapisovatel_id'], nove['zapisovatel_jmeno'], porada_id))
-                        c.commit(); cu.close(); c.close()
+                        try:
+                            cu = c.cursor()
+                            cu.execute("""UPDATE ukolovnik_porady SET nazev=%s, popis=%s, datum=%s, cas_od=%s, cas_do=%s,
+                                          misto=%s, moderator_id=%s, moderator_jmeno=%s, zapisovatel_id=%s, zapisovatel_jmeno=%s
+                                          WHERE id=%s""",
+                                       (nove['nazev'], nove['popis'], nove['datum'], nove['cas_od'], nove['cas_do'],
+                                        nove['misto'], nove['moderator_id'], nove['moderator_jmeno'],
+                                        nove['zapisovatel_id'], nove['zapisovatel_jmeno'], porada_id))
+                            c.commit(); cu.close()
+                        finally:
+                            if c: c.close()
                         intranet_logger.log_activity(user_name, "Úkolovník", f"Upravena porada #{porada_id}")
                         _log('porada', porada_id, user_id, user_name,
                              'Upravil/a poradu' + (f" ({', '.join(z[0] for z in zmeny)})" if zmeny else ''))
@@ -4796,9 +4835,12 @@ def _dialog_detail_porady(porada_id, user_id, user_name, vsechna_prava, on_refre
                                             ui.notify('Stav dokončené porady mění jen administrátor.', type='warning')
                                             return
                                         c = intranet_data.get_db_connection()
-                                        cu = c.cursor()
-                                        cu.execute("UPDATE ukolovnik_porady SET stav=%s WHERE id=%s", (st, porada_id))
-                                        c.commit(); cu.close(); c.close()
+                                        try:
+                                            cu = c.cursor()
+                                            cu.execute("UPDATE ukolovnik_porady SET stav=%s WHERE id=%s", (st, porada_id))
+                                            c.commit(); cu.close()
+                                        finally:
+                                            if c: c.close()
                                         intranet_logger.log_activity(user_name, "Úkolovník", f"Stav porady #{porada_id}→{st}")
                                         _log('porada', porada_id, user_id, user_name, f'Změnil/a stav na: {st}')
                                         _notifikuj_ucastniky_porady(porada_id, user_id, f"📅 Stav porady '{porada['nazev'][:40]}' byl změněn na: {st}")
@@ -4840,9 +4882,12 @@ def _dialog_detail_porady(porada_id, user_id, user_name, vsechna_prava, on_refre
                         if _zamek_brani(): return
                         def _provest():
                             c = intranet_data.get_db_connection()
-                            cu = c.cursor()
-                            cu.execute("DELETE FROM ukolovnik_porada_prilohy WHERE id=%s", (pr['id'],))
-                            c.commit(); cu.close(); c.close()
+                            try:
+                                cu = c.cursor()
+                                cu.execute("DELETE FROM ukolovnik_porada_prilohy WHERE id=%s", (pr['id'],))
+                                c.commit(); cu.close()
+                            finally:
+                                if c: c.close()
                             try:
                                 if pr.get('soubor_cesta') and os.path.isfile(pr['soubor_cesta']):
                                     os.remove(pr['soubor_cesta'])
@@ -4867,10 +4912,13 @@ def _dialog_detail_porady(porada_id, user_id, user_name, vsechna_prava, on_refre
                             with open(cesta, 'wb') as f:
                                 f.write(obsah)
                             c = intranet_data.get_db_connection()
-                            cu = c.cursor()
-                            cu.execute("INSERT INTO ukolovnik_porada_prilohy (id, porada_id, user_id, jmeno_autora, soubor_nazev, soubor_cesta) VALUES (%s,%s,%s,%s,%s,%s)",
-                                       (soubor_id, porada_id, user_id, user_name, nazev_s, cesta))
-                            c.commit(); cu.close(); c.close()
+                            try:
+                                cu = c.cursor()
+                                cu.execute("INSERT INTO ukolovnik_porada_prilohy (id, porada_id, user_id, jmeno_autora, soubor_nazev, soubor_cesta) VALUES (%s,%s,%s,%s,%s,%s)",
+                                           (soubor_id, porada_id, user_id, user_name, nazev_s, cesta))
+                                c.commit(); cu.close()
+                            finally:
+                                if c: c.close()
                             intranet_logger.log_activity(user_name, "Úkolovník", f"Příloha k poradě #{porada_id}: {nazev_s}")
                             _log('porada', porada_id, user_id, user_name, f'Nahrál/a přílohu: {nazev_s}')
                             _notifikuj_ucastniky_porady(porada_id, user_id,
@@ -4932,10 +4980,13 @@ def _dialog_detail_porady(porada_id, user_id, user_name, vsechna_prava, on_refre
                             txt = nova_p.value.strip() if nova_p.value else ''
                             if not txt: return
                             c = intranet_data.get_db_connection()
-                            cu = c.cursor()
-                            cu.execute("INSERT INTO ukolovnik_porada_poznamky (porada_id, user_id, jmeno_autora, text) VALUES (%s,%s,%s,%s)",
-                                       (porada_id, user_id, user_name, txt))
-                            c.commit(); cu.close(); c.close()
+                            try:
+                                cu = c.cursor()
+                                cu.execute("INSERT INTO ukolovnik_porada_poznamky (porada_id, user_id, jmeno_autora, text) VALUES (%s,%s,%s,%s)",
+                                           (porada_id, user_id, user_name, txt))
+                                c.commit(); cu.close()
+                            finally:
+                                if c: c.close()
                             intranet_logger.log_activity(user_name, "Úkolovník", f"Poznámka k poradě #{porada_id}")
                             _log('porada', porada_id, user_id, user_name, 'Přidal/a zápis z porady')
                             _notifikuj_ucastniky_porady(porada_id, user_id, f"✏️ {user_name} přidal/a zápis k poradě '{porada['nazev'][:40]}'.")
@@ -5068,28 +5119,31 @@ def _dialog_nova_porada(user_id, user_name, on_refresh, vsechna_prava=None):
             zap_id = next((uid for uid, jm in uziv_opts.items() if jm == zap_jmeno), None)
 
             c = intranet_data.get_db_connection()
-            cu = c.cursor()
-            cu.execute("""
-                INSERT INTO ukolovnik_porady
-                    (nazev, popis, datum, cas_od, cas_do, misto, moderator_id, moderator_jmeno,
-                     zapisovatel_id, zapisovatel_jmeno, vytvoril_id, vytvoril_jmeno)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            """, (nazev.value.strip(), popis.value.strip() if popis.value else '',
-                  datum_date, cas_od.value.strip() or None, cas_do.value.strip() or None,
-                  misto.value.strip() if misto.value else '',
-                  mod_id, mod_jmeno, zap_id, zap_jmeno, user_id, user_name))
-            nova_id = cu.lastrowid
+            try:
+                cu = c.cursor()
+                cu.execute("""
+                    INSERT INTO ukolovnik_porady
+                        (nazev, popis, datum, cas_od, cas_do, misto, moderator_id, moderator_jmeno,
+                         zapisovatel_id, zapisovatel_jmeno, vytvoril_id, vytvoril_jmeno)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """, (nazev.value.strip(), popis.value.strip() if popis.value else '',
+                      datum_date, cas_od.value.strip() or None, cas_do.value.strip() or None,
+                      misto.value.strip() if misto.value else '',
+                      mod_id, mod_jmeno, zap_id, zap_jmeno, user_id, user_name))
+                nova_id = cu.lastrowid
 
-            vybrany_ucastnici = []
-            for uid, jmeno in ucastnici_vyber.items():
-                try:
-                    cu.execute("INSERT IGNORE INTO ukolovnik_porada_ucastnici (porada_id, user_id, jmeno) VALUES (%s,%s,%s)",
-                               (nova_id, uid, jmeno))
-                    if uid != user_id:
-                        vybrany_ucastnici.append(uid)
-                except Exception:
-                    pass
-            c.commit(); cu.close(); c.close()
+                vybrany_ucastnici = []
+                for uid, jmeno in ucastnici_vyber.items():
+                    try:
+                        cu.execute("INSERT IGNORE INTO ukolovnik_porada_ucastnici (porada_id, user_id, jmeno) VALUES (%s,%s,%s)",
+                                   (nova_id, uid, jmeno))
+                        if uid != user_id:
+                            vybrany_ucastnici.append(uid)
+                    except Exception:
+                        pass
+                c.commit(); cu.close()
+            finally:
+                if c: c.close()
 
             intranet_logger.log_activity(user_name, "Úkolovník", f"Vytvořena porada: {nazev.value[:40]}")
             _log('porada', nova_id, user_id, user_name, f'Vytvořil/a poradu: {nazev.value[:80]}')
@@ -6838,31 +6892,36 @@ def _dialog_novy_projekt(user_id, user_name, on_refresh, projekt=None, vsechna_p
             odd_proj_val = ','.join(odd_proj_sel.value) if ('odd_proj_sel' in dir()) and odd_proj_sel and odd_proj_sel.value else None
 
             c = intranet_data.get_db_connection()
-            cu = c.cursor()
+            try:
+                cu = c.cursor()
+                if projekt:
+                    cu.execute("UPDATE ukolovnik_projekty SET nazev=%s, popis=%s, termin=%s, stav=%s, oddeleni=%s WHERE id=%s",
+                               (nazev.value.strip(), popis.value.strip() if popis.value else '',
+                                termin_date, stav_sel.value, odd_proj_val, projekt['id']))
+                    c.commit(); cu.close()
+                else:
+                    cu.execute("INSERT INTO ukolovnik_projekty (nazev, popis, termin, stav, vytvoril_id, vytvoril_jmeno, oddeleni) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                               (nazev.value.strip(), popis.value.strip() if popis.value else '',
+                                termin_date, stav_sel.value, user_id, user_name, odd_proj_val))
+                    nid = cu.lastrowid
+                    # Vlastník = tvůrce
+                    cu.execute("INSERT IGNORE INTO ukolovnik_projekt_clenove (projekt_id, user_id, jmeno, role) VALUES (%s,%s,%s,'vlastnik')",
+                               (nid, user_id, user_name))
+                    # Přidaní členové
+                    pozvaní = []
+                    for uid, (jmeno, cb, role_sel) in cbs.items():
+                        if cb.value:
+                            cu.execute("INSERT IGNORE INTO ukolovnik_projekt_clenove (projekt_id, user_id, jmeno, role) VALUES (%s,%s,%s,%s)",
+                                       (nid, uid, jmeno, role_sel.value))
+                            pozvaní.append(uid)
+                    c.commit(); cu.close()
+            finally:
+                if c: c.close()
             if projekt:
-                cu.execute("UPDATE ukolovnik_projekty SET nazev=%s, popis=%s, termin=%s, stav=%s, oddeleni=%s WHERE id=%s",
-                           (nazev.value.strip(), popis.value.strip() if popis.value else '',
-                            termin_date, stav_sel.value, odd_proj_val, projekt['id']))
-                c.commit(); cu.close(); c.close()
                 intranet_logger.log_activity(user_name, "Projekty", f"Upraven projekt #{projekt['id']}: {nazev.value[:40]}")
                 _log('projekt', projekt['id'], user_id, user_name, f'Upravil/a projekt: {nazev.value[:80]}')
                 _notifikuj_projekt(projekt['id'], user_id, f"✏️ {user_name} upravil/a projekt '{nazev.value[:50]}'.")
             else:
-                cu.execute("INSERT INTO ukolovnik_projekty (nazev, popis, termin, stav, vytvoril_id, vytvoril_jmeno, oddeleni) VALUES (%s,%s,%s,%s,%s,%s,%s)",
-                           (nazev.value.strip(), popis.value.strip() if popis.value else '',
-                            termin_date, stav_sel.value, user_id, user_name, odd_proj_val))
-                nid = cu.lastrowid
-                # Vlastník = tvůrce
-                cu.execute("INSERT IGNORE INTO ukolovnik_projekt_clenove (projekt_id, user_id, jmeno, role) VALUES (%s,%s,%s,'vlastnik')",
-                           (nid, user_id, user_name))
-                # Přidaní členové
-                pozvaní = []
-                for uid, (jmeno, cb, role_sel) in cbs.items():
-                    if cb.value:
-                        cu.execute("INSERT IGNORE INTO ukolovnik_projekt_clenove (projekt_id, user_id, jmeno, role) VALUES (%s,%s,%s,%s)",
-                                   (nid, uid, jmeno, role_sel.value))
-                        pozvaní.append(uid)
-                c.commit(); cu.close(); c.close()
                 intranet_logger.log_activity(user_name, "Projekty", f"Vytvořen projekt: {nazev.value[:40]}")
                 _log('projekt', nid, user_id, user_name, f'Vytvořil/a projekt: {nazev.value[:80]}')
                 for uid in pozvaní:
@@ -6982,9 +7041,12 @@ def _dialog_detail_projektu(projekt_id, user_id, user_name, vsechna_prava, on_re
                             for s in STAVY_PROJEKT:
                                 def _zmen_stav(st=s):
                                     c = intranet_data.get_db_connection()
-                                    cu = c.cursor()
-                                    cu.execute("UPDATE ukolovnik_projekty SET stav=%s WHERE id=%s", (st, projekt_id))
-                                    c.commit(); cu.close(); c.close()
+                                    try:
+                                        cu = c.cursor()
+                                        cu.execute("UPDATE ukolovnik_projekty SET stav=%s WHERE id=%s", (st, projekt_id))
+                                        c.commit(); cu.close()
+                                    finally:
+                                        if c: c.close()
                                     intranet_logger.log_activity(user_name, "Projekty", f"Stav projektu #{projekt_id}→{st}")
                                     _log('projekt', projekt_id, user_id, user_name, f'Změnil/a stav na: {st}')
                                     _notifikuj_projekt(projekt_id, user_id, f"📊 Stav projektu '{proj['nazev'][:40]}' změněn na: {st}")
@@ -7034,10 +7096,13 @@ def _dialog_detail_projektu(projekt_id, user_id, user_name, vsechna_prava, on_re
                             txt = nova_zprava.value.strip() if nova_zprava.value else ''
                             if not txt: return
                             c = intranet_data.get_db_connection()
-                            cu = c.cursor()
-                            cu.execute("INSERT INTO ukolovnik_projekt_komentare (projekt_id, user_id, jmeno_autora, text) VALUES (%s,%s,%s,%s)",
-                                       (projekt_id, user_id, user_name, txt))
-                            c.commit(); cu.close(); c.close()
+                            try:
+                                cu = c.cursor()
+                                cu.execute("INSERT INTO ukolovnik_projekt_komentare (projekt_id, user_id, jmeno_autora, text) VALUES (%s,%s,%s,%s)",
+                                           (projekt_id, user_id, user_name, txt))
+                                c.commit(); cu.close()
+                            finally:
+                                if c: c.close()
                             intranet_logger.log_activity(user_name, "Projekty", f"Zpráva v projektu #{projekt_id}")
                             _log('projekt', projekt_id, user_id, user_name, 'Odeslal/a zprávu v chatu')
                             _notifikuj_projekt(projekt_id, user_id, f"💬 {user_name} napsal/a v projektu '{proj['nazev'][:40]}'.")
@@ -7072,23 +7137,26 @@ def _dialog_detail_projektu(projekt_id, user_id, user_name, vsechna_prava, on_re
                                 prirazen_id = next((uid for uid, jm in uziv_opts.items() if jm == prirazen_jmeno), None)
 
                                 c = intranet_data.get_db_connection()
-                                cu = c.cursor()
-                                cu.execute("""
-                                    INSERT INTO ukolovnik_ukoly
-                                        (nazev, popis, projekt_id, projekt_nazev, prirazen_id, prirazen_jmeno,
-                                         zadal_id, zadal_jmeno, termin)
-                                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                                """, (proj['nazev'], proj.get('popis') or '', projekt_id, proj['nazev'],
-                                      prirazen_id, prirazen_jmeno, user_id, user_name, termin_date))
-                                ukol_id = cu.lastrowid
-                                cu.execute("UPDATE ukolovnik_projekty SET prevedeno_na_ukol=1, ukol_id=%s WHERE id=%s",
-                                           (ukol_id, projekt_id))
-                                # Systémová zpráva do chatu projektu
-                                cu.execute("INSERT INTO ukolovnik_projekt_komentare (projekt_id, user_id, jmeno_autora, text) VALUES (%s,%s,%s,%s)",
-                                           (projekt_id, user_id, '🤖 Systém',
-                                            f'Projekt byl zadán jako úkol pracovníkovi {prirazen_jmeno}' +
-                                            (f' s termínem {termin_date.strftime("%d.%m.%Y")}' if termin_date else '') + '.'))
-                                c.commit(); cu.close(); c.close()
+                                try:
+                                    cu = c.cursor()
+                                    cu.execute("""
+                                        INSERT INTO ukolovnik_ukoly
+                                            (nazev, popis, projekt_id, projekt_nazev, prirazen_id, prirazen_jmeno,
+                                             zadal_id, zadal_jmeno, termin)
+                                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                                    """, (proj['nazev'], proj.get('popis') or '', projekt_id, proj['nazev'],
+                                          prirazen_id, prirazen_jmeno, user_id, user_name, termin_date))
+                                    ukol_id = cu.lastrowid
+                                    cu.execute("UPDATE ukolovnik_projekty SET prevedeno_na_ukol=1, ukol_id=%s WHERE id=%s",
+                                               (ukol_id, projekt_id))
+                                    # Systémová zpráva do chatu projektu
+                                    cu.execute("INSERT INTO ukolovnik_projekt_komentare (projekt_id, user_id, jmeno_autora, text) VALUES (%s,%s,%s,%s)",
+                                               (projekt_id, user_id, '🤖 Systém',
+                                                f'Projekt byl zadán jako úkol pracovníkovi {prirazen_jmeno}' +
+                                                (f' s termínem {termin_date.strftime("%d.%m.%Y")}' if termin_date else '') + '.'))
+                                    c.commit(); cu.close()
+                                finally:
+                                    if c: c.close()
 
                                 intranet_logger.log_activity(user_name, "Projekty", f"Projekt #{projekt_id} převeden na úkol #{ukol_id}")
                                 _log('projekt', projekt_id, user_id, user_name, f'Převedl/a projekt na úkol (přidělen: {prirazen_jmeno})')
@@ -7127,10 +7195,13 @@ def _dialog_detail_projektu(projekt_id, user_id, user_name, vsechna_prava, on_re
                                         uid2 = next((uid for uid, j in uziv_opts.items() if j == jm), None)
                                         if not uid2: return
                                         c = intranet_data.get_db_connection()
-                                        cu = c.cursor()
-                                        cu.execute("INSERT IGNORE INTO ukolovnik_projekt_clenove (projekt_id, user_id, jmeno, role) VALUES (%s,%s,%s,%s)",
-                                                   (projekt_id, uid2, jm, novy_role.value))
-                                        c.commit(); cu.close(); c.close()
+                                        try:
+                                            cu = c.cursor()
+                                            cu.execute("INSERT IGNORE INTO ukolovnik_projekt_clenove (projekt_id, user_id, jmeno, role) VALUES (%s,%s,%s,%s)",
+                                                       (projekt_id, uid2, jm, novy_role.value))
+                                            c.commit(); cu.close()
+                                        finally:
+                                            if c: c.close()
                                         _log('projekt', projekt_id, user_id, user_name, f'Přidal/a člena: {jm} (role: {novy_role.value})')
                                         try: intranet_notifikace.pridej(uid2, f"🚀 {user_name} tě přidal/a do projektu '{proj['nazev'][:50]}'", 'info')
                                         except Exception: pass
@@ -7166,9 +7237,12 @@ def _dialog_detail_projektu(projekt_id, user_id, user_name, vsechna_prava, on_re
                                     if je_vlastnik and cl['user_id'] != user_id:
                                         def _odebrat(cid=cl['id'], jmeno=cl['jmeno']):
                                             c2 = intranet_data.get_db_connection()
-                                            cu2 = c2.cursor()
-                                            cu2.execute("DELETE FROM ukolovnik_projekt_clenove WHERE id=%s", (cid,))
-                                            c2.commit(); cu2.close(); c2.close()
+                                            try:
+                                                cu2 = c2.cursor()
+                                                cu2.execute("DELETE FROM ukolovnik_projekt_clenove WHERE id=%s", (cid,))
+                                                c2.commit(); cu2.close()
+                                            finally:
+                                                if c2: c2.close()
                                             nacti_cleny()
                                         ui.button(icon='close', on_click=_odebrat).props('flat round dense size=xs').classes('text-gray-300 hover:text-red-400')
 
@@ -7214,10 +7288,13 @@ def _dialog_detail_projektu(projekt_id, user_id, user_name, vsechna_prava, on_re
                             obsah = await e.file.read()
                             with open(cesta, 'wb') as f: f.write(obsah)
                             c = intranet_data.get_db_connection()
-                            cu = c.cursor()
-                            cu.execute("INSERT INTO ukolovnik_projekt_prilohy (id, projekt_id, user_id, jmeno_autora, soubor_nazev, soubor_cesta) VALUES (%s,%s,%s,%s,%s,%s)",
-                                       (sid, projekt_id, user_id, user_name, nazev, cesta))
-                            c.commit(); cu.close(); c.close()
+                            try:
+                                cu = c.cursor()
+                                cu.execute("INSERT INTO ukolovnik_projekt_prilohy (id, projekt_id, user_id, jmeno_autora, soubor_nazev, soubor_cesta) VALUES (%s,%s,%s,%s,%s,%s)",
+                                           (sid, projekt_id, user_id, user_name, nazev, cesta))
+                                c.commit(); cu.close()
+                            finally:
+                                if c: c.close()
                             intranet_logger.log_activity(user_name, "Projekty", f"Příloha k projektu #{projekt_id}: {nazev}")
                             _log('projekt', projekt_id, user_id, user_name, f'Nahrál/a přílohu: {nazev}')
                             _notifikuj_projekt(projekt_id, user_id, f"📎 {user_name} přidal/a přílohu '{nazev}' do projektu '{proj['nazev'][:40]}'.")

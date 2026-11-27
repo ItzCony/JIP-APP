@@ -5211,12 +5211,14 @@ def _sub_view_typ(typ, user_id, user_name, prava):
         try:
             _pc = intranet_data.get_db_connection()
             if _pc:
-                _pcu = _pc.cursor()
-                _pcu.execute("SELECT pobocka FROM user WHERE iduser=%s", (user_id,))
-                _pr = _pcu.fetchone()
-                _stav_pobocka["moje"] = _pr[0] if _pr else None
-                _pcu.close()
-                _pc.close()
+                try:
+                    _pcu = _pc.cursor()
+                    _pcu.execute("SELECT pobocka FROM user WHERE iduser=%s", (user_id,))
+                    _pr = _pcu.fetchone()
+                    _stav_pobocka["moje"] = _pr[0] if _pr else None
+                    _pcu.close()
+                finally:
+                    _pc.close()
         except Exception:
             _stav_pobocka["moje"] = None
 
