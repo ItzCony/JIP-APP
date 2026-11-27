@@ -2208,10 +2208,13 @@ def _obnov_zalohu(zaloha_id: int, vytvoril: str):
         return False, 0, f'Záloha je poškozená: {e}'
 
     # Pojistka: aktuální stav ulož jako automatickou zálohu, ať jde obnova vrátit zpět.
+    # Bez pojistky se neobnovuje — jinak by DELETE nevratně smazal aktuální data.
     try:
-        _vytvor_zalohu(tabulka, 'auto', f'{vytvoril} (před obnovou)', skip_if_empty=True)
-    except Exception:
-        pass
+        _, _, chyba = _vytvor_zalohu(tabulka, 'auto', f'{vytvoril} (před obnovou)', skip_if_empty=True)
+    except Exception as e:
+        chyba = str(e)
+    if chyba:
+        return False, 0, f'Pojistnou zálohu aktuálního stavu se nepodařilo vytvořit, data nebyla změněna: {chyba}'
 
     conn = intranet_data.get_db_connection()
     if not conn:
