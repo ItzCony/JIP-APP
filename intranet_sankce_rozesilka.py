@@ -100,7 +100,7 @@ PLAN_STAV_LABEL = OrderedDict([
 _BEH_LABEL = {
     'ok': 'Odesláno', 'prazdne': 'Nic k odeslání', 'chyba': 'Chyba', 'bezi': 'Běží',
     'nasazeno': 'Automat nasazen', 'zmeskano': 'Zmeškáno (server neběžel)',
-    'vypnuto': 'Automat vypnutý',
+    'vypnuto': 'Automat vypnutý', 'neprepnuto': 'Odesláno, ale NEPŘEPNUTO',
 }
 
 
@@ -739,24 +739,21 @@ async def rozesli_dodavatelum(ica: set, user_id, user_name, prubeh=None,
 # =========================================================
 # ÚČTÁRNA — „Pouze podklad" všeho ve stavu Fakturovat
 # =========================================================
-def _prepni_na_uctarnu(rows: list, spustil: str, user_id) -> int:
+def _prepni_na_uctarnu(conn, rows: list, spustil: str, user_id) -> int:
     """Fakturovat → Odevzdáno účtárně jen u řádků, které byly v odeslaném
-    podkladu A jsou stále ve stavu Fakturovat (mezitím je mohl někdo změnit)."""
-    conn = intranet_data.get_db_connection()
-    if not conn:
-        return 0
+    podkladu A jsou stále ve stavu Fakturovat (mezitím je mohl někdo změnit).
+    Spojení `conn` dodá a zavře volající — získané PŘED odesláním e-mailu.
+    Chyba = výjimka (nic se nepřeplo), nikdy tiché 0."""
+    conn.ping(reconnect=True, attempts=2, delay=1)  # spojení čekalo na PDF + SMTP
     zmenene = []
-    try:
-        cur = conn.cursor()
-        for r in rows:
-            cur.execute('UPDATE sankce_vystaveni SET stav=%s WHERE id=%s AND stav=%s',
-                        (STAV_UCTARNA, r.get('id'), STAV_FAKTUROVAT))
-            if cur.rowcount:
-                zmenene.append(r)
-        conn.commit()
-        cur.close()
-    finally:
-        conn.close()
+    cur = conn.cursor()
+    for r in rows:
+        cur.execute('UPDATE sankce_vystaveni SET stav=%s WHERE id=%s AND stav=%s',
+                    (STAV_UCTARNA, r.get('id'), STAV_FAKTUROVAT))
+        if cur.rowcount:
+            zmenene.append(r)
+    conn.commit()
+    cur.close()
     S._zapis_audit_bulk([
         ('sankce_vystaveni', r.get('row_hash'), r.get('id'), 'stav',
          S.STAV_LABEL[STAV_FAKTUROVAT], S.STAV_LABEL[STAV_UCTARNA], user_id, spustil)
@@ -804,8 +801,11 @@ async def odesli_uctarne(spustil: str, user_id=None) -> dict:
     podle poboček na příjemce z nastavení (ozubené kolečko). Po
     úspěšném odeslání přepne řádky daného příjemce na Odevzdáno účtárně; co
     neodešlo, zůstává ve Fakturovat a dožene ho další pokus automatu.
+    'neprepnuto' = něco odešlo, ale nepřeplo se — opakování by účtárně
+    poslalo stejné řádky znovu, takže automat to už sám nezkouší.
     Volá páteční automat i ruční tlačítko hlavního admina."""
-    out = {'ok': False, 'prazdne': False, 'pocet': 0, 'prepnuto': 0, 'zprava': ''}
+    out = {'ok': False, 'prazdne': False, 'neprepnuto': False, 'pocet': 0, 'prepnuto': 0,
+           'zprava': ''}
     zamek = await asyncio.to_thread(_zamek_ziskej, _ZAMEK_UCT)
     if zamek is None:
         out['zprava'] = 'Odeslání účtárně právě běží, nebo není spojení s databází.'
@@ -837,30 +837,50 @@ async def odesli_uctarne(spustil: str, user_id=None) -> dict:
         for email, cast in _rozdel_podle_prijemcu(rows, cfg):
             n_dod = len({norm_ico(r.get('ico')) for r in cast})
             castka = _castka(cast)
+            # Spojení PŘED odesláním: bez něj by odeslané řádky zůstaly ve Fakturovat
+            # a účtárna by je dostala znovu.
+            conn = await asyncio.to_thread(intranet_data.get_db_connection)
             try:
-                ok, zprava = await _odesli_cast_uctarne(smtp, email, cast, spustil)
-            except RuntimeError as e:            # Playwright / Chromium chybí
-                ok, zprava = False, str(e)
-            except Exception as e:
-                traceback.print_exc()
-                ok, zprava = False, f'Neočekávaná chyba: {e}'
-            if ok:
-                # Pojistka před hromadnou změnou stavů — jde vrátit přes Obnovu ze zálohy.
-                if not zalohovano:
+                if conn is None:
+                    ok, zprava = False, 'není spojení s databází, bez něj se neposílá.'
+                else:
                     try:
-                        await asyncio.to_thread(S._vytvor_zalohu, 'sankce_vystaveni', 'auto',
-                                                f'{spustil} (před odevzdáním účtárně)', True)
+                        ok, zprava = await _odesli_cast_uctarne(smtp, email, cast, spustil)
+                    except RuntimeError as e:            # Playwright / Chromium chybí
+                        ok, zprava = False, str(e)
                     except Exception as e:
-                        print(f'[sankce-rozesilka] záloha před odevzdáním: {e}')
-                    zalohovano = True
-                n = await asyncio.to_thread(_prepni_na_uctarnu, cast, spustil, user_id)
-                out['prepnuto'] += n
-                zprava = (f'Odesláno na {email}: {len(cast)} řádků, {n_dod} dodavatelů, '
-                          f'{S._cz_money(castka)} Kč; na Odevzdáno účtárně přepnuto {n} řádků.'
-                          + (f' ({zprava})' if zprava else ''))
-            else:
-                zprava = f'Na {email} NEODESLÁNO ({len(cast)} řádků): {zprava}'
-            logy.append((email, len(cast), castka, ok, zprava))
+                        traceback.print_exc()
+                        ok, zprava = False, f'Neočekávaná chyba: {e}'
+                if ok:
+                    # Pojistka před hromadnou změnou stavů — jde vrátit přes Obnovu ze zálohy.
+                    if not zalohovano:
+                        try:
+                            await asyncio.to_thread(S._vytvor_zalohu, 'sankce_vystaveni', 'auto',
+                                                    f'{spustil} (před odevzdáním účtárně)', True)
+                        except Exception as e:
+                            print(f'[sankce-rozesilka] záloha před odevzdáním: {e}')
+                        zalohovano = True
+                    try:
+                        n = await asyncio.to_thread(_prepni_na_uctarnu, conn, cast, spustil,
+                                                    user_id)
+                    except Exception as e:
+                        traceback.print_exc()
+                        ok = False
+                        out['neprepnuto'] = True
+                        zprava = (f'Na {email} ODESLÁNO ({len(cast)} řádků), ale NEPŘEPNUTO '
+                                  f'na Odevzdáno účtárně ({e}). Přepněte je ručně — jinak je '
+                                  'účtárna dostane znovu.')
+                    else:
+                        out['prepnuto'] += n
+                        zprava = (f'Odesláno na {email}: {len(cast)} řádků, {n_dod} dodavatelů, '
+                                  f'{S._cz_money(castka)} Kč; na Odevzdáno účtárně přepnuto '
+                                  f'{n} řádků.' + (f' ({zprava})' if zprava else ''))
+                else:
+                    zprava = f'Na {email} NEODESLÁNO ({len(cast)} řádků): {zprava}'
+                logy.append((email, len(cast), castka, ok, zprava))
+            finally:
+                if conn is not None:
+                    await asyncio.to_thread(conn.close)
         out['ok'] = all(l[3] for l in logy)
         out['zprava'] = ' '.join(l[4] for l in logy)
     except Exception as e:
@@ -1042,7 +1062,9 @@ async def bg_uctarna_patek():
                 if spustit:
                     print(f'[sankce-rozesilka] páteční odeslání účtárně (slot {slot:%d.%m.%Y %H:%M})')
                     vysl = await odesli_uctarne('Automat (pátek 3:00)')
-                    stav = 'prazdne' if vysl['prazdne'] else ('ok' if vysl['ok'] else 'chyba')
+                    # 'neprepnuto' _beh_zaber_znovu neopakuje — opakování by poslalo řádky znovu.
+                    stav = ('prazdne' if vysl['prazdne'] else 'neprepnuto' if vysl['neprepnuto']
+                            else 'ok' if vysl['ok'] else 'chyba')
                     await asyncio.to_thread(_beh_uzavri, slot, stav, vysl['zprava'])
                     print(f'[sankce-rozesilka] účtárna: {stav} — {vysl["zprava"]}')
         except Exception as e:
