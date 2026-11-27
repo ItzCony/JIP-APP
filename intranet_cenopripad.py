@@ -6245,8 +6245,9 @@ def _letaky_view(user_id, user_name, prava):
                     ui.notify(f"Nahrání selhalo: {err}", type="negative", timeout=9000)
                     btn.set_enabled(True)
                     return
-                pid, cislo = _letaky_uloz(kanal, radky, pismena, drzeny["raw"], drzeny["name"],
-                                          user_id, user_name, nazev_pripadu, druh)
+                pid, cislo = await asyncio.to_thread(
+                    _letaky_uloz, kanal, radky, pismena, drzeny["raw"], drzeny["name"],
+                    user_id, user_name, nazev_pripadu, druh)
                 if not pid:
                     ui.notify(f"Uložení selhalo: {cislo}", type="negative")
                     btn.set_enabled(True)
@@ -7355,7 +7356,8 @@ def _ovozel_sekce_master(user_id, user_name, prava):
                 if err:
                     ui.notify(f"Nahrání selhalo: {err}", type="negative", timeout=9000)
                     return
-                mid, err = _ovozel_uloz_master(hlavicka, radky, name, user_id, user_name)
+                mid, err = await asyncio.to_thread(
+                    _ovozel_uloz_master, hlavicka, radky, name, user_id, user_name)
                 if not mid:
                     ui.notify(f"Uložení selhalo: {err}", type="negative")
                     return
@@ -7412,9 +7414,9 @@ def _ovozel_sekce_kontrola(user_id, user_name, prava):
                     return
                 vysledek = await run.cpu_bound(_ovozel_kontrola, m["hlavicka"],
                                                m["radky"], radky)
-                pid, cislo = _ovozel_uloz_pripad(nazev_pripadu or _bez_pripony(name),
-                                                 vysledek, raw, name, m["id"],
-                                                 user_id, user_name)
+                pid, cislo = await asyncio.to_thread(
+                    _ovozel_uloz_pripad, nazev_pripadu or _bez_pripony(name),
+                    vysledek, raw, name, m["id"], user_id, user_name)
                 if not pid:
                     ui.notify(f"Uložení selhalo: {cislo}", type="negative")
                     return
@@ -8161,8 +8163,9 @@ def _oprava_sekce_nova(user_id, user_name, prava):
             if err:
                 ui.notify(err, type="negative", timeout=12000)
                 return
-            pid, cislo = _oprava_uloz(nazev_zadosti or _bez_pripony(name), duvod,
-                                      radky, raw, name, user_id, user_name)
+            pid, cislo = await asyncio.to_thread(
+                _oprava_uloz, nazev_zadosti or _bez_pripony(name), duvod,
+                radky, raw, name, user_id, user_name)
             if not pid:
                 ui.notify(f"Uložení selhalo: {cislo}", type="negative")
                 return
@@ -9264,8 +9267,9 @@ def _nc_sekce_nova(user_id, user_name, prava):
                 if err:
                     ui.notify(err, type="negative", timeout=15000)
                     return
-                pid, cislo = _nc_uloz(druh, nazev_zadosti or _bez_pripony(name), duvod,
-                                      radky, raw, name, user_id, user_name)
+                pid, cislo = await asyncio.to_thread(
+                    _nc_uloz, druh, nazev_zadosti or _bez_pripony(name), duvod,
+                    radky, raw, name, user_id, user_name)
                 if not pid:
                     ui.notify(f"Uložení selhalo: {cislo}", type="negative")
                     return
