@@ -9,6 +9,7 @@ import intranet_okruhy
 import intranet_2fa
 import intranet_lupa
 import intranet_nos
+import intranet_plantour
 import intranet_datuloziste
 import intranet_naklady_veletrh
 import intranet_session
@@ -719,6 +720,10 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
     ma_pristup_nos = (
         nastaveni.get('nos_zapnuty', True) and intranet_nos.ma_pristup(vsechna_prava)
     )
+    ma_pristup_plantour = (
+        nastaveni.get('plantour_zapnuty', True)
+        and intranet_plantour.ma_pristup(user_id, vsechna_prava)
+    )
     ma_pristup_analyticke = (
         nastaveni.get('analyticke_zapnuty', True)
         and intranet_prava.ma_pristup_analyticke(vsechna_prava)
@@ -863,6 +868,8 @@ def vykresli_prehled(user_id, user_name, vsechna_prava):
         _d('lupa', ma_pristup_lupa, '🔍', 'Lupopřípad', '#a855f7',
            _akce('lupa', f'lupa_pohled_{user_id}')),
         _d('nos', ma_pristup_nos, '💼', 'NOS', '#0d9488', _akce('nos', f'nos_dlazdice_{user_id}')),
+        _d('plantour', ma_pristup_plantour, '🧭', 'ASM Plantour', '#0891b2',
+           _akce('plantour', f'plantour_dlazdice_{user_id}')),
         _d('analyticke', ma_pristup_analyticke, '🧮', 'Analytické oddělení', '#eab308',
            _akce('analyticke', f'analyticke_sekce_{user_id}')),
         _d('gastrokurzy', ma_pristup_gastrokurzy, '👨‍🍳', 'Gastrokurzy', '#f97316',
