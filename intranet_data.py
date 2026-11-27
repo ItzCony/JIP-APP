@@ -1024,6 +1024,8 @@ def inicializace_db():
             # Vynucená změna hesla — 1 u nově založených účtů a po admin resetu.
             # Stávající uživatelé zůstávají na 0 (DEFAULT), takže je to neotravuje.
             ("zmena_hesla_nutna", "BOOLEAN DEFAULT 0"),
+            # Entra `oid` svázané při prvním přihlášení přes M365 — viz najdi_uzivatele_dle_emailu.
+            ("oidc_oid", "VARCHAR(64) DEFAULT NULL"),
         ]:
             try:
                 cursor.execute(f"ALTER TABLE user ADD COLUMN {col} {col_def}")
@@ -1262,18 +1264,26 @@ def email_z_osobniho_cisla(ident):
         if cursor: cursor.close()
         if conn: conn.close()
 
-def najdi_uzivatele_dle_emailu(email):
+def najdi_uzivatele_dle_emailu(email, oid):
     """Pro OIDC: heslo už ověřil IdP, hledáme jen účet v intranetu.
     Vrací (user_id, "Jméno Příjmení", chyba) — stejný tvar jako overit_prihlaseni.
+
+    E-mail z tokenu Microsoft neověřuje (mail atribut jde změnit), proto se účet
+    při prvním přihlášení sváže s neměnným `oid` a dál se to `oid` vyžaduje.
+    Nové svázání (např. znovu založený M365 účet): UPDATE user SET oidc_oid = NULL.
 
     Bez auto-provisioningu: neznámý e-mail = odmítnutí. Účty zakládá admin,
     protože z nich visí práva, útvary a schvalovací role."""
     email = (email or '').strip().lower()
     if not email:
         return None, None, "Chybný e-mail."
+    if not oid:
+        return None, None, "Chybí ID firemního účtu."
 
     if not nacti_mysql().get("enabled"):
         return None, None, "Systém není napojen na databázi."
+
+    inicializace_db()  # sloupec oidc_oid musí existovat i když je M365 první přihlášení po startu
 
     conn = get_db_connection()
     if not conn:
@@ -1282,12 +1292,20 @@ def najdi_uzivatele_dle_emailu(email):
     cursor = None
     try:
         cursor = conn.cursor(dictionary=True, buffered=True)
-        cursor.execute("SELECT iduser, name, surname, is_active FROM user WHERE email = %s", (email,))
+        cursor.execute("SELECT iduser, name, surname, is_active, oidc_oid FROM user WHERE email = %s", (email,))
         u = cursor.fetchone()
         if not u:
             return None, None, "Účet v intranetu neexistuje."
         if not u['is_active']:
             return None, None, "Účet byl deaktivován administrátorem!"
+        if not u['oidc_oid']:
+            # IS NULL: ze souběžných prvních přihlášení vyhraje jen jedno, ostatní pak neprojdou kontrolou níž.
+            cursor.execute("UPDATE user SET oidc_oid = %s WHERE iduser = %s AND oidc_oid IS NULL", (oid, u['iduser']))
+            conn.commit()
+            cursor.execute("SELECT oidc_oid FROM user WHERE iduser = %s", (u['iduser'],))
+            u['oidc_oid'] = cursor.fetchone()['oidc_oid']
+        if u['oidc_oid'] != oid:
+            return None, None, "Účet v intranetu je svázaný s jiným firemním účtem."
         return u['iduser'], f"{u['name']} {u['surname']}", "OK"
     except Exception as e:
         return None, None, str(e)

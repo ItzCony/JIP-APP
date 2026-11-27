@@ -111,6 +111,14 @@ def overit_claims(claims: dict, nonce: str, ted: float | None = None) -> str:
         return 'expirace'
     if nonce and claims.get('nonce') != nonce:
         return 'nonce'
+    # Host (B2B, osobní MS účet) dostane token od NAŠEHO tenantu (iss sedí), ale
+    # `idp` ukazuje na jeho domovský IdP — a jeho `email` si může nastavit kdokoli.
+    idp = claims.get('idp')
+    if idp and ISSUER.split('/')[3] not in idp:
+        return 'host'
+    # `oid` = neměnné ID účtu v tenantu; na něj se svazuje intranetový účet.
+    if not claims.get('oid'):
+        return 'oid'
     return ''
 
 
@@ -278,11 +286,12 @@ async def oidc_callback(request: Request):
     if not email:
         return _chyba('Firemní účet nemá e-mail, přihlaste se heslem.')
 
+    oid = claims['oid']
     if brana:
-        # Druhé ověření: firemní účet musí patřit TOMU, kdo je přihlášený.
-        prihlaseny = str(app.storage.user.get('user_email') or '').strip().lower()
-        jmeno = str(app.storage.user.get('user_name') or prihlaseny)
-        if not prihlaseny or email.strip().lower() != prihlaseny:
+        # Druhé ověření: firemní účet (e-mail + svázané oid) musí patřit TOMU, kdo je přihlášený.
+        jmeno = str(app.storage.user.get('user_name') or app.storage.user.get('user_email') or '')
+        id_u, _, _ = await asyncio.to_thread(intranet_data.najdi_uzivatele_dle_emailu, email, oid)
+        if not id_u or id_u != app.storage.user.get('user_id'):
             intranet_logger.log_activity(jmeno, 'Druhé ověření',
                                          f'Odmítnuto ({brana}): firemní účet {email} nepatří přihlášenému')
             return _chyba('Firemní účet nepatří přihlášenému uživateli.')
@@ -290,7 +299,7 @@ async def oidc_callback(request: Request):
         intranet_logger.log_activity(jmeno, 'Druhé ověření', f'Odemčeno přes M365 ({brana})')
         return RedirectResponse(intranet_session.BRANY[brana])
 
-    id_u, jmeno, potiz = await asyncio.to_thread(intranet_data.najdi_uzivatele_dle_emailu, email)
+    id_u, jmeno, potiz = await asyncio.to_thread(intranet_data.najdi_uzivatele_dle_emailu, email, oid)
     if not id_u:
         intranet_logger.log_activity('Systém', 'OIDC', f'Odmítnut účet {email}: {potiz}')
         return _zpet_s_chybou(potiz or 'Účet v intranetu neexistuje.')
