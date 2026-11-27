@@ -4953,10 +4953,10 @@ def vykresli_spravu_uzivatelu(user_email, user_name, vsechna_prava=None):
                                         ui.label('Opravdu smazat?').classes('text-xl font-bold text-slate-800')
                                     ui.label('Trvalé smazání uživatele i jeho přiřazení. Nelze vrátit zpět.').classes('text-sm text-slate-500 mb-4')
                                     async def potvrdit():
-                                        await asyncio.to_thread(intranet_data.smaz_uzivatele, cil_mail)
+                                        ok, zprava = await asyncio.to_thread(intranet_data.smaz_uzivatele, cil_mail)
                                         intranet_session.vynut_odhlaseni(cil_mail)
-                                        intranet_logger.log_activity(user_name, "Správa uživatelů", f"Trvale smazán uživatel: {cil_mail}")
-                                        ui.notify(f'Smazáno.', type='positive', position='top')
+                                        intranet_logger.log_activity(user_name, "Správa uživatelů", f"Trvale smazán uživatel: {cil_mail}" if ok else f"Smazání uživatele {cil_mail} selhalo: {zprava}")
+                                        ui.notify(zprava, type='positive' if ok else 'negative', position='top', multi_line=True)
                                         dlg.close()
                                         intranet_data.invaliduj_cache_sprava()
                                         await asyncio.to_thread(intranet_data.ziskej_vsechny_uzivatele)
