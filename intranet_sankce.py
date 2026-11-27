@@ -4118,9 +4118,12 @@ async def _vykresli_zamitnute(user_id, user_name, vsechna_prava):
                 return
             conn = intranet_data.get_db_connection()
             if conn:
-                cur = conn.cursor()
-                cur.execute('UPDATE sankce_zamitnute SET poznamka=%s WHERE id=%s', (nova, rid))
-                conn.commit(); cur.close(); conn.close()
+                try:
+                    cur = conn.cursor()
+                    cur.execute('UPDATE sankce_zamitnute SET poznamka=%s WHERE id=%s', (nova, rid))
+                    conn.commit(); cur.close()
+                finally:
+                    conn.close()
             zapis_audit('sankce_zamitnute', rh, rid, 'poznamka', stara, nova, user_id, user_name)
             for r in vsechny:
                 if r.get('id') == rid:
@@ -4900,12 +4903,15 @@ async def _vykresli_vystaveni(user_id, user_name, vsechna_prava):
 
             conn = intranet_data.get_db_connection()
             if conn:
-                cur = conn.cursor()
-                cur.executemany(
-                    f'UPDATE sankce_vystaveni SET {sloupec}=%s WHERE id=%s',
-                    [(kod_novy, r.get('id')) for r in cilove],
-                )
-                conn.commit(); cur.close(); conn.close()
+                try:
+                    cur = conn.cursor()
+                    cur.executemany(
+                        f'UPDATE sankce_vystaveni SET {sloupec}=%s WHERE id=%s',
+                        [(kod_novy, r.get('id')) for r in cilove],
+                    )
+                    conn.commit(); cur.close()
+                finally:
+                    conn.close()
 
             for r in cilove:
                 zapis_audit('sankce_vystaveni', r.get('row_hash'), r.get('id'),
@@ -5046,12 +5052,15 @@ async def _vykresli_vystaveni(user_id, user_name, vsechna_prava):
 
                 conn = intranet_data.get_db_connection()
                 if conn:
-                    cur = conn.cursor()
-                    cur.executemany(
-                        'UPDATE sankce_vystaveni SET stav=%s WHERE id=%s',
-                        [(kod_novy, r.get('id')) for r in cilove],
-                    )
-                    conn.commit(); cur.close(); conn.close()
+                    try:
+                        cur = conn.cursor()
+                        cur.executemany(
+                            'UPDATE sankce_vystaveni SET stav=%s WHERE id=%s',
+                            [(kod_novy, r.get('id')) for r in cilove],
+                        )
+                        conn.commit(); cur.close()
+                    finally:
+                        conn.close()
 
                 for r in cilove:
                     zapis_audit('sankce_vystaveni', r.get('row_hash'), r.get('id'),
@@ -5130,12 +5139,15 @@ async def _vykresli_vystaveni(user_id, user_name, vsechna_prava):
 
                 conn = intranet_data.get_db_connection()
                 if conn:
-                    cur = conn.cursor()
-                    cur.executemany(
-                        'UPDATE sankce_vystaveni SET stav2=%s WHERE id=%s',
-                        [(kod_novy, r.get('id')) for r in cilove],
-                    )
-                    conn.commit(); cur.close(); conn.close()
+                    try:
+                        cur = conn.cursor()
+                        cur.executemany(
+                            'UPDATE sankce_vystaveni SET stav2=%s WHERE id=%s',
+                            [(kod_novy, r.get('id')) for r in cilove],
+                        )
+                        conn.commit(); cur.close()
+                    finally:
+                        conn.close()
 
                 for r in cilove:
                     zapis_audit('sankce_vystaveni', r.get('row_hash'), r.get('id'),
@@ -5199,12 +5211,15 @@ async def _vykresli_vystaveni(user_id, user_name, vsechna_prava):
                 db_val = nova_val if nova_val else None
                 conn = intranet_data.get_db_connection()
                 if conn:
-                    cur = conn.cursor()
-                    cur.executemany(
-                        'UPDATE sankce_vystaveni SET sleva=%s WHERE id=%s',
-                        [(db_val, r.get('id')) for r in cilove],
-                    )
-                    conn.commit(); cur.close(); conn.close()
+                    try:
+                        cur = conn.cursor()
+                        cur.executemany(
+                            'UPDATE sankce_vystaveni SET sleva=%s WHERE id=%s',
+                            [(db_val, r.get('id')) for r in cilove],
+                        )
+                        conn.commit(); cur.close()
+                    finally:
+                        conn.close()
 
                 for r in cilove:
                     zapis_audit('sankce_vystaveni', r.get('row_hash'), r.get('id'),
@@ -5237,9 +5252,12 @@ async def _vykresli_vystaveni(user_id, user_name, vsechna_prava):
                     return
                 conn = intranet_data.get_db_connection()
                 if conn:
-                    cur = conn.cursor()
-                    cur.execute('UPDATE sankce_vystaveni SET poznamka=%s WHERE id=%s', (nova, rid))
-                    conn.commit(); cur.close(); conn.close()
+                    try:
+                        cur = conn.cursor()
+                        cur.execute('UPDATE sankce_vystaveni SET poznamka=%s WHERE id=%s', (nova, rid))
+                        conn.commit(); cur.close()
+                    finally:
+                        conn.close()
                 zapis_audit('sankce_vystaveni', rh, rid, 'poznamka', stara, nova, user_id, user_name)
                 for r in vsechny:
                     if r.get('id') == rid:

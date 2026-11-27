@@ -1344,11 +1344,13 @@ def overit_prihlaseni(email, heslo):
                 try:
                     conn2 = get_db_connection()
                     if conn2:
-                        c2 = conn2.cursor()
-                        c2.execute("UPDATE user SET password_hash=%s WHERE iduser=%s", (novy_hash, user_id))
-                        conn2.commit()
-                        c2.close()
-                        conn2.close()
+                        try:
+                            c2 = conn2.cursor()
+                            c2.execute("UPDATE user SET password_hash=%s WHERE iduser=%s", (novy_hash, user_id))
+                            conn2.commit()
+                            c2.close()
+                        finally:
+                            conn2.close()
                 except Exception:
                     pass
             _zaznamenej_uspech(email)
