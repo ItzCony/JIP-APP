@@ -2558,19 +2558,30 @@ def smaz_priznak(priznak_id: int) -> tuple[bool, str]:
     finally:
         cur.close(); conn.close()
 
-def smaz_uzivatele(email):
+def smaz_uzivatele(email) -> tuple[bool, str]:
+    """Smaže uživatele. Když smazání zablokují navázaná data (FK s ON DELETE RESTRICT,
+    např. případy značek), účet aspoň deaktivuje, aby se už nepřihlásil. Vrací (smazáno, zpráva)."""
     conn = get_db_connection()
-    if not conn: return
+    if not conn: return False, 'Chyba připojení k DB.'
     cursor = None
     try:
         cursor = conn.cursor(buffered=True)
         cursor.execute("SELECT iduser FROM user WHERE email=%s", (email,))
         row = cursor.fetchone()
-        cursor.execute("DELETE FROM user WHERE email=%s", (email,))
-        conn.commit()
-        if row:
-            vymazat_cache_prav(row[0])
-    except Exception: pass
+        try:
+            cursor.execute("DELETE FROM user WHERE email=%s", (email,))
+            conn.commit()
+            return True, 'Smazáno.'
+        except Exception as e:
+            conn.rollback()
+            cursor.execute("UPDATE user SET is_active=0 WHERE email=%s", (email,))
+            conn.commit()
+            return False, f'Uživatele nelze smazat (má navázaná data), účet byl proto deaktivován. ({e})'
+        finally:
+            if row:
+                vymazat_cache_prav(row[0])
+    except Exception as e:
+        return False, f'Smazání ani deaktivace se nepovedly: {e}'
     finally:
         if cursor: cursor.close()
         if conn: conn.close()
