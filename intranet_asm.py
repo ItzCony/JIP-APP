@@ -5639,15 +5639,16 @@ def _formular_novy(user_id, user_name, prava, zpet_fn):
 # ============================================================================
 def _detail_dialog(pid, user_id, user_name, prava):
     p = nacti_pripad(pid)
-    if not p:
+    formular = (p or {}).get("formular") or "oz_zmena"
+    je_office = _je_office(prava, formular)
+    je_spravce = _je_spravce(prava, formular)
+    je_zadatel_vlastnik = bool(p) and p.get("zadavatel_id") == user_id
+    # Cizí případ (např. deep-link /asm?pripad=<id>) hlásíme stejně jako neexistující.
+    if not p or not (je_office or je_spravce or je_zadatel_vlastnik):
         ui.notify("Případ nenalezen.", type="negative")
         return
     radky = nacti_radky(pid)
     historie = nacti_historie(pid)
-    formular = p.get("formular") or "oz_zmena"
-    je_office = _je_office(prava, formular)
-    je_spravce = _je_spravce(prava, formular)
-    je_zadatel_vlastnik = (p.get("zadavatel_id") == user_id)
     stav = p.get("stav")
 
     # Dialog navěsíme na stabilní top-level slot stránky, NE do slotu očičko-tlačítka
