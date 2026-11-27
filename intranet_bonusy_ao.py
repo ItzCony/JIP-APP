@@ -21,6 +21,7 @@ from xml.sax.saxutils import escape
 from nicegui import app, ui
 
 import intranet_data
+import intranet_kontakty_asm
 import intranet_kpi
 import intranet_logger
 import intranet_prava
@@ -2196,11 +2197,16 @@ def vykresli_analyticke(user_id: int, user_name: str, vsechna_prava: list):
             _hlavicka('KPI', lambda: _nastav(sekce_klic, None), 'Zpět na Analytické oddělení')
             intranet_kpi.vykresli(user_name)
             return
+        if sekce == 'kontakty':
+            _hlavicka('Kontakty Nákupčí', lambda: _nastav(sekce_klic, None), 'Zpět na Analytické oddělení')
+            intranet_kontakty_asm.vykresli(user_name)
+            return
         if sekce != 'bonusy':
             ui.label('Analytické oddělení').classes('text-3xl font-bold text-gray-800 mb-6')
             with ui.row().classes('w-full gap-8 flex-wrap pt-4'):
                 _dlazdice('💰', 'Pobočkové bon', _otevri_bonusy)
                 _dlazdice('📈', 'KPI', lambda: _nastav(sekce_klic, 'kpi'))
+                _dlazdice('📇', 'Kontakty Nákupčí', lambda: _nastav(sekce_klic, 'kontakty'))
             return
         sel = app.storage.user.get(pobocka_klic)
         if sel not in POBOCKY:

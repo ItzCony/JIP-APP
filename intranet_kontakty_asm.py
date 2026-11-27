@@ -1,4 +1,4 @@
-"""Analytické oddělení → Kontakty ASM.
+"""Analytické oddělení → Kontakty Nákupčí.
 
 Živý náhled dvou XLSX souborů s kontakty (seznam vedoucích poboček a ASM,
 číselník nákupčích podle sortimentu). Soubory leží ve složce KontaktyASM/ vedle
@@ -897,7 +897,7 @@ def vykresli(user_name: str):
             ui.notify(f'Soubor nejde načíst: {ex}', type='negative')
             return
         dialog.close()
-        intranet_logger.log_activity(user_name, 'Kontakty ASM', f'nahrána nová verze: {nazev}')
+        intranet_logger.log_activity(user_name, 'Kontakty Nákupčí', f'nahrána nová verze: {nazev}')
         ui.notify(f'Nahráno: {nazev}', type='positive')
         _obsah.refresh()
 
@@ -970,7 +970,7 @@ def vykresli(user_name: str):
                     return
                 dlg.close()
                 intranet_logger.log_activity(
-                    user_name, 'Kontakty ASM',
+                    user_name, 'Kontakty Nákupčí',
                     f'upraven řádek {r} ({nazev} / {list_nazev}): ' + ', '.join(z[0] for z in zmeny))
                 ui.notify('Uloženo', type='positive')
                 _obsah.refresh()
